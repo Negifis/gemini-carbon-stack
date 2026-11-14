@@ -750,6 +750,54 @@ class GateSubprocessTestCase(unittest.TestCase):
         _, esc_ok = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
         self.assertEqual(esc_ok, {"decision": "allow"})
 
+    def test_10_bookkeeping_and_outside_git_cwd_do_not_poison_review_freshness(self) -> None:
+        sec = self.workspace / "auth_check.py"
+        sec_code = "def allow_user(uid: str) -> bool:\n    return bool(uid and uid.strip())\n"
+        sec.write_text(sec_code, encoding="utf-8")
+        self.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {"toolCall": {"id": "k1", "name": "write_file", "args": {"Path": str(sec), "Content": sec_code}}, "error": ""},
+        )
+        self.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {"toolCall": {"id": "k2", "name": "run_command", "args": {"CommandLine": f'python -X utf8 "{self.workspace / "install.py"}" --diagnose'}}, "error": ""},
+        )
+        self.add_sonnet_simplify_lenses()
+        self.add_swarm_worker(
+            name="internal-reviewer",
+            model="claude-opus-5-5-high",
+            brief="Read-only review of auth_check.py.",
+            worker_post="@coordinator\nENGINE: internal-swarm (claude-opus-5-5-high)\nVERDICT: APPROVED",
+        )
+        # Running continuity checkpoint & an unrelated python probe outside workspace AFTER approval must NOT invalidate SHA-256 freshness
+        outside_dir = self.root / "no-git-dir"
+        outside_dir.mkdir(exist_ok=True)
+        self.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {
+                "cwd": str(outside_dir),
+                "workspacePaths": [],
+                "toolCall": {"id": "k3", "name": "run_command", "args": {"CommandLine": 'python -X utf8 continuity.py checkpoint --goal "done"'}},
+                "error": "",
+            },
+        )
+        self.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {
+                "cwd": str(outside_dir),
+                "workspacePaths": [],
+                "toolCall": {"id": "k4", "name": "run_command", "args": {"CommandLine": 'python -X utf8 -c "print(42)"'}},
+                "error": "",
+            },
+        )
+        self.add_final_response("Проверено.\n[gate] verified: HIGH; auth_check.py, diagnose + opus review")
+        _, ok = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
+        self.assertEqual(ok, {"decision": "allow"})
+
 
 if __name__ == "__main__":
     unittest.main()

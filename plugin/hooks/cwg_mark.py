@@ -27,7 +27,7 @@ CACHE_PATH_RE = re.compile(
 )
 
 BOOKKEEPING_CMD_RE = re.compile(
-    r"\b(carbon_memory\.py|gate_inbox\.py|chip_handoff\.py|codex_lane\.py\s+(check|status|reset|review))\b",
+    r"\b(carbon_memory\.py|continuity\.py\s+(?:checkpoint|show)|gate_inbox\.py|chip_handoff\.py|codex_lane\.py\s+(check|status|reset|review))\b",
     re.IGNORECASE,
 )
 
@@ -55,8 +55,8 @@ VALIDATION_CMD_RE = re.compile(
     r"|cargo\s+(?:test|check|clippy)"
     r"|go\s+(?:test|vet)"
     r"|dotnet\s+(?:test|build)"
-    r"|agy(?:\.exe)?\s+plugin\s+validate"
-    r"|install\.py\s+[^\n]*(?:--diagnose|--dry-run)"
+    r"|agy(?:\.exe|\.cmd)?[\"']?\s+plugin\s+validate"
+    r"|install\.py[\"']?\s+[^\n]*(?:--diagnose|--dry-run)"
     r")\b",
     re.IGNORECASE,
 )
@@ -66,6 +66,7 @@ CD_LEADING_RE = re.compile(
     r"^\s*(?:cd(?:\s+/d)?|Set-Location|Push-Location)\s+[\"']?(?P<dir>[^\"';&|\r\n]+)[\"']?",
     re.IGNORECASE,
 )
+GIT_DASH_C_RE = re.compile(r"\bgit(?:\.exe)?\s+-C\s+[\"']?(?P<dir>[^\"';&|\r\n]+)[\"']?", re.IGNORECASE)
 
 
 def classify_shell_command(cmd: str) -> str:
@@ -85,13 +86,20 @@ def classify_shell_command(cmd: str) -> str:
     return "MUTATING_OR_UNKNOWN"
 
 
-def resolve_command_cwd(cmd: str, default_cwd: str) -> str:
-    m = CD_LEADING_RE.match(cmd or "")
-    if m:
-        raw_dir = m.group("dir").strip()
-        candidate = raw_dir if os.path.isabs(raw_dir) else os.path.join(default_cwd, raw_dir)
-        if os.path.isdir(candidate):
-            return os.path.abspath(candidate)
+def resolve_command_cwd(cmd: str, default_cwd: str, session: str = "") -> str:
+    for pat in (CD_LEADING_RE, GIT_DASH_C_RE):
+        m = pat.search(cmd or "") if pat is GIT_DASH_C_RE else pat.match(cmd or "")
+        if m:
+            raw_dir = m.group("dir").strip()
+            candidate = raw_dir if os.path.isabs(raw_dir) else os.path.join(default_cwd, raw_dir)
+            if os.path.isdir(candidate):
+                return os.path.abspath(candidate)
+    if not rio.git_toplevel(default_cwd) and session:
+        existing = rio.read_json(cwg.marker_path(session), default=None)
+        if isinstance(existing, dict) and not existing.get("closed"):
+            groot = str(existing.get("git_root") or "")
+            if groot and os.path.isdir(groot):
+                return os.path.abspath(groot)
     return default_cwd
 
 
@@ -265,18 +273,31 @@ def update_candidate_marker(
         fp = cwg.content_fingerprint(merged_paths)
         marks = list(marker.get("content_marks") or [])
         mark_obj: dict[str, Any] = {"ts": now, "fp": fp, "cause": cause_label[:120]}
-        if unknown_barrier:
+        if not fp and unknown_barrier:
             mark_obj["unknown"] = True
-        if not marks or marks[-1].get("fp") != fp or unknown_barrier or marks[-1].get("unknown"):
+        if not marks or marks[-1].get("fp") != fp or mark_obj.get("unknown") or marks[-1].get("unknown"):
             marks.append(mark_obj)
         marker["content_marks"] = marks[-32:]
     elif operational_mutation:
         marker["operational"] = True
-        if unknown_barrier and cwg.durable_paths(marker.get("paths")):
+        dpaths = cwg.durable_paths(marker.get("paths"))
+        if dpaths:
             marks = list(marker.get("content_marks") or [])
-            fp = cwg.content_fingerprint(marker.get("paths") or [])
-            marks.append({"ts": now, "fp": fp, "unknown": True, "cause": cause_label[:120]})
-            marker["content_marks"] = marks[-32:]
+            fp = cwg.content_fingerprint(dpaths)
+            last_fp = marks[-1].get("fp") if marks and isinstance(marks[-1], dict) else None
+            if not fp:
+                marks.append({"ts": now, "fp": None, "unknown": True, "cause": cause_label[:120]})
+                marker["content_marks"] = marks[-32:]
+            elif fp != last_fp:
+                marks.append({"ts": now, "fp": fp, "cause": cause_label[:120]})
+                marker["last_durable_ts"] = now
+                marker["content_marks"] = marks[-32:]
+            elif marks and marks[-1].get("unknown"):
+                # Clear legacy unknown flag when SHA-256 fingerprint is confirmed identical
+                cleaned = dict(marks[-1])
+                cleaned.pop("unknown", None)
+                marks[-1] = cleaned
+                marker["content_marks"] = marks[-32:]
 
     rio.write_json(mp, marker)
     return before_open, marker
@@ -359,7 +380,7 @@ def handle_pre_tool(payload: dict[str, Any]) -> None:
         capture_direct_codex_packet(cmd, cwd, session)
         policy = classify_shell_command(cmd)
         if policy not in ("READ_ONLY", "BOOKKEEPING"):
-            cmd_cwd = resolve_command_cwd(cmd, cwd)
+            cmd_cwd = resolve_command_cwd(cmd, cwd, session=session)
             cwg.publish_claim(session, shell_active=True, cwd=cmd_cwd)
             snap = take_git_snapshot(cmd_cwd)
             snap["policy"] = policy
@@ -495,7 +516,7 @@ def handle_post_tool(payload: dict[str, Any]) -> None:
                 snap_file.unlink()
             except OSError:
                 pass
-        cmd_cwd = resolve_command_cwd(cmd, cwd)
+        cmd_cwd = resolve_command_cwd(cmd, cwd, session=session)
         after_snap = take_git_snapshot(cmd_cwd)
         changed_paths, unmeasured = diff_git_snapshots(before_snap, after_snap)
 

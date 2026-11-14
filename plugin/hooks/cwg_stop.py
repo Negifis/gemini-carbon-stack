@@ -666,20 +666,19 @@ def is_review_fresh(review: dict[str, Any], marker: dict[str, Any]) -> bool:
         return True
     launch_ts = float(review.get("launch_ts") or 0.0)
 
-    # INVARIANT: A reviewer only saw content that existed at or before `launch_ts` (never edits during/after review).
+    # INVARIANT: A mark with a concrete SHA-256 `fp` is cryptographically measured; only `fp is None` is unmeasured.
     covered_fps = {
         m.get("fp")
         for m in marks
-        if not m.get("unknown")
-        and m.get("fp") is not None
+        if m.get("fp")
         and float(m.get("ts") or 0.0) <= launch_ts
     }
     for m in marks:
         mts = float(m.get("ts") or 0.0)
-        if m.get("unknown") and mts > launch_ts:
+        if not m.get("fp") and m.get("unknown") and mts > launch_ts:
             return False
     current_mark = marks[-1]
-    if current_mark.get("unknown") or current_mark.get("fp") is None:
+    if not current_mark.get("fp"):
         return False
     if current_mark.get("fp") not in covered_fps:
         return False
