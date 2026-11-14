@@ -3,17 +3,14 @@
 
 from __future__ import annotations
 
-import os
 import pathlib
 import re
 import sys
-import time
 from typing import Any
 
 HOOKS_DIR = pathlib.Path(__file__).resolve().parent
 TOOLS_DIR = HOOKS_DIR.parent / "tools"
 sys.path.insert(0, str(HOOKS_DIR))
-sys.path.insert(0, str(TOOLS_DIR))
 
 import continuity
 import runtime_io as rio
@@ -187,31 +184,26 @@ def guard_subagent_invocation(
         )
 
     # 3. Propagate active Canonical Checkpoint AUTHORITATIVE STATE & SUPERSEDED constraints automatically
-    cwd = rio.effective_cwd(payload)
-    wps = payload.get("workspacePaths") if isinstance(payload.get("workspacePaths"), list) else None
-    pkey = rio.project_key(cwd, wps)
-    cp_file = continuity.checkpoint_path(pkey)
-    ws_cp = pathlib.Path(cwd) / ".agents" / "CHECKPOINT.md"
-    chosen = ws_cp if ws_cp.is_file() else (cp_file if cp_file.is_file() else None)
-
-    if chosen is not None and "[Canonical Constraints]" not in prompt:
-        secs = continuity.parse_checkpoint_sections(chosen.read_text(encoding="utf-8", errors="replace"))
-        auth = secs.get("AUTHORITATIVE STATE", "").strip()
-        sup = secs.get("SUPERSEDED / CANCELLED", "").strip()
-        extra_lines: list[str] = []
-        if auth and auth != "—":
-            extra_lines.append(f"- Active Requirements: {auth[:400]}")
-        if sup and sup != "—":
-            extra_lines.append(f"- Cancelled / Do NOT Reintroduce: {sup[:300]}")
-        if extra_lines:
-            enriched = prompt + "\n\n[Canonical Constraints]\n" + "\n".join(extra_lines)
-            return "allow", None, {"Prompt": enriched}
+    if "[Canonical Constraints]" not in prompt:
+        wps = payload.get("workspacePaths") if isinstance(payload.get("workspacePaths"), list) else None
+        chosen = continuity.resolve_checkpoint_file(rio.effective_cwd(payload), wps)
+        if chosen is not None:
+            secs = continuity.parse_checkpoint_sections(chosen.read_text(encoding="utf-8", errors="replace"))
+            auth = secs.get("AUTHORITATIVE STATE", "").strip()
+            sup = secs.get("SUPERSEDED / CANCELLED", "").strip()
+            extra_lines: list[str] = []
+            if auth and auth != "—":
+                extra_lines.append(f"- Active Requirements: {auth[:400]}")
+            if sup and sup != "—":
+                extra_lines.append(f"- Cancelled / Do NOT Reintroduce: {sup[:300]}")
+            if extra_lines:
+                enriched = prompt + "\n\n[Canonical Constraints]\n" + "\n".join(extra_lines)
+                return "allow", None, {"Prompt": enriched}
 
     return "allow", None, None
 
 
 def main() -> int:
-    event = rio.parse_event_arg("PreToolUse")
     payload, err = rio.read_hook_stdin()
     if err or payload is None:
         if err:

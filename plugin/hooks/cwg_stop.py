@@ -20,7 +20,7 @@ import gate_inbox
 import runtime_io as rio
 
 MAX_BLOCKS_PER_CANDIDATE = 3
-MAX_BACKGROUND_WAITS = 4
+MAX_BACKGROUND_WAITS = 8
 MAX_REVIEW_ROUNDS = 3
 MAX_CLOSURE_PASSES = 2
 
@@ -140,6 +140,383 @@ def extract_subagent_final_texts(subagent_transcript_path: str | None) -> tuple[
     return "\n\n".join(chunks), last_ts, finished
 
 
+SWARM_ROLE_MEMBER_RE = re.compile(r"^(?:narrator|monitor)(?:-\d+)?$", re.IGNORECASE)
+MODEL_FAILURE_RE = re.compile(
+    r"(?:RESOURCE_EXHAUSTED|quota[^\n]{0,30}(?:exceeded|exhausted|0%)|"
+    r"rate[ _-]limit[ _-]exceeded|429\s+too\s+many|model[^\n]{0,30}(?:unavailable|at\s+capacity)|"
+    r"overloaded|not\s+eligible|internal\s+server\s+error)",
+    re.IGNORECASE,
+)
+
+
+def _infer_single_simplify_lens(name: str, brief_or_role: str, output_text: str) -> str | None:
+    """Resolve at most one simplify lens (`reuse` | `quality` | `efficiency`) owned by a single worker."""
+    explicit = [m.lower() for m in cwg.SIMPLIFY_LENS_LINE_RE.findall(output_text or "")]
+    if len(set(explicit)) == 1 and explicit[0] in cwg.SIMPLIFY_LENSES:
+        return explicit[0]
+
+    low_name = (name or "").lower()
+    for lens in cwg.SIMPLIFY_LENSES:
+        if lens in low_name:
+            return lens
+
+    if "simplify" in low_name or "simplify" in (brief_or_role or "").lower():
+        low_brief = (brief_or_role or "").lower()
+        matched = [lens for lens in cwg.SIMPLIFY_LENSES if re.search(rf"\b{lens}\b", low_brief)]
+        if len(matched) == 1:
+            return matched[0]
+    return None
+
+
+def _member_transcript_summary(member_tp: pathlib.Path | None, first_ts: float) -> dict[str, Any]:
+    """Inspect a swarm member's system transcript for outputs, completion state, and model/runtime errors."""
+    if member_tp is None or not member_tp.is_file():
+        return {"exists": False, "outputs": [], "has_error": False, "error_ts": 0.0, "parked_or_done": False, "start_ts": 0.0}
+    m_steps = rio.read_transcript_steps(str(member_tp), max_lines=600)
+    if not m_steps:
+        return {"exists": True, "outputs": [], "has_error": False, "error_ts": 0.0, "parked_or_done": False, "start_ts": 0.0}
+
+    outputs: list[tuple[float, str]] = []
+    has_error = False
+    error_ts = 0.0
+    start_ts = rio.parse_iso_ts(m_steps[0].get("created_at"))
+
+    for st in m_steps:
+        ts = rio.parse_iso_ts(st.get("created_at"))
+        stype = str(st.get("type") or "")
+        sstatus = str(st.get("status") or "")
+        scontent = str(st.get("content") or "")
+
+        if sstatus == "ERROR" or stype == "ERROR_MESSAGE" or (
+            st.get("source") == "SYSTEM" and MODEL_FAILURE_RE.search(scontent)
+        ):
+            if not ts or ts >= first_ts - 2.0:
+                has_error = True
+                error_ts = max(error_ts, ts or time.time())
+
+        if st.get("source") == "MODEL" and stype == "PLANNER_RESPONSE":
+            tcs = st.get("tool_calls") or []
+            for tc in tcs:
+                if isinstance(tc, dict) and tc.get("name") in ("post_message", "send_message"):
+                    targs = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+                    txt = str(targs.get("text") or targs.get("Message") or "").strip()
+                    if txt and (not ts or ts >= first_ts - 2.0):
+                        outputs.append((ts or time.time(), txt))
+            if scontent.strip() and not tcs and (not ts or ts >= first_ts - 2.0):
+                outputs.append((ts or time.time(), scontent.strip()))
+
+    last_st = m_steps[-1]
+    last_type = str(last_st.get("type") or "")
+    parked_or_done = False
+    if last_st.get("source") == "MODEL" and last_type == "PLANNER_RESPONSE" and not (last_st.get("tool_calls") or []):
+        parked_or_done = True
+    elif last_type == "GENERIC" and "swarm_wait" in str(last_st.get("content") or "") and str(last_st.get("status") or "") == "DONE":
+        parked_or_done = True
+    elif has_error:
+        parked_or_done = True
+
+    return {
+        "exists": True,
+        "outputs": outputs,
+        "has_error": has_error,
+        "error_ts": error_ts,
+        "parked_or_done": parked_or_done,
+        "start_ts": start_ts,
+    }
+
+
+def scan_swarm_activity(
+    steps: list[dict[str, Any]],
+    transcript_path: str | None,
+    first_ts: float,
+) -> dict[str, Any]:
+    """Verify native Antigravity `swarm` workers (`members.json` + `board.jsonl` + member transcripts)."""
+    sonnet_lenses: set[str] = set()
+    fallback_lenses: set[str] = set()
+    simplify_failures = 0
+    reviews: list[dict[str, Any]] = []
+    review_failures: list[float] = []
+    in_flight_workers: list[str] = []
+    opus_issue_verified = False
+    opus_issue_ts = 0.0
+    sonnet_issue_verified = False
+
+    def _mark_opus_issue(ts_val: float) -> None:
+        nonlocal opus_issue_verified, opus_issue_ts
+        opus_issue_verified = True
+        eff = ts_val or time.time()
+        if opus_issue_ts <= 0.0 or eff < opus_issue_ts:
+            opus_issue_ts = eff
+
+    requested_models: dict[str, set[str]] = {}
+    model_switches: dict[str, list[tuple[float, str]]] = {}
+
+    # 1. Inspect parent `swarm` tool calls & outputs for model quotas, spawn errors, and escalations
+    for idx, st in enumerate(steps):
+        if st.get("source") != "MODEL" or st.get("type") != "PLANNER_RESPONSE":
+            continue
+        call_ts = rio.parse_iso_ts(st.get("created_at"))
+        if call_ts and call_ts < first_ts - 2.0:
+            continue
+        swarm_calls = [
+            tc for tc in (st.get("tool_calls") or []) if isinstance(tc, dict) and tc.get("name") == "swarm"
+        ]
+        if not swarm_calls:
+            continue
+
+        g_cur = idx + 1
+        generic_blobs: list[str] = []
+        while g_cur < len(steps) and steps[g_cur].get("type") == "GENERIC":
+            generic_blobs.append(str(steps[g_cur].get("content") or ""))
+            g_cur += 1
+
+        for pos, tc in enumerate(swarm_calls):
+            args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+            action = str(args.get("action") or "").strip().lower()
+            wname = str(args.get("name") or "").strip()
+            req_model = str(args.get("model") or "").strip().lower()
+            blob = generic_blobs[pos] if pos < len(generic_blobs) else "\n".join(generic_blobs)
+
+            if wname and req_model:
+                requested_models.setdefault(wname, set()).add(req_model)
+            if action == "model" and wname and call_ts:
+                model_switches.setdefault(wname, []).append((call_ts, f"[model-switch:{req_model}]"))
+
+            if action == "models" and blob.strip().startswith("{"):
+                try:
+                    mdata = json.loads(blob)
+                    avail = set(mdata.get("models") or [])
+                    quotas = mdata.get("quotas") or {}
+                    if avail:
+                        if cwg.OPUS_HIGH_MODEL not in avail:
+                            _mark_opus_issue(call_ts)
+                        if cwg.SONNET_HIGH_MODEL not in avail:
+                            sonnet_issue_verified = True
+                    opus_q = str((quotas.get(cwg.OPUS_HIGH_MODEL) or {}).get("quota_remaining") or "")
+                    if opus_q in ("0%", "0"):
+                        _mark_opus_issue(call_ts)
+                    sonnet_q = str((quotas.get(cwg.SONNET_HIGH_MODEL) or {}).get("quota_remaining") or "")
+                    if sonnet_q in ("0%", "0"):
+                        sonnet_issue_verified = True
+                except Exception:
+                    pass
+
+            low_blob = blob.lower()
+            is_err = ("error" in low_blob or "failed" in low_blob or bool(MODEL_FAILURE_RE.search(blob))) and not blob.strip().startswith("{")
+            if is_err:
+                if cwg.OPUS_HIGH_MODEL in req_model:
+                    _mark_opus_issue(call_ts)
+                    review_failures.append(call_ts or time.time())
+                elif cwg.SONNET_HIGH_MODEL in req_model:
+                    sonnet_issue_verified = True
+                    simplify_failures += 1
+
+    # 2. Locate `<brain>/<convId>/.system_generated/swarm/{members.json, board.jsonl}`
+    conv_dir: pathlib.Path | None = None
+    brain_root: pathlib.Path | None = None
+    if transcript_path:
+        p = pathlib.Path(transcript_path).resolve()
+        if len(p.parents) >= 4 and p.parents[1].name == ".system_generated":
+            conv_dir = p.parents[2]
+            brain_root = p.parents[3]
+
+    if conv_dir is None:
+        return {
+            "sonnet_lenses": sonnet_lenses,
+            "fallback_lenses": fallback_lenses,
+            "simplify_failures": simplify_failures,
+            "reviews": reviews,
+            "review_failures": review_failures,
+            "in_flight_workers": in_flight_workers,
+            "opus_issue_verified": opus_issue_verified,
+            "opus_issue_ts": opus_issue_ts,
+            "sonnet_issue_verified": sonnet_issue_verified,
+        }
+
+    swarm_dir = conv_dir / ".system_generated" / "swarm"
+    members_doc = rio.read_json(swarm_dir / "members.json", default=None)
+    members_map = (members_doc.get("members") if isinstance(members_doc, dict) else None) or {}
+    if not isinstance(members_map, dict) or not members_map:
+        return {
+            "sonnet_lenses": sonnet_lenses,
+            "fallback_lenses": fallback_lenses,
+            "simplify_failures": simplify_failures,
+            "reviews": reviews,
+            "review_failures": review_failures,
+            "in_flight_workers": in_flight_workers,
+            "opus_issue_verified": opus_issue_verified,
+            "opus_issue_ts": opus_issue_ts,
+            "sonnet_issue_verified": sonnet_issue_verified,
+        }
+
+    board_posts: list[dict[str, Any]] = []
+    board_file = swarm_dir / "board.jsonl"
+    if board_file.is_file():
+        for raw_ln in board_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not raw_ln.strip():
+                continue
+            try:
+                rec = json.loads(raw_ln)
+                if isinstance(rec, dict):
+                    board_posts.append(rec)
+            except Exception:
+                continue
+
+    for mname, minfo in members_map.items():
+        if not isinstance(minfo, dict):
+            continue
+        role_val = str(minfo.get("role") or "worker").lower()
+        if mname == "coordinator" or role_val in ("coordinator", "narrator", "monitor") or SWARM_ROLE_MEMBER_RE.match(mname):
+            continue
+
+        cur_model = str(minfo.get("model") or "").strip().lower()
+        mcid = str(minfo.get("conversation_id") or "").strip()
+        killed = bool(minfo.get("killed"))
+        group_prefix = mname.rsplit("-", 1)[0] if re.search(r"-\d+$", mname) else ""
+
+        # Coordinator assignment posts targeting this worker
+        coord_posts: list[tuple[float, str]] = []
+        worker_board_posts: list[tuple[float, str]] = []
+        mention_pats = [re.compile(rf"(?<![A-Za-z0-9_-])@{re.escape(mname)}(?![A-Za-z0-9_-])", re.IGNORECASE)]
+        if group_prefix:
+            mention_pats.append(re.compile(rf"(?<![A-Za-z0-9_-])@{re.escape(group_prefix)}(?![A-Za-z0-9_-])", re.IGNORECASE))
+
+        for bp in board_posts:
+            poster = str(bp.get("agent") or "")
+            btext = str(bp.get("text") or "").strip()
+            bts = rio.parse_iso_ts(bp.get("time"))
+            if poster == "coordinator" and btext:
+                if any(mp.search(btext) for mp in mention_pats) or "@all" in btext.lower():
+                    coord_posts.append((bts, btext))
+            elif poster == mname and btext:
+                # SECURITY INVARIANT: Only posts authored by `mname` itself count as worker output (never coordinator prompts).
+                if not bts or bts >= first_ts - 2.0:
+                    worker_board_posts.append((bts or time.time(), btext))
+
+        m_tp = (brain_root / mcid / ".system_generated" / "logs" / "transcript.jsonl") if (brain_root and mcid) else None
+        tsum = _member_transcript_summary(m_tp, first_ts)
+
+        prior_reqs = set(requested_models.get(mname, set()))
+        if group_prefix:
+            prior_reqs |= set(requested_models.get(group_prefix, set()))
+
+        if tsum["has_error"]:
+            if cur_model == cwg.OPUS_HIGH_MODEL or cwg.OPUS_HIGH_MODEL in prior_reqs:
+                _mark_opus_issue(tsum["error_ts"])
+                review_failures.append(tsum["error_ts"] or time.time())
+            if cur_model == cwg.SONNET_HIGH_MODEL or cwg.SONNET_HIGH_MODEL in prior_reqs:
+                sonnet_issue_verified = True
+                simplify_failures += 1
+
+        # Combine worker board posts and worker transcript outputs
+        combined_outputs: list[tuple[float, str]] = list(worker_board_posts)
+        seen_texts = {txt for _, txt in combined_outputs}
+        for ots, otxt in tsum["outputs"]:
+            if otxt not in seen_texts:
+                combined_outputs.append((ots, otxt))
+                seen_texts.add(otxt)
+        combined_outputs.sort(key=lambda pair: pair[0])
+
+        latest_assign_ts = coord_posts[-1][0] if coord_posts else tsum["start_ts"]
+        latest_brief = "\n".join(txt for _, txt in coord_posts)
+        has_reply_since_assign = bool(
+            combined_outputs and (not latest_assign_ts or combined_outputs[-1][0] >= latest_assign_ts - 1.0)
+        )
+
+        if not killed and latest_assign_ts >= first_ts - 2.0 and not has_reply_since_assign and not tsum["parked_or_done"]:
+            in_flight_workers.append(f"swarm:{mname}")
+            continue
+
+        if not combined_outputs:
+            continue
+
+        joined_worker_text = "\n\n".join(txt for _, txt in combined_outputs)
+        lens = _infer_single_simplify_lens(mname, latest_brief, joined_worker_text)
+        if lens is not None:
+            if cur_model == cwg.SONNET_HIGH_MODEL:
+                sonnet_lenses.add(lens)
+            else:
+                fallback_lenses.add(lens)
+            continue
+
+        # Internal adversarial review worker: group outputs by coordinator assignment/switch window
+        # so board posts + transcript summaries from a single round are never double-counted.
+        windows: list[tuple[float, str]] = sorted(
+            list(coord_posts) + list(model_switches.get(mname, [])),
+            key=lambda pair: pair[0],
+        )
+        if not windows:
+            windows = [(tsum["start_ts"] or first_ts, "")]
+
+        bucketed_outputs: dict[int, list[tuple[float, str]]] = {}
+        for out_ts, out_txt in combined_outputs:
+            w_idx = 0
+            for cand_idx, (wts, _) in enumerate(windows):
+                if not wts or wts <= out_ts + 0.5:
+                    w_idx = cand_idx
+            bucketed_outputs.setdefault(w_idx, []).append((out_ts, out_txt))
+
+        eng = "internal-opus" if cur_model == cwg.OPUS_HIGH_MODEL else "internal-carbon"
+        escalated_from_opus = cwg.OPUS_HIGH_MODEL in prior_reqs
+        for w_idx in sorted(bucketed_outputs):
+            win_ts, win_brief = windows[w_idx]
+            win_outs = bucketed_outputs[w_idx]
+            eff_launch_ts = win_ts or tsum["start_ts"] or first_ts
+            eff_end_ts = max(eff_launch_ts, max((ots for ots, _ in win_outs), default=eff_launch_ts))
+            win_txt = "\n\n".join(otxt for _, otxt in win_outs)
+            is_xhigh = (
+                ("xhigh" in mname.lower())
+                or bool(cwg.REVIEW_TIER_XHIGH_RE.search(latest_brief))
+                or bool(cwg.REVIEW_TIER_XHIGH_RE.search(win_brief))
+                or bool(cwg.REVIEW_TIER_XHIGH_RE.search(win_txt))
+            )
+
+            cls_matches = cwg.CLOSURE_LINE_RE.findall(win_txt)
+            ord_matches = cwg.VERDICT_LINE_RE.findall(win_txt)
+            if cls_matches:
+                reviews.append(
+                    {
+                        "engine": eng,
+                        "reviewer": mname,
+                        "cid": mcid,
+                        "kind": "closure",
+                        "verdict": cls_matches[-1].upper(),
+                        "launch_ts": eff_launch_ts,
+                        "verdict_ts": eff_end_ts,
+                        "xhigh": is_xhigh,
+                        "model": cur_model,
+                        "escalated_from_opus": escalated_from_opus,
+                    }
+                )
+            elif ord_matches:
+                reviews.append(
+                    {
+                        "engine": eng,
+                        "reviewer": mname,
+                        "cid": mcid,
+                        "kind": "ordinary",
+                        "verdict": ord_matches[-1].upper(),
+                        "launch_ts": eff_launch_ts,
+                        "verdict_ts": eff_end_ts,
+                        "xhigh": is_xhigh,
+                        "model": cur_model,
+                        "escalated_from_opus": escalated_from_opus,
+                    }
+                )
+
+    return {
+        "sonnet_lenses": sonnet_lenses,
+        "fallback_lenses": fallback_lenses,
+        "simplify_failures": simplify_failures,
+        "reviews": reviews,
+        "review_failures": review_failures,
+        "in_flight_workers": in_flight_workers,
+        "opus_issue_verified": opus_issue_verified,
+        "opus_issue_ts": opus_issue_ts,
+        "sonnet_issue_verified": sonnet_issue_verified,
+    }
+
+
 def scan_native_subagents(
     steps: list[dict[str, Any]],
     transcript_path: str | None,
@@ -149,11 +526,9 @@ def scan_native_subagents(
     brain_root: pathlib.Path | None = None
     if transcript_path:
         p = pathlib.Path(transcript_path).resolve()
-        # .../<brain>/<conv-id>/.system_generated/logs/transcript.jsonl -> brain_root is parents[3]
         if len(p.parents) >= 4 and p.parents[1].name == ".system_generated":
             brain_root = p.parents[3]
 
-    # Collect SYSTEM_MESSAGE deliveries keyed by sender conversationId
     delivered_by_sender: dict[str, list[tuple[float, str]]] = {}
     for st in steps:
         if st.get("source") == "SYSTEM" and st.get("type") == "SYSTEM_MESSAGE":
@@ -163,7 +538,7 @@ def scan_native_subagents(
                 msg_ts = rio.parse_iso_ts(m.group("ts")) or rio.parse_iso_ts(st.get("created_at"))
                 delivered_by_sender.setdefault(sender, []).append((msg_ts, m.group("body").strip()))
 
-    simplify_passes: list[dict[str, Any]] = []
+    fallback_lenses: set[str] = set()
     simplify_failures: int = 0
     reviews: list[dict[str, Any]] = []
     review_failures: list[float] = []
@@ -182,7 +557,6 @@ def scan_native_subagents(
         if not sub_calls:
             continue
 
-        # Look ahead at immediate MODEL/GENERIC tool responses for conversationId / logAbsoluteUri
         generic_Cursor = idx + 1
         generic_blobs: list[str] = []
         while generic_Cursor < len(steps) and steps[generic_Cursor].get("type") == "GENERIC":
@@ -193,9 +567,12 @@ def scan_native_subagents(
             args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
             tname = str(args.get("TypeName") or "").strip()
             base_tname = tname.rsplit(":", 1)[-1]
-            role_lower = str(args.get("Role") or "").strip().lower()
-            is_simplify_subagent = (base_tname == cwg.SIMPLIFY_REVIEWER) or (
-                base_tname == "research" and "simplify" in role_lower
+            role_str = str(args.get("Role") or "").strip()
+            prompt_str = str(args.get("Prompt") or "").strip()
+            is_simplify_subagent = (
+                base_tname in cwg.SIMPLIFY_LENS_AGENTS
+                or base_tname == cwg.SIMPLIFY_REVIEWER
+                or (base_tname == "research" and "simplify" in role_str.lower())
             )
             model_arg = str(args.get("Model") or "inherit").strip()
             blob = generic_blobs[pos] if pos < len(generic_blobs) else ("\n".join(generic_blobs))
@@ -233,7 +610,9 @@ def scan_native_subagents(
 
             if is_simplify_subagent:
                 if sub_text.strip():
-                    simplify_passes.append({"ts": eff_end_ts, "cid": cid, "text": sub_text[:300]})
+                    lens = _infer_single_simplify_lens(base_tname, f"{role_str}\n{prompt_str}", sub_text)
+                    if lens:
+                        fallback_lenses.add(lens)
                 else:
                     simplify_failures += 1
 
@@ -272,7 +651,7 @@ def scan_native_subagents(
                     review_failures.append(eff_end_ts)
 
     return {
-        "simplify_passes": simplify_passes,
+        "fallback_lenses": fallback_lenses,
         "simplify_failures": simplify_failures,
         "reviews": reviews,
         "review_failures": review_failures,
@@ -312,6 +691,7 @@ def validate_candidate_closure(
     marker: dict[str, Any],
     checks_ev: dict[str, Any],
     sub_ev: dict[str, Any],
+    swarm_ev: dict[str, Any],
     codex_reviews: list[dict[str, Any]],
 ) -> tuple[bool, str]:
     wclass = cwg.candidate_class(marker)
@@ -333,7 +713,6 @@ def validate_candidate_closure(
         if rkind in ("operational", "no-change"):
             return True, rkind
         if rkind == "verified":
-            # Allowed when an operational command intentionally wrote untracked external artifacts
             pass
         else:
             return False, f"OPERATIONAL candidate cannot close with `{rkind}`"
@@ -376,22 +755,36 @@ def validate_candidate_closure(
                 "last passing test/verification command ran BEFORE the latest file edit; re-verify current bytes",
             )
 
-    # 2. Proportionate Simplify Verification (non-small STANDARD, HIGH, XHIGH)
+    # 2. Proportionate 3-Lens Simplify Verification on `claude-sonnet-5-5-high` (non-small STANDARD, HIGH, XHIGH)
     needs_simplify = (effective_risk in ("HIGH", "XHIGH")) or (
         effective_risk == "STANDARD" and not small
     )
-    simplify_ok = len(sub_ev["simplify_passes"]) >= 1
-    simplify_exhausted = sub_ev["simplify_failures"] >= 2
-    if needs_simplify and not simplify_ok:
+    required_lenses = set(cwg.SIMPLIFY_LENSES)
+    sonnet_lenses = set(swarm_ev.get("sonnet_lenses") or set())
+    fallback_lenses = set(swarm_ev.get("fallback_lenses") or set()) | set(sub_ev.get("fallback_lenses") or set())
+    sonnet_issue = bool(swarm_ev.get("sonnet_issue_verified"))
+    simplify_failures = int(swarm_ev.get("simplify_failures") or 0) + int(sub_ev.get("simplify_failures") or 0)
+    simplify_exhausted = simplify_failures >= 2
+    effective_lenses = (sonnet_lenses | fallback_lenses) if sonnet_issue else sonnet_lenses
+    missing_lenses = sorted(required_lenses - effective_lenses)
+
+    if needs_simplify and missing_lenses:
         if not (rkind == "draft-blocked" and simplify_exhausted):
+            if not sonnet_issue and (sonnet_lenses | fallback_lenses) >= required_lenses:
+                return (
+                    False,
+                    f"simplify lenses ran on fallback model without verified `{cwg.SONNET_HIGH_MODEL}` error/quota issue; "
+                    f"run all 3 lenses (`reuse`, `quality`, `efficiency`) on `{cwg.SONNET_HIGH_MODEL}` via `swarm`",
+                )
             return (
                 False,
-                f"{effective_risk} candidate requires 1 completed `{cwg.SIMPLIFY_REVIEWER}` subagent pass before closure",
+                f"{effective_risk} candidate requires all 3 `{cwg.SONNET_HIGH_MODEL}` simplify lenses (`reuse`, `quality`, `efficiency`); "
+                f"missing: {', '.join(missing_lenses)}",
             )
 
-    # 3. Independent Adversarial Review Verification (HIGH / XHIGH, plus any invoked review on lower risks)
+    # 3. Independent Adversarial Review Verification (Codex lane unchanged; internal `claude-opus-5-5-high` -> `gemini-4-carbon-high`)
     all_reviews = sorted(
-        list(sub_ev["reviews"]) + list(codex_reviews),
+        list(sub_ev["reviews"]) + list(swarm_ev["reviews"]) + list(codex_reviews),
         key=lambda r: float(r.get("verdict_ts") or 0.0),
     )
     ordinary_reviews = [r for r in all_reviews if r.get("kind") == "ordinary"]
@@ -402,7 +795,6 @@ def validate_candidate_closure(
     if len(closure_reviews) > MAX_CLOSURE_PASSES:
         return False, f"closure validation exceeded MAX_CLOSURE_PASSES={MAX_CLOSURE_PASSES}"
 
-    # Normalize early ESCALATE (< round 3) as REVISE per bounded 3-round protocol
     norm_ordinary: list[tuple[dict[str, Any], str]] = []
     for idx, rev in enumerate(ordinary_reviews, start=1):
         v = str(rev.get("verdict") or "")
@@ -410,8 +802,28 @@ def validate_candidate_closure(
             v = "REVISE"
         norm_ordinary.append((rev, v))
 
+    opus_issue = bool(swarm_ev.get("opus_issue_verified"))
+    opus_issue_ts = float(swarm_ev.get("opus_issue_ts") or 0.0)
+
+    def _is_acceptable_carbon_escalation(rev_item: dict[str, Any]) -> bool:
+        if not opus_issue:
+            return False
+        if rev_item.get("escalated_from_opus"):
+            return True
+        if opus_issue_ts <= 0.0:
+            return True
+        return float(rev_item.get("launch_ts") or 0.0) >= opus_issue_ts
+
+    def _is_acceptable_engine(rev_item: dict[str, Any]) -> bool:
+        eng_name = str(rev_item.get("engine") or "")
+        if eng_name in ("codex", "internal-opus"):
+            return True
+        if eng_name in ("internal-carbon", "native") and _is_acceptable_carbon_escalation(rev_item):
+            return True
+        return False
+
     for earlier_rev, earlier_v in norm_ordinary[:-1]:
-        if earlier_v == "APPROVED" and is_review_fresh(earlier_rev, marker):
+        if earlier_v == "APPROVED" and is_review_fresh(earlier_rev, marker) and _is_acceptable_engine(earlier_rev):
             if effective_risk != "XHIGH" or earlier_rev.get("xhigh"):
                 return False, "review rounds continued unnecessarily after a current terminal APPROVED"
 
@@ -420,8 +832,9 @@ def validate_candidate_closure(
     latest_cls_verdict = str(latest_cls_rev.get("verdict") or "") if latest_cls_rev else ""
 
     breaker_open = bool(codex_lane.breaker_status().get("tripped"))
-    review_unavailable = (len(sub_ev["review_failures"]) >= 2) or (
-        breaker_open and len(sub_ev["review_failures"]) >= 1
+    total_review_failures = list(sub_ev.get("review_failures") or []) + list(swarm_ev.get("review_failures") or [])
+    review_unavailable = (len(total_review_failures) >= 2) or (
+        breaker_open and opus_issue and len(total_review_failures) >= 1
     )
 
     if rkind == "verified":
@@ -431,17 +844,23 @@ def validate_candidate_closure(
             if latest_ord_verdict != "APPROVED" or latest_ord_rev is None:
                 return (
                     False,
-                    f"{effective_risk} candidate lacks an independent `VERDICT: APPROVED` from Codex lane or `{cwg.XHIGH_NATIVE_REVIEWER if effective_risk == 'XHIGH' else 'adversarial-reviewer'}`",
+                    f"{effective_risk} candidate lacks an independent `VERDICT: APPROVED` from Codex lane or internal `{cwg.OPUS_HIGH_MODEL}` (escalating to `{cwg.CARBON_HIGH_MODEL}` only on verified Opus issue)",
                 )
             if not is_review_fresh(latest_ord_rev, marker):
                 return (
                     False,
                     f"{effective_risk} candidate's `APPROVED` verdict is stale: durable candidate content changed after review",
                 )
+            eng = str(latest_ord_rev.get("engine") or "")
+            if eng in ("internal-carbon", "native") and not _is_acceptable_carbon_escalation(latest_ord_rev):
+                return (
+                    False,
+                    f"internal review ran on `{latest_ord_rev.get('model') or cwg.CARBON_HIGH_MODEL}` without a verified `{cwg.OPUS_HIGH_MODEL}` error/quota/availability failure; run internal review on `{cwg.OPUS_HIGH_MODEL}` first",
+                )
             if effective_risk == "XHIGH" and not latest_ord_rev.get("xhigh"):
                 return (
                     False,
-                    f"XHIGH candidate's `APPROVED` verdict came from standard lane (`{latest_ord_rev.get('engine')}`), not XHIGH (`codex --xhigh` or `{cwg.XHIGH_NATIVE_REVIEWER}`)",
+                    f"XHIGH candidate's `APPROVED` verdict came from standard tier (`{eng}`), not XHIGH (`codex --xhigh` or internal `{cwg.OPUS_HIGH_MODEL}` with `REVIEW_TIER: XHIGH`)",
                 )
         return True, "verified"
 
@@ -514,12 +933,13 @@ def format_block_message(
         )
     else:
         reqs = cwg.receipt_requirements_summary(floor, small)
+        xhigh_hint = " с `REVIEW_TIER: XHIGH`" if floor == "XHIGH" else ""
         guidance = (
             f"Кандидат `PERSISTENT` (path floor `{floor}`). Обязательные условия: {reqs}.\n"
+            f"- Для simplify запустите 3 read-only линзы (`reuse`, `quality`, `efficiency`) на `{cwg.SONNET_HIGH_MODEL}` через `swarm(action=\"add\", ..., model=\"{cwg.SONNET_HIGH_MODEL}\")`.\n"
             f"- Для внешнего ревью HIGH/XHIGH сначала проверьте `python -X utf8 \"{codex_script}\" check`; "
             f"если доступно — запустите `python -X utf8 \"{codex_script}\" review --summary \"...\"` "
-            f"{'--xhigh ' if floor == 'XHIGH' else ''}(либо при открытом circuit breaker вызовите субагента "
-            f"`{'adversarial-reviewer-xhigh' if floor == 'XHIGH' else 'adversarial-reviewer'}`).\n"
+            f"{'--xhigh ' if floor == 'XHIGH' else ''}(при недоступности Codex запустите внутреннее ревью на `{cwg.OPUS_HIGH_MODEL}`{xhigh_hint} через `swarm`, с эскалацией на `{cwg.CARBON_HIGH_MODEL}` при ошибке/квоте Opus).\n"
             f"- Завершите финальный ответ строкой `[gate] verified: {floor}; <кандидат и решающие проверки>`."
         )
 
@@ -557,7 +977,6 @@ def main() -> int:
         session = rio.session_key(payload)
         mfile = cwg.marker_path(session)
         if not mfile.is_file():
-            # NO_CHANGE task: zero ceremony, immediate allow
             rio.emit_stop_allow()
             return 0
 
@@ -590,7 +1009,6 @@ def main() -> int:
         assistant_msg = str(payload.get("lastAssistantMessage") or "") or rio.last_assistant_message(steps)
         receipt = cwg.parse_terminal_receipt(assistant_msg)
 
-        # Handle anomaly-reported escape hatch first
         if receipt and receipt.get("kind") == "anomaly-reported":
             ok_anom, anom_note = gate_inbox.verify_anomaly_report(
                 str(receipt.get("report_id") or ""),
@@ -606,8 +1024,11 @@ def main() -> int:
         else:
             checks_ev = read_checks_evidence(session, first_ts)
             sub_ev = scan_native_subagents(steps, transcript_path, first_ts)
+            swarm_ev = scan_swarm_activity(steps, transcript_path, first_ts)
             codex_revs = codex_lane.scan_verified_codex_reviews(since_ts=first_ts)
-            valid, reason = validate_candidate_closure(receipt, marker, checks_ev, sub_ev, codex_revs)
+            valid, reason = validate_candidate_closure(
+                receipt, marker, checks_ev, sub_ev, swarm_ev, codex_revs
+            )
 
             if valid:
                 rkind = str((receipt or {}).get("kind") or "verified")
@@ -622,9 +1043,10 @@ def main() -> int:
                 rio.emit_stop_allow()
                 return 0
 
-            # Allow turn to yield without consuming block budget if background tasks or subagents are still running
             fully_idle = payload.get("fullyIdle", True)
-            in_flight = list(sub_ev.get("in_flight_subagents") or [])
+            in_flight = list(sub_ev.get("in_flight_subagents") or []) + list(
+                swarm_ev.get("in_flight_workers") or []
+            )
             waits = int(state.get("waits") or 0)
             if (fully_idle is False or in_flight) and waits < MAX_BACKGROUND_WAITS:
                 state["waits"] = waits + 1

@@ -1,6 +1,6 @@
 ---
 name: adversarial-reviewer
-description: Independent read-only adversarial code reviewer for HIGH-risk changes and fallback when the external Codex lane is unavailable. Finds concrete correctness, security, concurrency, and contract bugs without modifying files.
+description: Read-only Gemini Carbon High escalation reviewer used ONLY when both the primary Codex lane and internal Claude Opus 5.5 High (`claude-opus-5-5-high`) swarm reviewer have a verified outage, error, or exhausted quota.
 subagent: true
 mainAgent: false
 tools: [read_file, run_command, manage_task]

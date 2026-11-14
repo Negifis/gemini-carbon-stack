@@ -1,35 +1,35 @@
 ---
 name: subagent-delegation
-description: Native subagent, workflow, and swarm routing for Gemini 4 Carbon in Antigravity: when to execute directly vs delegate, model selection, scope ownership, and failure containment.
+description: Multi-model subagent, workflow, and swarm routing for Gemini 4 Carbon in Antigravity: Sonnet 5.5 High simplify lenses, Codex external review, Opus 5.5 High -> Carbon High internal review escalation, and strict scope ownership.
 ---
 
-# Subagent Delegation & Model Routing (Gemini Carbon)
+# Subagent Delegation & Multi-Model Routing (Gemini Carbon)
 
 ## 1. Когда НЕ нужно делегировать
 
 Gemini 4 Carbon (High) обладает глубоким рассуждением и большим окном контекста. **Выполняйте работу напрямую без субагентов**, если:
 - нужно прочитать 1–6 известных файлов или найти символ через `code_search.py`;
-- правка локализована в одном модуле;
+- правка локализована в одном модуле (`<= 3` строк);
 - требуется последовательная отладка, где каждый следующий шаг зависит от предыдущего.
 
-## 2. Матрица нативных агентов и инструментов оркестрации Antigravity
+## 2. Матрица межмодельной маршрутизации Antigravity 2.0
 
-| Задача | Инструмент / Агент | Модель / Режим |
+*Важное ограничение среды (подтверждено эмпирически на Language Server `hub-2.32.1`):* `invoke_subagent` принимает только Gemini-тиры (`inherit`, `flash_lite`, `flash`, `pro`), а ключ `model:` во frontmatter `agents/*.md` отбрасывает агента при загрузке плагина. Точное закрепление моделей семейства Claude (`claude-sonnet-5-5-high`, `claude-opus-5-5-high`) и живое переключение при исчерпании квоты выполняются через нативный `swarm`.
+
+| Задача | Инструмент / Агент | Модель / Маршрут |
 |---|---|---|
-| Широкая разведка незнакомой подсистемы (>10 файлов) | `invoke_subagent(TypeName="code-explorer")` или встроенный `research` | `inherit` (Carbon) |
-| Живая проверка веб-интерфейса и DOM/визуальных состояний | `invoke_subagent(TypeName="browser")` | `flash` (по умолчанию для `browser`) |
+| Широкая разведка незнакомой подсистемы (>10 файлов) | `invoke_subagent(TypeName="code-explorer")` или `research` | `inherit` (`gemini-4-carbon-high`) |
+| Живая проверка веб-интерфейса и визуальных состояний | `invoke_subagent(TypeName="browser")` | `flash` |
 | Генерация растровых иллюстраций / иконок | `invoke_subagent(TypeName="image-generator")` | по умолчанию |
-| Перевод объёмной документации без засорения контекста | `invoke_subagent(TypeName="translator")` | `flash` или `inherit` |
-| Единый simplify-проход (Reuse + Quality + Efficiency) | `invoke_subagent(TypeName="simplify-reviewer")` | `inherit` |
-| Независимое ревью `HIGH` (основной внешний движок) | `codex_lane.py review` (межсемейная проверка OpenAI Codex) | `high` |
-| Независимое ревью `HIGH` (нативный fallback при outage Codex) | `invoke_subagent(TypeName="adversarial-reviewer")` | `inherit` или `pro` |
-| Усиленное ревью `XHIGH` | `codex_lane.py review --xhigh` или `adversarial-reviewer-xhigh` | `xhigh` / `Model="pro"` (Hydrogen XHigh) |
-| Программный fan-out по множеству независимых модулей | `run_workflow` (Python-скрипт с `parallel` / `pipeline`) | по задаче |
-| Командная параллельная разработка нескольких подсистем | `swarm` (`workspace="share"` или `"branch"`) | `inherit` |
+| Перевод объёмной документации | `invoke_subagent(TypeName="translator")` | `flash` или `inherit` |
+| **Simplify — 3 линзы (`reuse`, `quality`, `efficiency`)** | `swarm(action="add", ..., model="claude-sonnet-5-5-high")` | **`Claude Sonnet 5.5 (High)`** (fallback -> `gemini-4-carbon-high` / `simplify-*-reviewer` при сбое/0% квоты Sonnet) |
+| **Внешнее adversarial-ревью (`HIGH` / `XHIGH`)** | `codex_lane.py review` (`--xhigh` для `XHIGH`) | **OpenAI Codex CLI** (`gpt-6.1-sol`, без изменений) |
+| **Внутреннее adversarial-ревью (`HIGH` / `XHIGH`)** | `swarm(action="add", ..., model="claude-opus-5-5-high")` | **`Claude Opus 5.5 (High)`** -> эскалация на **`Gemini 4 Carbon (High)`** (`swarm(action="model", ..., model="gemini-4-carbon-high")` или `adversarial-reviewer*`) при проблеме с Opus |
+| Программный fan-out по множеству независимых модулей | `run_workflow` (`parallel` / `pipeline`) | по задаче |
+| Параллельная разработка нескольких подсистем | `swarm` (`workspace="share"` или `"branch"`) | `inherit` |
 
 ## 3. Жёсткие правила делегирования
 
-1. **Контракт задачи:** каждый вызов субагента обязан указывать (а) точную границу файлов/модулей, (б) ожидаемый формат ответа, (в) критерий завершения. Активные ограничения `AUTHORITATIVE STATE` и `SUPERSEDED / CANCELLED` автоматически подставляются хуком `safety_guards.py`.
-2. **Единоличное владение записью:** никогда не назначайте двум пишущим агентам пересекающиеся файлы в одном рабочем дереве; для параллельной записи используйте `Workspace="share"` / `"branch"` или `chip_handoff.py open`.
-3. **Независимость ревью:** ревьюер (`adversarial-reviewer*`, `simplify-reviewer`, `codex_lane`) никогда не редактирует код.
-4. **Обработка сбоев без циклов:** после вызова `invoke_subagent` не опрашивайте статус в цикле — дождитесь реактивного уведомления системы. При сбое субагента максимум 1 повтор с исправленным входом либо переход на документированный fallback.
+1. **Контракт задачи:** каждый вызов обязан указывать точную границу файлов, запрет на редактирование для ревьюеров и точный формат выходных маркеров (`SIMPLIFY_LENS`, `VERDICT`). Активные ограничения `AUTHORITATIVE STATE` и `SUPERSEDED / CANCELLED` автоматически подставляются хуком `safety_guards.py` в `invoke_subagent`, а для `swarm` включаются в `brief`.
+2. **Единоличное владение записью:** никогда не назначайте двум пишущим агентам пересекающиеся файлы в одном рабочем дереве; для параллельной записи используйте `workspace="share"` / `"branch"` или `chip_handoff.py open`.
+3. **Уборка завершённых swarm-воркеров:** после получения отчётов линз или внутреннего ревьюера вызывайте `swarm(action="kill", name=...)` — их системные транскрипты и записи в `board.jsonl`/`members.json` сохраняются для проверки `cwg_stop.py`, а холостые воркеры не висят в списке.

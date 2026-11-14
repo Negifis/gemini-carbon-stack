@@ -287,28 +287,34 @@ def _extract_rollout_texts_and_meta(rollout_file: pathlib.Path) -> dict[str, Any
 
 def scan_verified_codex_reviews(since_ts: float) -> list[dict[str, Any]]:
     """Return cryptographically bound Codex review verdicts from `~/.codex/sessions` rollout logs."""
+    known_packets: dict[str, dict[str, Any]] = {}
+    for pf in packets_dir().glob("*.json"):
+        pdata = rio.read_json(pf, default=None)
+        if not isinstance(pdata, dict) or not pdata.get("review_id"):
+            continue
+        if float(pdata.get("created_ts") or 0.0) >= since_ts - 2.0:
+            known_packets[str(pdata["review_id"])] = pdata
+
+    if not known_packets:
+        return []
+
     root = codex_sessions_dir()
     if not root.is_dir():
         return []
 
-    known_packets: dict[str, dict[str, Any]] = {}
-    for pf in packets_dir().glob("*.json"):
-        pdata = rio.read_json(pf, default=None)
-        if isinstance(pdata, dict) and pdata.get("review_id"):
-            known_packets[str(pdata["review_id"])] = pdata
-
     results: list[dict[str, Any]] = []
-    # Scan recent rollout files modified after (since_ts - 5s)
-    candidates: list[pathlib.Path] = []
+    min_mtime = max(0.0, since_ts - 5.0)
+    candidates: list[tuple[float, pathlib.Path]] = []
     for rf in root.rglob("rollout-*.jsonl"):
         try:
-            if rf.stat().st_mtime >= max(0.0, since_ts - 5.0):
-                candidates.append(rf)
+            mt = rf.stat().st_mtime
+            if mt >= min_mtime:
+                candidates.append((mt, rf))
         except OSError:
             continue
-    candidates.sort(key=lambda p: p.stat().st_mtime)
+    candidates.sort(key=lambda pair: pair[0])
 
-    for rf in candidates[-40:]:
+    for _, rf in candidates[-40:]:
         parsed = _extract_rollout_texts_and_meta(rf)
         if not parsed:
             continue
@@ -319,11 +325,7 @@ def scan_verified_codex_reviews(since_ts: float) -> list[dict[str, Any]]:
             if rid in known_packets:
                 bound_packet = known_packets[rid]
                 break
-        # Require REVIEW_ID binding from a recorded packet in this stack so unassociated Codex chats never leak in
         if bound_packet is None:
-            continue
-        pkt_ts = float(bound_packet.get("created_ts") or 0.0)
-        if pkt_ts < since_ts - 2.0:
             continue
 
         # Inspect final assistant messages in this rollout for VERDICT or CLOSURE_VALIDATION
@@ -345,6 +347,7 @@ def scan_verified_codex_reviews(since_ts: float) -> list[dict[str, Any]]:
                 break
 
         if verdict and kind:
+            pkt_ts = float(bound_packet.get("created_ts") or parsed["started_ts"] or 0.0)
             eff = parsed["effort"] or bound_packet.get("effort") or "high"
             results.append(
                 {

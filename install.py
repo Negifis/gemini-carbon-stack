@@ -19,7 +19,8 @@ SOURCE_PLUGIN_DIR = REPO_ROOT / "plugin"
 SOURCE_GLOB_RULE = REPO_ROOT / "rules" / "uiux-design.md"
 PLUGIN_NAME = "gemini-carbon-stack"
 
-SKIP_NAMES = frozenset({"__pycache__", ".pyc", ".pyo", ".DS_Store"})
+SKIP_NAMES = frozenset({"__pycache__", ".DS_Store"})
+IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003
 
 
 def sha256_file(path: pathlib.Path) -> str:
@@ -37,25 +38,29 @@ def tree_manifest(root: pathlib.Path) -> dict[str, str]:
     if not root.is_dir():
         return {}
     out: dict[str, str] = {}
-    for p in sorted(root.rglob("*")):
-        if any(part in SKIP_NAMES or part.endswith((".pyc", ".pyo")) for part in p.parts):
-            continue
-        if p.is_file():
-            rel = p.relative_to(root).as_posix()
-            out[rel] = sha256_file(p)
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_NAMES)
+        for fname in sorted(filenames):
+            if fname in SKIP_NAMES or fname.endswith((".pyc", ".pyo")):
+                continue
+            fpath = pathlib.Path(dirpath) / fname
+            if fpath.is_file():
+                rel = fpath.relative_to(root).as_posix()
+                out[rel] = sha256_file(fpath)
     return out
 
 
 def is_link_or_junction(path: pathlib.Path) -> bool:
     try:
-        if path.is_symlink():
-            return True
-        fn = getattr(os.path, "isjunction", None)
-        if callable(fn) and fn(str(path)):
-            return True
+        st = os.lstat(path)
     except OSError:
-        pass
-    return False
+        return False
+    if path.is_symlink():
+        return True
+    if getattr(st, "st_reparse_tag", 0) == IO_REPARSE_TAG_MOUNT_POINT:
+        return True
+    fn = getattr(os.path, "isjunction", None)
+    return bool(callable(fn) and fn(str(path)))
 
 
 def find_agy_cli() -> str | None:
@@ -105,7 +110,7 @@ def preflight_check(config_dir: pathlib.Path) -> dict[str, Any]:
     target_glob_rule = config_dir / "rules" / "uiux-design.md"
 
     for t in (config_dir, target_plugin_dir, target_glob_rule):
-        if t.exists() and is_link_or_junction(t):
+        if is_link_or_junction(t):
             errors.append(f"Refusing to overwrite symlink/junction target: {t}")
 
     # Ensure we never touch ~/.claude or ~/.gemini/config/config.json

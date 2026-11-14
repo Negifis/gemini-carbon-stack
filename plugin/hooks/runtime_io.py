@@ -353,6 +353,8 @@ def subagent_parent_id(transcript_path: str | None, steps: list[dict[str, Any]] 
         m = SUBAGENT_MSG_RE.search(content)
         if m:
             return m.group("sender")
+        if "<swarm_worker>" in content or "post_message" in content or "swarm_wait" in content:
+            return "swarm-coordinator"
     return None
 
 

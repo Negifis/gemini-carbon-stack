@@ -8,7 +8,15 @@
 - `~/.gemini/config/rules/uiux-design.md` — glob-правило (`trigger: glob`), подключаемое только при открытии/редактировании фронтенд-файлов.
 - `~/.gemini/carbon-stack/` — изолированное хранилище runtime-состояния (`state/gate`, `state/continuity`, `state/memory`, `state/chips`, `state/hygiene`, `state/logs`) и резервных копий установщика (`backups/`).
 
-## 2. Поток событий Lifecycle Hooks (`hooks.json`)
+## 2. Межмодельная маршрутизация проверок
+
+В Antigravity 2.0 помимо основного координатора **Gemini 4 Carbon (High)** (`gemini-4-carbon-high`) доступны модели семейства Claude (`claude-sonnet-5-5-high`, `claude-opus-5-5-high`) и внешний OpenAI Codex CLI (`gpt-6.1-sol`). Поскольку `invoke_subagent` принимает только Gemini-тиры, а ключ `model:` во frontmatter `agents/*.md` отклоняется Language Server, закрепление моделей Claude и горячая эскалация выполняются через нативный инструмент `swarm`:
+
+1. **Simplify (3 параллельные линзы):** `simplify-reuse`, `simplify-quality`, `simplify-efficiency` запускаются на **`Claude Sonnet 5.5 (High)`** (`claude-sonnet-5-5-high`) с резервным переключением на `gemini-4-carbon-high` при подтверждённом исчерпании квоты или ошибке Sonnet.
+2. **Внешнее adversarial-ревью (основной контур):** `codex_lane.py review` (OpenAI Codex CLI, без изменений).
+3. **Внутреннее adversarial-ревью (при открытом circuit breaker Codex или прямом внутреннем ревью):** запускается на **`Claude Opus 5.5 (High)`** (`claude-opus-5-5-high`) с автоматической эскалацией на **`Gemini 4 Carbon (High)`** (`gemini-4-carbon-high`), если с Opus зафиксирована ошибка, нулевая квота или недоступность.
+
+## 3. Поток событий Lifecycle Hooks (`hooks.json`)
 
 | Событие Antigravity | Подключённые обработчики | Назначение и контракт ответа (protojson) |
 |---|---|---|
@@ -16,18 +24,18 @@
 | `PreInvocation` | `continuity.py`, `chip_hooks.py`, `cwg_pre_invocation.py` | Детекция коррекций пользователя и сжатия контекста (`compaction`), доставка уведомлений о готовых чипах и 1-строчного статуса открытого кандидата гейта -> `{"injectSteps": [...]}` |
 | `PreToolUse` | `continuity.py`, `safety_guards.py`, `cwg_mark.py` | Loop Guard (блокировка 3-го чтения неизменённого файла и 4-го повтора одинаковой команды), защита от голого `git worktree remove` и `git reset --hard`, контроль плотности комментариев, защита от вложенных субагентов, автоматическая инжекция `AUTHORITATIVE STATE` в промпт субагента через `overwrite`, снимок Git перед shell-командой -> `{"decision": "allow"\|"deny", "overwrite": ...}` |
 | `PostToolUse` | `continuity.py`, `chip_hooks.py`, `cwg_mark.py` | Сброс поколения чтения после правок, запись фактического прогона проверок/тестов (`checks/*.jsonl`), вычисление файловой дельты и SHA-256 отпечатков кандидата (`content_marks`), фиксация отказов `codex_lane` -> `{}` |
-| `Stop` | `continuity.py`, `chip_hooks.py`, `cwg_stop.py` | Пост-коррекционный Output Lint, проверка сдачи дочернего чипа, финальная проверка Code Work Gate (реальные тесты + `simplify-reviewer` + свежесть и подлинность `VERDICT: APPROVED` в rollout-логе Codex или системном транскрипте субагента, бюджет 3 блокировки) -> `{"decision": "allow"\|"continue"}` |
+| `Stop` | `continuity.py`, `chip_hooks.py`, `cwg_stop.py` | Пост-коррекционный Output Lint, проверка сдачи дочернего чипа, финальная проверка Code Work Gate (реальные тесты + 3 линзы `claude-sonnet-5-5-high` + свежесть и подлинность `VERDICT: APPROVED` в rollout-логе Codex или системном реестре `.system_generated/swarm/` `claude-opus-5-5-high` -> `gemini-4-carbon-high`, бюджет 3 блокировки) -> `{"decision": "allow"\|"continue"}` |
 
-## 3. Происхождение доказательств (Zero Self-Attestation)
+## 4. Происхождение доказательств (Zero Self-Attestation)
 
-В отличие от текстовых инструкций, `cwg_stop.py` не доверяет утверждениям модели в её собственном ответе:
+`cwg_stop.py` не доверяет утверждениям модели в её собственном ответе:
 1. **Тесты и проверки:** подтверждаются записями `PostToolUse` (`error == ""`) в `state/gate/checks/<session>.jsonl` с временной меткой не старее последней правки файлов.
-2. **Внешнее ревью Codex:** подтверждается сканированием реальных rollout-файлов `~/.codex/sessions/**/rollout-*.jsonl`, связанных по криптографическому токену `REVIEW_ID` из `state/gate/packets/`, с проверкой `effort == "xhigh"` для `XHIGH`.
-3. **Нативное ревью и Simplify:** подтверждается связкой вызова `invoke_subagent` в родительском `transcript_full.jsonl` с системным транскриптом самого субагента (`brain/<subagent-id>/.system_generated/logs/transcript_full.jsonl`) и системным сообщением `SYSTEM_MESSAGE`.
-4. **Инвалидация после правок:** любое изменение байтов затронутых файлов после ревью меняет SHA-256 в `content_marks` и делает прежний `APPROVED` недействительным.
+2. **Внешнее ревью Codex:** подтверждается сканированием rollout-файлов `~/.codex/sessions/**/rollout-*.jsonl`, связанных по токену `REVIEW_ID` из `state/gate/packets/`, с проверкой `effort == "xhigh"` для `XHIGH`.
+3. **Внутреннее ревью Opus -> Carbon и 3 линзы Sonnet:** подтверждаются системными файлами Language Server `<brain>/<convId>/.system_generated/swarm/members.json` (фактическая модель воркера), `board.jsonl` (фильтрация строго `post.agent == member_name`, исключающая эхо промпта координатора) и транскриптами самих воркеров. Одобрение от `gemini-4-carbon-high` принимается только при наличии системного свидетельства ошибки или нулевой квоты `claude-opus-5-5-high`.
+4. **Инвалидация после правок:** любое изменение байтов затронутых файлов после запуска ревьюера меняет SHA-256 в `content_marks` и делает прежний `APPROVED` недействительным.
 
-## 4. Реальные границы гарантий
+## 5. Реальные границы гарантий
 
-- Хуки Antigravity выполняются синхронно с таймаутом и должны быть отказоустойчивыми (fail-open при повреждении входного JSON или системном сбое, с обязательной записью в `hook-errors.jsonl`).
-- При принудительных системных причинах остановки (`USER_CANCELED`, `ERROR`, `MAX_INVOCATIONS`, `MAX_TOKEN_BUDGET_EXCEEDED`) `Stop`-хук намеренно возвращает `allow`, не препятствуя отмене пользователем или системным лимитам.
-- Внешний приватный мост `nlm-memory` для облачной синхронизации с NotebookLM в системе отсутствует: долговременная память полностью работает локально на SQLite WAL + FTS5 (`carbon_memory.py`), а пакеты для будущего импорта в NotebookLM формируются локально командой `export-nlm`.
+- Хуки Antigravity выполняются синхронно с таймаутом и работают в режиме fail-open при повреждении входного JSON или системном сбое (с записью в `hook-errors.jsonl`).
+- При системных причинах остановки (`USER_CANCELED`, `ERROR`, `MAX_INVOCATIONS`, `MAX_TOKEN_BUDGET_EXCEEDED`) `Stop`-хук возвращает `allow`.
+- Приватный мост `nlm-memory` в системе отсутствует: долговременная память работает локально на SQLite WAL + FTS5 (`carbon_memory.py`) с экспортом пакетов `export-nlm`.

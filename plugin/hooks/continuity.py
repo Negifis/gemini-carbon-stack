@@ -85,6 +85,16 @@ def checkpoint_path(pkey: str) -> pathlib.Path:
     return continuity_dir("checkpoints") / f"{pkey}.md"
 
 
+def resolve_checkpoint_file(cwd: str, workspace_paths: list[str] | None = None) -> pathlib.Path | None:
+    if cwd:
+        ws_cp = pathlib.Path(cwd) / ".agents" / "CHECKPOINT.md"
+        if ws_cp.is_file():
+            return ws_cp
+    pkey = rio.project_key(cwd, workspace_paths)
+    cp_file = checkpoint_path(pkey)
+    return cp_file if cp_file.is_file() else None
+
+
 def tree_lock_path(pkey: str) -> pathlib.Path:
     return rio.state_dir("hygiene", "tree_locks") / f"{pkey}.json"
 

@@ -103,7 +103,27 @@ SIMPLIFY_LINE_RE = re.compile(
     r"^\s*(?:\*{0,2})SIMPLIFY_VERDICT(?:\*{0,2})\s*:\s*(?:\*{0,2})(CLEAN|ACTIONABLE_FIXES)(?:\*{0,2})\b",
     re.MULTILINE,
 )
+SIMPLIFY_LENS_LINE_RE = re.compile(
+    r"^\s*(?:\*{0,2})SIMPLIFY_LENS(?:\*{0,2})\s*:\s*(?:\*{0,2})(REUSE|QUALITY|EFFICIENCY)(?:\*{0,2})\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+REVIEW_TIER_XHIGH_RE = re.compile(
+    r"\bREVIEW_TIER\s*:\s*XHIGH\b",
+    re.IGNORECASE,
+)
 
+SONNET_HIGH_MODEL = "claude-sonnet-5-5-high"
+OPUS_HIGH_MODEL = "claude-opus-5-5-high"
+CARBON_HIGH_MODEL = "gemini-4-carbon-high"
+
+SIMPLIFY_LENSES = ("reuse", "quality", "efficiency")
+SIMPLIFY_LENS_AGENTS = frozenset(
+    {
+        "simplify-reuse-reviewer",
+        "simplify-quality-reviewer",
+        "simplify-efficiency-reviewer",
+    }
+)
 NATIVE_REVIEWERS = frozenset({"adversarial-reviewer", "adversarial-reviewer-xhigh"})
 XHIGH_NATIVE_REVIEWER = "adversarial-reviewer-xhigh"
 SIMPLIFY_REVIEWER = "simplify-reviewer"
@@ -400,11 +420,19 @@ def candidate_key(marker: dict[str, Any]) -> str:
 
 def receipt_requirements_summary(floor: str, small: bool) -> str:
     if floor == "LOW":
-        return "honest content/render check (no simplify or adversarial subagent required)"
+        return "honest content/render check (no simplify lenses or adversarial review required)"
     if floor == "STANDARD":
         if small:
-            return "decisive check execution (small edit <=3 lines: simplify subagent exempt)"
-        return "decisive test/check execution + 1 simplify-reviewer pass"
+            return "decisive check execution (small edit <=3 lines: simplify lenses exempt)"
+        return (
+            f"decisive test/check execution + 3 simplify lenses (reuse, quality, efficiency on `{SONNET_HIGH_MODEL}`)"
+        )
     if floor == "HIGH":
-        return "decisive test/check execution + 1 simplify-reviewer pass + 1 independent APPROVED review (Codex lane or adversarial-reviewer)"
-    return "decisive test/check execution + 1 simplify-reviewer pass + 1 XHIGH APPROVED review (Codex xhigh or adversarial-reviewer-xhigh)"
+        return (
+            f"decisive test/check execution + 3 simplify lenses (`{SONNET_HIGH_MODEL}`) + "
+            f"1 independent APPROVED review (Codex lane or internal `{OPUS_HIGH_MODEL}` -> fallback `{CARBON_HIGH_MODEL}`)"
+        )
+    return (
+        f"decisive test/check execution + 3 simplify lenses (`{SONNET_HIGH_MODEL}`) + "
+        f"1 XHIGH APPROVED review (Codex --xhigh or internal `{OPUS_HIGH_MODEL}` [XHIGH] -> fallback `{CARBON_HIGH_MODEL}`)"
+    )

@@ -1,6 +1,6 @@
 ---
 name: development-verification
-description: Authoritative specification of the Code Work Gate: task classes (NO_CHANGE, OPERATIONAL, PERSISTENT), risk floors (LOW/STANDARD/HIGH/XHIGH), deterministic check evidence, independent review provenance, and bounded closure receipts.
+description: Authoritative specification of the Code Work Gate: task classes (NO_CHANGE, OPERATIONAL, PERSISTENT), risk floors (LOW/STANDARD/HIGH/XHIGH), Sonnet High 3-lens simplify, Codex + Opus High -> Carbon High review provenance, and bounded closure receipts.
 ---
 
 # Development Verification & Code Work Gate
@@ -19,27 +19,23 @@ description: Authoritative specification of the Code Work Gate: task classes (NO
 
 - **`LOW`** (чистая документация `.md/.txt/.rst` вне конфигураций агента): проверка корректности текста, ссылок и разметки.
 - **`STANDARD`** (обычный исходный код, тесты, скрипты):
-  - Малая правка (`1` файл, `<= 3` изменённых строк через `edit_file`): обязателен реальный успешный запуск проверок (`pytest`, `unittest`, `tsc`, `cargo test` и т.п.) после последней правки; `simplify-reviewer` не требуется.
-  - Обычная правка: успешный запуск проверок после последней правки + `1` завершённый проход субагента `simplify-reviewer`.
+  - Малая правка (`1` файл, `<= 3` изменённых строк через `edit_file`): обязателен реальный успешный запуск проверок (`pytest`, `unittest`, `tsc`, `cargo test` и т.п.) после последней правки; simplify-линзы не требуются.
+  - Обычная правка: успешный запуск проверок после последней правки + все **3 simplify-линзы** (`reuse`, `quality`, `efficiency`) на **`claude-sonnet-5-5-high`** через `swarm` (с fallback на `gemini-4-carbon-high` только при подтверждённом сбое/исчерпании квоты Sonnet).
 - **`HIGH`** (авторизация/криптография/права, миграции/схемы, CI/CD, `pyproject.toml`/lock-файлы, `hooks.json`/`plugin.json`/правила/хуки/субагенты):
-  - Реальные проверки + `1` проход `simplify-reviewer` + `1` независимый `VERDICT: APPROVED`, полученный **строго после** последнего изменения байтов кандидата (через `codex_lane.py review` или субагент `adversarial-reviewer`).
+  - Реальные проверки + 3 simplify-линзы (`claude-sonnet-5-5-high`) + `1` свежий независимый `VERDICT: APPROVED`, полученный **строго после** последнего изменения байтов кандидата:
+    - основной внешний контур: `codex_lane.py review` (без изменений);
+    - внутренний контур (при открытом circuit breaker Codex или прямом внутреннем ревью): **`claude-opus-5-5-high`** через `swarm` с автоматической эскалацией на **`gemini-4-carbon-high`**, если с Opus зафиксирована ошибка/нулевая квота.
 - **`XHIGH`** (критичные архитектурные, протокольные, конкурентные или security-изменения):
-  - То же, что `HIGH`, но `VERDICT: APPROVED` должен прийти из XHIGH-профиля: `codex_lane.py review --xhigh` либо субагента `adversarial-reviewer-xhigh` (предпочтительно с `Model="pro"`).
+  - То же, что `HIGH`, но `VERDICT: APPROVED` должен прийти из XHIGH-профиля: `codex_lane.py review --xhigh` либо внутренний `claude-opus-5-5-high` с маркером `REVIEW_TIER: XHIGH` (с эскалацией на `gemini-4-carbon-high` / `adversarial-reviewer-xhigh` только при подтверждённом сбое Opus).
 
-## 3. Свежесть доказательств и инвалидация
+## 3. Свежесть доказательств и защита от подделки
 
-- Кандидат отслеживается по SHA-256 отпечатку содержимого затронутых файлов (`content_marks`).
-- Любая правка файла после получения `VERDICT: APPROVED` меняет SHA-256 и **автоматически инвалидирует старый вердикт** — требуется повторный раунд ревью и проверок на актуальных байтах.
-- Прогон read-only команд и тестов (`pytest`, `git diff`, `git status`) не меняет файлы кандидата и **не инвалидирует** полученный `APPROVED`.
+- Кандидат отслеживается по SHA-256 отпечатку содержимого затронутых файлов (`content_marks`). Любая правка файла после получения `VERDICT: APPROVED` меняет SHA-256 и **автоматически инвалидирует старый вердикт**.
+- Для `swarm`-ревью и simplify-линз `cwg_stop.py` проверяет системные файлы Language Server (`.system_generated/swarm/members.json`, `board.jsonl` с фильтрацией строго `post.agent == member_name` и транскрипты воркеров), исключая подмену модели или эхо промпта координатора.
 - Квитанция `[gate] no-change: <причина>` на `PERSISTENT`-кандидате принимается только если все затронутые файлы полностью возвращены к чистому состоянию `HEAD`.
 
 ## 4. Конечность процесса и граничные квитанции
 
 - Максимум **3 обычных раунда** ревью на кандидата. Немедленно прекращайте ревью после первого `VERDICT: APPROVED`.
-- Если 3-й раунд завершился `VERDICT: ESCALATE`, выполните не более **2 раундов closure validation**:
-  - При `CLOSURE_VALIDATION: READY` закрывайте `[gate] pr-ready: <резюме и компромиссы>`.
-  - При `CLOSURE_VALIDATION: BLOCKED` или исчерпании обоих движков ревью закрывайте `[gate] draft-blocked: <точный блокер>`.
-- Хук `Stop` ограничен бюджетом **3 блокировки** на неизменный отпечаток кандидата и никогда не создаёт бесконечных циклов.
-- Если блокировка хука объективно противоречит фактам транскрипта, подайте отчёт с `nonce` из сообщения блокировки:
-  `python -X utf8 "<PLUGIN_ROOT>/hooks/gate_inbox.py" report --session "<id>" --nonce "<nonce>" --block "<причина>" --facts "<проверенные факты>" --did "<выполненные проверки>"`
-  и закройте ответ строкой `[gate] anomaly-reported: <report-id>; <факт>`.
+- Если 3-й раунд завершился `VERDICT: ESCALATE`, выполните не более **2 раундов closure validation** (`READY` -> `[gate] pr-ready`, `BLOCKED` -> `[gate] draft-blocked`).
+- Хук `Stop` ограничен бюджетом **3 блокировки** на неизменный отпечаток кандидата и никогда не создаёт бесконечных циклов. При объективной аномалии используйте nonce-репорт `gate_inbox.py report` -> `[gate] anomaly-reported: <report-id>; <факт>`.

@@ -1,39 +1,49 @@
 ---
 name: adversarial-review
-description: Run independent read-only adversarial code review (`/adversarial-review`) using the external OpenAI Codex lane when healthy, with deterministic circuit-breaker fallback to the native `adversarial-reviewer` subagent.
+description: Run independent read-only adversarial code review (`/adversarial-review`): primary external OpenAI Codex lane (`codex_lane.py`) unchanged; internal review lane on Claude Opus 5.5 High (`claude-opus-5-5-high`) with automatic escalation to Gemini 4 Carbon High (`gemini-4-carbon-high`) on Opus error/quota/stall.
 ---
 
 # `/adversarial-review` — Независимое критическое ревью кода
 
-Один независимый review-движок на раунд, максимум 3 обычных раунда, строгая проверка происхождения вердикта.
+Один независимый review-движок на раунд, максимум 3 обычных раунда, строгая криптографическая/системная проверка происхождения вердикта хуком `cwg_stop.py`.
 
-## Шаг 1. Проверка доступности внешнего движка Codex
+## Шаг 1. Основной внешний контур — OpenAI Codex CLI (без изменений)
 
+Сначала проверьте состояние внешнего контура Codex:
 ```powershell
 python -X utf8 "<PLUGIN_ROOT>/hooks/codex_lane.py" check
 ```
-
-## Шаг 2А. Если `available: true` — запуск изолированного Codex-ревью
-
-Для `HIGH`:
+Если `available: true`, запустите изолированное read-only ревью Codex:
 ```powershell
 python -X utf8 "<PLUGIN_ROOT>/hooks/codex_lane.py" review `
   --cwd "<путь к репозиторию>" `
   --summary "<цель изменений, затронутые контракты и выполненные тесты>"
 ```
-Для `XHIGH` добавьте флаг `--xhigh` (при post-ESCALATE валидации закрытия — `--closure`).
-`codex_lane.py` автоматически закрывает `stdin`, отключает лишние MCP-серверы, фиксирует криптографический `REVIEW_ID` и сохраняет rollout-лог в `~/.codex/sessions/` для проверки хуком `cwg_stop.py`.
+Для `XHIGH` добавьте `--xhigh` (при post-ESCALATE проверке — `--closure`).
 
-## Шаг 2Б. Если `available: false` (или `codex_lane.py review` вернул код `2`/`3` и открыл circuit breaker)
+## Шаг 2. Внутренний межсемейный контур — `Claude Opus 5.5 (High)` -> эскалация на `Gemini 4 Carbon (High)`
 
-Не повторяйте упавший внешний вызов в цикле. Переключитесь на нативный независимый read-only субагент:
-- Для `HIGH`: `invoke_subagent(TypeName="adversarial-reviewer", Role="Independent Adversarial Review", Prompt="...")`
-- Для `XHIGH`: `invoke_subagent(TypeName="adversarial-reviewer-xhigh", Model="pro", Role="XHIGH Adversarial Review", Prompt="...")`
+Используется при открытом circuit breaker / недоступности Codex либо при прямом запросе внутреннего ревью в Antigravity:
 
-**Честность атрибуции:** никогда не выдавайте вердикт нативного субагента или собственный анализ Carbon за внешний отчёт Codex.
+1. Проверьте квоту `claude-opus-5-5-high` через `swarm(action="models", all=True)`.
+2. Если `claude-opus-5-5-high` доступен — запустите read-only воркера в `swarm`, закреплённого на **`claude-opus-5-5-high`**:
+   ```python
+   swarm(
+       action="add",
+       name="internal-reviewer",  # или internal-reviewer-xhigh для XHIGH
+       model="claude-opus-5-5-high",
+       workspace="inherit",
+       brief="Strictly read-only adversarial code review of <repo_path> (<files>). Do NOT modify any files. Verify invariants, security boundaries, failure modes, and tests. Post your report to @coordinator ending with exact standalone line `VERDICT: APPROVED` or `VERDICT: REVISE` (for XHIGH include `REVIEW_TIER: XHIGH`).",
+   )
+   ```
+   После получения вердикта освободите воркера через `swarm(action="kill", name="internal-reviewer")`.
+3. **Эскалация на `gemini-4-carbon-high`, если с Opus что-то не так:**
+   - Если `claude-opus-5-5-high` имеет квоту `0%`, недоступен, вернул `ERROR_MESSAGE` / `RESOURCE_EXHAUSTED` или завис:
+   - Переключите воркер на месте вызовом `swarm(action="model", name="internal-reviewer", model="gemini-4-carbon-high")` (сохраняя его контекст) либо вызовите резервный субагент `adversarial-reviewer` / `adversarial-reviewer-xhigh`.
+   - **Гарантия от обхода:** `cwg_stop.py` проверяет `.system_generated/swarm/members.json` и системные транскрипты и **отклоняет** вердикт `gemini-4-carbon-high`, если в runtime нет подтверждённого сбоя или нулевой квоты `claude-opus-5-5-high`.
 
 ## Шаг 3. Обработка вердикта
 
-- `VERDICT: APPROVED` -> ревью завершено. Не запускайте лишних раундов; не редактируйте файлы кандидата без повторного ревью.
-- `VERDICT: REVISE` -> устраните реальные подтверждённые дефекты, перезапустите тесты и выполните следующий раунд.
+- `VERDICT: APPROVED` -> ревью завершено. Не запускайте лишних раундов; любая правка файлов после этого изменит SHA-256 и инвалидирует вердикт.
+- `VERDICT: REVISE` -> устраните подтверждённые дефекты, перезапустите тесты и выполните следующий раунд.
 - `VERDICT: ESCALATE` (на 3-м раунде) -> выполните до 2 проходов `CLOSURE_VALIDATION` (`READY` -> `[gate] pr-ready`, `BLOCKED` -> `[gate] draft-blocked`).

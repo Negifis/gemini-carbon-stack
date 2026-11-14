@@ -22,6 +22,7 @@ sys.path.insert(0, str(TOOLS_DIR))
 import carbon_memory
 import chip_handoff
 import codex_lane
+import cwg_common as cwg
 import gate_inbox
 import runtime_io as rio
 
@@ -157,6 +158,18 @@ def run_diagnostics(cwd: str = "") -> dict[str, Any]:
         "skills": skills,
         "agents": agents,
         "rules": rules,
+        "model_routing": {
+            "simplify_lenses": {
+                "lenses": list(cwg.SIMPLIFY_LENSES),
+                "primary_model": cwg.SONNET_HIGH_MODEL,
+                "fallback_model": cwg.CARBON_HIGH_MODEL,
+            },
+            "external_review": "codex-cli (unchanged)",
+            "internal_review": {
+                "primary_model": cwg.OPUS_HIGH_MODEL,
+                "escalation_model": cwg.CARBON_HIGH_MODEL,
+            },
+        },
         "codex_lane": codex_info,
         "memory": mem,
         "active_chips": chips_info.get("active_count", 0),
