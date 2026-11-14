@@ -132,7 +132,7 @@ def extract_subagent_final_texts(subagent_transcript_path: str | None) -> tuple[
     return "\n\n".join(chunks), last_ts, finished
 
 
-SWARM_ROLE_MEMBER_RE = re.compile(r"^(?:narrator|monitor)(?:-\d+)?$", re.IGNORECASE)
+SIMPLIFY_COMBINED_NAME_RE = re.compile(r"^simplify(?:-reviewer)?(?:-r\d+)?$", re.IGNORECASE)
 SYSTEM_SWARM_ERR_RE = re.compile(
     r'\[Message\]\s+timestamp=\S+\s+sender=system\b[^\n]*Swarm Worker \((?P<name>[A-Za-z0-9._-]+)\)[^\n]*with id "(?P<cid>[A-Za-z0-9._-]+)" encountered an error[^\n]*?:\s*(?P<err>.+)',
     re.IGNORECASE,
@@ -147,23 +147,34 @@ MODEL_FAILURE_RE = re.compile(
 )
 
 
-def _infer_single_simplify_lens(name: str, brief_or_role: str, output_text: str) -> str | None:
-    """Resolve at most one simplify lens (`reuse` | `quality` | `efficiency`) owned by a single worker."""
-    explicit = [m.lower() for m in cwg.SIMPLIFY_LENS_LINE_RE.findall(output_text or "")]
-    if len(set(explicit)) == 1 and explicit[0] in cwg.SIMPLIFY_LENSES:
-        return explicit[0]
+def _classify_simplify_worker(name: str, brief_or_role: str, output_text: str) -> tuple[str, str | None]:
+    """Classify worker as ('lens', <lens>), ('combined', None), or ('other', None) in one pass."""
+    text = output_text or ""
+    has_verdict = bool(cwg.SIMPLIFY_LINE_RE.search(text))
+    if cwg.SIMPLIFY_COMBINED_LENS_RE.search(text):
+        return ("combined", None) if has_verdict else ("other", None)
+
+    explicit = {m.lower() for m in cwg.SIMPLIFY_LENS_LINE_RE.findall(text)}
+    if len(explicit) == 1:
+        return ("lens", next(iter(explicit)))
+    if len(explicit) > 1:
+        return ("combined", None) if has_verdict else ("other", None)
 
     low_name = (name or "").lower()
     for lens in cwg.SIMPLIFY_LENSES:
         if lens in low_name:
-            return lens
+            return ("lens", lens)
+
+    if SIMPLIFY_COMBINED_NAME_RE.match((name or "").strip()):
+        return ("combined", None) if has_verdict else ("other", None)
 
     if "simplify" in low_name or "simplify" in (brief_or_role or "").lower():
         low_brief = (brief_or_role or "").lower()
         matched = [lens for lens in cwg.SIMPLIFY_LENSES if re.search(rf"\b{lens}\b", low_brief)]
         if len(matched) == 1:
-            return matched[0]
-    return None
+            return ("lens", matched[0])
+
+    return ("other", None)
 
 
 def _member_transcript_summary(member_tp: pathlib.Path | None, first_ts: float) -> dict[str, Any]:
@@ -275,6 +286,8 @@ def scan_swarm_activity(
     """Verify native Antigravity `swarm` workers (`members.json` + `board.jsonl` + member transcripts)."""
     sonnet_lenses: dict[str, float] = {}
     fallback_lenses: dict[str, float] = {}
+    sonnet_combined_ts = 0.0
+    fallback_combined_ts = 0.0
     simplify_failures = 0
     reviews: list[dict[str, Any]] = []
     review_failures: list[float] = []
@@ -399,6 +412,8 @@ def scan_swarm_activity(
         return {
             "sonnet_lenses": sonnet_lenses,
             "fallback_lenses": fallback_lenses,
+            "sonnet_combined_ts": sonnet_combined_ts,
+            "fallback_combined_ts": fallback_combined_ts,
             "simplify_failures": simplify_failures,
             "reviews": reviews,
             "review_failures": review_failures,
@@ -409,13 +424,14 @@ def scan_swarm_activity(
             "board_head": board_head,
         }
 
-    swarm_dir = conv_dir / ".system_generated" / "swarm"
-    members_doc = rio.read_json(swarm_dir / "members.json", default=None)
-    members_map = (members_doc.get("members") if isinstance(members_doc, dict) else None) or {}
-    if not isinstance(members_map, dict) or not members_map:
+    swarm_dir = cwg.swarm_dir(brain_root, conv_dir.name)
+    members_map = cwg.load_swarm_members(brain_root, conv_dir.name)
+    if not members_map:
         return {
             "sonnet_lenses": sonnet_lenses,
             "fallback_lenses": fallback_lenses,
+            "sonnet_combined_ts": sonnet_combined_ts,
+            "fallback_combined_ts": fallback_combined_ts,
             "simplify_failures": simplify_failures,
             "reviews": reviews,
             "review_failures": review_failures,
@@ -460,8 +476,7 @@ def scan_swarm_activity(
     for mname, minfo in members_map.items():
         if not isinstance(minfo, dict):
             continue
-        role_val = str(minfo.get("role") or "worker").lower()
-        if mname == "coordinator" or role_val in ("coordinator", "narrator", "monitor") or SWARM_ROLE_MEMBER_RE.match(mname):
+        if cwg.is_swarm_role_member(mname, minfo):
             continue
 
         cur_model = str(minfo.get("model") or "").strip().lower()
@@ -490,7 +505,7 @@ def scan_swarm_activity(
                 if not bts or bts >= first_ts - 2.0:
                     worker_board_posts.append((bts or time.time(), btext))
 
-        m_tp = (brain_root / mcid / ".system_generated" / "logs" / "transcript.jsonl") if (brain_root and mcid) else None
+        m_tp = cwg.member_transcript_path(brain_root, mcid) if (brain_root and mcid) else None
         tsum = _member_transcript_summary(m_tp, first_ts)
 
         prior_reqs = set(requested_models.get(mname, set()))
@@ -562,17 +577,29 @@ def scan_swarm_activity(
             bucketed_outputs.setdefault(w_idx, []).append((out_ts, out_txt))
 
         joined_worker_text = "\n\n".join(txt for _, txt in combined_outputs)
-        lens = _infer_single_simplify_lens(mname, latest_brief, joined_worker_text)
-        if lens is not None:
+        skind, slens = _classify_simplify_worker(mname, latest_brief, joined_worker_text)
+        if skind == "lens" and slens is not None:
             for w_idx in sorted(bucketed_outputs):
                 win_ts, _ = windows[w_idx]
                 win_txt = "\n\n".join(otxt for _, otxt in bucketed_outputs[w_idx])
                 if cwg.SIMPLIFY_LINE_RE.search(win_txt):
                     eff_lts = win_ts or tsum["start_ts"] or first_ts
                     if cur_model == cwg.SONNET_HIGH_MODEL:
-                        sonnet_lenses[lens] = max(sonnet_lenses.get(lens, 0.0), eff_lts)
+                        sonnet_lenses[slens] = max(sonnet_lenses.get(slens, 0.0), eff_lts)
                     else:
-                        fallback_lenses[lens] = max(fallback_lenses.get(lens, 0.0), eff_lts)
+                        fallback_lenses[slens] = max(fallback_lenses.get(slens, 0.0), eff_lts)
+            continue
+
+        if skind == "combined":
+            for w_idx in sorted(bucketed_outputs):
+                win_ts, _ = windows[w_idx]
+                win_txt = "\n\n".join(otxt for _, otxt in bucketed_outputs[w_idx])
+                if cwg.SIMPLIFY_LINE_RE.search(win_txt):
+                    eff_lts = win_ts or tsum["start_ts"] or first_ts
+                    if cur_model == cwg.SONNET_HIGH_MODEL:
+                        sonnet_combined_ts = max(sonnet_combined_ts, eff_lts)
+                    else:
+                        fallback_combined_ts = max(fallback_combined_ts, eff_lts)
             continue
 
         eng = "internal-opus" if cur_model == cwg.OPUS_HIGH_MODEL else "internal-carbon"
@@ -629,6 +656,8 @@ def scan_swarm_activity(
     return {
         "sonnet_lenses": sonnet_lenses,
         "fallback_lenses": fallback_lenses,
+        "sonnet_combined_ts": sonnet_combined_ts,
+        "fallback_combined_ts": fallback_combined_ts,
         "simplify_failures": simplify_failures,
         "reviews": reviews,
         "review_failures": review_failures,
@@ -663,6 +692,7 @@ def scan_native_subagents(
                 delivered_by_sender.setdefault(sender, []).append((msg_ts, m.group("body").strip()))
 
     fallback_lenses: dict[str, float] = {}
+    fallback_combined_ts = 0.0
     simplify_failures: int = 0
     reviews: list[dict[str, Any]] = []
     review_failures: list[float] = []
@@ -713,7 +743,7 @@ def scan_native_subagents(
             cid = sm.group("cid")
             sub_tp = uri_to_path(sm.group("uri")) if sm.group("uri") else ""
             if not sub_tp and brain_root:
-                cand = brain_root / cid / ".system_generated" / "logs" / "transcript.jsonl"
+                cand = cwg.member_transcript_path(brain_root, cid)
                 if cand.exists():
                     sub_tp = str(cand)
 
@@ -735,9 +765,11 @@ def scan_native_subagents(
 
             if is_simplify_subagent:
                 if sub_text.strip() and cwg.SIMPLIFY_LINE_RE.search(sub_text):
-                    lens = _infer_single_simplify_lens(base_tname, f"{role_str}\n{prompt_str}", sub_text)
-                    if lens:
-                        fallback_lenses[lens] = max(fallback_lenses.get(lens, 0.0), eff_launch_ts)
+                    skind, slens = _classify_simplify_worker(base_tname, f"{role_str}\n{prompt_str}", sub_text)
+                    if skind == "lens" and slens is not None:
+                        fallback_lenses[slens] = max(fallback_lenses.get(slens, 0.0), eff_launch_ts)
+                    elif skind == "combined":
+                        fallback_combined_ts = max(fallback_combined_ts, eff_launch_ts)
                 elif not sub_text.strip():
                     simplify_failures += 1
 
@@ -777,6 +809,7 @@ def scan_native_subagents(
 
     return {
         "fallback_lenses": fallback_lenses,
+        "fallback_combined_ts": fallback_combined_ts,
         "simplify_failures": simplify_failures,
         "reviews": reviews,
         "review_failures": review_failures,
@@ -900,24 +933,69 @@ def validate_candidate_closure(
     effective_lenses = (sonnet_lenses | fallback_lenses) if sonnet_issue else sonnet_lenses
     missing_lenses = sorted(required_lenses - effective_lenses)
 
-    if needs_simplify and missing_lenses:
-        if not (rkind == "draft-blocked" and simplify_exhausted):
-            if not sonnet_issue and (sonnet_lenses | fallback_lenses) >= required_lenses:
+    raw_sonnet_combined = float(swarm_ev.get("sonnet_combined_ts") or 0.0)
+    raw_fallback_combined = max(
+        float(swarm_ev.get("fallback_combined_ts") or 0.0),
+        float(sub_ev.get("fallback_combined_ts") or 0.0),
+    )
+    sonnet_combined_fresh = raw_sonnet_combined > 0.0 and is_review_fresh(
+        {"launch_ts": raw_sonnet_combined}, marker
+    )
+    fallback_combined_fresh = raw_fallback_combined > 0.0 and is_review_fresh(
+        {"launch_ts": raw_fallback_combined}, marker
+    )
+    combined_fresh = sonnet_combined_fresh or (sonnet_issue and fallback_combined_fresh)
+    combined_stale = (raw_sonnet_combined > 0.0 and not sonnet_combined_fresh) or (
+        sonnet_issue and raw_fallback_combined > 0.0 and not fallback_combined_fresh
+    )
+
+    if needs_simplify:
+        simplify_satisfied = (not missing_lenses) or (effective_risk == "STANDARD" and combined_fresh)
+        if not simplify_satisfied and not (rkind == "draft-blocked" and simplify_exhausted):
+            if effective_risk != "STANDARD" and (
+                combined_fresh or raw_sonnet_combined > 0.0 or raw_fallback_combined > 0.0
+            ):
                 return (
                     False,
-                    f"simplify lenses ran on fallback model without verified `{cwg.SONNET_HIGH_MODEL}` error/quota issue; "
-                    f"run all 3 lenses (`reuse`, `quality`, `efficiency`) on `{cwg.SONNET_HIGH_MODEL}` via `swarm`",
+                    f"{effective_risk} candidate cannot collapse simplify into a single combined lane; "
+                    f"run all 3 separate `{cwg.SONNET_HIGH_MODEL}` lenses (`reuse`, `quality`, `efficiency`); "
+                    f"missing: {', '.join(missing_lenses)}",
                 )
-            if stale_sonnet_lenses:
+            if not sonnet_issue and (
+                (effective_risk == "STANDARD" and fallback_combined_fresh)
+                or (sonnet_lenses | fallback_lenses) >= required_lenses
+            ):
+                target = (
+                    "`simplify-reviewer`"
+                    if effective_risk == "STANDARD"
+                    else "all 3 lenses (`reuse`, `quality`, `efficiency`)"
+                )
                 return (
                     False,
-                    f"simplify lenses ({', '.join(stale_sonnet_lenses)}) are stale because durable files changed after simplify; "
-                    f"re-verify {', '.join(missing_lenses)} on `{cwg.SONNET_HIGH_MODEL}`",
+                    f"simplify ran on fallback model without verified `{cwg.SONNET_HIGH_MODEL}` error/quota issue; "
+                    f"run {target} on `{cwg.SONNET_HIGH_MODEL}` via `swarm`",
+                )
+            if stale_sonnet_lenses or (effective_risk == "STANDARD" and combined_stale):
+                stale_label = (
+                    "combined simplify"
+                    if (effective_risk == "STANDARD" and combined_stale and not stale_sonnet_lenses)
+                    else f"simplify lenses ({', '.join(stale_sonnet_lenses)})"
+                )
+                return (
+                    False,
+                    f"{stale_label} stale because durable files changed after simplify; "
+                    f"re-verify on `{cwg.SONNET_HIGH_MODEL}`",
+                )
+            if effective_risk == "STANDARD":
+                return (
+                    False,
+                    f"STANDARD candidate requires 1 combined `simplify-reviewer` lane (`SIMPLIFY_LENS: ALL`) "
+                    f"or all 3 lenses on `{cwg.SONNET_HIGH_MODEL}` via `swarm`",
                 )
             return (
                 False,
-                f"{effective_risk} candidate requires all 3 `{cwg.SONNET_HIGH_MODEL}` simplify lenses (`reuse`, `quality`, `efficiency`); "
-                f"missing: {', '.join(missing_lenses)}",
+                f"{effective_risk} candidate requires all 3 separate `{cwg.SONNET_HIGH_MODEL}` simplify lenses "
+                f"(`reuse`, `quality`, `efficiency`); missing: {', '.join(missing_lenses)}",
             )
 
     # 3. Independent Adversarial Review Verification (Codex lane unchanged; internal `claude-opus-5-5-high` -> `gemini-4-carbon-high`)
@@ -1063,6 +1141,7 @@ def retire_candidate(
     )
     rio.write_json(state_file, state)
     cwg.clear_claim(session)
+    cwg.clear_swarm_rounds(session)
 
 
 def format_block_message(
@@ -1087,9 +1166,21 @@ def format_block_message(
     else:
         reqs = cwg.receipt_requirements_summary(floor, small)
         xhigh_hint = " с `REVIEW_TIER: XHIGH`" if floor == "XHIGH" else ""
+        if floor == "STANDARD" and not small:
+            simplify_hint = (
+                f"- Для simplify (`STANDARD > 3` строк) запустите 1 объединённый read-only воркер `simplify-reviewer` "
+                f"(`SIMPLIFY_LENS: ALL`) на `{cwg.SONNET_HIGH_MODEL}` через `swarm(action=\"add\", name=\"simplify-reviewer\", model=\"{cwg.SONNET_HIGH_MODEL}\")`.\n"
+            )
+        elif floor in ("HIGH", "XHIGH"):
+            simplify_hint = (
+                f"- Для simplify (`{floor}`) запустите строго 3 отдельные параллельные линзы (`reuse`, `quality`, `efficiency`) "
+                f"на `{cwg.SONNET_HIGH_MODEL}` через `swarm(action=\"add\", ..., model=\"{cwg.SONNET_HIGH_MODEL}\")`.\n"
+            )
+        else:
+            simplify_hint = ""
         guidance = (
             f"Кандидат `PERSISTENT` (path floor `{floor}`). Обязательные условия: {reqs}.\n"
-            f"- Для simplify запустите 3 read-only линзы (`reuse`, `quality`, `efficiency`) на `{cwg.SONNET_HIGH_MODEL}` через `swarm(action=\"add\", ..., model=\"{cwg.SONNET_HIGH_MODEL}\")`.\n"
+            f"{simplify_hint}"
             f"- Для внешнего ревью HIGH/XHIGH сначала проверьте `python -X utf8 \"{codex_script}\" check`; "
             f"если доступно — запустите `python -X utf8 \"{codex_script}\" review --session \"{session}\" --summary \"...\"` "
             f"{'--xhigh ' if floor == 'XHIGH' else ''}(при недоступности Codex запустите внутреннее ревью на `{cwg.OPUS_HIGH_MODEL}`{xhigh_hint} через `swarm`, с эскалацией на `{cwg.CARBON_HIGH_MODEL}` при ошибке/квоте Opus).\n"
@@ -1210,7 +1301,8 @@ def main() -> int:
             progress_sig = (
                 f"{swarm_ev.get('worker_activity_count', 0)}:"
                 f"{len(sub_ev.get('reviews', []))}:"
-                f"{len(sub_ev.get('fallback_lenses', {}))}"
+                f"{len(sub_ev.get('fallback_lenses', {}))}:"
+                f"{1 if (swarm_ev.get('sonnet_combined_ts') or swarm_ev.get('fallback_combined_ts') or sub_ev.get('fallback_combined_ts')) else 0}"
             )
             waits = 0 if state.get("last_wait_progress") != progress_sig else int(state.get("waits") or 0)
             total_waits = int(state.get("total_waits") or 0)

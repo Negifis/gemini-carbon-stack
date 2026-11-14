@@ -36,10 +36,10 @@ python -X utf8 "<PLUGIN_ROOT>/hooks/codex_lane.py" review `
        name="internal-reviewer",  # или internal-reviewer-xhigh для XHIGH
        model="claude-opus-5-5-high",
        workspace="inherit",
-       brief="Strictly read-only adversarial code review of <repo_path> (<files>). Do NOT modify any files. Verify invariants, security boundaries, failure modes, and tests. Post your report to @coordinator ending with exact standalone line `VERDICT: APPROVED` or `VERDICT: REVISE` (for XHIGH include `REVIEW_TIER: XHIGH`).",
+       brief="Strictly read-only adversarial code review of <repo_path> (<files>, diff: <full_diff_path>). Do NOT modify any files. Note: shell is Windows PowerShell 5.1 (never use << heredoc, &&, sed, pyflakes, or python slice [a:b]). Verify invariants, security boundaries, failure modes, and tests. Post your report to @coordinator ending with exact standalone line `VERDICT: APPROVED` or `VERDICT: REVISE` (for XHIGH include `REVIEW_TIER: XHIGH`).",
    )
    ```
-   При `REVISE` не убивайте воркера: после исправлений направляйте следующий раунд в тот же чат через `post_message("@internal-reviewer ...")`. Освобождайте воркера (`swarm(action="kill", name="internal-reviewer")`) только после финального вердикта по кандидату (`APPROVED` или завершения `--closure`).
+   Перед повторным раундом (`REVISE` -> Раунд 2/3) запустите `python -X utf8 "<PLUGIN_ROOT>/tools/swarm_cache.py" prepare --session "<conversation-id>" --cwd "<repo_path>" --label review`: пока кэш воркера тёплый (`<= 270s`, `resume_in_place`), направляйте дельту в тот же чат через `post_message("@internal-reviewer ...")`; если 5-минутный TTL кэша истёк (`> 270s`, `rotate_incremental`), не будите остывший чат — закройте его (`swarm(action="kill", name="internal-reviewer")`) и запустите `internal-reviewer-r<N>` с кратким списком замечаний предыдущего раунда и `<incremental_diff_path>`. Освобождайте воркера (`swarm(action="kill", ...)`) только после финального вердикта по кандидату (`APPROVED` или завершения `--closure`).
 3. **Эскалация на `gemini-4-carbon-high`, если с Opus что-то не так:**
    - Если `claude-opus-5-5-high` имеет квоту `0%`, недоступен, вернул `ERROR_MESSAGE` / `RESOURCE_EXHAUSTED` или завис:
    - Переключите воркер на месте вызовом `swarm(action="model", name="internal-reviewer", model="gemini-4-carbon-high")` (сохраняя его контекст) либо вызовите резервный субагент `adversarial-reviewer` / `adversarial-reviewer-xhigh`.

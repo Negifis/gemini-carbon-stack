@@ -10,9 +10,9 @@
 - `plugin/` — нативный плагин-бандл Antigravity (`gemini-carbon-stack`):
   - `plugin.json`, `hooks.json` — манифест плагина и 4 группы runtime-хуков (`continuity`, `safety-and-quality-guards`, `chip-handoff`, `code-work-gate`).
   - `hooks/` — исполняемые модули гейта, межмодельной верификации (`codex_lane.py` + `swarm` `members.json`/`board.jsonl`), continuity, защиты от циклов, контроля плотности комментариев, безопасности git worktree и межсессионной передачи задач.
-  - `tools/` — локальная FTS5-память с защитой от секретов (`carbon_memory.py`), оркестратор изолированных задач (`chip_handoff.py`), быстрый AST/git-grep поиск (`code_search.py`), безопасное управление worktrees/junctions (`worktree_guard.py`), самодиагностика (`stack_doctor.py`), диагностика файловых дескрипторов Windows (`file-holders.ps1`) и векторизация SVG (`vectorize.mjs`).
-  - `rules/AGENTS.md` — компактная глобальная конституция Gemini Carbon.
-  - `agents/` — 7 специализированных read-only субагентов (`simplify-reuse-reviewer`, `simplify-quality-reviewer`, `simplify-efficiency-reviewer`, `adversarial-reviewer`, `adversarial-reviewer-xhigh`, `code-explorer`, `translator`).
+  - `tools/` — локальная FTS5-память с защитой от секретов (`carbon_memory.py`), оркестратор изолированных задач (`chip_handoff.py`), быстрый AST/git-grep поиск (`code_search.py`), контроль 5-минутного TTL кэша `swarm` и инкрементальных диффов (`swarm_cache.py`), безопасное управление worktrees/junctions (`worktree_guard.py`), самодиагностика (`stack_doctor.py`), диагностика файловых дескрипторов Windows (`file-holders.ps1`) и векторизация SVG (`vectorize.mjs`).
+  - `rules/AGENTS.md` — компактная глобальная конституция Gemini Carbon и правила Windows PowerShell 5.1.
+  - `agents/` — 8 специализированных read-only субагентов (`simplify-reviewer`, `simplify-reuse-reviewer`, `simplify-quality-reviewer`, `simplify-efficiency-reviewer`, `adversarial-reviewer`, `adversarial-reviewer-xhigh`, `code-explorer`, `translator`).
   - `skills/` — 19 прогрессивных навыков и slash-команд (`/task-start`, `/checkpoint`, `/rebuild`, `/adversarial-review`, `/verify-ready`, `/stack-doctor` и профильные дисциплины).
 - `rules/uiux-design.md` — контекстное правило фронтенда (`trigger: glob`), активируемое только на файлах UI/разметки.
 - `tests/` — полный набор модульных, негативных и live-интеграционных тестов.

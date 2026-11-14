@@ -109,6 +109,10 @@ SIMPLIFY_LENS_LINE_RE = re.compile(
     r"^\s*(?:\*{0,2})SIMPLIFY_LENS(?:\*{0,2})\s*:\s*(?:\*{0,2})(REUSE|QUALITY|EFFICIENCY)(?:\*{0,2})\b",
     re.IGNORECASE | re.MULTILINE,
 )
+SIMPLIFY_COMBINED_LENS_RE = re.compile(
+    r"^\s*(?:\*{0,2})SIMPLIFY_LENS(?:\*{0,2})\s*:\s*(?:\*{0,2})(ALL|COMBINED)(?:\*{0,2})\b",
+    re.IGNORECASE | re.MULTILINE,
+)
 REVIEW_TIER_XHIGH_RE = re.compile(
     r"\bREVIEW_TIER\s*:\s*XHIGH\b",
     re.IGNORECASE,
@@ -129,6 +133,9 @@ SIMPLIFY_LENS_AGENTS = frozenset(
 NATIVE_REVIEWERS = frozenset({"adversarial-reviewer", "adversarial-reviewer-xhigh"})
 XHIGH_NATIVE_REVIEWER = "adversarial-reviewer-xhigh"
 SIMPLIFY_REVIEWER = "simplify-reviewer"
+ANTHROPIC_EPHEMERAL_TTL_SECONDS = 300
+SWARM_CACHE_SAFE_TTL_SECONDS = 270
+SWARM_ROLE_MEMBER_RE = re.compile(r"^(?:narrator|monitor)(?:-\d+)?$", re.IGNORECASE)
 
 
 def gate_dir(*parts: str) -> pathlib.Path:
@@ -161,6 +168,10 @@ def snapshot_path(session: str, call_id: str) -> pathlib.Path:
 
 def claim_path(session: str) -> pathlib.Path:
     return gate_dir("claims") / f"{session}.json"
+
+
+def swarm_rounds_path(session: str) -> pathlib.Path:
+    return gate_dir("swarm_rounds") / f"{session}.json"
 
 
 def is_scratch_or_ephemeral(
@@ -386,13 +397,43 @@ def publish_claim(session: str, paths: list[str] | None = None, shell_active: bo
     rio.write_json(p, cur)
 
 
-def clear_claim(session: str) -> None:
-    p = claim_path(session)
+def unlink_quiet(path: pathlib.Path) -> None:
     try:
-        if p.exists():
-            p.unlink()
+        path.unlink(missing_ok=True)
     except OSError:
         pass
+
+
+def clear_claim(session: str) -> None:
+    unlink_quiet(claim_path(session))
+
+
+def clear_swarm_rounds(session: str) -> None:
+    unlink_quiet(swarm_rounds_path(session))
+
+
+def swarm_dir(brain_root: pathlib.Path, session: str) -> pathlib.Path:
+    return brain_root / session / ".system_generated" / "swarm"
+
+
+def member_transcript_path(brain_root: pathlib.Path, cid: str) -> pathlib.Path:
+    return brain_root / cid / ".system_generated" / "logs" / "transcript.jsonl"
+
+
+def load_swarm_members(brain_root: pathlib.Path, session: str) -> dict[str, Any]:
+    doc = rio.read_json(swarm_dir(brain_root, session) / "members.json", default=None)
+    if isinstance(doc, dict) and isinstance(doc.get("members"), dict):
+        return doc["members"]
+    return doc if isinstance(doc, dict) else {}
+
+
+def is_swarm_role_member(name: str, meta: dict[str, Any] | None = None) -> bool:
+    role_val = str((meta or {}).get("role") or "worker").strip().lower()
+    return (
+        name == "coordinator"
+        or role_val in ("coordinator", "narrator", "monitor")
+        or bool(SWARM_ROLE_MEMBER_RE.match(name))
+    )
 
 
 def claimed_by_other_sessions(my_session: str, paths: list[str], ttl: float = 600.0) -> set[str]:
@@ -434,14 +475,14 @@ def receipt_requirements_summary(floor: str, small: bool) -> str:
         if small:
             return "decisive check execution (small edit <=3 lines: simplify lenses exempt)"
         return (
-            f"decisive test/check execution + 3 simplify lenses (reuse, quality, efficiency on `{SONNET_HIGH_MODEL}`)"
+            f"decisive test/check execution + 1 combined `simplify-reviewer` lane (or 3 lenses) on `{SONNET_HIGH_MODEL}`"
         )
     if floor == "HIGH":
         return (
-            f"decisive test/check execution + 3 simplify lenses (`{SONNET_HIGH_MODEL}`) + "
+            f"decisive test/check execution + 3 separate simplify lenses (`{SONNET_HIGH_MODEL}`) + "
             f"1 independent APPROVED review (Codex lane or internal `{OPUS_HIGH_MODEL}` -> fallback `{CARBON_HIGH_MODEL}`)"
         )
     return (
-        f"decisive test/check execution + 3 simplify lenses (`{SONNET_HIGH_MODEL}`) + "
+        f"decisive test/check execution + 3 separate simplify lenses (`{SONNET_HIGH_MODEL}`) + "
         f"1 XHIGH APPROVED review (Codex --xhigh or internal `{OPUS_HIGH_MODEL}` [XHIGH] -> fallback `{CARBON_HIGH_MODEL}`)"
     )

@@ -13,8 +13,8 @@ description: Pre-closure readiness check (`/verify-ready`): audits current candi
    - Все решающие тесты и проверки типов были запущены и прошли успешно **после самой последней правки файлов**.
 3. **Проверьте выполнение требований Code Work Gate по уровню риска:**
    - `LOW`: проверена разметка и ссылки.
-   - `STANDARD` (не малая правка): пройдены все 3 simplify-линзы (`reuse`, `quality`, `efficiency`) на `claude-sonnet-5-5-high`.
-   - `HIGH` / `XHIGH`: пройдены 3 simplify-линзы (`claude-sonnet-5-5-high`) + получен свежий `VERDICT: APPROVED` от `codex_lane.py` либо от внутреннего `claude-opus-5-5-high` (или эскалированного `gemini-4-carbon-high` при подтверждённом сбое Opus) на текущем SHA-256 содержимого файлов, а завершённые `swarm`-воркеры остановлены через `kill`.
+   - `STANDARD` (не малая правка `> 3` строк): пройден 1 объединённый `simplify-reviewer` (или 3 линзы) на `claude-sonnet-5-5-high`.
+   - `HIGH` / `XHIGH`: пройдены строго 3 отдельные simplify-линзы (`claude-sonnet-5-5-high`) + получен свежий `VERDICT: APPROVED` от `codex_lane.py` либо от внутреннего `claude-opus-5-5-high` (или эскалированного `gemini-4-carbon-high` при подтверждённом сбое Opus) на текущем SHA-256 содержимого файлов, а завершённые `swarm`-воркеры остановлены через `kill`.
 4. **Проверьте незакрытые делегированные задачи:**
    - `chip_handoff.py status` — все дочерние чипы приняты (`accepted`) или явно задокументированы.
 5. Сформируйте лаконичный финальный ответ с корректной последней строкой `[gate] ...`.

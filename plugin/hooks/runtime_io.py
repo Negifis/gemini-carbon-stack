@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime
 import hashlib
 import json
 import os
@@ -460,6 +460,39 @@ def git_toplevel(cwd: str | None) -> str | None:
     if rc == 0 and isinstance(out, str) and out.strip():
         return os.path.abspath(out.strip())
     return None
+
+
+def git_head_oid(git_root: str) -> str:
+    if not git_root or not os.path.isdir(git_root):
+        return ""
+    rc, out, _ = run_git(git_root, ["rev-parse", "--verify", "-q", "HEAD"], timeout=3.0)
+    return str(out or "").strip() if rc == 0 else ""
+
+
+def capture_worktree_tree_oid(git_root: str, timeout: float = 15.0) -> tuple[str, str]:
+    """Capture current tracked+untracked worktree state as a git tree OID without mutating `.git/index`."""
+    if not git_root or not os.path.isdir(git_root):
+        return "", "invalid_git_root"
+    rc_idx, idx_path_out, _ = run_git(git_root, ["rev-parse", "--git-path", "index"], timeout=3.0)
+    idx_rel = str(idx_path_out or "").strip() if rc_idx == 0 else ""
+    real_idx = os.path.join(git_root, idx_rel) if idx_rel and not os.path.isabs(idx_rel) else idx_rel
+
+    tmp_dir = tempfile.mkdtemp(prefix="carbon-idx-")
+    tmp_index = os.path.join(tmp_dir, "index")
+    try:
+        if real_idx and os.path.isfile(real_idx):
+            shutil.copy2(real_idx, tmp_index)
+        env = dict(os.environ, GIT_INDEX_FILE=tmp_index)
+        rc1, _, err1 = run_git(git_root, ["add", "-A"], timeout=timeout, text=True, env=env)
+        if rc1 != 0:
+            return "", f"git_add_failed:{err1.strip()[:160]}"
+        rc2, tree_sha, err2 = run_git(git_root, ["write-tree"], timeout=timeout, text=True, env=env)
+        tree_str = str(tree_sha or "").strip()
+        if rc2 != 0 or not tree_str:
+            return "", f"git_write_tree_failed:{err2.strip()[:160]}"
+        return tree_str, ""
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def resolve_command_cwd(cmd: str, default_cwd: str, fallback_dir: str = "") -> str:

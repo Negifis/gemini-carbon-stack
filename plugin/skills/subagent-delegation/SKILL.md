@@ -22,7 +22,8 @@ Gemini 4 Carbon (High) обладает глубоким рассуждение�
 | Живая проверка веб-интерфейса и визуальных состояний | `invoke_subagent(TypeName="browser")` | `flash` |
 | Генерация растровых иллюстраций / иконок | `invoke_subagent(TypeName="image-generator")` | по умолчанию |
 | Перевод объёмной документации | `invoke_subagent(TypeName="translator")` | `flash` или `inherit` |
-| **Simplify — 3 линзы (`reuse`, `quality`, `efficiency`)** | `swarm(action="add", ..., model="claude-sonnet-5-5-high")` | **`Claude Sonnet 5.5 (High)`** (fallback -> `gemini-4-carbon-high` / `simplify-*-reviewer` при сбое/0% квоты Sonnet) |
+| **Simplify (`STANDARD > 3` строк)** | `swarm(action="add", name="simplify-reviewer", model="claude-sonnet-5-5-high")` | **1 объединённый `Claude Sonnet 5.5 (High)`** (`SIMPLIFY_LENS: ALL`; fallback -> `simplify-reviewer` на Carbon при сбое/0% квоты Sonnet) |
+| **Simplify (`HIGH` / `XHIGH` — 3 линзы)** | `swarm(action="add", ..., model="claude-sonnet-5-5-high")` | **3 отдельные линзы `Claude Sonnet 5.5 (High)`** (без схлопывания; fallback -> `gemini-4-carbon-high` / `simplify-*-reviewer` при сбое/0% квоты Sonnet) |
 | **Внешнее adversarial-ревью (`HIGH` / `XHIGH`)** | `codex_lane.py review` (`--xhigh` для `XHIGH`) | **OpenAI Codex CLI** (`gpt-6.1-sol`, без изменений) |
 | **Внутреннее adversarial-ревью (`HIGH` / `XHIGH`)** | `swarm(action="add", ..., model="claude-opus-5-5-high")` | **`Claude Opus 5.5 (High)`** -> эскалация на **`Gemini 4 Carbon (High)`** (`swarm(action="model", ..., model="gemini-4-carbon-high")` или `adversarial-reviewer*`) при проблеме с Opus |
 | Программный fan-out по множеству независимых модулей | `run_workflow` (`parallel` / `pipeline`) | по задаче |

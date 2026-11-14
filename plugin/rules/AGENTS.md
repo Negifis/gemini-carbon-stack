@@ -23,13 +23,21 @@
   - Сначала находите точные определения и строки через `code_search.py symbols` / `code_search.py grep`, затем читайте целевые диапазоны строк (`read_file` со `StartLine`/`EndLine`).
   - Не перечитывайте неизменившийся файл повторно в том же поколении без правок.
 - **Межмодельная маршрутизация проверок в Antigravity:**
-  - **Simplify (3 линзы):** для немалых правок (`STANDARD > 3` строк, `HIGH`, `XHIGH`) запускайте параллельно 3 read-only линзы (`simplify-reuse`, `simplify-quality`, `simplify-efficiency`) на **`Claude Sonnet 5.5 (High)`** (`model="claude-sonnet-5-5-high"`) через нативный `swarm` (см. навык `simplify`).
+  - **Simplify (`Claude Sonnet 5.5 (High)` через нативный `swarm`):**
+    - для обычных правок **`STANDARD > 3` строк** — 1 объединённый read-only воркер `simplify-reviewer` (`REUSE + QUALITY + EFFICIENCY` в одном отчёте, маркер `SIMPLIFY_LENS: ALL`);
+    - для **`HIGH` и `XHIGH`** — строго **3 отдельные параллельные read-only линзы** (`simplify-reuse`, `simplify-quality`, `simplify-efficiency`) без схлопывания в один воркер (см. навык `simplify`).
   - **Внешнее adversarial-ревью (основной контур):** `codex_lane.py review` (OpenAI Codex CLI; повторные раунды и `--closure` по тому же кандидату автоматически продолжаются в той же сессии через `codex exec resume`).
   - **Внутреннее adversarial-ревью (при открытом circuit breaker Codex или запросе внутреннего ревью):** запускается на **`Claude Opus 5.5 (High)`** (`model="claude-opus-5-5-high"`) через `swarm` с автоматической эскалацией на **`Gemini 4 Carbon (High)`** (`gemini-4-carbon-high`), если с Opus возникла проблема (исчерпание квоты, сбой модели, недоступность).
-- В пределах одного кандидата гейта все раунды simplify и ревью ведутся в существующих чатах воркеров/`codex exec resume` (без преждевременного `kill` между раундами). Интеграцией результатов и финальным инженерным решением всегда владеет основной агент; ревьюеры и simplify-линзы работают строго read-only.
+- **Многораундовое продолжение и кэш токенов (TTL 5 мин в Antigravity):**
+  - Внешний `codex_lane.py review` продолжает все раунды в той же сессии через `codex exec resume`.
+  - Для `swarm`-воркеров Claude перед раундом проверяйте возраст кэша через `swarm_cache.py prepare --session <id> --cwd <repo> --label simplify|review`: пока кэш тёплый (`<= 270s`), продолжайте раунд в том же чате через `post_message`; если TTL истёк (`> 270s`), не будите раздутый остывший чат — завершите его (`swarm(action="kill")`) и запустите чистый `<name>-r<N>`, передав только инкрементальный дифф (`*_incremental.diff`) и краткий список замечаний прошлого раунда. Глубина шагов read-only проверки воркеров не ограничивается. Интеграцией результатов всегда владеет основной агент; ревьюеры и simplify-воркеры работают строго read-only.
 
-## 4. Специфика среды Windows + Antigravity
+## 4. Специфика среды Windows + PowerShell 5.1 + Antigravity
 
+- **Оболочка `run_command` — Windows PowerShell 5.1 (НЕ bash и НЕ pwsh 7):**
+  - Запрещены bash-операторы `&&` / `||` (разделяйте команды через `;` с проверкой `$LASTEXITCODE`), bash heredoc `<<'EOF'` / редирект `<` (для inline-скрипта используйте `@' ... '@ | python -X utf8 -`), Python-срезы массивов `arr[10:20]` (в PowerShell используйте `arr[10..20]`, а для диапазонов строк файла — инструмент `read_file` со `StartLine`/`EndLine`) и `/dev/null` (используйте `$null` / `2>$null`).
+  - Не вызывайте отсутствующие GNU/Unix-утилиты (`sed`, `awk`, `head`, `tail`, `rg`) и неустановленные пакеты вроде `pyflakes`: используйте `read_file`, `code_search.py`, `git grep -n`, `Select-String`, `Select-Object -First/-Last` и `python -X utf8 -m py_compile` / `ast.parse`.
+  - Всегда передавайте Python флаг `-X utf8` (исключает сбои `cp1251`) и не делайте пайп `python -m unittest ... 2>&1 | Select-Object` (вывод `OK` в `stderr` вызывает ложный `NativeCommandError` с кодом `1`).
 - В `run_command` стандартный ввод (`stdin`) остаётся открытым пайпом. Неинтерактивные CLI, проверяющие piped stdin (например, `codex exec`), запускайте через обёртку `codex_lane.py` либо явно закрывайте вход (`$null | ...` в PowerShell, `stdin=subprocess.DEVNULL` в Python).
 - Для актуальной документации библиотек проверяйте установленную версию пакета и используйте навык `current-docs` / MCP `context7`.
 - Подтверждённые нетривиальные особенности проекта (`GOTCHA`, `RISK`, `DECISION`, `CONSTRAINT`, `COMMAND`) сохраняйте в локальную память через `carbon_memory.py remember` (строго без секретов и токенов). Для длительных задач поддерживайте каноническое состояние через `/checkpoint` (`continuity.py checkpoint`).
@@ -41,8 +49,8 @@ Runtime-хук `cwg_stop.py` проверяет соответствие реа�
 - **`OPERATIONAL`** (мутирующие команды shell без изменения файлов репозитория): завершается строкой `[gate] operational: <предпроверка>; <подтверждённый эффект>` (или `[gate] no-change: <причина>`).
 - **`PERSISTENT`** (изменение артефактов на диске, уровни риска `LOW | STANDARD | HIGH | XHIGH`):
   - `LOW` (чистая документация): проверка содержимого -> `[gate] verified: LOW; <итог>`.
-  - `STANDARD` (обычный код; малая правка `<= 3` строк в 1 файле освобождена от simplify-линз): реальный прогон решающих проверок/тестов + (для немалых правок) все 3 линзы `reuse`, `quality`, `efficiency` на `claude-sonnet-5-5-high` -> `[gate] verified: STANDARD; <кандидат и проверки>`.
-  - `HIGH` / `XHIGH` (безопасность, схемы/миграции, CI/CD, конфиги агента/хуков, публичные контракты): решающие тесты + 3 simplify-линзы (`claude-sonnet-5-5-high`) + свежий независимый `VERDICT: APPROVED` новее последней правки файла (через `codex_lane.py review` либо внутренний `claude-opus-5-5-high` с эскалацией на `gemini-4-carbon-high` при сбое Opus) -> `[gate] verified: HIGH|XHIGH; <кандидат, тесты и ревью>`.
+  - `STANDARD` (обычный код; малая правка `<= 3` строк в 1 файле освобождена от simplify): реальный прогон решающих проверок/тестов + (для `> 3` строк) 1 объединённый воркер `simplify-reviewer` (или 3 линзы) на `claude-sonnet-5-5-high` -> `[gate] verified: STANDARD; <кандидат и проверки>`.
+  - `HIGH` / `XHIGH` (безопасность, схемы/миграции, CI/CD, конфиги агента/хуков, публичные контракты): решающие тесты + 3 отдельные simplify-линзы (`claude-sonnet-5-5-high`) + свежий независимый `VERDICT: APPROVED` новее последней правки файла (через `codex_lane.py review` либо внутренний `claude-opus-5-5-high` с эскалацией на `gemini-4-carbon-high` при сбое Opus) -> `[gate] verified: HIGH|XHIGH; <кандидат, тесты и ревью>`.
   - Граничные исходы закрытия (детали в навыке `development-verification`): `[gate] pr-ready: ...`, `[gate] draft-blocked: ...`, `[gate] anomaly-reported: <id>; <факт>`. Квитанция `[gate]` всегда располагается **последней непустой строкой** финального ответа.
 
 ## 6. Стиль коммуникации и код

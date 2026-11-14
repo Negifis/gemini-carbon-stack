@@ -154,8 +154,11 @@ def run_diagnostics(cwd: str = "") -> dict[str, Any]:
         "model_routing": {
             "simplify_lenses": {
                 "lenses": list(cwg.SIMPLIFY_LENSES),
+                "standard_mode": "single_combined (simplify-reviewer)",
+                "high_xhigh_mode": "three_parallel_lenses (reuse, quality, efficiency)",
                 "primary_model": cwg.SONNET_HIGH_MODEL,
                 "fallback_model": cwg.CARBON_HIGH_MODEL,
+                "prompt_cache_ttl_seconds": cwg.SWARM_CACHE_SAFE_TTL_SECONDS,
             },
             "external_review": "codex-cli (unchanged)",
             "internal_review": {

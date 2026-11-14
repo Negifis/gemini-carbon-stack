@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 HOOKS_DIR = REPO_ROOT / "plugin" / "hooks"
@@ -33,12 +34,7 @@ class GateSubprocessTestCase(unittest.TestCase):
         self.workspace.mkdir(parents=True)
         self.codex_sessions.mkdir(parents=True)
 
-        subprocess.run(["git", "init", "-b", "main"], cwd=str(self.workspace), check=True, capture_output=True)
-        subprocess.run(["git", "config", "user.name", "Test"], cwd=str(self.workspace), check=True)
-        subprocess.run(["git", "config", "user.email", "test@local"], cwd=str(self.workspace), check=True)
-        (self.workspace / "app.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
-        subprocess.run(["git", "add", "."], cwd=str(self.workspace), check=True)
-        subprocess.run(["git", "commit", "-m", "init"], cwd=str(self.workspace), check=True, capture_output=True)
+        self._init_git_repo(self.workspace, {"app.py": "def add(a, b):\n    return a + b\n"}, "init")
 
         self.conv_id = "11111111-2222-3333-4444-555555555555"
         self.logs_dir = self.brain / self.conv_id / ".system_generated" / "logs"
@@ -58,6 +54,18 @@ class GateSubprocessTestCase(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
+
+    def _init_git_repo(self, repo_dir: pathlib.Path, files: dict[str, str], commit_msg: str = "init") -> None:
+        repo_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", "-b", "main"], cwd=str(repo_dir), check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo_dir), check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@local"], cwd=str(repo_dir), check=True, capture_output=True)
+        for rel, content in files.items():
+            fpath = repo_dir / rel
+            fpath.parent.mkdir(parents=True, exist_ok=True)
+            fpath.write_text(content, encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=str(repo_dir), check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", commit_msg], cwd=str(repo_dir), check=True, capture_output=True)
 
     def _flush_transcript(self) -> None:
         text = "\n".join(json.dumps(s, ensure_ascii=False) for s in self.steps) + "\n"
@@ -680,7 +688,42 @@ class GateSubprocessTestCase(unittest.TestCase):
         )
 
     def test_09_claude_sonnet_lenses_and_opus_to_carbon_escalation(self) -> None:
-        # Part A: STANDARD multi-line edit enforces all 3 `claude-sonnet-5-5-high` lenses
+        # Part A0: Non-small STANDARD edit accepts 1 combined `simplify-reviewer` on `claude-sonnet-5-5-high`, never on Carbon without Sonnet failure
+        helper = self.workspace / "report_helper.py"
+        helper_code = "\n".join([f"def fmt_{i}(x):\n    return str(x + {i})" for i in range(6)]) + "\n"
+        helper.write_text(helper_code, encoding="utf-8")
+        self.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {"toolCall": {"id": "a0_w", "name": "write_file", "args": {"Path": str(helper), "Content": helper_code}}, "error": ""},
+        )
+        self.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {"toolCall": {"id": "a0_t", "name": "run_command", "args": {"CommandLine": "pytest -q"}}, "error": ""},
+        )
+        self.add_swarm_worker(
+            name="simplify-reviewer",
+            model="gemini-4-carbon-high",
+            brief="Combined STANDARD simplify review.",
+            worker_post="@coordinator\nSIMPLIFY_LENS: ALL\nSIMPLIFY_VERDICT: CLEAN",
+        )
+        self.add_final_response("Готово.\n[gate] verified: STANDARD; report_helper.py, pytest")
+        _, blk_comb_fb = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
+        self.assertEqual(blk_comb_fb["decision"], "continue")
+        self.assertIn("without verified `claude-sonnet-5-5-high` error/quota issue", blk_comb_fb["reason"])
+
+        self.add_swarm_worker(
+            name="simplify-reviewer-r2",
+            model="claude-sonnet-5-5-high",
+            brief="Combined STANDARD simplify review (REUSE, QUALITY, EFFICIENCY).",
+            worker_post="@coordinator\nSIMPLIFY_LENS: ALL\nSIMPLIFY_VERDICT: CLEAN",
+        )
+        self.add_final_response("Готово.\n[gate] verified: STANDARD; report_helper.py, pytest + combined simplify-reviewer")
+        _, ok_comb = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
+        self.assertEqual(ok_comb, {"decision": "allow"})
+
+        # Part A: STANDARD multi-line edit also still accepts the full 3 `claude-sonnet-5-5-high` lenses
         svc = self.workspace / "service.py"
         code = "\n".join([f"def compute_{i}(v):\n    return v * {i + 1}" for i in range(6)]) + "\n"
         svc.write_text(code, encoding="utf-8")
@@ -710,7 +753,7 @@ class GateSubprocessTestCase(unittest.TestCase):
         _, std_ok = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
         self.assertEqual(std_ok, {"decision": "allow"})
 
-        # Part B: HIGH edit enforces internal `claude-opus-5-5-high` with escalation to `gemini-4-carbon-high` ONLY on verified Opus issue
+        # Part B: HIGH edit NEVER collapses simplify lenses into 1 worker, and enforces `claude-opus-5-5-high` -> `gemini-4-carbon-high` escalation
         sec = self.workspace / "token_policy.py"
         sec_code = "\n".join([f"def check_scope_{i}(claims):\n    return 'admin' in claims" for i in range(5)]) + "\n"
         sec.write_text(sec_code, encoding="utf-8")
@@ -724,7 +767,32 @@ class GateSubprocessTestCase(unittest.TestCase):
             "PostToolUse",
             {"toolCall": {"id": "b2", "name": "run_command", "args": {"CommandLine": "pytest -q"}}, "error": ""},
         )
-        self.add_sonnet_simplify_lenses()
+        # Negative B0: Collapsing simplify into 1 combined worker (or emitting all 3 SIMPLIFY_LENS lines in 1 worker) is rejected on HIGH
+        self.add_swarm_worker(
+            name="simplify-reviewer",
+            model="claude-sonnet-5-5-high",
+            brief="Combined simplify.",
+            worker_post="@coordinator\nSIMPLIFY_LENS: ALL\nSIMPLIFY_VERDICT: CLEAN",
+        )
+        self.add_swarm_worker(
+            name="simplify",
+            model="claude-sonnet-5-5-high",
+            brief="All three simplify lenses: reuse, quality, efficiency.",
+            worker_post="@coordinator\nSIMPLIFY_LENS: REUSE\nSIMPLIFY_LENS: QUALITY\nSIMPLIFY_LENS: EFFICIENCY\nSIMPLIFY_VERDICT: CLEAN",
+        )
+        self.add_final_response("Проверено.\n[gate] verified: HIGH; token_policy.py, pytest")
+        _, blk_collapsed = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
+        self.assertEqual(blk_collapsed["decision"], "continue")
+        self.assertIn("cannot collapse simplify into a single combined lane", blk_collapsed["reason"])
+
+        # Sharded `tasks=` workers named `simplify-1..3` must satisfy HIGH (not be misclassified as combined)
+        for idx, (lens, tag) in enumerate((("reuse", "REUSE"), ("quality", "QUALITY"), ("efficiency", "EFFICIENCY")), start=1):
+            self.add_swarm_worker(
+                name=f"simplify-{idx}",
+                model="claude-sonnet-5-5-high",
+                brief=f"LENS: {tag}. Strictly read-only.",
+                worker_post=f"@coordinator\nSIMPLIFY_LENS: {tag}\nSIMPLIFY_VERDICT: CLEAN",
+            )
 
         # Negative B1: Coordinator posting `VERDICT: APPROVED` on `board.jsonl` must NEVER count as worker approval
         self.append_board_post("coordinator", "@internal-rev Example format:\nVERDICT: APPROVED")
@@ -1354,6 +1422,206 @@ class GateSubprocessTestCase(unittest.TestCase):
         # Invocation 3 tried `exec resume dead-uuid`, invocation 4 fell back to fresh `exec`
         self.assertEqual(inv_rows[3]["argv"][:2], ["exec", "resume"])
         self.assertEqual(inv_rows[4]["argv"][0], "exec")
+
+    def test_14_swarm_cache_ttl_incremental_diff_and_rotated_rounds(self) -> None:
+        sys.path.insert(0, str(HOOKS_DIR))
+        sys.path.insert(0, str(REPO_ROOT / "plugin" / "tools"))
+        import cwg_mark
+        import swarm_cache
+
+        self.assertEqual(
+            cwg_mark.classify_shell_command(
+                f'python -X utf8 "{REPO_ROOT / "plugin" / "tools" / "swarm_cache.py"}" prepare --session {self.conv_id} --cwd "{self.workspace}" --label simplify'
+            ),
+            "BOOKKEEPING",
+        )
+
+        # Killed legacy worker from a prior candidate must not skew Round 1 `initial_spawn`.
+        self.add_swarm_worker("simplify-legacy", "claude-sonnet-5-5-high", "Old.", "@coordinator\nSIMPLIFY_VERDICT: CLEAN", killed=True)
+
+        real_idx = self.workspace / ".git" / "index"
+        idx_before = real_idx.read_bytes()
+
+        os.environ["CARBON_STACK_HOME"] = str(self.stack_home)
+        policy = self.workspace / "auth_policy.py"
+        v1_code = "def authorize_v1(role: str) -> bool:\n    return role == 'admin'\n\n" + "\n".join(
+            f"def pad_{i}(x):\n    return x + {i}" for i in range(4)
+        ) + "\n"
+        policy.write_text(v1_code, encoding="utf-8")
+        self.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {"toolCall": {"id": "sc1", "name": "write_file", "args": {"Path": str(policy), "Content": v1_code}}, "error": ""},
+        )
+
+        base_t = time.time()
+        r1 = swarm_cache.prepare_round(
+            session=self.conv_id,
+            cwd=str(self.workspace),
+            brain_root=self.brain,
+            label="simplify",
+            now_ts=base_t,
+        )
+        self.assertTrue(r1["ok"])
+        self.assertEqual(r1["round"], 1)
+        self.assertEqual(r1["overall_action"], "initial_spawn")
+        self.assertEqual(r1["incremental_diff_path"], "")
+        self.assertTrue(pathlib.Path(r1["full_diff_path"]).is_file())
+        self.assertIn("authorize_v1", pathlib.Path(r1["full_diff_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(real_idx.read_bytes(), idx_before)
+
+        r1_cids = {
+            "reuse": self.add_swarm_worker("simplify-reuse", "claude-sonnet-5-5-high", "Reuse lens.", "@coordinator\nSIMPLIFY_LENS: REUSE\nSIMPLIFY_VERDICT: ACTIONABLE_FIXES"),
+            "quality": self.add_swarm_worker("simplify-quality", "claude-sonnet-5-5-high", "Quality lens.", "@coordinator\nSIMPLIFY_LENS: QUALITY\nSIMPLIFY_VERDICT: CLEAN"),
+            "efficiency": self.add_swarm_worker("simplify-efficiency", "claude-sonnet-5-5-high", "Efficiency lens.", "@coordinator\nSIMPLIFY_LENS: EFFICIENCY\nSIMPLIFY_VERDICT: CLEAN"),
+        }
+        self.add_swarm_worker("internal-reviewer", "claude-opus-5-5-high", "Review auth_policy.", "@coordinator\nVERDICT: REVISE")
+
+        time.sleep(0.05)
+        v2_code = v1_code.replace("role == 'admin'", "role in ('admin', 'owner')") + "\ndef extra_r2_guard():\n    return True\n"
+        policy.write_text(v2_code, encoding="utf-8")
+        self.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {"toolCall": {"id": "sc2", "name": "write_file", "args": {"Path": str(policy), "Content": v2_code}}, "error": ""},
+        )
+        self.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {"toolCall": {"id": "sc_t", "name": "run_command", "args": {"CommandLine": "pytest -q"}}, "error": ""},
+        )
+
+        reuse_tp = self.brain / r1_cids["reuse"] / ".system_generated" / "logs" / "transcript_full.jsonl"
+        reuse_rows = [json.loads(ln) for ln in reuse_tp.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        reuse_rows[-1]["input_tokens"] = 1200
+        reuse_rows[-1]["cache_read_tokens"] = 38500
+        reuse_rows[-1]["output_tokens"] = 450
+        last_worker_ts = time.time()
+        reuse_tp.write_text("\n".join(json.dumps(r) for r in reuse_rows) + "\n", encoding="utf-8")
+
+        r2_warm = swarm_cache.prepare_round(
+            session=self.conv_id,
+            cwd=str(self.workspace),
+            brain_root=self.brain,
+            label="simplify",
+            now_ts=last_worker_ts + 60.0,
+        )
+        self.assertEqual(r2_warm["round"], 2)
+        self.assertEqual(r2_warm["overall_action"], "resume_in_place")
+        self.assertIn("1 file(s) changed", r2_warm["incremental_stat"])
+        inc_txt = pathlib.Path(r2_warm["incremental_diff_path"]).read_text(encoding="utf-8")
+        self.assertIn("extra_r2_guard", inc_txt)
+        self.assertNotIn("+def pad_0", inc_txt)
+        self.assertEqual(real_idx.read_bytes(), idx_before)
+        reuse_entry = next(w for w in r2_warm["worker_status"]["workers"] if w["name"] == "simplify-reuse")
+        self.assertEqual(reuse_entry["cache_state"], "WARM")
+        self.assertEqual(reuse_entry["last_context_tokens"], 39700)
+
+        st_expired = swarm_cache.inspect_swarm_workers(
+            session=self.conv_id,
+            brain_root=self.brain,
+            label="simplify",
+            now_ts=last_worker_ts + 400.0,
+        )
+        self.assertEqual(st_expired["overall_action"], "rotate_incremental")
+        self.assertTrue(all(w["cache_state"] == "EXPIRED" for w in st_expired["workers"]))
+
+        mfile = self.brain / self.conv_id / ".system_generated" / "swarm" / "members.json"
+        mdoc = json.loads(mfile.read_text(encoding="utf-8"))
+        for old_name in ("simplify-reuse", "simplify-quality", "simplify-efficiency", "internal-reviewer"):
+            mdoc["members"][old_name]["killed"] = True
+        mfile.write_text(json.dumps(mdoc, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        self.add_swarm_worker("simplify-reuse-r2", "claude-sonnet-5-5-high", "Verify r2 diff.", "@coordinator\nSIMPLIFY_LENS: REUSE\nSIMPLIFY_VERDICT: CLEAN")
+        self.add_swarm_worker("simplify-quality-r2", "claude-sonnet-5-5-high", "Verify r2 diff.", "@coordinator\nSIMPLIFY_LENS: QUALITY\nSIMPLIFY_VERDICT: CLEAN")
+        self.add_swarm_worker("simplify-efficiency-r2", "claude-sonnet-5-5-high", "Verify r2 diff.", "@coordinator\nSIMPLIFY_LENS: EFFICIENCY\nSIMPLIFY_VERDICT: CLEAN")
+        self.add_swarm_worker("internal-reviewer-r2", "claude-opus-5-5-high", "Verify r2 diff after REVISE.", "@coordinator\nVERDICT: APPROVED")
+
+        self.add_final_response("Готово после ротации воркеров.\n[gate] verified: HIGH; auth_policy.py, pytest + rotated r2 lenses & review")
+        _, ok_rot = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
+        self.assertEqual(ok_rot, {"decision": "allow"})
+
+    def test_15_swarm_cache_errors_and_repo_isolation(self) -> None:
+        sys.path.insert(0, str(HOOKS_DIR))
+        sys.path.insert(0, str(REPO_ROOT / "plugin" / "tools"))
+        import cwg_common as cwg
+        import swarm_cache
+
+        os.environ["CARBON_STACK_HOME"] = str(self.stack_home)
+        r2_p4 = swarm_cache._rotated_worker_name("simplify-efficiency-p4", 2)
+        r2_p5 = swarm_cache._rotated_worker_name("simplify-efficiency-p5", 2)
+        self.assertLessEqual(len(r2_p4), 24)
+        self.assertLessEqual(len(r2_p5), 24)
+        self.assertTrue(r2_p4.endswith("-r2") and r2_p5.endswith("-r2"))
+        self.assertNotEqual(r2_p4, r2_p5)
+
+        (self.workspace / "app.py").write_text("workspace_repo_a_token = 1\n", encoding="utf-8")
+        real_run_git = swarm_cache.rio.run_git
+
+        def _failing_diff_git(cwd_arg, args, **kwargs):
+            if args and args[0] == "diff":
+                return (128, "", "fatal: simulated git diff failure")
+            return real_run_git(cwd_arg, args, **kwargs)
+
+        with mock.patch.object(swarm_cache.rio, "run_git", side_effect=_failing_diff_git):
+            res_err = swarm_cache.prepare_round(
+                session=self.conv_id,
+                cwd=str(self.workspace),
+                brain_root=self.brain,
+                label="errcheck",
+                now_ts=1000.0,
+            )
+        self.assertFalse(res_err["ok"])
+        self.assertIn("git_diff_failed", res_err["error"])
+        scratch_root = self.brain / self.conv_id / "scratch"
+        self.assertEqual(list(scratch_root.rglob("errcheck_r1_full.diff")), [])
+        rounds_file = cwg.swarm_rounds_path(swarm_cache.rio.safe_key(self.conv_id))
+        rounds_data = json.loads(rounds_file.read_text(encoding="utf-8")) if rounds_file.is_file() else {}
+        self.assertFalse(any(k.endswith("|errcheck") for k in rounds_data.get("lanes", {})))
+
+        res_ok = swarm_cache.prepare_round(
+            session=self.conv_id,
+            cwd=str(self.workspace),
+            brain_root=self.brain,
+            label="errcheck",
+            now_ts=1005.0,
+        )
+        self.assertTrue(res_ok["ok"])
+        self.assertEqual(res_ok["round"], 1)
+        self.assertIn("workspace_repo_a_token", pathlib.Path(res_ok["full_diff_path"]).read_text(encoding="utf-8"))
+
+        repo_b = self.root / "repo_b"
+        self._init_git_repo(repo_b, {"b.py": "x = 1\n"}, "init b")
+        (repo_b / "b.py").write_text("repo_b_unique_token = 2\n", encoding="utf-8")
+
+        iso_a1 = swarm_cache.prepare_round(
+            session=self.conv_id,
+            cwd=str(self.workspace),
+            brain_root=self.brain,
+            label="iso",
+            now_ts=1010.0,
+        )
+        iso_b = swarm_cache.prepare_round(
+            session=self.conv_id,
+            cwd=str(repo_b),
+            brain_root=self.brain,
+            label="iso",
+            now_ts=1011.0,
+        )
+        iso_a2 = swarm_cache.prepare_round(
+            session=self.conv_id,
+            cwd=str(self.workspace),
+            brain_root=self.brain,
+            label="iso",
+            now_ts=1012.0,
+        )
+        self.assertTrue(iso_a1["ok"] and iso_b["ok"] and iso_a2["ok"])
+        self.assertNotEqual(iso_a1["full_diff_path"], iso_b["full_diff_path"])
+        self.assertEqual(iso_a2["full_diff_path"], iso_a1["full_diff_path"])
+        iso_a_txt = pathlib.Path(iso_a2["full_diff_path"]).read_text(encoding="utf-8")
+        self.assertIn("workspace_repo_a_token", iso_a_txt)
+        self.assertNotIn("repo_b_unique_token", iso_a_txt)
+        self.assertIn("repo_b_unique_token", pathlib.Path(iso_b["full_diff_path"]).read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

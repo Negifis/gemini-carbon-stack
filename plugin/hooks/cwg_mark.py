@@ -28,7 +28,7 @@ CACHE_PATH_RE = re.compile(
 
 BOOKKEEPING_CMD_RE = re.compile(
     r"^\s*(?:\$null\s*\|\s*)?(?:&\s*)?(?:python|py(?:\s+-3)?)(?:\.exe)?\s+(?:-X\s+utf8\s+)?"
-    r"(?:[\"']?[^\s|;&\"']*(?:carbon_memory\.py|continuity\.py\s+(?:checkpoint|show)|gate_inbox\.py|chip_handoff\.py|codex_lane\.py\s+(?:check|status|reset|review))[\"']?)(?:\s+[^|;&\r\n]*)?$",
+    r"[\"']?[^\s|;&\"']*(?:(?:carbon_memory|gate_inbox|chip_handoff|swarm_cache)\.py[\"']?|(?:continuity\.py[\"']?\s+(?:checkpoint|show)|codex_lane\.py[\"']?\s+(?:check|status|reset|review)))(?:\s+[^|;&\r\n]*)?$",
     re.IGNORECASE,
 )
 

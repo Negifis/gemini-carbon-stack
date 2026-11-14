@@ -7,10 +7,7 @@ import argparse
 import json
 import os
 import pathlib
-import shutil
-import subprocess
 import sys
-import tempfile
 import time
 from typing import Any
 
@@ -90,59 +87,33 @@ def snapshot_dirty_worktree(worktree_dir: str, label: str = "auto") -> dict[str,
     if not str(status_out or "").strip():
         return {"ok": True, "clean": True, "ref": "", "commit": ""}
 
-    rc_h, head_out, _ = rio.run_git(top, ["rev-parse", "--verify", "-q", "HEAD"], timeout=3.0)
-    parent_sha = str(head_out or "").strip() if rc_h == 0 else ""
+    parent_sha = rio.git_head_oid(top)
 
-    # Copy current git index to a temporary file so the user's real staging area is never mutated
-    rc_idx, idx_path_out, _ = rio.run_git(top, ["rev-parse", "--git-path", "index"], timeout=3.0)
-    real_idx = (
-        os.path.join(top, str(idx_path_out).strip())
-        if rc_idx == 0 and str(idx_path_out).strip()
-        else ""
-    )
+    tree_sha, tree_err = rio.capture_worktree_tree_oid(top)
+    if not tree_sha:
+        return {"ok": False, "error": tree_err}
 
-    tmp_dir = tempfile.mkdtemp(prefix="carbon-wip-idx-")
-    tmp_index = os.path.join(tmp_dir, "index")
-    try:
-        if real_idx and os.path.isfile(real_idx):
-            shutil.copy2(real_idx, tmp_index)
+    commit_args = ["commit-tree", tree_sha, "-m", f"WIP snapshot ({label}) at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}"]
+    if parent_sha:
+        commit_args[2:2] = ["-p", parent_sha]
+    rc3, commit_out, err3 = rio.run_git(top, commit_args, timeout=15.0)
+    commit_sha = str(commit_out or "").strip()
+    if rc3 != 0 or not commit_sha:
+        return {"ok": False, "error": f"git_commit_tree_failed:{err3.strip()[:160]}"}
 
-        env = dict(os.environ, GIT_INDEX_FILE=tmp_index)
+    safe_lbl = rio.safe_key(label, "wip")[:32]
+    ref_name = f"refs/wip/{safe_lbl}-{int(time.time())}"
+    rc4, _, err4 = rio.run_git(top, ["update-ref", ref_name, commit_sha], timeout=5.0)
+    if rc4 != 0:
+        return {"ok": False, "error": f"git_update_ref_failed:{err4.strip()[:160]}"}
 
-        def git_env(args: list[str]) -> tuple[int, str, str]:
-            rc, out, err = rio.run_git(top, args, timeout=15.0, text=True, env=env)
-            return rc, str(out), err
-
-        rc1, _, err1 = git_env(["add", "-A"])
-        if rc1 != 0:
-            return {"ok": False, "error": f"git_add_failed:{err1.strip()[:160]}"}
-
-        rc2, tree_sha, err2 = git_env(["write-tree"])
-        if rc2 != 0 or not tree_sha.strip():
-            return {"ok": False, "error": f"git_write_tree_failed:{err2.strip()[:160]}"}
-
-        commit_args = ["commit-tree", tree_sha.strip(), "-m", f"WIP snapshot ({label}) at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}"]
-        if parent_sha:
-            commit_args[2:2] = ["-p", parent_sha]
-        rc3, commit_sha, err3 = git_env(commit_args)
-        if rc3 != 0 or not commit_sha.strip():
-            return {"ok": False, "error": f"git_commit_tree_failed:{err3.strip()[:160]}"}
-
-        safe_lbl = rio.safe_key(label, "wip")[:32]
-        ref_name = f"refs/wip/{safe_lbl}-{int(time.time())}"
-        rc4, _, err4 = git_env(["update-ref", ref_name, commit_sha.strip()])
-        if rc4 != 0:
-            return {"ok": False, "error": f"git_update_ref_failed:{err4.strip()[:160]}"}
-
-        return {
-            "ok": True,
-            "clean": False,
-            "ref": ref_name,
-            "commit": commit_sha.strip(),
-            "worktree": rio.normalize_path(top),
-        }
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+    return {
+        "ok": True,
+        "clean": False,
+        "ref": ref_name,
+        "commit": commit_sha,
+        "worktree": rio.normalize_path(top),
+    }
 
 
 def safe_remove_worktree(
