@@ -1299,8 +1299,10 @@ class GateSubprocessTestCase(unittest.TestCase):
         sid1 = next(ln.split(":", 1)[1].strip() for ln in p1.stdout.splitlines() if ln.startswith("SESSION_ID:"))
         self.assertTrue(sid1.startswith("sess-live-"))
 
-        # 2. Round 2 (same candidate): automatically resumes `sid1` WITHOUT `-s` or `-C`
-        p2 = run_cli("--summary", "Round 2")
+        # 2. Round 2 (same candidate): automatically resumes `sid1` WITHOUT `-s` or `-C`, keeps `-c sandbox_mode`, and decodes UTF-16 BOM diff
+        utf16_diff = self.root / "utf16.diff"
+        utf16_diff.write_bytes("diff --git a/x.py b/x.py\n+ok_utf16_marker\n".encode("utf-16"))
+        p2 = run_cli("--diff-file", str(utf16_diff), "--summary", "Round 2")
         self.assertEqual(p2.returncode, 0, msg=p2.stdout + p2.stderr)
         self.assertIn("SESSION_MODE: resumed", p2.stdout)
         self.assertIn(f"SESSION_ID: {sid1}", p2.stdout)
@@ -1343,7 +1345,10 @@ class GateSubprocessTestCase(unittest.TestCase):
         self.assertEqual(inv_rows[1]["argv"][:2], ["exec", "resume"])
         self.assertNotIn("-s", inv_rows[1]["argv"])
         self.assertNotIn("-C", inv_rows[1]["argv"])
+        self.assertTrue(any("sandbox_mode" in a and "read-only" in a for a in inv_rows[1]["argv"]))
         self.assertIn("ROUND_MODE: continuation", inv_rows[1]["prompt"])
+        self.assertIn("+ok_utf16_marker", inv_rows[1]["prompt"])
+        self.assertNotIn("\x00", inv_rows[1]["prompt"])
         self.assertEqual(inv_rows[2]["argv"][0], "exec")
         self.assertNotEqual(inv_rows[2]["argv"][1], "resume")
         # Invocation 3 tried `exec resume dead-uuid`, invocation 4 fell back to fresh `exec`

@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 import uuid
-from typing import Any
+from typing import Any, NamedTuple
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import cwg_common as cwg
@@ -22,6 +22,15 @@ import runtime_io as rio
 
 BREAKER_TTL_SECONDS = 1800  # 30 minutes cooldown after quota/auth/capacity outage
 PACKET_TTL_SECONDS = 86400
+MAX_DIFF_SNAPSHOT_CHARS = 160_000
+
+
+class _CodexExecResult(NamedTuple):
+    rc: int
+    stdout: str
+    stderr: str
+    has_verdict: bool
+    outage: str | None
 
 OUTAGE_PATTERNS = tuple(
     re.compile(pat, re.IGNORECASE)
@@ -132,7 +141,9 @@ def _infer_single_open_session(cwd: str) -> str:
         mroot = rio.fold_path(str(mdata.get("git_root") or mdata.get("cwd") or ""))
         path_match = mroot == target_root
         if not path_match:
-            for touched in mdata.get("paths") or []:
+            raw_paths = mdata.get("paths")
+            touched_paths = raw_paths if isinstance(raw_paths, list) else []
+            for touched in touched_paths:
                 ftouched = rio.fold_path(str(touched))
                 if ftouched == target_root or ftouched.startswith(root_prefix):
                     path_match = True
@@ -178,11 +189,11 @@ def record_packet(
         "created_ts": now,
     }
     rio.write_json(packets_dir() / f"{rio.safe_key(review_id)}.json", pkt)
-    sweep_old_packets()
+    sweep_expired_gate_files()
     return pkt
 
 
-def sweep_old_packets() -> None:
+def sweep_expired_gate_files() -> None:
     cutoff = time.time() - PACKET_TTL_SECONDS
     for base_dir in (packets_dir(), threads_dir()):
         for p in base_dir.glob("*.json"):
@@ -272,8 +283,6 @@ def _extract_rollout_texts_and_meta(rollout_file: pathlib.Path) -> dict[str, Any
     except OSError:
         file_mtime = 0.0
 
-    user_texts: list[str] = []
-    assistant_texts: list[tuple[float, str]] = []
     turns: list[dict[str, Any]] = []
     current_turn: dict[str, Any] | None = None
     cur_effort = ""
@@ -281,6 +290,7 @@ def _extract_rollout_texts_and_meta(rollout_file: pathlib.Path) -> dict[str, Any
     session_id = ""
     started_ts = 0.0
     completed_ts = 0.0
+    last_msg_ts = 0.0
 
     for rec in records:
         rec_ts = rio.parse_iso_ts(rec.get("timestamp"))
@@ -316,7 +326,6 @@ def _extract_rollout_texts_and_meta(rollout_file: pathlib.Path) -> dict[str, Any
             joined = "\n".join(chunks).strip()
             if joined:
                 if role == "user":
-                    user_texts.append(joined)
                     m_ids = REVIEW_ID_RE.findall(joined)
                     if m_ids:
                         if current_turn is not None:
@@ -332,19 +341,18 @@ def _extract_rollout_texts_and_meta(rollout_file: pathlib.Path) -> dict[str, Any
                         }
                         turns.append(current_turn)
                 elif role == "assistant":
-                    msg_pair = (rec_ts or file_mtime, joined)
-                    assistant_texts.append(msg_pair)
+                    msg_ts = rec_ts or file_mtime
+                    last_msg_ts = msg_ts
                     if current_turn is not None and not current_turn["closed"]:
-                        current_turn["assistant_messages"].append(msg_pair)
+                        current_turn["assistant_messages"].append((msg_ts, joined))
         elif rtype == "event_msg" and payload.get("type") == "task_complete":
             ts_done = rec_ts or rio.parse_iso_ts(payload.get("completed_at")) or file_mtime
             completed_ts = ts_done
+            last_msg_ts = ts_done
             last_msg = payload.get("last_agent_message")
             if isinstance(last_msg, str) and last_msg.strip():
-                done_pair = (ts_done, last_msg.strip())
-                assistant_texts.append(done_pair)
                 if current_turn is not None and not current_turn["closed"]:
-                    current_turn["assistant_messages"].append(done_pair)
+                    current_turn["assistant_messages"].append((ts_done, last_msg.strip()))
             if current_turn is not None:
                 current_turn["completed_ts"] = ts_done
                 current_turn["closed"] = True
@@ -357,9 +365,7 @@ def _extract_rollout_texts_and_meta(rollout_file: pathlib.Path) -> dict[str, Any
         "effort": cur_effort,
         "model": cur_model,
         "started_ts": started_ts,
-        "completed_ts": completed_ts or (assistant_texts[-1][0] if assistant_texts else started_ts),
-        "user_blob": "\n".join(user_texts),
-        "assistant_messages": assistant_texts,
+        "completed_ts": completed_ts or last_msg_ts or started_ts,
         "turns": turns,
     }
 
@@ -485,8 +491,9 @@ def _resolve_resume_session(
     if isinstance(saved, dict) and saved.get("session_id"):
         saved_cand_ts = float(saved.get("candidate_first_ts") or 0.0)
         if candidate_first_ts > 0.0:
-            if saved.get("session") == session and abs(saved_cand_ts - candidate_first_ts) < 1.0:
+            if abs(saved_cand_ts - candidate_first_ts) < 1.0:
                 return str(saved["session_id"])
+        # INVARIANT: When no candidate marker is open (NO_CHANGE / manual review), reuse same-repo thread for 1h.
         elif saved_cand_ts <= 0.0 and (time.time() - float(saved.get("updated_ts") or 0.0)) < 3600.0:
             return str(saved["session_id"])
 
@@ -516,6 +523,17 @@ def _find_session_id_for_review(review_id: str, since_ts: float) -> str:
     return ""
 
 
+def _read_diff_file(path: str) -> str:
+    raw = pathlib.Path(path).read_bytes()
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        text = raw.decode("utf-16", errors="replace")
+    elif raw.startswith(b"\xef\xbb\xbf"):
+        text = raw.decode("utf-8-sig", errors="replace")
+    else:
+        text = raw.decode("utf-8", errors="replace")
+    return text.replace("\x00", "")
+
+
 def _build_codex_exec_cmd(
     binary: str,
     cwd: str,
@@ -528,6 +546,8 @@ def _build_codex_exec_cmd(
         "-c",
         "mcp_servers={}",
         "-c",
+        'sandbox_mode="read-only"',
+        "-c",
         f'model_reasoning_effort="{effort}"',
         "--disable",
         "codex_hooks",
@@ -535,7 +555,7 @@ def _build_codex_exec_cmd(
     if model:
         common_opts.extend(["-m", model])
     if resume_session_id:
-        # INVARIANT: `codex exec resume` rejects `-s` and `-C`; rely on subprocess `cwd=cwd` and `--all`.
+        # INVARIANT: `codex exec resume` rejects `-s` and `-C`; rely on `-c sandbox_mode="read-only"`, `cwd=cwd`, and `--all`.
         return [binary, "exec", "resume", "--all", *common_opts, resume_session_id, "-"]
     return [binary, "exec", "-s", "read-only", "-C", cwd, *common_opts, "-"]
 
@@ -582,7 +602,7 @@ def build_adversarial_prompt(
         "3. Separate confirmed defects ([HIGH]/[MEDIUM]) from non-blocking observations.\n"
         f"4. {verdict_rule}\n\n"
         f"CANDIDATE SUMMARY:\n{scope_summary}\n\n"
-        f"GIT DIFF SNAPSHOT:\n{diff_text[:32000]}\n"
+        f"GIT DIFF SNAPSHOT:\n{diff_text[:MAX_DIFF_SNAPSHOT_CHARS]}\n"
     )
 
 
@@ -593,7 +613,7 @@ def _exec_codex_once(
     timeout: float,
     review_id: str,
     xhigh: bool,
-) -> tuple[int | None, str, str, bool, str | None]:
+) -> _CodexExecResult | None:
     kw = rio.subprocess_kwargs()
     kw.pop("stdin", None)
     try:
@@ -618,11 +638,11 @@ def _exec_codex_once(
                 indent=2,
             )
         )
-        return None, "", "", False, "timeout"
+        return None
     except Exception as exc:
         trip_breaker(f"codex_exec_error:{type(exc).__name__}")
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
-        return None, "", "", False, str(exc)
+        return None
 
     stdout_text = (proc.stdout or b"").decode("utf-8", errors="replace")
     stderr_text = (proc.stderr or b"").decode("utf-8", errors="replace")
@@ -635,7 +655,7 @@ def _exec_codex_once(
         if (proc.returncode == 0 and has_structured_verdict)
         else detect_outage_from_output(combined, exit_code=proc.returncode)
     )
-    return proc.returncode, stdout_text, stderr_text, has_structured_verdict, outage
+    return _CodexExecResult(proc.returncode, stdout_text, stderr_text, has_structured_verdict, outage)
 
 
 def cmd_review(args: argparse.Namespace) -> int:
@@ -655,27 +675,24 @@ def cmd_review(args: argparse.Namespace) -> int:
         git_root=git_root,
         session=eff_session,
         candidate_first_ts=cand_first_ts,
-        explicit_resume=getattr(args, "resume", "") or "",
-        force_new=bool(getattr(args, "new_session", False)),
+        explicit_resume=args.resume or "",
+        force_new=bool(args.new_session),
     )
 
-    diff_text = ""
     if args.diff_file and os.path.isfile(args.diff_file):
-        diff_text = pathlib.Path(args.diff_file).read_text(encoding="utf-8", errors="replace")
+        diff_text = _read_diff_file(args.diff_file)
     else:
-        rc, out, _ = rio.run_git(cwd, ["diff", "HEAD"], timeout=10.0)
-        if rc == 0 and isinstance(out, str) and out.strip():
+        rc_git, out, _ = rio.run_git(cwd, ["diff", "HEAD"], timeout=10.0)
+        if rc_git == 0 and isinstance(out, str) and out.strip():
             diff_text = out
         else:
-            rc2, out2, _ = rio.run_git(cwd, ["status", "--short"], timeout=5.0)
+            _, out2, _ = rio.run_git(cwd, ["status", "--short"], timeout=5.0)
             diff_text = str(out2 or "")
 
     scope_summary = args.summary or "Review current repository candidate changes."
-    launch_wall_ts = time.time()
-    rc = 1
-    stdout_text = ""
-    stderr_text = ""
-    outage: str | None = None
+    exec_res: _CodexExecResult | None = None
+    launch_wall_ts = 0.0
+    used_resume_sid = ""
     attempts = (resume_sid, "") if resume_sid else ("",)
     for attempt_idx, cur_resume_sid in enumerate(attempts):
         prompt = build_adversarial_prompt(
@@ -701,15 +718,20 @@ def cmd_review(args: argparse.Namespace) -> int:
             model=args.model,
             resume_session_id=cur_resume_sid,
         )
-        rc_opt, stdout_text, stderr_text, has_structured_verdict, outage = _exec_codex_once(
+        exec_res = _exec_codex_once(
             cmd, prompt, cwd, float(args.timeout), review_id, args.xhigh
         )
-        if rc_opt is None:
+        if exec_res is None:
             return 3
-        rc = rc_opt
-        resume_sid = cur_resume_sid
+        used_resume_sid = cur_resume_sid
         # Graceful single fallback to a fresh session if resuming a deleted/unreadable thread UUID
-        if attempt_idx == 0 and cur_resume_sid and rc != 0 and not has_structured_verdict and not outage:
+        if (
+            attempt_idx == 0
+            and cur_resume_sid
+            and exec_res.rc != 0
+            and not exec_res.has_verdict
+            and not exec_res.outage
+        ):
             tpath = _thread_state_path(eff_session, git_root)
             try:
                 if tpath.exists():
@@ -719,16 +741,17 @@ def cmd_review(args: argparse.Namespace) -> int:
             continue
         break
 
-    if outage or rc != 0:
-        trip_breaker(outage or f"codex_nonzero_exit_{rc}")
+    assert exec_res is not None
+    if exec_res.outage or exec_res.rc != 0:
+        trip_breaker(exec_res.outage or f"codex_nonzero_exit_{exec_res.rc}")
         print(
             json.dumps(
                 {
                     "ok": False,
                     "review_id": review_id,
-                    "exit_code": rc,
+                    "exit_code": exec_res.rc,
                     "fallback": "adversarial-reviewer-xhigh" if args.xhigh else "adversarial-reviewer",
-                    "error": (outage or stderr_text[-400:] or stdout_text[-400:]).strip(),
+                    "error": (exec_res.outage or exec_res.stderr[-400:] or exec_res.stdout[-400:]).strip(),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -736,7 +759,7 @@ def cmd_review(args: argparse.Namespace) -> int:
         )
         return 2
 
-    actual_sid = _find_session_id_for_review(review_id, launch_wall_ts) or resume_sid
+    actual_sid = _find_session_id_for_review(review_id, launch_wall_ts) or used_resume_sid
     if actual_sid:
         rio.write_json(
             _thread_state_path(eff_session, git_root),
@@ -750,14 +773,14 @@ def cmd_review(args: argparse.Namespace) -> int:
             },
         )
 
-    session_mode = "resumed" if resume_sid else "new"
+    session_mode = "resumed" if used_resume_sid else "new"
     sys.stdout.write(
         f"REVIEW_ID: {review_id}\n"
         f"SESSION_ID: {actual_sid}\n"
         f"SESSION_MODE: {session_mode}\n"
         f"ENGINE: codex ({effort})\n"
         "--- CODEX REVIEW OUTPUT ---\n"
-        f"{stdout_text.strip()}\n"
+        f"{exec_res.stdout.strip()}\n"
     )
     return 0
 
@@ -789,6 +812,7 @@ def main() -> int:
         print(json.dumps(res, ensure_ascii=False, indent=2))
         return 0 if res.get("available") else 1
     if args.subcommand == "status":
+        sweep_expired_gate_files()
         print(
             json.dumps(
                 {
