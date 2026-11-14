@@ -110,18 +110,8 @@ def snapshot_dirty_worktree(worktree_dir: str, label: str = "auto") -> dict[str,
         env = dict(os.environ, GIT_INDEX_FILE=tmp_index)
 
         def git_env(args: list[str]) -> tuple[int, str, str]:
-            proc = subprocess.run(
-                ["git", "--no-optional-locks"] + args,
-                cwd=top,
-                env=env,
-                timeout=15.0,
-                **rio.subprocess_kwargs(),
-            )
-            return (
-                proc.returncode,
-                (proc.stdout or b"").decode("utf-8", errors="replace"),
-                (proc.stderr or b"").decode("utf-8", errors="replace"),
-            )
+            rc, out, err = rio.run_git(top, args, timeout=15.0, text=True, env=env)
+            return rc, str(out), err
 
         rc1, _, err1 = git_env(["add", "-A"])
         if rc1 != 0:

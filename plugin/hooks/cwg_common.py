@@ -51,6 +51,8 @@ HIGH_RISK_PATTERNS = tuple(
     )
 )
 
+CHIP_TREES_RE = re.compile(r"/\.gemini/carbon-stack/state/chips/trees/", re.IGNORECASE)
+
 ALWAYS_EPHEMERAL_PATTERNS = tuple(
     re.compile(pat, re.IGNORECASE)
     for pat in (
@@ -100,8 +102,8 @@ CLOSURE_LINE_RE = re.compile(
     re.MULTILINE,
 )
 SIMPLIFY_LINE_RE = re.compile(
-    r"^\s*(?:\*{0,2})SIMPLIFY_VERDICT(?:\*{0,2})\s*:\s*(?:\*{0,2})(CLEAN|ACTIONABLE_FIXES)(?:\*{0,2})\b",
-    re.MULTILINE,
+    r"^\s*(?:\*{0,2})SIMPLIFY_VERDICT(?:\*{0,2})\s*:\s*(?:\*{0,2})(CLEAN|FINDINGS_REPORTED|ACTIONABLE_FIXES)(?:\*{0,2})\b",
+    re.IGNORECASE | re.MULTILINE,
 )
 SIMPLIFY_LENS_LINE_RE = re.compile(
     r"^\s*(?:\*{0,2})SIMPLIFY_LENS(?:\*{0,2})\s*:\s*(?:\*{0,2})(REUSE|QUALITY|EFFICIENCY)(?:\*{0,2})\b",
@@ -175,6 +177,9 @@ def is_scratch_or_ephemeral(
         art = rio.fold_path(artifact_dir)
         if art and (folded == art or folded.startswith(art + "/")):
             return True
+    # INVARIANT: Isolated chip worktrees live under `state/chips/trees/` and hold real durable repository files.
+    if CHIP_TREES_RE.search(norm):
+        return False
     for pat in ALWAYS_EPHEMERAL_PATTERNS:
         if pat.search(norm):
             return True
@@ -399,9 +404,13 @@ def claimed_by_other_sessions(my_session: str, paths: list[str], ttl: float = 60
         data = rio.read_json(entry, default=None)
         if not isinstance(data, dict):
             continue
-        if data.get("session") == my_session:
-            continue
         if now - float(data.get("updated_ts") or 0.0) > ttl:
+            try:
+                entry.unlink()
+            except OSError:
+                pass
+            continue
+        if data.get("session") == my_session:
             continue
         for cp in data.get("paths") or []:
             if cp in wanted:

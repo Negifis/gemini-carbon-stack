@@ -144,7 +144,7 @@ def symbol_search(query: str, cwd: str, limit: int = 50) -> dict[str, Any]:
     q_low = (query or "").strip().lower()
     hits: list[dict[str, Any]] = []
 
-    for fpath in iter_source_files(root):
+    for fpath in iter_source_files(root, glob_ext=".py,.ts,.tsx,.js,.jsx,.mjs,.go,.rs"):
         rel = os.path.relpath(str(fpath), root).replace("\\", "/")
         suffix = fpath.suffix.lower()
         try:

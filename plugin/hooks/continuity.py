@@ -291,7 +291,6 @@ def handle_pre_invocation(payload: dict[str, Any]) -> None:
     session = rio.session_key(payload)
     cwd = rio.effective_cwd(payload)
     wps = payload.get("workspacePaths") if isinstance(payload.get("workspacePaths"), list) else None
-    pkey = rio.project_key(cwd, wps)
     state = load_session_state(session)
 
     injected: list[str] = []
@@ -336,9 +335,7 @@ def handle_pre_invocation(payload: dict[str, Any]) -> None:
 
     # Detect context compaction and restore authoritative state
     if detect_compaction(payload, state, steps):
-        cp_file = checkpoint_path(pkey)
-        workspace_cp = pathlib.Path(cwd) / ".agents" / "CHECKPOINT.md"
-        chosen_cp = workspace_cp if workspace_cp.is_file() else (cp_file if cp_file.is_file() else None)
+        chosen_cp = resolve_checkpoint_file(cwd, wps)
         if chosen_cp is not None:
             digest = compact_recovery_digest(
                 chosen_cp.read_text(encoding="utf-8", errors="replace"),
@@ -424,24 +421,29 @@ def handle_pre_tool(payload: dict[str, Any]) -> None:
         return
 
     if tool_name == "run_command":
-        if new_count == CMD_REPEAT_WARN_LIMIT:
-            warns = list(state.get("pending_warnings") or [])
-            warns.append(
-                f"[Continuity Loop Guard] Одинаковая команда `run_command` вызвана {new_count} раза подряд без изменений кода. "
-                "Проверьте первопричину вместо повторения идентичного вызова; следующий повтор будет заблокирован."
-            )
-            state["pending_warnings"] = warns[-4:]
-        elif new_count >= CMD_REPEAT_DENY_LIMIT:
-            save_session_state(session, state)
-            rio.log_hook_event("continuity-events", "loop_guard_deny_cmd", session=session, sig=sig, count=new_count)
-            rio.emit_pre_tool(
-                "deny",
-                reason=(
-                    f"[Continuity Loop Guard] Заблокирован непродуктивный цикл: идентичная команда `run_command` "
-                    f"запущена {new_count}-й раз подряд без изменений состояния. Измените диагностику или устраните первопричину."
-                ),
-            )
-            return
+        cmd_str = str(args.get("CommandLine") or "")
+        is_test_runner = bool(
+            re.search(r"\b(?:pytest|py\.test|unittest|npm\s+test|pnpm\s+test|yarn\s+test|cargo\s+test|go\s+test|dotnet\s+test)\b", cmd_str, re.IGNORECASE)
+        )
+        if not is_test_runner:
+            if new_count == CMD_REPEAT_WARN_LIMIT:
+                warns = list(state.get("pending_warnings") or [])
+                warns.append(
+                    f"[Continuity Loop Guard] Одинаковая команда `run_command` вызвана {new_count} раза подряд без изменений кода. "
+                    "Проверьте первопричину вместо повторения идентичного вызова; следующий повтор будет заблокирован."
+                )
+                state["pending_warnings"] = warns[-4:]
+            elif new_count >= CMD_REPEAT_DENY_LIMIT:
+                save_session_state(session, state)
+                rio.log_hook_event("continuity-events", "loop_guard_deny_cmd", session=session, sig=sig, count=new_count)
+                rio.emit_pre_tool(
+                    "deny",
+                    reason=(
+                        f"[Continuity Loop Guard] Заблокирован непродуктивный цикл: идентичная команда `run_command` "
+                        f"запущена {new_count}-й раз подряд без изменений состояния. Измените диагностику или устраните первопричину."
+                    ),
+                )
+                return
 
     save_session_state(session, state)
     rio.emit_pre_tool("allow")
@@ -455,6 +457,7 @@ def handle_post_tool(payload: dict[str, Any]) -> None:
     cwd = rio.effective_cwd(payload)
     tc = payload.get("toolCall") if isinstance(payload.get("toolCall"), dict) else {}
     tool_name = str(tc.get("name") or "")
+    args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
 
     state = load_session_state(session)
     if tool_name in ("edit_file", "write_file"):
@@ -463,6 +466,13 @@ def handle_post_tool(payload: dict[str, Any]) -> None:
         state["edits_since_checkpoint"] = int(state.get("edits_since_checkpoint") or 0) + 1
         save_session_state(session, state)
         touch_tree_lock(session, cwd)
+    elif tool_name == "run_command":
+        import cwg_mark
+
+        if cwg_mark.classify_shell_command(str(args.get("CommandLine") or "")) == "MUTATING_OR_UNKNOWN":
+            state["generation"] = int(state.get("generation") or 1) + 1
+            state["tool_counts"] = {}
+            save_session_state(session, state)
     rio.emit_json({})
 
 
@@ -472,15 +482,17 @@ def handle_stop(payload: dict[str, Any]) -> None:
         rio.emit_stop_allow()
         return
 
+    session = rio.session_key(payload)
+    state = load_session_state(session)
+    if not state.get("correction_active"):
+        rio.emit_stop_allow()
+        return
+
     transcript_path = payload.get("transcriptPath")
     steps = rio.read_transcript_steps(transcript_path, max_lines=80)
     if rio.is_subagent_session(transcript_path, steps=steps):
         rio.emit_stop_allow()
         return
-
-    session = rio.session_key(payload)
-    cwd = rio.effective_cwd(payload)
-    state = load_session_state(session)
 
     if state.get("correction_active"):
         msg = str(payload.get("lastAssistantMessage") or "") or rio.last_assistant_message(steps)

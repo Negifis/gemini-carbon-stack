@@ -12,7 +12,6 @@ HOOKS_DIR = pathlib.Path(__file__).resolve().parent
 TOOLS_DIR = HOOKS_DIR.parent / "tools"
 sys.path.insert(0, str(HOOKS_DIR))
 
-import continuity
 import runtime_io as rio
 
 CODE_EXTENSIONS = frozenset(
@@ -145,7 +144,8 @@ def guard_shell_command(cmd: str, cwd: str) -> tuple[str, str | None]:
 
     # 2. Protect uncommitted dirty worktree from destructive git wipe commands
     if DESTRUCTIVE_GIT_RE.search(stripped):
-        git_root = rio.git_toplevel(cwd)
+        eff_cwd = rio.resolve_command_cwd(stripped, cwd)
+        git_root = rio.git_toplevel(eff_cwd)
         if git_root:
             rc, st_out, _ = rio.run_git(git_root, ["status", "--porcelain=v1"], timeout=4.0)
             if rc == 0 and str(st_out or "").strip():
@@ -185,6 +185,8 @@ def guard_subagent_invocation(
 
     # 3. Propagate active Canonical Checkpoint AUTHORITATIVE STATE & SUPERSEDED constraints automatically
     if "[Canonical Constraints]" not in prompt:
+        import continuity
+
         wps = payload.get("workspacePaths") if isinstance(payload.get("workspacePaths"), list) else None
         chosen = continuity.resolve_checkpoint_file(rio.effective_cwd(payload), wps)
         if chosen is not None:

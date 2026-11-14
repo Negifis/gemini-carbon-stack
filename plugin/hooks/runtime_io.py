@@ -301,12 +301,56 @@ def parse_iso_ts(raw: Any) -> float:
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
     try:
-        dt = datetime.fromisoformat(text)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.timestamp()
+        # INVARIANT: Naive strings (e.g. `board.jsonl` "YYYY-MM-DD HH:MM:SS") are local wall-clock time;
+        # `datetime.timestamp()` converts naive datetimes using system local tz and aware datetimes using their offset.
+        return datetime.fromisoformat(text).timestamp()
     except Exception:
         return 0.0
+
+
+def _parse_jsonl_lines(lines: list[str]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for raw in lines:
+        if not raw.strip():
+            continue
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            items.append(obj)
+    return items
+
+
+def read_jsonl(path: str | pathlib.Path | None, max_lines: int | None = None) -> list[dict[str, Any]]:
+    """Read JSONL dicts from `path`; when `max_lines` is set, preserve line 0 plus the tail without loading multi-MB files."""
+    if not path:
+        return []
+    p = pathlib.Path(path)
+    if not p.is_file():
+        return []
+    try:
+        size = p.stat().st_size
+        if max_lines is not None and max_lines > 0 and size > 131072:
+            with p.open("rb") as fh:
+                first_line = fh.readline().decode("utf-8", errors="replace")
+                if max_lines == 1:
+                    return _parse_jsonl_lines([first_line])
+                window = min(size, max(65536, max_lines * 2048))
+                fh.seek(max(0, size - window))
+                tail_chunk = fh.read().decode("utf-8", errors="replace")
+            tail_lines = tail_chunk.splitlines()
+            if size > window and tail_lines:
+                tail_lines = tail_lines[1:]
+            picked = [first_line] + tail_lines[-(max_lines - 1) :]
+            return _parse_jsonl_lines(picked)
+
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return []
+    if max_lines is not None and max_lines > 0 and len(lines) > max_lines:
+        lines = [lines[0]] + lines[-(max_lines - 1) :]
+    return _parse_jsonl_lines(lines)
 
 
 def resolve_transcript_path(transcript_path: str | None) -> pathlib.Path | None:
@@ -324,23 +368,7 @@ def read_transcript_steps(transcript_path: str | None, max_lines: int = 4000) ->
     tp = resolve_transcript_path(transcript_path)
     if tp is None:
         return []
-    try:
-        lines = tp.read_text(encoding="utf-8", errors="replace").splitlines()
-    except Exception:
-        return []
-    if len(lines) > max_lines:
-        lines = [lines[0]] + lines[-(max_lines - 1) :]
-    steps: list[dict[str, Any]] = []
-    for raw in lines:
-        if not raw.strip():
-            continue
-        try:
-            obj = json.loads(raw)
-        except Exception:
-            continue
-        if isinstance(obj, dict):
-            steps.append(obj)
-    return steps
+    return read_jsonl(tp, max_lines=max_lines)
 
 
 def subagent_parent_id(transcript_path: str | None, steps: list[dict[str, Any]] | None = None) -> str | None:
@@ -376,6 +404,13 @@ def last_assistant_message(steps: list[dict[str, Any]]) -> str:
     return ""
 
 
+CD_LEADING_RE = re.compile(
+    r"^\s*(?:cd(?:\s+/d)?|Set-Location|Push-Location)\s+[\"']?(?P<dir>[^\"';&|\r\n]+)[\"']?",
+    re.IGNORECASE,
+)
+GIT_DASH_C_RE = re.compile(r"\bgit(?:\.exe)?\s+-C\s+[\"']?(?P<dir>[^\"';&|\r\n]+)[\"']?", re.IGNORECASE)
+
+
 def subprocess_kwargs() -> dict[str, Any]:
     kw: dict[str, Any] = {
         "stdin": subprocess.DEVNULL,
@@ -386,11 +421,18 @@ def subprocess_kwargs() -> dict[str, Any]:
     return kw
 
 
-def run_git(cwd: str, args: list[str], timeout: float = 5.0, text: bool = True) -> tuple[int, str | bytes, str]:
+def run_git(
+    cwd: str,
+    args: list[str],
+    timeout: float = 5.0,
+    text: bool = True,
+    env: dict[str, str] | None = None,
+) -> tuple[int, str | bytes, str]:
     try:
         proc = subprocess.run(
             ["git", "--no-optional-locks"] + args,
             cwd=cwd,
+            env=env,
             timeout=max(0.25, timeout),
             **subprocess_kwargs(),
         )
@@ -410,3 +452,26 @@ def git_toplevel(cwd: str | None) -> str | None:
     if rc == 0 and isinstance(out, str) and out.strip():
         return os.path.abspath(out.strip())
     return None
+
+
+def resolve_command_cwd(cmd: str, default_cwd: str, fallback_dir: str = "") -> str:
+    for pat in (CD_LEADING_RE, GIT_DASH_C_RE):
+        m = pat.search(cmd or "") if pat is GIT_DASH_C_RE else pat.match(cmd or "")
+        if m:
+            raw_dir = m.group("dir").strip()
+            candidate = raw_dir if os.path.isabs(raw_dir) else os.path.join(default_cwd, raw_dir)
+            if os.path.isdir(candidate):
+                return os.path.abspath(candidate)
+    if fallback_dir and os.path.isdir(fallback_dir) and not git_toplevel(default_cwd):
+        return os.path.abspath(fallback_dir)
+    return default_cwd
+
+
+def find_agy_cli() -> str | None:
+    import shutil
+
+    on_path = shutil.which("agy") or shutil.which("agy.exe")
+    if on_path:
+        return on_path
+    default_win = pathlib.Path.home() / "AppData" / "Local" / "agy" / "bin" / "agy.exe"
+    return str(default_win) if default_win.is_file() else None

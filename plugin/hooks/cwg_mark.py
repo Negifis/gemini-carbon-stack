@@ -27,80 +27,108 @@ CACHE_PATH_RE = re.compile(
 )
 
 BOOKKEEPING_CMD_RE = re.compile(
-    r"\b(carbon_memory\.py|continuity\.py\s+(?:checkpoint|show)|gate_inbox\.py|chip_handoff\.py|codex_lane\.py\s+(check|status|reset|review))\b",
+    r"^\s*(?:\$null\s*\|\s*)?(?:&\s*)?(?:python|py(?:\s+-3)?)(?:\.exe)?\s+(?:-X\s+utf8\s+)?"
+    r"(?:[\"']?[^\s|;&\"']*(?:carbon_memory\.py|continuity\.py\s+(?:checkpoint|show)|gate_inbox\.py|chip_handoff\.py|codex_lane\.py\s+(?:check|status|reset|review))[\"']?)(?:\s+[^|;&\r\n]*)?$",
     re.IGNORECASE,
 )
 
 READ_ONLY_CMD_RE = re.compile(
     r"^\s*(?:\$null\s*\|\s*)?(?:"
-    r"git\s+(?:--no-pager\s+)?(?:status|diff|log|show|rev-parse|ls-files|ls-tree|check-ignore|remote\s+-v|worktree\s+list|branch(?:\s+(?:--list|-a|-r|--show-current))?\s*$)"
+    r"git(?:\.exe)?\s+(?:--no-pager\s+)?(?:-C\s+[\"']?[^\"'|;&\r\n]+[\"']?\s+)?(?:status|diff|log|show|rev-parse|ls-files|ls-tree|check-ignore|remote\s+-v|worktree\s+list|branch(?:\s+(?:--list|-a|-r|--show-current))?)"
     r"|rg(?:\.exe)?\b"
     r"|findstr(?:\.exe)?\b"
     r"|where(?:\.exe)?\b"
     r"|Get-ChildItem\b|Get-Content\b|Select-String\b|Get-Command\b|Test-Path\b|Get-Item\b"
-    r"|codex(?:\.cmd|\.exe)?\s+(?:--version|login\s+status|exec\b[^|;&]*-s\s+read-only\b)"
-    r"|agy(?:\.exe)?\s+(?:--help|--version|plugin\s+(?:list|help))"
-    r"|(?:python|py(?:\s+-3)?)\s+(?:-X\s+utf8\s+)?[^\s|;&]*(?:code_search\.py|stack_doctor\.py|worktree_guard\.py\s+(?:audit|status))\b"
+    r"|codex(?:\.cmd|\.exe)?\s+(?:--version|login\s+status|exec\b[^|;&\r\n]*-s\s+read-only\b)"
+    r"|agy(?:\.exe|\.cmd)?\s+(?:--help|--version|plugin\s+(?:list|help))"
+    r"|(?:python|py(?:\s+-3)?)(?:\.exe)?\s+(?:-X\s+utf8\s+)?[\"']?[^\s|;&\"']*(?:code_search\.py|stack_doctor\.py|worktree_guard\.py[\"']?\s+(?:audit|status))\b"
+    r")(?:\s+[^|;&\r\n]*)?$",
+    re.IGNORECASE,
+)
+
+VALIDATION_SEGMENT_RE = re.compile(
+    r"^\s*(?:\$null\s*\|\s*)?(?:&\s*)?(?:"
+    r"(?:pytest|py\.test|mypy|ruff\s+check|flake8)(?:\.exe)?\b"
+    r"|(?:python|py(?:\s+-3)?)(?:\.exe)?\s+(?:-X\s+utf8\s+)?(?:-m\s+(?:pytest|unittest|py_compile|compileall|mypy|ruff|flake8)\b|[\"']?[^\s|;&\"']*install\.py[\"']?\s+[^\r\n|;&]*(?:--diagnose|--dry-run)\b)"
+    r"|npm(?:\.cmd)?\s+(?:test|run\s+(?:test|lint|build|typecheck|check))\b"
+    r"|pnpm(?:\.cmd)?\s+(?:test|lint|build|typecheck)\b"
+    r"|yarn(?:\.cmd)?\s+(?:test|lint|build|typecheck)\b"
+    r"|npx(?:\.cmd)?\s+(?:tsc|vitest|jest|eslint|playwright\s+test)\b"
+    r"|cargo(?:\.exe)?\s+(?:test|check|clippy)\b"
+    r"|go(?:\.exe)?\s+(?:test|vet)\b"
+    r"|dotnet(?:\.exe)?\s+(?:test|build)\b"
+    r"|[\"']?[^\s|;&\"']*agy(?:\.exe|\.cmd)?[\"']?\s+plugin\s+validate\b"
     r")",
     re.IGNORECASE,
 )
 
-VALIDATION_CMD_RE = re.compile(
-    r"\b(?:"
-    r"pytest|py\.test|unittest|py_compile|compileall|mypy|ruff\s+check|flake8"
-    r"|npm\s+(?:test|run\s+(?:test|lint|build|typecheck|check))"
-    r"|pnpm\s+(?:test|lint|build|typecheck)"
-    r"|yarn\s+(?:test|lint|build|typecheck)"
-    r"|npx\s+(?:tsc|vitest|jest|eslint|playwright\s+test)"
-    r"|cargo\s+(?:test|check|clippy)"
-    r"|go\s+(?:test|vet)"
-    r"|dotnet\s+(?:test|build)"
-    r"|agy(?:\.exe|\.cmd)?[\"']?\s+plugin\s+validate"
-    r"|install\.py[\"']?\s+[^\n]*(?:--diagnose|--dry-run)"
-    r")\b",
-    re.IGNORECASE,
-)
-
 SKILL_MD_RE = re.compile(r"[/\\]skills[/\\](?P<skill>[A-Za-z0-9._-]+)[/\\]SKILL\.md$", re.IGNORECASE)
-CD_LEADING_RE = re.compile(
-    r"^\s*(?:cd(?:\s+/d)?|Set-Location|Push-Location)\s+[\"']?(?P<dir>[^\"';&|\r\n]+)[\"']?",
-    re.IGNORECASE,
-)
-GIT_DASH_C_RE = re.compile(r"\bgit(?:\.exe)?\s+-C\s+[\"']?(?P<dir>[^\"';&|\r\n]+)[\"']?", re.IGNORECASE)
+
+
+def _strip_quoted(text: str) -> str:
+    return re.sub(r"\"(?:\\.|[^\"])*\"|'(?:''|[^'])*'", '""', text)
+
+
+def _has_shell_chaining(stripped: str) -> bool:
+    core = re.sub(r"^\s*\$null\s*\|\s*", "", stripped, flags=re.IGNORECASE)
+    unquoted = _strip_quoted(core)
+    return bool(re.search(r"[;\r\n]|&&|\|\||(?<![|])\|(?![|])", unquoted))
+
+
+def _split_shell_segments(stripped: str) -> list[str]:
+    core = re.sub(r"^\s*\$null\s*\|\s*", "", stripped, flags=re.IGNORECASE)
+    # Split on top-level `;` or newlines to detect validation runners inside `cd dir; pytest`
+    parts: list[str] = []
+    cur: list[str] = []
+    quote: str | None = None
+    for ch in core:
+        if quote:
+            cur.append(ch)
+            if ch == quote:
+                quote = None
+        elif ch in ('"', "'"):
+            quote = ch
+            cur.append(ch)
+        elif ch in (";", "\n", "\r"):
+            seg = "".join(cur).strip()
+            if seg:
+                parts.append(seg)
+            cur = []
+        else:
+            cur.append(ch)
+    tail = "".join(cur).strip()
+    if tail:
+        parts.append(tail)
+    return parts
 
 
 def classify_shell_command(cmd: str) -> str:
     stripped = (cmd or "").strip()
     if not stripped:
         return "READ_ONLY"
-    if BOOKKEEPING_CMD_RE.search(stripped):
-        return "BOOKKEEPING"
-    # Reject shell redirections to real files as read-only (allow > $null / 2>&1 / NUL)
     has_file_redirect = bool(
-        re.search(r"(?<![0-9])>>?\s*(?!\$null\b|nul\b|/dev/null\b|&[12]\b)\S+", stripped, re.IGNORECASE)
+        re.search(r"(?<![0-9])>>?\s*(?!\$null\b|nul\b|/dev/null\b|&[12]\b)\S+", _strip_quoted(stripped), re.IGNORECASE)
     )
-    if not has_file_redirect and READ_ONLY_CMD_RE.search(stripped):
-        return "READ_ONLY"
-    if VALIDATION_CMD_RE.search(stripped) and not has_file_redirect:
-        return "VALIDATION"
+    chained = _has_shell_chaining(stripped)
+    if not chained and not has_file_redirect:
+        if "--merge" not in stripped.lower() and BOOKKEEPING_CMD_RE.match(stripped):
+            return "BOOKKEEPING"
+        if READ_ONLY_CMD_RE.match(stripped):
+            return "READ_ONLY"
+    if not has_file_redirect:
+        segments = _split_shell_segments(stripped)
+        if segments and any(VALIDATION_SEGMENT_RE.match(seg) for seg in segments):
+            return "VALIDATION"
     return "MUTATING_OR_UNKNOWN"
 
 
 def resolve_command_cwd(cmd: str, default_cwd: str, session: str = "") -> str:
-    for pat in (CD_LEADING_RE, GIT_DASH_C_RE):
-        m = pat.search(cmd or "") if pat is GIT_DASH_C_RE else pat.match(cmd or "")
-        if m:
-            raw_dir = m.group("dir").strip()
-            candidate = raw_dir if os.path.isabs(raw_dir) else os.path.join(default_cwd, raw_dir)
-            if os.path.isdir(candidate):
-                return os.path.abspath(candidate)
-    if not rio.git_toplevel(default_cwd) and session:
+    fallback_root = ""
+    if session:
         existing = rio.read_json(cwg.marker_path(session), default=None)
         if isinstance(existing, dict) and not existing.get("closed"):
-            groot = str(existing.get("git_root") or "")
-            if groot and os.path.isdir(groot):
-                return os.path.abspath(groot)
-    return default_cwd
+            fallback_root = str(existing.get("git_root") or "")
+    return rio.resolve_command_cwd(cmd, default_cwd, fallback_dir=fallback_root)
 
 
 def take_git_snapshot(cwd: str) -> dict[str, Any]:
@@ -407,6 +435,29 @@ def handle_pre_tool(payload: dict[str, Any]) -> None:
 
 
 def handle_post_tool(payload: dict[str, Any]) -> None:
+    tc = payload.get("toolCall") if isinstance(payload.get("toolCall"), dict) else {}
+    tool_name = str(tc.get("name") or "")
+    args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+    error_text = str(payload.get("error") or "").strip()
+    failed = bool(error_text)
+
+    # Fast exit on ordinary `read_file` calls before touching transcript files
+    if tool_name == "read_file":
+        if not failed:
+            sm = SKILL_MD_RE.search(str(args.get("Path") or ""))
+            if sm and not rio.is_subagent_session(payload.get("transcriptPath")):
+                rio.append_jsonl(
+                    cwg.checks_ledger_path(rio.session_key(payload)),
+                    {
+                        "kind": "skill_read",
+                        "skill": sm.group("skill").lower(),
+                        "ts": time.time(),
+                        "step_idx": payload.get("stepIdx"),
+                    },
+                )
+        rio.emit_json({})
+        return
+
     steps = rio.read_transcript_steps(payload.get("transcriptPath"), max_lines=5)
     if rio.is_subagent_session(payload.get("transcriptPath"), steps=steps):
         rio.emit_json({})
@@ -414,28 +465,7 @@ def handle_post_tool(payload: dict[str, Any]) -> None:
 
     session = rio.session_key(payload)
     cwd = rio.effective_cwd(payload)
-    tc = payload.get("toolCall") if isinstance(payload.get("toolCall"), dict) else {}
-    tool_name = str(tc.get("name") or "")
     call_id = str(tc.get("id") or "call")
-    args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
-    error_text = str(payload.get("error") or "").strip()
-    failed = bool(error_text)
-
-    if tool_name == "read_file" and not failed:
-        rpath = str(args.get("Path") or "")
-        sm = SKILL_MD_RE.search(rpath)
-        if sm:
-            rio.append_jsonl(
-                cwg.checks_ledger_path(session),
-                {
-                    "kind": "skill_read",
-                    "skill": sm.group("skill").lower(),
-                    "ts": time.time(),
-                    "step_idx": payload.get("stepIdx"),
-                },
-            )
-        rio.emit_json({})
-        return
 
     if tool_name in SUBAGENT_TOOLS:
         rio.append_jsonl(

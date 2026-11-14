@@ -22,18 +22,27 @@ def handle_pre_invocation(payload: dict[str, Any]) -> None:
     if rio.is_subagent_session(payload.get("transcriptPath")):
         rio.emit_json({})
         return
+    pending_cards = [
+        c for c in ch.load_all_cards() if c.get("status") == "handed-off" and not c.get("parent_notified")
+    ]
+    if not pending_cards:
+        rio.emit_json({})
+        return
+
     session = rio.session_key(payload)
     cwd = rio.effective_cwd(payload)
-    git_root = rio.normalize_path(rio.git_toplevel(cwd) or "")
+    git_root: str | None = None
 
     notifications: list[str] = []
     with rio.file_lock(ch.chip_lock_path()):
         for card in ch.load_all_cards():
             if card.get("status") != "handed-off" or card.get("parent_notified"):
                 continue
-            matches_parent = (card.get("parent_session") and card.get("parent_session") == session) or (
-                not card.get("parent_session") and git_root and card.get("repo_root") == git_root
-            )
+            matches_parent = bool(card.get("parent_session") and card.get("parent_session") == session)
+            if not matches_parent and not card.get("parent_session"):
+                if git_root is None:
+                    git_root = rio.normalize_path(rio.git_toplevel(cwd) or "")
+                matches_parent = bool(git_root and card.get("repo_root") == git_root)
             if matches_parent:
                 cid = str(card["chip_id"])
                 script_norm = rio.normalize_path(TOOLS_DIR / "chip_handoff.py")

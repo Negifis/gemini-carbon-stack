@@ -34,8 +34,9 @@ SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "secret_assignment",
         re.compile(
-            r"\b(?:api[_-]?key|secret[_-]?key|access[_-]?token|auth[_-]?token|password|passwd|client[_-]?secret)"
-            r"\s*[:=]\s*[\"']?[A-Za-z0-9/+._~-]{12,}[\"']?",
+            r"(?:^|(?<![A-Za-z0-9]))(?:[A-Za-z0-9_]*[_-])?"
+            r"(?:api[_-]?key|secret(?:[_-]?access)?[_-]?key|access[_-]?token|auth[_-]?token|password|passwd|client[_-]?secret)"
+            r"\s*[:=]\s*[\"']?[A-Za-z0-9/+._~!$%@&*=-]{10,}[\"']?",
             re.IGNORECASE,
         ),
     ),

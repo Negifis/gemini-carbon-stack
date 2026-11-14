@@ -7,7 +7,6 @@ import argparse
 import json
 import os
 import pathlib
-import shutil
 import ssl
 import subprocess
 import sys
@@ -28,11 +27,7 @@ import runtime_io as rio
 
 
 def find_agy_cli() -> str | None:
-    on_path = shutil.which("agy") or shutil.which("agy.exe")
-    if on_path:
-        return on_path
-    default_win = pathlib.Path.home() / "AppData" / "Local" / "agy" / "bin" / "agy.exe"
-    return str(default_win) if default_win.is_file() else None
+    return rio.find_agy_cli()
 
 
 def query_live_ls_plugin(plugin_name: str = "gemini-carbon-stack") -> dict[str, Any]:
@@ -118,9 +113,7 @@ def run_diagnostics(cwd: str = "") -> dict[str, Any]:
         )
 
     err_log = rio.state_dir("logs") / "hook-errors.jsonl"
-    recent_errors = 0
-    if err_log.is_file():
-        recent_errors = len([ln for ln in err_log.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()])
+    recent_errors = len(rio.read_jsonl(err_log))
 
     mem = carbon_memory.memory_stats(cwd=cwd or os.getcwd())
     codex_info = {

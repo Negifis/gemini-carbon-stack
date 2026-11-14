@@ -82,21 +82,12 @@ def read_checks_evidence(session: str, first_ts: float) -> dict[str, Any]:
     path = cwg.checks_ledger_path(session)
     checks: list[dict[str, Any]] = []
     skills_read: set[str] = set()
-    if path.is_file():
-        try:
-            for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
-                if not raw.strip():
-                    continue
-                rec = json.loads(raw)
-                if not isinstance(rec, dict):
-                    continue
-                ts = float(rec.get("ts") or 0.0)
-                if rec.get("kind") == "skill_read" and rec.get("skill"):
-                    skills_read.add(str(rec["skill"]))
-                elif rec.get("kind") == "check" and ts >= first_ts - 1.0:
-                    checks.append(rec)
-        except Exception:
-            pass
+    for rec in rio.read_jsonl(path):
+        ts = float(rec.get("ts") or 0.0)
+        if rec.get("kind") == "skill_read" and rec.get("skill"):
+            skills_read.add(str(rec["skill"]))
+        elif rec.get("kind") == "check" and ts >= first_ts - 1.0:
+            checks.append(rec)
     passed = [c for c in checks if c.get("passed")]
     failed = [c for c in checks if not c.get("passed")]
     latest_pass_ts = max((float(c.get("ts") or 0.0) for c in passed), default=0.0)
@@ -187,8 +178,9 @@ def _member_transcript_summary(member_tp: pathlib.Path | None, first_ts: float) 
         sstatus = str(st.get("status") or "")
         scontent = str(st.get("content") or "")
 
-        if sstatus == "ERROR" or stype == "ERROR_MESSAGE" or (
-            st.get("source") == "SYSTEM" and MODEL_FAILURE_RE.search(scontent)
+        # SECURITY INVARIANT: Only model/turn failures count (never GENERIC tool-call errors or SYSTEM brief text).
+        if stype == "ERROR_MESSAGE" or (
+            st.get("source") == "MODEL" and stype != "GENERIC" and sstatus == "ERROR"
         ):
             if not ts or ts >= first_ts - 2.0:
                 has_error = True
@@ -225,14 +217,25 @@ def _member_transcript_summary(member_tp: pathlib.Path | None, first_ts: float) 
     }
 
 
+def _extract_json_dict(blob: str) -> dict[str, Any] | None:
+    pos = blob.find("{")
+    if pos < 0:
+        return None
+    try:
+        obj = json.loads(blob[pos:])
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
 def scan_swarm_activity(
     steps: list[dict[str, Any]],
     transcript_path: str | None,
     first_ts: float,
 ) -> dict[str, Any]:
     """Verify native Antigravity `swarm` workers (`members.json` + `board.jsonl` + member transcripts)."""
-    sonnet_lenses: set[str] = set()
-    fallback_lenses: set[str] = set()
+    sonnet_lenses: dict[str, float] = {}
+    fallback_lenses: dict[str, float] = {}
     simplify_failures = 0
     reviews: list[dict[str, Any]] = []
     review_failures: list[float] = []
@@ -240,6 +243,7 @@ def scan_swarm_activity(
     opus_issue_verified = False
     opus_issue_ts = 0.0
     sonnet_issue_verified = False
+    board_head = 0
 
     def _mark_opus_issue(ts_val: float) -> None:
         nonlocal opus_issue_verified, opus_issue_ts
@@ -250,59 +254,81 @@ def scan_swarm_activity(
 
     requested_models: dict[str, set[str]] = {}
     model_switches: dict[str, list[tuple[float, str]]] = {}
+    coord_call_events: list[tuple[float, str]] = []
 
-    # 1. Inspect parent `swarm` tool calls & outputs for model quotas, spawn errors, and escalations
+    # 1. Inspect parent `swarm` / `post_message` tool calls (aligned 1-to-1 across all tool_calls in each turn)
     for idx, st in enumerate(steps):
         if st.get("source") != "MODEL" or st.get("type") != "PLANNER_RESPONSE":
             continue
         call_ts = rio.parse_iso_ts(st.get("created_at"))
         if call_ts and call_ts < first_ts - 2.0:
             continue
-        swarm_calls = [
-            tc for tc in (st.get("tool_calls") or []) if isinstance(tc, dict) and tc.get("name") == "swarm"
-        ]
-        if not swarm_calls:
+        all_tcs = st.get("tool_calls") or []
+        if call_ts:
+            for tc in all_tcs:
+                if not isinstance(tc, dict):
+                    continue
+                tname = tc.get("name")
+                targs = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+                if tname == "post_message":
+                    coord_call_events.append((call_ts, str(targs.get("text") or "").strip().lower()[:64]))
+                elif tname == "swarm" and str(targs.get("action") or "").strip().lower() == "add":
+                    base_n = str(targs.get("name") or "").strip()
+                    tasks_arg = targs.get("tasks") if isinstance(targs.get("tasks"), list) else []
+                    n_raw = targs.get("n")
+                    n_cnt = int(n_raw) if isinstance(n_raw, int) or (isinstance(n_raw, str) and n_raw.isdigit()) else 1
+                    copies = max(1, len(tasks_arg), n_cnt)
+                    for copy_idx in range(copies):
+                        hint = (
+                            f"@{base_n}-{copy_idx + 1}".lower()
+                            if (copies > 1 and base_n)
+                            else (f"@{base_n}".lower() if base_n else "")
+                        )
+                        coord_call_events.append((call_ts, hint))
+        if not any(isinstance(tc, dict) and tc.get("name") == "swarm" for tc in all_tcs):
             continue
 
         g_cur = idx + 1
-        generic_blobs: list[str] = []
+        generic_steps: list[tuple[str, str]] = []
         while g_cur < len(steps) and steps[g_cur].get("type") == "GENERIC":
-            generic_blobs.append(str(steps[g_cur].get("content") or ""))
+            generic_steps.append((str(steps[g_cur].get("status") or ""), str(steps[g_cur].get("content") or "")))
             g_cur += 1
 
-        for pos, tc in enumerate(swarm_calls):
+        for pos, tc in enumerate(all_tcs):
+            if not isinstance(tc, dict) or tc.get("name") != "swarm":
+                continue
             args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
             action = str(args.get("action") or "").strip().lower()
             wname = str(args.get("name") or "").strip()
             req_model = str(args.get("model") or "").strip().lower()
-            blob = generic_blobs[pos] if pos < len(generic_blobs) else "\n".join(generic_blobs)
+            g_status, blob = generic_steps[pos] if pos < len(generic_steps) else ("", "")
+            mdata = _extract_json_dict(blob)
 
             if wname and req_model:
                 requested_models.setdefault(wname, set()).add(req_model)
             if action == "model" and wname and call_ts:
                 model_switches.setdefault(wname, []).append((call_ts, f"[model-switch:{req_model}]"))
 
-            if action == "models" and blob.strip().startswith("{"):
-                try:
-                    mdata = json.loads(blob)
-                    avail = set(mdata.get("models") or [])
-                    quotas = mdata.get("quotas") or {}
-                    if avail:
-                        if cwg.OPUS_HIGH_MODEL not in avail:
-                            _mark_opus_issue(call_ts)
-                        if cwg.SONNET_HIGH_MODEL not in avail:
-                            sonnet_issue_verified = True
-                    opus_q = str((quotas.get(cwg.OPUS_HIGH_MODEL) or {}).get("quota_remaining") or "")
-                    if opus_q in ("0%", "0"):
+            if action == "models" and mdata is not None:
+                avail = set(mdata.get("models") or [])
+                quotas = mdata.get("quotas") or {}
+                if avail:
+                    if cwg.OPUS_HIGH_MODEL not in avail:
                         _mark_opus_issue(call_ts)
-                    sonnet_q = str((quotas.get(cwg.SONNET_HIGH_MODEL) or {}).get("quota_remaining") or "")
-                    if sonnet_q in ("0%", "0"):
+                    if cwg.SONNET_HIGH_MODEL not in avail:
                         sonnet_issue_verified = True
-                except Exception:
-                    pass
+                opus_q = str((quotas.get(cwg.OPUS_HIGH_MODEL) or {}).get("quota_remaining") or "")
+                if opus_q in ("0%", "0"):
+                    _mark_opus_issue(call_ts)
+                sonnet_q = str((quotas.get(cwg.SONNET_HIGH_MODEL) or {}).get("quota_remaining") or "")
+                if sonnet_q in ("0%", "0"):
+                    sonnet_issue_verified = True
 
             low_blob = blob.lower()
-            is_err = ("error" in low_blob or "failed" in low_blob or bool(MODEL_FAILURE_RE.search(blob))) and not blob.strip().startswith("{")
+            json_err = bool(mdata and mdata.get("error"))
+            is_err = (g_status == "ERROR") or json_err or (
+                mdata is None and ("error" in low_blob or "failed" in low_blob or bool(MODEL_FAILURE_RE.search(blob)))
+            )
             if is_err:
                 if cwg.OPUS_HIGH_MODEL in req_model:
                     _mark_opus_issue(call_ts)
@@ -331,6 +357,7 @@ def scan_swarm_activity(
             "opus_issue_verified": opus_issue_verified,
             "opus_issue_ts": opus_issue_ts,
             "sonnet_issue_verified": sonnet_issue_verified,
+            "board_head": board_head,
         }
 
     swarm_dir = conv_dir / ".system_generated" / "swarm"
@@ -347,20 +374,39 @@ def scan_swarm_activity(
             "opus_issue_verified": opus_issue_verified,
             "opus_issue_ts": opus_issue_ts,
             "sonnet_issue_verified": sonnet_issue_verified,
+            "board_head": board_head,
         }
 
-    board_posts: list[dict[str, Any]] = []
-    board_file = swarm_dir / "board.jsonl"
-    if board_file.is_file():
-        for raw_ln in board_file.read_text(encoding="utf-8", errors="replace").splitlines():
-            if not raw_ln.strip():
-                continue
-            try:
-                rec = json.loads(raw_ln)
-                if isinstance(rec, dict):
-                    board_posts.append(rec)
-            except Exception:
-                continue
+    raw_board = rio.read_jsonl(swarm_dir / "board.jsonl")
+    board_head = len(raw_board)
+    coord_call_events.sort(key=lambda item: item[0])
+    c_cursor = 0
+    running_board_ts = 0.0
+    parsed_board: list[tuple[str, str, float]] = []
+    for bp in raw_board:
+        poster = str(bp.get("agent") or "")
+        btext = str(bp.get("text") or "").strip()
+        raw_bts = rio.parse_iso_ts(bp.get("time"))
+        bts = raw_bts
+        if poster == "coordinator" and raw_bts:
+            low_btext = btext.lower()
+            probe = c_cursor
+            while probe < len(coord_call_events) and coord_call_events[probe][0] < raw_bts - 0.1:
+                probe += 1
+            for cand_i in range(probe, len(coord_call_events)):
+                evt_ts, evt_hint = coord_call_events[cand_i]
+                if evt_ts - raw_bts >= 1.5:
+                    break
+                if not evt_hint or evt_hint in low_btext:
+                    bts = evt_ts
+                    c_cursor = cand_i + 1
+                    break
+        if bts and running_board_ts and bts < running_board_ts:
+            # `board.jsonl` is strictly append-only; clamp whole-second floor truncation to preceding board timestamp.
+            bts = running_board_ts
+        if bts > running_board_ts:
+            running_board_ts = bts
+        parsed_board.append((poster, btext, bts))
 
     for mname, minfo in members_map.items():
         if not isinstance(minfo, dict):
@@ -381,14 +427,13 @@ def scan_swarm_activity(
         if group_prefix:
             mention_pats.append(re.compile(rf"(?<![A-Za-z0-9_-])@{re.escape(group_prefix)}(?![A-Za-z0-9_-])", re.IGNORECASE))
 
-        for bp in board_posts:
-            poster = str(bp.get("agent") or "")
-            btext = str(bp.get("text") or "").strip()
-            bts = rio.parse_iso_ts(bp.get("time"))
-            if poster == "coordinator" and btext:
+        for poster, btext, bts in parsed_board:
+            if not btext:
+                continue
+            if poster == "coordinator":
                 if any(mp.search(btext) for mp in mention_pats) or "@all" in btext.lower():
                     coord_posts.append((bts, btext))
-            elif poster == mname and btext:
+            elif poster == mname:
                 # SECURITY INVARIANT: Only posts authored by `mname` itself count as worker output (never coordinator prompts).
                 if not bts or bts >= first_ts - 2.0:
                     worker_board_posts.append((bts or time.time(), btext))
@@ -408,13 +453,24 @@ def scan_swarm_activity(
                 sonnet_issue_verified = True
                 simplify_failures += 1
 
-        # Combine worker board posts and worker transcript outputs
-        combined_outputs: list[tuple[float, str]] = list(worker_board_posts)
-        seen_texts = {txt for _, txt in combined_outputs}
-        for ots, otxt in tsum["outputs"]:
-            if otxt not in seen_texts:
+        # Combine worker board posts and worker transcript outputs, upgrading whole-second board times with exact transcript timestamps
+        tsum_outs: list[tuple[float, str]] = list(tsum["outputs"])
+        t_cursor = 0
+        matched_t: set[int] = set()
+        combined_outputs: list[tuple[float, str]] = []
+        for bts, btxt in worker_board_posts:
+            eff_ots = bts
+            for tidx in range(t_cursor, len(tsum_outs)):
+                ots, otxt = tsum_outs[tidx]
+                if otxt == btxt and abs(ots - bts) < 5.0:
+                    eff_ots = max(eff_ots, ots)
+                    matched_t.add(tidx)
+                    t_cursor = tidx + 1
+                    break
+            combined_outputs.append((eff_ots, btxt))
+        for tidx, (ots, otxt) in enumerate(tsum_outs):
+            if tidx not in matched_t:
                 combined_outputs.append((ots, otxt))
-                seen_texts.add(otxt)
         combined_outputs.sort(key=lambda pair: pair[0])
 
         latest_assign_ts = coord_posts[-1][0] if coord_posts else tsum["start_ts"]
@@ -430,17 +486,7 @@ def scan_swarm_activity(
         if not combined_outputs:
             continue
 
-        joined_worker_text = "\n\n".join(txt for _, txt in combined_outputs)
-        lens = _infer_single_simplify_lens(mname, latest_brief, joined_worker_text)
-        if lens is not None:
-            if cur_model == cwg.SONNET_HIGH_MODEL:
-                sonnet_lenses.add(lens)
-            else:
-                fallback_lenses.add(lens)
-            continue
-
-        # Internal adversarial review worker: group outputs by coordinator assignment/switch window
-        # so board posts + transcript summaries from a single round are never double-counted.
+        # Group outputs by coordinator assignment/switch window for both simplify lenses and adversarial reviewers
         windows: list[tuple[float, str]] = sorted(
             list(coord_posts) + list(model_switches.get(mname, [])),
             key=lambda pair: pair[0],
@@ -455,6 +501,20 @@ def scan_swarm_activity(
                 if not wts or wts <= out_ts + 0.5:
                     w_idx = cand_idx
             bucketed_outputs.setdefault(w_idx, []).append((out_ts, out_txt))
+
+        joined_worker_text = "\n\n".join(txt for _, txt in combined_outputs)
+        lens = _infer_single_simplify_lens(mname, latest_brief, joined_worker_text)
+        if lens is not None:
+            for w_idx in sorted(bucketed_outputs):
+                win_ts, _ = windows[w_idx]
+                win_txt = "\n\n".join(otxt for _, otxt in bucketed_outputs[w_idx])
+                if cwg.SIMPLIFY_LINE_RE.search(win_txt):
+                    eff_lts = win_ts or tsum["start_ts"] or first_ts
+                    if cur_model == cwg.SONNET_HIGH_MODEL:
+                        sonnet_lenses[lens] = max(sonnet_lenses.get(lens, 0.0), eff_lts)
+                    else:
+                        fallback_lenses[lens] = max(fallback_lenses.get(lens, 0.0), eff_lts)
+            continue
 
         eng = "internal-opus" if cur_model == cwg.OPUS_HIGH_MODEL else "internal-carbon"
         escalated_from_opus = cwg.OPUS_HIGH_MODEL in prior_reqs
@@ -514,6 +574,7 @@ def scan_swarm_activity(
         "opus_issue_verified": opus_issue_verified,
         "opus_issue_ts": opus_issue_ts,
         "sonnet_issue_verified": sonnet_issue_verified,
+        "board_head": board_head,
     }
 
 
@@ -538,7 +599,7 @@ def scan_native_subagents(
                 msg_ts = rio.parse_iso_ts(m.group("ts")) or rio.parse_iso_ts(st.get("created_at"))
                 delivered_by_sender.setdefault(sender, []).append((msg_ts, m.group("body").strip()))
 
-    fallback_lenses: set[str] = set()
+    fallback_lenses: dict[str, float] = {}
     simplify_failures: int = 0
     reviews: list[dict[str, Any]] = []
     review_failures: list[float] = []
@@ -551,19 +612,20 @@ def scan_native_subagents(
         if call_ts and call_ts < first_ts - 2.0:
             continue
         tcs = st.get("tool_calls") or []
-        sub_calls = [
-            tc for tc in tcs if isinstance(tc, dict) and tc.get("name") == "invoke_subagent"
-        ]
-        if not sub_calls:
+        if not any(isinstance(tc, dict) and tc.get("name") == "invoke_subagent" for tc in tcs):
             continue
 
         generic_Cursor = idx + 1
-        generic_blobs: list[str] = []
+        generic_steps: list[tuple[str, str]] = []
         while generic_Cursor < len(steps) and steps[generic_Cursor].get("type") == "GENERIC":
-            generic_blobs.append(str(steps[generic_Cursor].get("content") or ""))
+            generic_steps.append(
+                (str(steps[generic_Cursor].get("status") or ""), str(steps[generic_Cursor].get("content") or ""))
+            )
             generic_Cursor += 1
 
-        for pos, tc in enumerate(sub_calls):
+        for pos, tc in enumerate(tcs):
+            if not isinstance(tc, dict) or tc.get("name") != "invoke_subagent":
+                continue
             args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
             tname = str(args.get("TypeName") or "").strip()
             base_tname = tname.rsplit(":", 1)[-1]
@@ -575,10 +637,10 @@ def scan_native_subagents(
                 or (base_tname == "research" and "simplify" in role_str.lower())
             )
             model_arg = str(args.get("Model") or "inherit").strip()
-            blob = generic_blobs[pos] if pos < len(generic_blobs) else ("\n".join(generic_blobs))
+            g_status, blob = generic_steps[pos] if pos < len(generic_steps) else ("", "")
             sm = SUBAGENT_URI_RE.search(blob)
             if not sm:
-                if "error" in blob.lower() or "failed" in blob.lower():
+                if g_status == "ERROR" or "error" in blob.lower() or "failed" in blob.lower():
                     if is_simplify_subagent:
                         simplify_failures += 1
                     elif base_tname in cwg.NATIVE_REVIEWERS:
@@ -609,11 +671,11 @@ def scan_native_subagents(
             eff_end_ts = max(eff_launch_ts, sub_end_ts or eff_launch_ts)
 
             if is_simplify_subagent:
-                if sub_text.strip():
+                if sub_text.strip() and cwg.SIMPLIFY_LINE_RE.search(sub_text):
                     lens = _infer_single_simplify_lens(base_tname, f"{role_str}\n{prompt_str}", sub_text)
                     if lens:
-                        fallback_lenses.add(lens)
-                else:
+                        fallback_lenses[lens] = max(fallback_lenses.get(lens, 0.0), eff_launch_ts)
+                elif not sub_text.strip():
                     simplify_failures += 1
 
             elif base_tname in cwg.NATIVE_REVIEWERS:
@@ -759,8 +821,16 @@ def validate_candidate_closure(
         effective_risk == "STANDARD" and not small
     )
     required_lenses = set(cwg.SIMPLIFY_LENSES)
-    sonnet_lenses = set(swarm_ev.get("sonnet_lenses") or set())
-    fallback_lenses = set(swarm_ev.get("fallback_lenses") or set()) | set(sub_ev.get("fallback_lenses") or set())
+    raw_sonnet_map: dict[str, float] = dict(swarm_ev.get("sonnet_lenses") or {})
+    raw_fallback_map: dict[str, float] = {}
+    for src_map in (swarm_ev.get("fallback_lenses") or {}, sub_ev.get("fallback_lenses") or {}):
+        for k, v in dict(src_map).items():
+            raw_fallback_map[k] = max(raw_fallback_map.get(k, 0.0), float(v or 0.0))
+
+    sonnet_lenses = {k for k, lts in raw_sonnet_map.items() if is_review_fresh({"launch_ts": lts}, marker)}
+    fallback_lenses = {k for k, lts in raw_fallback_map.items() if is_review_fresh({"launch_ts": lts}, marker)}
+    stale_sonnet_lenses = sorted((set(raw_sonnet_map) & required_lenses) - sonnet_lenses)
+
     sonnet_issue = bool(swarm_ev.get("sonnet_issue_verified"))
     simplify_failures = int(swarm_ev.get("simplify_failures") or 0) + int(sub_ev.get("simplify_failures") or 0)
     simplify_exhausted = simplify_failures >= 2
@@ -774,6 +844,12 @@ def validate_candidate_closure(
                     False,
                     f"simplify lenses ran on fallback model without verified `{cwg.SONNET_HIGH_MODEL}` error/quota issue; "
                     f"run all 3 lenses (`reuse`, `quality`, `efficiency`) on `{cwg.SONNET_HIGH_MODEL}` via `swarm`",
+                )
+            if stale_sonnet_lenses:
+                return (
+                    False,
+                    f"simplify lenses ({', '.join(stale_sonnet_lenses)}) are stale because durable files changed after simplify; "
+                    f"re-verify {', '.join(missing_lenses)} on `{cwg.SONNET_HIGH_MODEL}`",
                 )
             return (
                 False,
@@ -967,12 +1043,7 @@ def main() -> int:
             rio.emit_stop_allow()
             return 0
 
-        transcript_path = payload.get("transcriptPath")
-        steps = rio.read_transcript_steps(transcript_path)
-        if rio.is_subagent_session(transcript_path, steps=steps):
-            rio.emit_stop_allow()
-            return 0
-
+        # Fast exit on NO_CHANGE sessions before touching multi-thousand-line transcript files
         session = rio.session_key(payload)
         mfile = cwg.marker_path(session)
         if not mfile.is_file():
@@ -981,6 +1052,12 @@ def main() -> int:
 
         raw_marker = rio.read_json(mfile, default=None)
         if not isinstance(raw_marker, dict) or raw_marker.get("closed"):
+            rio.emit_stop_allow()
+            return 0
+
+        transcript_path = payload.get("transcriptPath")
+        steps = rio.read_transcript_steps(transcript_path)
+        if rio.is_subagent_session(transcript_path, steps=steps):
             rio.emit_stop_allow()
             return 0
 
@@ -1024,7 +1101,11 @@ def main() -> int:
             checks_ev = read_checks_evidence(session, first_ts)
             sub_ev = scan_native_subagents(steps, transcript_path, first_ts)
             swarm_ev = scan_swarm_activity(steps, transcript_path, first_ts)
-            codex_revs = codex_lane.scan_verified_codex_reviews(since_ts=first_ts)
+            codex_revs = codex_lane.scan_verified_codex_reviews(
+                since_ts=first_ts,
+                session=session,
+                git_root=str(marker.get("git_root") or ""),
+            )
             valid, reason = validate_candidate_closure(
                 receipt, marker, checks_ev, sub_ev, swarm_ev, codex_revs
             )
@@ -1046,9 +1127,11 @@ def main() -> int:
             in_flight = list(sub_ev.get("in_flight_subagents") or []) + list(
                 swarm_ev.get("in_flight_workers") or []
             )
-            waits = int(state.get("waits") or 0)
+            progress_sig = f"{len(steps)}:{swarm_ev.get('board_head', 0)}"
+            waits = 0 if state.get("last_wait_progress") != progress_sig else int(state.get("waits") or 0)
             if (fully_idle is False or in_flight) and waits < MAX_BACKGROUND_WAITS:
                 state["waits"] = waits + 1
+                state["last_wait_progress"] = progress_sig
                 rio.write_json(sfile, state)
                 rio.log_hook_event(
                     "gate-events",

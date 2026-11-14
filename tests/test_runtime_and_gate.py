@@ -143,7 +143,10 @@ class GateSubprocessTestCase(unittest.TestCase):
         bfile = sdir / "board.jsonl"
         existing = [ln for ln in bfile.read_text(encoding="utf-8").splitlines() if ln.strip()] if bfile.exists() else []
         seq = len(existing) + 1
-        rec = {"seq": seq, "agent": agent, "text": text, "time": iso_now(ts)}
+        eff_ts = ts if ts is not None else time.time()
+        # Match live Antigravity swarm_board naive local wall-clock format ("YYYY-MM-DD HH:MM:SS")
+        local_time_str = datetime.fromtimestamp(eff_ts).strftime("%Y-%m-%d %H:%M:%S")
+        rec = {"seq": seq, "agent": agent, "text": text, "time": local_time_str}
         existing.append(json.dumps(rec, ensure_ascii=False))
         bfile.write_text("\n".join(existing) + "\n", encoding="utf-8")
         return seq
@@ -515,6 +518,13 @@ class GateSubprocessTestCase(unittest.TestCase):
             {"toolCall": {"id": "h4", "name": "run_command", "args": {"CommandLine": "pytest"}}, "error": ""},
         )
         self.add_final_response("Обновлено после ревью.\n[gate] verified: HIGH; auth_guard.py")
+        _, stale_simplify_blk = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
+        self.assertEqual(stale_simplify_blk["decision"], "continue")
+        self.assertIn("stale", stale_simplify_blk["reason"])
+
+        # Re-run fresh Sonnet simplify lenses; review itself is STILL stale until re-approved!
+        self.add_sonnet_simplify_lenses()
+        self.add_final_response("Обновлено после ревью.\n[gate] verified: HIGH; auth_guard.py")
         _, stale_blk = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
         self.assertEqual(stale_blk["decision"], "continue")
         self.assertIn("stale", stale_blk["reason"])
@@ -797,6 +807,128 @@ class GateSubprocessTestCase(unittest.TestCase):
         self.add_final_response("Проверено.\n[gate] verified: HIGH; auth_check.py, diagnose + opus review")
         _, ok = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
         self.assertEqual(ok, {"decision": "allow"})
+
+    def test_11_opus_round1_adversarial_regressions(self) -> None:
+        sys.path.insert(0, str(HOOKS_DIR))
+        sys.path.insert(0, str(REPO_ROOT / "plugin" / "tools"))
+        import carbon_memory
+        import cwg_common as cwg
+        import cwg_mark
+        import runtime_io as rio
+        import safety_guards
+
+        # 1. Naive local board timestamp matches local epoch within 1s (no UTC+5 5h shift)
+        now = time.time()
+        naive_local = datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S")
+        self.assertAlmostEqual(rio.parse_iso_ts(naive_local), float(int(now)), delta=1.5)
+
+        # 2. Shell command classifier blocks chained/piped mutations and `echo pytest` / `--merge`
+        self.assertEqual(cwg_mark.classify_shell_command(r"git status; Remove-Item src\app.py"), "MUTATING_OR_UNKNOWN")
+        self.assertEqual(cwg_mark.classify_shell_command("Get-Content a.py | Set-Content b.py"), "MUTATING_OR_UNKNOWN")
+        self.assertEqual(cwg_mark.classify_shell_command('git diff && python -c "open(\'x\',\'w\')"'), "MUTATING_OR_UNKNOWN")
+        self.assertEqual(cwg_mark.classify_shell_command("echo pytest"), "MUTATING_OR_UNKNOWN")
+        self.assertEqual(
+            cwg_mark.classify_shell_command("python -X utf8 chip_handoff.py close --chip c1 --accept --merge"),
+            "MUTATING_OR_UNKNOWN",
+        )
+        self.assertEqual(cwg_mark.classify_shell_command("pytest -q"), "VALIDATION")
+
+        # 3. Chip worktrees under state/chips/trees/ are durable repository paths, NOT ephemeral
+        chip_file = str(self.stack_home.parent / ".gemini" / "carbon-stack" / "state" / "chips" / "trees" / "wt1" / "app.py")
+        self.assertFalse(cwg.is_scratch_or_ephemeral(chip_file))
+
+        # 4. Env-style secrets after `_` and symbols in passwords are caught by carbon_memory
+        for leak in (
+            "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "DATABASE_PASSWORD=SuperSecretValue123",
+            "GEMINI_API_KEY=abcdefghijklmnop1234",
+            "password=Hunter2!xyz$abcdef",
+        ):
+            self.assertIsNotNone(carbon_memory.scan_for_secrets(leak), msg=leak)
+
+        # 5. Dirty-worktree guard catches `cd <dirty>; git reset --hard` even when payload cwd is outside git
+        (self.workspace / "dirty.txt").write_text("uncommitted user work\n", encoding="utf-8")
+        outside = self.root / "non-git-cwd"
+        outside.mkdir(exist_ok=True)
+        dec, _ = safety_guards.guard_shell_command(f'cd "{self.workspace}"; git reset --hard', str(outside))
+        self.assertEqual(dec, "deny")
+
+        # 6. Simplify worker posting "starting" without SIMPLIFY_VERDICT does NOT satisfy lens,
+        # and GENERIC tool error + brief prose mentioning "quota is exhausted" do NOT fake Opus failure.
+        sec = self.workspace / "rbac_guard.py"
+        sec_code = "\n".join([f"def allow_{i}(r):\n    return r == 'owner'" for i in range(5)]) + "\n"
+        sec.write_text(sec_code, encoding="utf-8")
+        self.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {"toolCall": {"id": "r1", "name": "write_file", "args": {"Path": str(sec), "Content": sec_code}}, "error": ""},
+        )
+        self.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {"toolCall": {"id": "r2", "name": "run_command", "args": {"CommandLine": "pytest -q"}}, "error": ""},
+        )
+        self.add_sonnet_simplify_lenses(lenses=("reuse", "quality"))
+        self.add_swarm_worker(
+            name="simplify-efficiency",
+            model="claude-sonnet-5-5-high",
+            brief="Efficiency lens.",
+            worker_post="@coordinator starting efficiency check...",
+        )
+        self.add_final_response("Готово.\n[gate] verified: HIGH; rbac_guard.py, pytest")
+        _, blk_incomplete = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
+        self.assertEqual(blk_incomplete["decision"], "continue")
+        self.assertIn("missing: efficiency", blk_incomplete["reason"])
+
+        # Complete efficiency lens properly, then verify fake tool-error / brief prose cannot unlock Carbon review
+        self.add_sonnet_simplify_lenses(lenses=("efficiency",))
+        wcid = self.add_swarm_worker(
+            name="opus-with-tool-err",
+            model="claude-opus-5-5-high",
+            brief="Use carbon only if Opus quota is exhausted or model is overloaded.",
+            worker_post=None,
+        )
+        # Inject an ordinary GENERIC tool error (missing read_file) + SYSTEM brief step into worker transcript
+        wlogs = self.brain / wcid / ".system_generated" / "logs"
+        wsteps = [
+            {
+                "step_index": 0,
+                "source": "SYSTEM",
+                "type": "SYSTEM_MESSAGE",
+                "status": "DONE",
+                "created_at": iso_now(),
+                "content": "Use carbon only if Opus quota is exhausted or model is overloaded.",
+            },
+            {
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "ERROR",
+                "created_at": iso_now(),
+                "content": "Error: file not found",
+            },
+            {
+                "step_index": 2,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": iso_now(),
+                "content": "Done checking.",
+            },
+        ]
+        (wlogs / "transcript_full.jsonl").write_text("\n".join(json.dumps(x) for x in wsteps) + "\n", encoding="utf-8")
+        (wlogs / "transcript.jsonl").write_text((wlogs / "transcript_full.jsonl").read_text(encoding="utf-8"), encoding="utf-8")
+
+        self.add_swarm_worker(
+            name="unjustified-carbon",
+            model="gemini-4-carbon-high",
+            brief="Review.",
+            worker_post="@coordinator\nVERDICT: APPROVED",
+        )
+        self.add_final_response("Попытка закрыть через Carbon.\n[gate] verified: HIGH; rbac_guard.py, pytest")
+        _, blk_fake_opus = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
+        self.assertEqual(blk_fake_opus["decision"], "continue")
+        self.assertIn("without a verified `claude-opus-5-5-high` error/quota/availability failure", blk_fake_opus["reason"])
 
 
 if __name__ == "__main__":

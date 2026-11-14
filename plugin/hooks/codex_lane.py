@@ -215,9 +215,8 @@ def check_health() -> dict[str, Any]:
 
 
 def _extract_rollout_texts_and_meta(rollout_file: pathlib.Path) -> dict[str, Any] | None:
-    try:
-        lines = rollout_file.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
+    records = rio.read_jsonl(rollout_file)
+    if not records:
         return None
     user_texts: list[str] = []
     assistant_texts: list[tuple[float, str]] = []
@@ -227,15 +226,7 @@ def _extract_rollout_texts_and_meta(rollout_file: pathlib.Path) -> dict[str, Any
     started_ts = 0.0
     completed_ts = 0.0
 
-    for raw in lines:
-        if not raw.strip():
-            continue
-        try:
-            rec = json.loads(raw)
-        except Exception:
-            continue
-        if not isinstance(rec, dict):
-            continue
+    for rec in records:
         rec_ts = rio.parse_iso_ts(rec.get("timestamp"))
         rtype = rec.get("type")
         payload = rec.get("payload") if isinstance(rec.get("payload"), dict) else {}
@@ -285,15 +276,29 @@ def _extract_rollout_texts_and_meta(rollout_file: pathlib.Path) -> dict[str, Any
     }
 
 
-def scan_verified_codex_reviews(since_ts: float) -> list[dict[str, Any]]:
-    """Return cryptographically bound Codex review verdicts from `~/.codex/sessions` rollout logs."""
+def scan_verified_codex_reviews(
+    since_ts: float,
+    session: str = "",
+    git_root: str = "",
+) -> list[dict[str, Any]]:
+    """Return nonce- and workspace-bound Codex review verdicts from `~/.codex/sessions` rollout logs."""
+    fold_target_root = rio.fold_path(git_root) if git_root else ""
     known_packets: dict[str, dict[str, Any]] = {}
     for pf in packets_dir().glob("*.json"):
         pdata = rio.read_json(pf, default=None)
         if not isinstance(pdata, dict) or not pdata.get("review_id"):
             continue
-        if float(pdata.get("created_ts") or 0.0) >= since_ts - 2.0:
-            known_packets[str(pdata["review_id"])] = pdata
+        if float(pdata.get("created_ts") or 0.0) < since_ts - 2.0:
+            continue
+        pkt_sess = str(pdata.get("session") or "")
+        if session and pkt_sess and pkt_sess != session:
+            continue
+        pkt_cwd = str(pdata.get("cwd") or "")
+        if fold_target_root and pkt_cwd:
+            pkt_root = rio.fold_path(rio.git_toplevel(pkt_cwd) or pkt_cwd)
+            if pkt_root and pkt_root != fold_target_root:
+                continue
+        known_packets[str(pdata["review_id"])] = pdata
 
     if not known_packets:
         return []
