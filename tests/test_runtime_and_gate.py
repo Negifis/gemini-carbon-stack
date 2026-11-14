@@ -947,17 +947,23 @@ class GateSubprocessTestCase(unittest.TestCase):
         parsed_rows = rio.read_jsonl(mid_jsonl, max_lines=4000)
         self.assertEqual([r["idx"] for r in parsed_rows], list(range(100)))
 
-        # 2. `git diff --output=...` and PowerShell `$(...)` subexpressions are NOT READ_ONLY
+        # 2. `git diff --output=...`, PowerShell `$(...)` / `(...)` / `@(...)`, and `rg --pre` are NOT READ_ONLY
         self.assertEqual(cwg_mark.classify_shell_command("git diff --output=src/app.py"), "MUTATING_OR_UNKNOWN")
         self.assertEqual(cwg_mark.classify_shell_command("Get-Content $(Set-Content src\\x.py 'y')"), "MUTATING_OR_UNKNOWN")
         self.assertEqual(cwg_mark.classify_shell_command('Get-Content "$(Set-Content src\\x.py \'y\')"'), "MUTATING_OR_UNKNOWN")
+        self.assertEqual(cwg_mark.classify_shell_command("Test-Path (New-Item src\\new.py -Force)"), "MUTATING_OR_UNKNOWN")
+        self.assertEqual(cwg_mark.classify_shell_command("Get-Content @(Remove-Item src\\app.py)"), "MUTATING_OR_UNKNOWN")
+        self.assertEqual(cwg_mark.classify_shell_command("rg --pre C:\\t\\x.bat foo"), "MUTATING_OR_UNKNOWN")
 
-        # 3. JSON quoted keys, unseparated prefixes (`PGPASSWORD`), and `HF_TOKEN` caught by secret guard
+        # 3. JSON quoted keys, unseparated prefixes (`PGPASSWORD`), Stripe/Telegram/HF secrets caught by secret guard
         for leak in (
             '{"password": "SuperSecretValue123"}',
             '"api_key": "abcdefghijklmnop1234"',
             "PGPASSWORD=SuperSecretValue123",
             "HF_TOKEN=hf_abcdefghijklmnopqrstu",
+            "STRIPE_SECRET=sk_live_abcdefghijklmnop",
+            "DB_PASS=SuperSecretValue123",
+            "TELEGRAM_BOT_TOKEN=123456789:ABCdefghijklmnopqrstuvwxyz123456",
         ):
             self.assertIsNotNone(carbon_memory.scan_for_secrets(leak), msg=leak)
 

@@ -30,16 +30,17 @@ SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     ("private_key_pem", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----")),
     ("bearer_jwt", re.compile(r"\bBearer\s+eyJ[0-9A-Za-z_-]{15,}\.[0-9A-Za-z_-]{15,}\.[0-9A-Za-z_-]{10,}\b")),
+    ("stripe_key", re.compile(r"\b[rs]k_(?:live|test)_[0-9A-Za-z]{16,}\b")),
+    ("telegram_bot_token", re.compile(r"\b\d{6,12}:[0-9A-Za-z_-]{28,}\b")),
     ("prefixed_pat_token", re.compile(r"\b(?:hf|npm|pypi)_[0-9A-Za-z_-]{20,}\b")),
     ("uri_password", re.compile(r"\b[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]{4,}@[^\s/]+", re.IGNORECASE)),
     (
         "secret_assignment",
         re.compile(
-            r"(?:^|(?<![A-Za-z0-9]))[A-Za-z0-9_-]{0,32}?"
-            r"(?:api[_-]?key|secret(?:[_-]?access)?[_-]?key|access[_-]?key|access[_-]?token|auth[_-]?token|"
-            r"(?:hf|gh|npm|pypi|slack|discord|bot|bearer|refresh|session)[_-]?token|"
-            r"password|passwd|pwd|client[_-]?secret|private[_-]?key)"
-            r"[\"']?\s*[:=]\s*[\"']?[A-Za-z0-9/+._~!$%@&*=-]{10,}[\"']?",
+            r"(?:^|(?<![A-Za-z0-9]))[A-Za-z0-9_.-]{0,40}?"
+            r"(?:secret(?:[_-]?access)?(?:[_-]?key)?|token|pass(?:word|wd)?|pwd|"
+            r"(?:api|access|private|signing|encryption|master|client)[_-]?key)"
+            r"[\"']?\s*[:=]\s*[\"']?[A-Za-z0-9/+._~!$%@&*:=-]{12,}[\"']?",
             re.IGNORECASE,
         ),
     ),

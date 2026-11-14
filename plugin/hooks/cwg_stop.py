@@ -456,8 +456,9 @@ def scan_swarm_activity(
         killed = bool(minfo.get("killed"))
         group_prefix = mname.rsplit("-", 1)[0] if re.search(r"-\d+$", mname) else ""
 
-        # Coordinator assignment posts targeting this worker
+        # Coordinator assignment posts targeting this worker (`coord_posts` drives in-flight; `broadcast_posts` also updates launch windows)
         coord_posts: list[tuple[float, str]] = []
+        broadcast_posts: list[tuple[float, str]] = []
         worker_board_posts: list[tuple[float, str]] = []
         mention_pats = [re.compile(rf"(?<![A-Za-z0-9_-])@{re.escape(mname)}(?![A-Za-z0-9_-])", re.IGNORECASE)]
         if group_prefix:
@@ -469,6 +470,8 @@ def scan_swarm_activity(
             if poster == "coordinator":
                 if any(mp.search(btext) for mp in mention_pats):
                     coord_posts.append((bts, btext))
+                elif "@all" in btext.lower():
+                    broadcast_posts.append((bts, btext))
             elif poster == mname:
                 # SECURITY INVARIANT: Only posts authored by `mname` itself count as worker output (never coordinator prompts).
                 if not bts or bts >= first_ts - 2.0:
@@ -526,9 +529,9 @@ def scan_swarm_activity(
         if not combined_outputs:
             continue
 
-        # Group outputs by coordinator assignment/switch window for both simplify lenses and adversarial reviewers
+        # Group outputs by coordinator assignment/broadcast/switch window for both simplify lenses and adversarial reviewers
         windows: list[tuple[float, str]] = sorted(
-            list(coord_posts) + list(model_switches.get(mname, [])),
+            list(coord_posts) + list(broadcast_posts) + list(model_switches.get(mname, [])),
             key=lambda pair: pair[0],
         )
         if not windows:
@@ -956,7 +959,21 @@ def validate_candidate_closure(
         breaker_open and opus_issue and len(total_review_failures) >= 1
     )
 
+    closure_ready_rev: dict[str, Any] | None = None
+    if (
+        len(ordinary_reviews) == MAX_REVIEW_ROUNDS
+        and latest_ord_verdict in ("REVISE", "ESCALATE")
+        and latest_cls_verdict == "READY"
+        and latest_cls_rev is not None
+        and is_review_fresh(latest_cls_rev, marker)
+        and _is_acceptable_engine(latest_cls_rev)
+        and (effective_risk != "XHIGH" or latest_cls_rev.get("xhigh"))
+    ):
+        closure_ready_rev = latest_cls_rev
+
     if rkind == "verified":
+        if closure_ready_rev is not None:
+            return True, "verified"
         if latest_ord_verdict and latest_ord_verdict != "APPROVED":
             return False, f"invoked adversarial review ended in `{latest_ord_verdict}`, not `APPROVED`"
         if effective_risk in ("HIGH", "XHIGH"):
@@ -984,10 +1001,10 @@ def validate_candidate_closure(
         return True, "verified"
 
     if rkind == "pr-ready":
-        if latest_ord_verdict != "ESCALATE":
-            return False, "`pr-ready` requires round-3 `VERDICT: ESCALATE` followed by `CLOSURE_VALIDATION: READY`"
-        if latest_cls_verdict != "READY" or latest_cls_rev is None or not is_review_fresh(latest_cls_rev, marker):
-            return False, "`pr-ready` lacks fresh `CLOSURE_VALIDATION: READY`"
+        if len(ordinary_reviews) < MAX_REVIEW_ROUNDS or latest_ord_verdict not in ("ESCALATE", "REVISE"):
+            return False, "`pr-ready` requires round-3 `ESCALATE`/`REVISE` followed by fresh `CLOSURE_VALIDATION: READY`"
+        if closure_ready_rev is None:
+            return False, "`pr-ready` lacks fresh `CLOSURE_VALIDATION: READY` from an eligible review engine"
         return True, "pr-ready"
 
     if rkind == "draft-blocked":

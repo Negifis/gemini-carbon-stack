@@ -117,11 +117,15 @@ def classify_shell_command(cmd: str) -> str:
         re.search(r"(?<![0-9])>>?\s*(?!\$null\b|nul\b|/dev/null\b|&[12]\b)\S+", _strip_quoted(stripped), re.IGNORECASE)
     )
     chained = _has_shell_chaining(stripped)
-    has_output_flag = bool(re.search(r"(?:^|\s)(?:--output(?:=|\s)|-o(?:\s|$))", _strip_quoted(stripped), re.IGNORECASE))
-    if not chained and not has_file_redirect:
+    unquoted = _strip_quoted(stripped)
+    has_subshell_parens = "(" in unquoted or ")" in unquoted
+    has_unsafe_ro_flag = bool(
+        re.search(r"(?:^|\s)(?:--output(?:=|\s)|-o(?:\s|$)|--pre(?:=|\s))", unquoted, re.IGNORECASE)
+    )
+    if not chained and not has_file_redirect and not has_subshell_parens:
         if "--merge" not in stripped.lower() and BOOKKEEPING_CMD_RE.match(stripped):
             return "BOOKKEEPING"
-        if not has_output_flag and READ_ONLY_CMD_RE.match(stripped):
+        if not has_unsafe_ro_flag and READ_ONLY_CMD_RE.match(stripped):
             return "READ_ONLY"
     if not has_file_redirect:
         segments = _split_shell_segments(stripped)
