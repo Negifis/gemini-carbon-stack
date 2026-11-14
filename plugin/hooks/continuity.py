@@ -29,42 +29,10 @@ CHECKPOINT_EDIT_NUDGE = 8
 MAX_LINT_BLOCKS_PER_EPISODE = 2
 TREE_LOCK_TTL_SECONDS = 1800  # 30 minutes active heartbeat window
 
-PROGRESS_COMPLEX_START_STEPS = 3
-PROGRESS_HEARTBEAT_STEPS = 8
-PROGRESS_BOARD_SILENCE_STEPS = 3
-PROGRESS_HEARTBEAT_SECONDS = 60
-PROGRESS_NUDGE_COOLDOWN_STEPS = 6
-
-# Swarm/subagent messaging channels write only to board.jsonl / inbox and never surface in main chat.
-BOARD_COMMS_TOOLS = frozenset({"post_message", "send_message", "swarm", "swarm_wait", "read_board"})
-
 TEST_RUNNER_RE = re.compile(
     r"\b(?:pytest|py\.test|unittest|npm\s+test|pnpm\s+test|yarn\s+test|cargo\s+test|go\s+test|dotnet\s+test)\b",
     re.IGNORECASE,
 )
-
-PROGRESS_BLOCKER_SYS_RE = re.compile(
-    r"(?:RESOURCE_EXHAUSTED|code\s+429|quota[^\n.]{0,30}(?:exceeded|exhausted|reached|0%)|"
-    r"failed\s+to\s+start\s+execution|ERROR_MESSAGE|\[Code\s+Work\s+Gate\][^\n]*(?:блокир|block))",
-    re.IGNORECASE,
-)
-
-NONZERO_EXIT_RE = re.compile(r"Command\s+exited\s+with\s+code\s+(?!0\b)\d+", re.IGNORECASE)
-ZERO_EXIT_RE = re.compile(r"Command\s+exited\s+with\s+code\s+0\b", re.IGNORECASE)
-STAGE_CMD_RE = re.compile(
-    r"\b(?:install\.py(?![^\n]*--(?:dry-run|diagnose)\b)|"
-    r"git(?:\.exe)?\s+(?:-C\s+\S+\s+)?commit\b|"
-    r"chip_handoff\.py\s+(?:merge|close)\b)",
-    re.IGNORECASE,
-)
-VERIFY_CMD_RE = re.compile(r"codex_lane\.py[\"']?\s+review\b", re.IGNORECASE)
-CHIP_OPEN_CMD_RE = re.compile(r"\bchip_handoff\.py\s+open\b", re.IGNORECASE)
-SWARM_VERIFY_NAME_RE = re.compile(r"\b(?:simplify|review|adversarial)\b", re.IGNORECASE)
-SWARM_VERIFY_BRIEF_RE = re.compile(
-    r"(?:SIMPLIFY_LENS\s*:|SIMPLIFY_VERDICT\s*:|CLOSURE_VALIDATION\s*:|VERDICT\s*:\s*APPROVED|adversarial\s+(?:code\s+)?review)",
-    re.IGNORECASE,
-)
-SWARM_UI_PILL = f"[Open the Swarm UI]({rio.SWARM_SIDECAR_URI})"
 
 CANONICAL_SECTIONS = (
     "GOAL",
@@ -140,24 +108,11 @@ def session_index_path() -> pathlib.Path:
     return rio.state_dir("hygiene") / "sessions.jsonl"
 
 
-def _reset_turn_progress_state(state: dict[str, Any]) -> None:
-    """Clear per-turn progress-visibility counters without disturbing loop guard or turn hash."""
-    state["last_progress_nudge_seq"] = -1
-    state["last_progress_nudge_kind"] = ""
-    state["last_seen_model_step_idx"] = -1
-    state["turn_model_step_seq"] = 0
-    state["turn_visible_updates"] = 0
-    state["last_visible_seq"] = 0
-    state["turn_start_ts"] = 0.0
-    state["last_visible_ts"] = 0.0
-    state["last_user_step_idx"] = None
-
-
 def load_session_state(session: str) -> dict[str, Any]:
     raw = rio.read_json(session_state_path(session), default=None)
     if isinstance(raw, dict):
         return raw
-    state: dict[str, Any] = {
+    return {
         "session": session,
         "generation": 1,
         "edits_since_checkpoint": 0,
@@ -170,8 +125,6 @@ def load_session_state(session: str) -> dict[str, Any]:
         "pending_warnings": [],
         "updated_ts": time.time(),
     }
-    _reset_turn_progress_state(state)
-    return state
 
 
 def save_session_state(session: str, state: dict[str, Any]) -> None:
@@ -333,387 +286,9 @@ def detect_compaction(payload: dict[str, Any], state: dict[str, Any], steps: lis
     return False
 
 
-def _tc_args_dict(tc: dict[str, Any]) -> dict[str, Any]:
-    args = tc.get("args")
-    if isinstance(args, dict):
-        return args
-    if isinstance(args, str) and args.strip().startswith("{"):
-        try:
-            parsed = json.loads(args)
-            return parsed if isinstance(parsed, dict) else {}
-        except (json.JSONDecodeError, TypeError, ValueError):
-            return {}
-    return {}
-
-
-def _build_progress_nudge(kind: str, reason: str, swarm_active: bool) -> str:
-    base_footer = (
-        "Выведите краткий отчёт (2–4 строки на русском языке по сути, БЕЗ перечисления вызовов инструментов) "
-        "в `content` ЭТОГО ЖЕ ответа параллельно со следующими `tool_calls`, не останавливая автономное выполнение. "
-        "Записи в `swarm` board (`post_message`/`send_message`) пользователю не видны."
-    )
-    if kind == "blocker":
-        return (
-            f"[Progress Visibility — Блокер / переключение] Обнаружено: {reason}. "
-            f"Сообщите пользователю о проблеме и выбранном обходе прямо сейчас. {base_footer}"
-        )
-    if kind == "verification_start":
-        pill_hint = f" Если открыт `swarm`, приложите `{SWARM_UI_PILL}`." if swarm_active else ""
-        return (
-            f"[Progress Visibility — Начало проверки] Запущена финальная верификация/ревью ({reason}). "
-            f"Кратко уведомите пользователя о старте проверки и её контуре.{pill_hint} {base_footer}"
-        )
-    if kind == "complex_start":
-        return (
-            "[Progress Visibility — Старт сложной задачи] В текущем ходе ещё не было видимых сообщений пользователю. "
-            f"Кратко обозначьте цель и ближайший этап работ. {base_footer}"
-        )
-    if kind == "hypothesis_change":
-        return (
-            "[Progress Visibility — Смена гипотезы] После сбоя команды/теста начаты новые правки. "
-            f"Кратко поясните выявленную причину и скорректированный подход. {base_footer}"
-        )
-    if kind == "stage_complete":
-        return (
-            "[Progress Visibility — Этап выполнен] Завершён существенный этап работ или серия правок с тестами. "
-            f"Кратко подведите итог этапа и назовите следующий шаг. {base_footer}"
-        )
-    return (
-        f"[Progress Visibility — Регулярный статус] {reason}. "
-        f"Дайте краткую живую сводку текущего прогресса и оставшейся работы. {base_footer}"
-    )
-
-
-def _is_swarm_active_action(args: dict[str, Any]) -> bool:
-    return str(args.get("action") or "").lower() in ("add", "model", "status", "title")
-
-
-def _advance_turn_progress_state(
-    state: dict[str, Any],
-    model_events: list[tuple[int, bool, float]],
-    user_step_idx: int | None,
-    window_truncated_turn: bool,
-    turn_start_ts: float,
-    last_visible_ts: float,
-) -> tuple[int, int, int, float, float]:
-    """Reconcile monotonic per-turn progress counters across 120-line sliding windows."""
-    raw_prev_user = state.get("last_user_step_idx")
-    prev_user_idx = int(raw_prev_user) if isinstance(raw_prev_user, int) else None
-    raw_last_seen = state.get("last_seen_model_step_idx")
-    last_seen_idx = int(raw_last_seen) if raw_last_seen is not None else -1
-    need_turn_reset = (
-        (user_step_idx is not None and prev_user_idx is not None and user_step_idx != prev_user_idx)
-        or (not window_truncated_turn and not model_events and last_seen_idx >= 0)
-        or (bool(model_events) and model_events[-1][0] < last_seen_idx)
-    )
-    if need_turn_reset:
-        _reset_turn_progress_state(state)
-        last_seen_idx = -1
-
-    if user_step_idx is not None:
-        state["last_user_step_idx"] = user_step_idx
-    if turn_start_ts > 0:
-        state["turn_start_ts"] = turn_start_ts
-
-    seq = int(state.get("turn_model_step_seq") or 0)
-    turn_vis_count = int(state.get("turn_visible_updates") or 0)
-    last_vis_seq = int(state.get("last_visible_seq") or 0)
-    state_vis_ts = float(state.get("last_visible_ts") or 0.0)
-    for eff_idx, is_vis, ev_ts in model_events:
-        if eff_idx > last_seen_idx:
-            seq += 1
-            last_seen_idx = eff_idx
-            if is_vis:
-                turn_vis_count += 1
-                last_vis_seq = seq
-                if ev_ts > 0:
-                    state_vis_ts = ev_ts
-    state["last_seen_model_step_idx"] = last_seen_idx
-    state["turn_model_step_seq"] = seq
-    state["turn_visible_updates"] = turn_vis_count
-    state["last_visible_seq"] = last_vis_seq
-    if last_visible_ts > state_vis_ts:
-        state_vis_ts = last_visible_ts
-    state["last_visible_ts"] = state_vis_ts
-
-    eff_turn_start_ts = turn_start_ts or float(state.get("turn_start_ts") or 0.0)
-    return seq, turn_vis_count, last_vis_seq, state_vis_ts, eff_turn_start_ts
-
-
-def analyze_progress_visibility(
-    steps: list[dict[str, Any]],
-    now_ts: float | None = None,
-    state: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Scan user-turn steps for visible updates vs silent loops; update `state` when supplied."""
-    # Lazy import avoids ~6ms startup overhead on PreToolUse/PostToolUse/Stop hook invocations.
-    import codex_lane
-
-    now = time.time() if now_ts is None else float(now_ts)
-
-    s0_idx = steps[0].get("step_index") if steps else None
-    s1_idx = steps[1].get("step_index") if len(steps) >= 2 else None
-    head_gapped = isinstance(s0_idx, int) and isinstance(s1_idx, int) and s1_idx > s0_idx + 1
-
-    last_user_pos = -1
-    for i in range(1 if head_gapped else 0, len(steps)):
-        st = steps[i]
-        if st.get("source") == "USER_EXPLICIT" and st.get("type") == "USER_INPUT":
-            last_user_pos = i
-
-    if last_user_pos >= 0:
-        turn_steps = steps[last_user_pos + 1 :]
-        turn_start_ts = rio.parse_iso_ts(steps[last_user_pos].get("created_at"))
-        u_raw = steps[last_user_pos].get("step_index")
-        user_step_idx = int(u_raw) if isinstance(u_raw, int) else None
-        window_truncated_turn = False
-    elif head_gapped:
-        # INVARIANT: `read_jsonl` pins line 0 at steps[0]; when a gap separates steps[0] and steps[1],
-        # steps[0] belongs to an evicted head of transcript and cannot anchor an in-window USER_INPUT.
-        turn_steps = steps[1:]
-        turn_start_ts = 0.0
-        user_step_idx = None
-        window_truncated_turn = True
-    else:
-        has_indices = any(isinstance(st.get("step_index"), int) for st in steps)
-        turn_steps = steps if has_indices else (steps[1:] if len(steps) > 1 else [])
-        turn_start_ts = 0.0
-        user_step_idx = None
-        window_truncated_turn = True
-
-    total_model_steps = 0
-    visible_updates_count = 0
-    last_visible_model_step = 0
-    last_visible_ts = 0.0
-    silent_invocations = 0
-    silent_board_comms = 0
-    silent_mutations = 0
-    complex_delegated = False
-    verification_started = False
-    verification_reason = ""
-    blocker_reason = ""
-    stage_completed = False
-    tests_ran = False
-    failed_cmd_seen = False
-    pending_tc_kinds: list[tuple[bool, bool, bool]] = []
-    hypothesis_shift = False
-    swarm_active = False
-    model_events: list[tuple[int, bool, float]] = []
-
-    for pos, st in enumerate(turn_steps):
-        src = st.get("source")
-        tp = st.get("type")
-        st_ts = rio.parse_iso_ts(st.get("created_at"))
-
-        if src == "MODEL" and tp == "PLANNER_RESPONSE":
-            total_model_steps += 1
-            raw_idx = st.get("step_index")
-            eff_idx = int(raw_idx) if isinstance(raw_idx, int) else pos
-            visible_text = str(st.get("content") or "").strip()
-            tcs = st.get("tool_calls") or []
-            is_vis = bool(visible_text)
-            model_events.append((eff_idx, is_vis, st_ts))
-            pending_tc_kinds.clear()
-            if is_vis:
-                for tc in tcs:
-                    if not isinstance(tc, dict):
-                        pending_tc_kinds.append((False, False, False))
-                        continue
-                    tname_vis = str(tc.get("name") or "")
-                    if tname_vis == "swarm" and _is_swarm_active_action(_tc_args_dict(tc)):
-                        swarm_active = True
-                    pending_tc_kinds.append((tname_vis == "run_command", False, False))
-                visible_updates_count += 1
-                last_visible_model_step = total_model_steps
-                last_visible_ts = st_ts or last_visible_ts
-                silent_invocations = 0
-                silent_board_comms = 0
-                silent_mutations = 0
-                complex_delegated = False
-                verification_started = False
-                verification_reason = ""
-                blocker_reason = ""
-                stage_completed = False
-                tests_ran = False
-                failed_cmd_seen = False
-                hypothesis_shift = False
-                continue
-
-            if not tcs:
-                continue
-
-            silent_invocations += 1
-            for tc in tcs:
-                if not isinstance(tc, dict):
-                    pending_tc_kinds.append((False, False, False))
-                    continue
-                tname = str(tc.get("name") or "")
-                args = _tc_args_dict(tc)
-                if tname in BOARD_COMMS_TOOLS:
-                    silent_board_comms += 1
-                if tname in ("edit_file", "write_file"):
-                    silent_mutations += 1
-                    if failed_cmd_seen:
-                        hypothesis_shift = True
-                    pending_tc_kinds.append((False, False, False))
-                elif tname == "swarm":
-                    action = str(args.get("action") or "").lower()
-                    if _is_swarm_active_action(args):
-                        swarm_active = True
-                    if action == "model":
-                        target_model = str(args.get("model") or "fallback")
-                        blocker_reason = blocker_reason or f"переключение модели воркера на `{target_model}`"
-                    elif action == "add":
-                        name_str = str(args.get("name") or "")
-                        brief_blob = " ".join(str(args.get(k) or "") for k in ("brief", "tasks"))
-                        if SWARM_VERIFY_NAME_RE.search(name_str) or SWARM_VERIFY_BRIEF_RE.search(brief_blob):
-                            verification_started = True
-                            verification_reason = verification_reason or "запуск swarm simplify/review"
-                        else:
-                            complex_delegated = True
-                    pending_tc_kinds.append((False, False, False))
-                elif tname == "invoke_subagent":
-                    sub_type = str(args.get("TypeName") or "")
-                    if SWARM_VERIFY_NAME_RE.search(sub_type):
-                        verification_started = True
-                        verification_reason = verification_reason or f"субагент {sub_type}"
-                    else:
-                        complex_delegated = True
-                    pending_tc_kinds.append((False, False, False))
-                elif tname in ("run_workflow", "exit_plan_mode"):
-                    complex_delegated = True
-                    pending_tc_kinds.append((False, False, False))
-                elif tname == "run_command":
-                    cmd = str(args.get("CommandLine") or "")
-                    if VERIFY_CMD_RE.search(cmd):
-                        verification_started = True
-                        verification_reason = verification_reason or "внешний Codex review"
-                    is_stage = bool(STAGE_CMD_RE.search(cmd))
-                    is_test = bool(TEST_RUNNER_RE.search(cmd))
-                    if is_test:
-                        tests_ran = True
-                    pending_tc_kinds.append((True, is_stage, is_test))
-                    # Codex CLI invocations should not also count as worktree chip delegation.
-                    if "codex" not in cmd.lower() and CHIP_OPEN_CMD_RE.search(cmd):
-                        complex_delegated = True
-                else:
-                    pending_tc_kinds.append((False, False, False))
-
-        elif src in ("SYSTEM", "SYSTEM_SDK") and tp == "SYSTEM_MESSAGE":
-            msg = str(st.get("content") or "")
-            stripped_msg = msg.lstrip()
-            if (
-                "[Progress Visibility" not in msg
-                and not stripped_msg.startswith(("Plan mode is off", "[plan review]"))
-                and PROGRESS_BLOCKER_SYS_RE.search(msg)
-            ):
-                blocker_reason = blocker_reason or "сбой/429 квота модели или блокировка гейта"
-
-        elif tp == "GENERIC":
-            msg = str(st.get("content") or "")
-            is_cmd, is_stage_cmd, is_test_cmd = pending_tc_kinds.pop(0) if pending_tc_kinds else (True, False, False)
-            if is_cmd:
-                if NONZERO_EXIT_RE.search(msg):
-                    failed_cmd_seen = True
-                    if is_stage_cmd:
-                        stage_completed = False
-                elif ZERO_EXIT_RE.search(msg):
-                    if is_stage_cmd:
-                        stage_completed = True
-                    if is_test_cmd:
-                        failed_cmd_seen = False
-                        hypothesis_shift = False
-
-    if state is not None:
-        turn_model_step_seq, turn_vis_count, last_vis_seq, state_vis_ts, state_turn_start_ts = (
-            _advance_turn_progress_state(
-                state,
-                model_events,
-                user_step_idx,
-                window_truncated_turn,
-                turn_start_ts,
-                last_visible_ts,
-            )
-        )
-        eff_visible_count = max(visible_updates_count, turn_vis_count)
-        eff_last_visible_ts = last_visible_ts or state_vis_ts
-        eff_turn_start_ts = state_turn_start_ts or (
-            rio.parse_iso_ts(turn_steps[0].get("created_at")) if turn_steps else 0.0
-        )
-    else:
-        turn_model_step_seq = total_model_steps
-        last_vis_seq = last_visible_model_step
-        eff_visible_count = visible_updates_count
-        eff_last_visible_ts = last_visible_ts
-        eff_turn_start_ts = turn_start_ts or (
-            rio.parse_iso_ts(turn_steps[0].get("created_at")) if turn_steps else 0.0
-        )
-
-    # Also detect a freshly tripped Codex circuit breaker within the silent window
-    breaker = codex_lane.breaker_status()
-    if breaker.get("tripped"):
-        tripped_at = float(breaker.get("tripped_at") or 0.0)
-        anchor_ts = max(eff_turn_start_ts, eff_last_visible_ts)
-        # Allow 5s forward skew in case the breaker file was stamped cleanly by another process.
-        if tripped_at > anchor_ts and tripped_at <= now + 5:
-            reason_code = str(breaker.get("reason") or "outage")[:80]
-            blocker_reason = blocker_reason or f"открыт circuit breaker Codex ({reason_code})"
-
-    ref_ts = eff_last_visible_ts or eff_turn_start_ts
-    elapsed_silent_sec = int(max(0.0, now - ref_ts)) if ref_ts > 0 else 0
-
-    trigger_kind = ""
-    trigger_reason = ""
-    if blocker_reason:
-        trigger_kind = "blocker"
-        trigger_reason = blocker_reason
-    elif verification_started:
-        trigger_kind = "verification_start"
-        trigger_reason = verification_reason or "финальная проверка"
-    elif eff_visible_count == 0 and (
-        complex_delegated or silent_mutations >= 2 or silent_invocations >= PROGRESS_COMPLEX_START_STEPS
-    ):
-        trigger_kind = "complex_start"
-        trigger_reason = "старт многошаговой задачи"
-    elif hypothesis_shift:
-        trigger_kind = "hypothesis_change"
-        trigger_reason = "смена гипотезы после сбоя"
-    elif stage_completed or (silent_mutations >= 5 and tests_ran):
-        trigger_kind = "stage_complete"
-        trigger_reason = "завершён существенный этап"
-    elif (
-        silent_board_comms >= PROGRESS_BOARD_SILENCE_STEPS
-        or silent_invocations >= PROGRESS_HEARTBEAT_STEPS
-        or (silent_invocations >= 5 and elapsed_silent_sec >= PROGRESS_HEARTBEAT_SECONDS)
-    ):
-        trigger_kind = "heartbeat"
-        if silent_board_comms >= PROGRESS_BOARD_SILENCE_STEPS:
-            trigger_reason = f"выполнено {silent_board_comms} тихих шагов с воркерами без статуса в чате"
-        else:
-            trigger_reason = f"выполнено {silent_invocations} тихих шагов без отчёта ({elapsed_silent_sec}с)"
-
-    trigger_message = (
-        _build_progress_nudge(trigger_kind, trigger_reason, swarm_active) if trigger_kind else ""
-    )
-
-    return {
-        "turn_model_step_seq": turn_model_step_seq,
-        "visible_updates_count": eff_visible_count,
-        "last_visible_seq": last_vis_seq,
-        "silent_invocations": silent_invocations,
-        "silent_board_comms": silent_board_comms,
-        "silent_mutations": silent_mutations,
-        "elapsed_silent_sec": elapsed_silent_sec,
-        "swarm_active": swarm_active,
-        "trigger": trigger_kind or None,
-        "trigger_reason": trigger_reason,
-        "trigger_message": trigger_message,
-    }
-
-
 def handle_pre_invocation(payload: dict[str, Any]) -> None:
     transcript_path = payload.get("transcriptPath")
-    steps = rio.read_transcript_steps(transcript_path, max_lines=120)
+    steps = rio.read_transcript_steps(transcript_path, max_lines=60)
     if rio.is_subagent_session(transcript_path, steps=steps):
         rio.emit_json({})
         return
@@ -738,7 +313,6 @@ def handle_pre_invocation(payload: dict[str, Any]) -> None:
         state["generation"] = int(state.get("generation") or 1) + 1
         state["tool_counts"] = {}
         state["lint_blocks"] = 0
-        _reset_turn_progress_state(state)
 
         if STRONG_CORRECTION_RE.search(user_input):
             state["correction_active"] = True
@@ -784,39 +358,6 @@ def handle_pre_invocation(payload: dict[str, Any]) -> None:
             f"[Continuity] Выполнено >= {CHECKPOINT_EDIT_NUDGE} правок без обновления checkpoint. "
             f"Для длительной задачи обновите каноническое состояние (`python -X utf8 \"{cp_script}\" checkpoint ...` или `/checkpoint`)."
         )
-
-    # Progress transparency check with cooldown (worker/swarm board traffic never resets silence)
-    vis = analyze_progress_visibility(steps, state=state)
-    trig = vis.get("trigger")
-    if trig:
-        cur_seq = int(vis.get("turn_model_step_seq") or 0)
-        last_vis_seq = int(vis.get("last_visible_seq") or 0)
-        last_nudge_seq = int(state.get("last_progress_nudge_seq") if state.get("last_progress_nudge_seq") is not None else -1)
-        last_nudge_kind = str(state.get("last_progress_nudge_kind") or "")
-        # Require strict `>` so a SYSTEM_MESSAGE arriving after visible step `N` does not treat pre-nudge step `N` as post-nudge acknowledgement.
-        no_prior_nudge_in_episode = (
-            (not last_nudge_kind)
-            or last_nudge_seq < 0
-            or last_vis_seq > last_nudge_seq
-        )
-        cooldown_ok = (
-            no_prior_nudge_in_episode
-            or (cur_seq - last_nudge_seq) >= PROGRESS_NUDGE_COOLDOWN_STEPS
-            or (trig in ("blocker", "verification_start") and trig != last_nudge_kind)
-        )
-        if cooldown_ok:
-            injected.append(str(vis["trigger_message"]))
-            state["last_progress_nudge_seq"] = cur_seq
-            state["last_progress_nudge_kind"] = trig
-            rio.log_hook_event(
-                "continuity-events",
-                "progress_nudge",
-                session=session,
-                trigger=trig,
-                turn_seq=cur_seq,
-                silent_invocations=vis["silent_invocations"],
-                silent_board_comms=vis["silent_board_comms"],
-            )
 
     state["last_step_count"] = max(int(payload.get("initialNumSteps") or 0), len(steps))
     save_session_state(session, state)
@@ -1064,15 +605,8 @@ def cmd_show(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_progress(args: argparse.Namespace) -> int:
-    steps = rio.read_transcript_steps(args.transcript, max_lines=120)
-    report = analyze_progress_visibility(steps)
-    print(json.dumps(report, ensure_ascii=False, indent=2))
-    return 0
-
-
 def main() -> int:
-    if len(sys.argv) > 1 and sys.argv[1] in ("checkpoint", "show", "progress"):
+    if len(sys.argv) > 1 and sys.argv[1] in ("checkpoint", "show"):
         parser = argparse.ArgumentParser(prog="continuity")
         sub = parser.add_subparsers(dest="subcmd", required=True)
 
@@ -1095,14 +629,9 @@ def main() -> int:
         sh = sub.add_parser("show")
         sh.add_argument("--cwd", default="")
 
-        pr = sub.add_parser("progress")
-        pr.add_argument("--transcript", required=True)
-
         parsed = parser.parse_args()
         if parsed.subcmd == "checkpoint":
             return cmd_checkpoint(parsed)
-        if parsed.subcmd == "progress":
-            return cmd_progress(parsed)
         return cmd_show(parsed)
 
     event = rio.parse_event_arg()

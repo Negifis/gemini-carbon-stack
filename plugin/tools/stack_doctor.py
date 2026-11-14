@@ -163,10 +163,6 @@ def run_diagnostics(cwd: str = "") -> dict[str, Any]:
                 "escalation_model": cwg.CARBON_HIGH_MODEL,
             },
         },
-        "progress_transparency": {
-            "channel": "PLANNER_RESPONSE.content + PreInvocation continuity guard",
-            "swarm_sidecar_uri": rio.SWARM_SIDECAR_URI,
-        },
         "codex_lane": codex_info,
         "memory": mem,
         "active_chips": chips_info.get("active_count", 0),

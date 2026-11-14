@@ -29,7 +29,6 @@ description: End-to-end engineering execution workflow for Gemini Carbon: orient
 ## 4. Верификация и закрытие (Verify & Close)
 
 - Запустите реальные тесты, сборку и проверки типов для затронутой функциональности.
-- Перед блокирующим запуском финальной проверки (`codex_lane.py review` или `swarm`) отправьте уведомление о старте проверки в основном чате в одном шаге с `tool_calls` (см. единые правила видимости в `AGENTS.md §6`).
 - Для немалых `STANDARD` и всех `HIGH`/`XHIGH` правок выполните проход `simplify-reviewer`.
 - Для `HIGH`/`XHIGH` получите свежий `VERDICT: APPROVED` через `/adversarial-review` после финальной правки.
 - Завершите ответ точной квитанцией `[gate]` согласно навыку `development-verification`.
