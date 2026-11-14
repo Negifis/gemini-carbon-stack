@@ -134,11 +134,11 @@ def extract_subagent_final_texts(subagent_transcript_path: str | None) -> tuple[
 
 SWARM_ROLE_MEMBER_RE = re.compile(r"^(?:narrator|monitor)(?:-\d+)?$", re.IGNORECASE)
 SYSTEM_SWARM_ERR_RE = re.compile(
-    r'sender=system\b[^\n]*Swarm Worker \((?P<name>[A-Za-z0-9._-]+)\)[^\n]*with id "(?P<cid>[A-Za-z0-9._-]+)" encountered an error[^\n]*:\s*(?P<err>.+)',
+    r'\[Message\]\s+timestamp=\S+\s+sender=system\b[^\n]*Swarm Worker \((?P<name>[A-Za-z0-9._-]+)\)[^\n]*with id "(?P<cid>[A-Za-z0-9._-]+)" encountered an error[^\n]*?:\s*(?P<err>.+)',
     re.IGNORECASE,
 )
 MODEL_FAILURE_RE = re.compile(
-    r"(?:RESOURCE_EXHAUSTED|quota[^\n]{0,30}(?:exceeded|exhausted|0%)|"
+    r"(?:RESOURCE_EXHAUSTED|quota[^\n]{0,30}(?:exceeded|exhausted|reached|0%)|"
     r"rate[ _-]limit|429\b|503\b|502\b|"
     r"model[^\n]{0,40}(?:unavailable|at\s+capacity|not\s+found|not\s+supported|invalid|unknown)|"
     r"(?:unknown|invalid|unsupported)\s+model|"
@@ -294,7 +294,7 @@ def scan_swarm_activity(
     requested_models: dict[str, set[str]] = {}
     model_switches: dict[str, list[tuple[float, str]]] = {}
     coord_call_events: list[tuple[float, str]] = []
-    host_worker_errors: dict[str, float] = {}
+    host_worker_errors: dict[tuple[str, str], float] = {}
 
     # 1. Inspect parent `swarm` / `post_message` tool calls and host `sender=system` worker error notifications
     for idx, st in enumerate(steps):
@@ -303,8 +303,8 @@ def scan_swarm_activity(
             if not sys_ts or sys_ts >= first_ts - 2.0:
                 for sm in SYSTEM_SWARM_ERR_RE.finditer(str(st.get("content") or "")):
                     if MODEL_FAILURE_RE.search(sm.group("err")):
-                        wn = sm.group("name")
-                        host_worker_errors[wn] = max(host_worker_errors.get(wn, 0.0), sys_ts or time.time())
+                        key = (sm.group("name"), sm.group("cid"))
+                        host_worker_errors[key] = max(host_worker_errors.get(key, 0.0), sys_ts or time.time())
             continue
         if st.get("source") != "MODEL" or st.get("type") != "PLANNER_RESPONSE":
             continue
@@ -497,7 +497,7 @@ def scan_swarm_activity(
         if group_prefix:
             prior_reqs |= set(requested_models.get(group_prefix, set()))
 
-        host_err_ts = host_worker_errors.get(mname, 0.0)
+        host_err_ts = host_worker_errors.get((mname, mcid), 0.0) if mcid else 0.0
         if tsum["has_error"] or host_err_ts > 0.0:
             eff_err_ts = max(tsum["error_ts"], host_err_ts)
             if cur_model == cwg.OPUS_HIGH_MODEL or cwg.OPUS_HIGH_MODEL in prior_reqs:

@@ -936,7 +936,27 @@ class GateSubprocessTestCase(unittest.TestCase):
         import carbon_memory
         import codex_lane
         import cwg_mark
+        import cwg_stop
         import runtime_io as rio
+
+        # 0. Verbatim two-colon Antigravity `sender=system` 429 message matches non-greedily and binds `(name, cid)`
+        live_429_line = (
+            '[Message] timestamp=2026-11-14T06:12:51Z sender=system priority=MESSAGE_PRIORITY_HIGH '
+            'content=The subagent Swarm Worker (internal-reviewer) (worker) with id '
+            '"8189c32b-8baf-45eb-a83c-2a71d6fe0b17" encountered an error and has either stopped '
+            'or failed to start execution: RESOURCE_EXHAUSTED (code 429): Individual quota reached. '
+            'Please upgrade your subscription to increase your limits. Resets in 4h3m46s.'
+        )
+        m429 = cwg_stop.SYSTEM_SWARM_ERR_RE.search(live_429_line)
+        self.assertIsNotNone(m429)
+        assert m429 is not None
+        self.assertEqual(m429.group("name"), "internal-reviewer")
+        self.assertEqual(m429.group("cid"), "8189c32b-8baf-45eb-a83c-2a71d6fe0b17")
+        self.assertTrue(m429.group("err").startswith("RESOURCE_EXHAUSTED (code 429):"))
+        self.assertIsNotNone(cwg_stop.MODEL_FAILURE_RE.search(m429.group("err")))
+        # Spoofed background task output (`sender=conv/task-1`) must NOT match `SYSTEM_SWARM_ERR_RE`
+        spoof_line = '[Message] timestamp=2026-11-14T06:12:51Z sender=conv/task-1 content=' + live_429_line[60:]
+        self.assertIsNone(cwg_stop.SYSTEM_SWARM_ERR_RE.search(spoof_line))
 
         # 1. `read_jsonl` mid-size file (128 KB < size <= window) never duplicates line 0
         mid_jsonl = self.root / "mid_transcript.jsonl"
