@@ -133,6 +133,10 @@ def extract_subagent_final_texts(subagent_transcript_path: str | None) -> tuple[
 
 
 SWARM_ROLE_MEMBER_RE = re.compile(r"^(?:narrator|monitor)(?:-\d+)?$", re.IGNORECASE)
+SYSTEM_SWARM_ERR_RE = re.compile(
+    r'sender=system\b[^\n]*Swarm Worker \((?P<name>[A-Za-z0-9._-]+)\)[^\n]*with id "(?P<cid>[A-Za-z0-9._-]+)" encountered an error[^\n]*:\s*(?P<err>.+)',
+    re.IGNORECASE,
+)
 MODEL_FAILURE_RE = re.compile(
     r"(?:RESOURCE_EXHAUSTED|quota[^\n]{0,30}(?:exceeded|exhausted|0%)|"
     r"rate[ _-]limit|429\b|503\b|502\b|"
@@ -290,9 +294,18 @@ def scan_swarm_activity(
     requested_models: dict[str, set[str]] = {}
     model_switches: dict[str, list[tuple[float, str]]] = {}
     coord_call_events: list[tuple[float, str]] = []
+    host_worker_errors: dict[str, float] = {}
 
-    # 1. Inspect parent `swarm` / `post_message` tool calls (aligned 1-to-1 across all tool_calls in each turn)
+    # 1. Inspect parent `swarm` / `post_message` tool calls and host `sender=system` worker error notifications
     for idx, st in enumerate(steps):
+        if st.get("source") == "SYSTEM":
+            sys_ts = rio.parse_iso_ts(st.get("created_at"))
+            if not sys_ts or sys_ts >= first_ts - 2.0:
+                for sm in SYSTEM_SWARM_ERR_RE.finditer(str(st.get("content") or "")):
+                    if MODEL_FAILURE_RE.search(sm.group("err")):
+                        wn = sm.group("name")
+                        host_worker_errors[wn] = max(host_worker_errors.get(wn, 0.0), sys_ts or time.time())
+            continue
         if st.get("source") != "MODEL" or st.get("type") != "PLANNER_RESPONSE":
             continue
         call_ts = rio.parse_iso_ts(st.get("created_at"))
@@ -484,10 +497,12 @@ def scan_swarm_activity(
         if group_prefix:
             prior_reqs |= set(requested_models.get(group_prefix, set()))
 
-        if tsum["has_error"]:
+        host_err_ts = host_worker_errors.get(mname, 0.0)
+        if tsum["has_error"] or host_err_ts > 0.0:
+            eff_err_ts = max(tsum["error_ts"], host_err_ts)
             if cur_model == cwg.OPUS_HIGH_MODEL or cwg.OPUS_HIGH_MODEL in prior_reqs:
-                _mark_opus_issue(tsum["error_ts"])
-                review_failures.append(tsum["error_ts"] or time.time())
+                _mark_opus_issue(eff_err_ts)
+                review_failures.append(eff_err_ts or time.time())
             if cur_model == cwg.SONNET_HIGH_MODEL or cwg.SONNET_HIGH_MODEL in prior_reqs:
                 sonnet_issue_verified = True
                 simplify_failures += 1
@@ -517,9 +532,10 @@ def scan_swarm_activity(
         has_reply_since_assign = bool(
             combined_outputs and (not latest_assign_ts or combined_outputs[-1][0] >= latest_assign_ts - 1.0)
         )
+        eff_park_ts = max(tsum["parked_ts"], host_err_ts)
         parked_after_assign = bool(
-            tsum["parked_or_done"]
-            and (not latest_assign_ts or not tsum["parked_ts"] or tsum["parked_ts"] >= latest_assign_ts - 0.5)
+            (tsum["parked_or_done"] or host_err_ts > 0.0)
+            and (not latest_assign_ts or not eff_park_ts or eff_park_ts >= latest_assign_ts - 0.5)
         )
 
         if not killed and latest_assign_ts >= first_ts - 2.0 and not has_reply_since_assign and not parked_after_assign:
