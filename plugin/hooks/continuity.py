@@ -19,7 +19,6 @@ sys.path.insert(0, str(HOOKS_DIR))
 sys.path.insert(0, str(TOOLS_DIR))
 
 import carbon_memory
-import codex_lane
 import gate_inbox
 import runtime_io as rio
 
@@ -141,11 +140,24 @@ def session_index_path() -> pathlib.Path:
     return rio.state_dir("hygiene") / "sessions.jsonl"
 
 
+def _reset_turn_progress_state(state: dict[str, Any]) -> None:
+    """Clear per-turn progress-visibility counters without disturbing loop guard or turn hash."""
+    state["last_progress_nudge_seq"] = -1
+    state["last_progress_nudge_kind"] = ""
+    state["last_seen_model_step_idx"] = -1
+    state["turn_model_step_seq"] = 0
+    state["turn_visible_updates"] = 0
+    state["last_visible_seq"] = 0
+    state["turn_start_ts"] = 0.0
+    state["last_visible_ts"] = 0.0
+    state["last_user_step_idx"] = None
+
+
 def load_session_state(session: str) -> dict[str, Any]:
     raw = rio.read_json(session_state_path(session), default=None)
     if isinstance(raw, dict):
         return raw
-    return {
+    state: dict[str, Any] = {
         "session": session,
         "generation": 1,
         "edits_since_checkpoint": 0,
@@ -154,19 +166,12 @@ def load_session_state(session: str) -> dict[str, Any]:
         "correction_active": False,
         "strong_correction_streak": 0,
         "lint_blocks": 0,
-        "last_progress_nudge_seq": 0,
-        "last_progress_nudge_kind": "",
-        "last_seen_model_step_idx": -1,
-        "turn_model_step_seq": 0,
-        "turn_visible_updates": 0,
-        "last_visible_seq": 0,
-        "turn_start_ts": 0.0,
-        "last_visible_ts": 0.0,
-        "last_user_step_idx": None,
         "tool_counts": {},
         "pending_warnings": [],
         "updated_ts": time.time(),
     }
+    _reset_turn_progress_state(state)
+    return state
 
 
 def save_session_state(session: str, state: dict[str, Any]) -> None:
@@ -379,12 +384,71 @@ def _build_progress_nudge(kind: str, reason: str, swarm_active: bool) -> str:
     )
 
 
+def _is_swarm_active_action(args: dict[str, Any]) -> bool:
+    return str(args.get("action") or "").lower() in ("add", "model", "status", "title")
+
+
+def _advance_turn_progress_state(
+    state: dict[str, Any],
+    model_events: list[tuple[int, bool, float]],
+    user_step_idx: int | None,
+    window_truncated_turn: bool,
+    turn_start_ts: float,
+    last_visible_ts: float,
+) -> tuple[int, int, int, float, float]:
+    """Reconcile monotonic per-turn progress counters across 120-line sliding windows."""
+    raw_prev_user = state.get("last_user_step_idx")
+    prev_user_idx = int(raw_prev_user) if isinstance(raw_prev_user, int) else None
+    raw_last_seen = state.get("last_seen_model_step_idx")
+    last_seen_idx = int(raw_last_seen) if raw_last_seen is not None else -1
+    need_turn_reset = (
+        (user_step_idx is not None and prev_user_idx is not None and user_step_idx != prev_user_idx)
+        or (not window_truncated_turn and not model_events and last_seen_idx >= 0)
+        or (bool(model_events) and model_events[-1][0] < last_seen_idx)
+    )
+    if need_turn_reset:
+        _reset_turn_progress_state(state)
+        last_seen_idx = -1
+
+    if user_step_idx is not None:
+        state["last_user_step_idx"] = user_step_idx
+    if turn_start_ts > 0:
+        state["turn_start_ts"] = turn_start_ts
+
+    seq = int(state.get("turn_model_step_seq") or 0)
+    turn_vis_count = int(state.get("turn_visible_updates") or 0)
+    last_vis_seq = int(state.get("last_visible_seq") or 0)
+    state_vis_ts = float(state.get("last_visible_ts") or 0.0)
+    for eff_idx, is_vis, ev_ts in model_events:
+        if eff_idx > last_seen_idx:
+            seq += 1
+            last_seen_idx = eff_idx
+            if is_vis:
+                turn_vis_count += 1
+                last_vis_seq = seq
+                if ev_ts > 0:
+                    state_vis_ts = ev_ts
+    state["last_seen_model_step_idx"] = last_seen_idx
+    state["turn_model_step_seq"] = seq
+    state["turn_visible_updates"] = turn_vis_count
+    state["last_visible_seq"] = last_vis_seq
+    if last_visible_ts > state_vis_ts:
+        state_vis_ts = last_visible_ts
+    state["last_visible_ts"] = state_vis_ts
+
+    eff_turn_start_ts = turn_start_ts or float(state.get("turn_start_ts") or 0.0)
+    return seq, turn_vis_count, last_vis_seq, state_vis_ts, eff_turn_start_ts
+
+
 def analyze_progress_visibility(
     steps: list[dict[str, Any]],
     now_ts: float | None = None,
     state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Inspect user-turn transcript steps for user-visible `PLANNER_RESPONSE.content` vs silent worker/tool loops."""
+    """Scan user-turn steps for visible updates vs silent loops; update `state` when supplied."""
+    # Lazy import avoids ~6ms startup overhead on PreToolUse/PostToolUse/Stop hook invocations.
+    import codex_lane
+
     now = time.time() if now_ts is None else float(now_ts)
 
     s0_idx = steps[0].get("step_index") if steps else None
@@ -404,7 +468,8 @@ def analyze_progress_visibility(
         user_step_idx = int(u_raw) if isinstance(u_raw, int) else None
         window_truncated_turn = False
     elif head_gapped:
-        # SAFETY: `read_transcript_steps` keeps `steps[0]` from file head; skip it across head gaps.
+        # INVARIANT: `read_jsonl` pins line 0 at steps[0]; when a gap separates steps[0] and steps[1],
+        # steps[0] belongs to an evicted head of transcript and cannot anchor an in-window USER_INPUT.
         turn_steps = steps[1:]
         turn_start_ts = 0.0
         user_step_idx = None
@@ -418,7 +483,6 @@ def analyze_progress_visibility(
 
     total_model_steps = 0
     visible_updates_count = 0
-    last_visible_step_idx = -1
     last_visible_model_step = 0
     last_visible_ts = 0.0
     silent_invocations = 0
@@ -432,6 +496,7 @@ def analyze_progress_visibility(
     tests_ran = False
     failed_cmd_seen = False
     pending_test_cmd = False
+    pending_stage_cmd = False
     hypothesis_shift = False
     swarm_active = False
     model_events: list[tuple[int, bool, float]] = []
@@ -451,12 +516,9 @@ def analyze_progress_visibility(
             model_events.append((eff_idx, is_vis, st_ts))
             if is_vis:
                 for tc in tcs:
-                    if isinstance(tc, dict) and str(tc.get("name") or "") == "swarm":
-                        action = str(_tc_args_dict(tc).get("action") or "").lower()
-                        if action in ("add", "model", "status", "title"):
-                            swarm_active = True
+                    if isinstance(tc, dict) and str(tc.get("name") or "") == "swarm" and _is_swarm_active_action(_tc_args_dict(tc)):
+                        swarm_active = True
                 visible_updates_count += 1
-                last_visible_step_idx = eff_idx
                 last_visible_model_step = total_model_steps
                 last_visible_ts = st_ts or last_visible_ts
                 silent_invocations = 0
@@ -470,6 +532,7 @@ def analyze_progress_visibility(
                 tests_ran = False
                 failed_cmd_seen = False
                 pending_test_cmd = False
+                pending_stage_cmd = False
                 hypothesis_shift = False
                 continue
 
@@ -490,7 +553,7 @@ def analyze_progress_visibility(
                         hypothesis_shift = True
                 elif tname == "swarm":
                     action = str(args.get("action") or "").lower()
-                    if action in ("add", "model", "status", "title"):
+                    if _is_swarm_active_action(args):
                         swarm_active = True
                     if action == "model":
                         target_model = str(args.get("model") or "fallback")
@@ -517,13 +580,13 @@ def analyze_progress_visibility(
                     if VERIFY_CMD_RE.search(cmd):
                         verification_started = True
                         verification_reason = verification_reason or "внешний Codex review"
-                    if STAGE_CMD_RE.search(cmd):
-                        stage_completed = True
+                    pending_stage_cmd = bool(STAGE_CMD_RE.search(cmd))
                     if TEST_RUNNER_RE.search(cmd):
                         tests_ran = True
                         pending_test_cmd = True
                     else:
                         pending_test_cmd = False
+                    # Codex CLI invocations should not also count as worktree chip delegation.
                     if "codex" not in cmd.lower() and CHIP_OPEN_CMD_RE.search(cmd):
                         complex_delegated = True
 
@@ -536,64 +599,33 @@ def analyze_progress_visibility(
             msg = str(st.get("content") or "")
             if NONZERO_EXIT_RE.search(msg):
                 failed_cmd_seen = True
+                if pending_stage_cmd:
+                    stage_completed = False
                 pending_test_cmd = False
+                pending_stage_cmd = False
             elif ZERO_EXIT_RE.search(msg):
+                if pending_stage_cmd:
+                    stage_completed = True
                 if pending_test_cmd:
                     failed_cmd_seen = False
                     hypothesis_shift = False
                 pending_test_cmd = False
+                pending_stage_cmd = False
 
     if state is not None:
-        raw_prev_user = state.get("last_user_step_idx")
-        prev_user_idx = int(raw_prev_user) if isinstance(raw_prev_user, int) else None
-        raw_last_seen = state.get("last_seen_model_step_idx")
-        last_seen_idx = int(raw_last_seen) if raw_last_seen is not None else -1
-        need_turn_reset = (
-            (user_step_idx is not None and prev_user_idx is not None and user_step_idx != prev_user_idx)
-            or (not window_truncated_turn and not model_events and last_seen_idx >= 0)
-            or (bool(model_events) and model_events[-1][0] < last_seen_idx)
+        turn_model_step_seq, turn_vis_count, last_vis_seq, state_vis_ts, state_turn_start_ts = (
+            _advance_turn_progress_state(
+                state,
+                model_events,
+                user_step_idx,
+                window_truncated_turn,
+                turn_start_ts,
+                last_visible_ts,
+            )
         )
-        if need_turn_reset:
-            state["last_seen_model_step_idx"] = -1
-            state["turn_model_step_seq"] = 0
-            state["turn_visible_updates"] = 0
-            state["last_visible_seq"] = 0
-            state["last_progress_nudge_seq"] = 0
-            state["last_progress_nudge_kind"] = ""
-            state["turn_start_ts"] = 0.0
-            state["last_visible_ts"] = 0.0
-            last_seen_idx = -1
-
-        if user_step_idx is not None:
-            state["last_user_step_idx"] = user_step_idx
-        if turn_start_ts > 0:
-            state["turn_start_ts"] = turn_start_ts
-
-        seq = int(state.get("turn_model_step_seq") or 0)
-        turn_vis_count = int(state.get("turn_visible_updates") or 0)
-        last_vis_seq = int(state.get("last_visible_seq") or 0)
-        state_vis_ts = float(state.get("last_visible_ts") or 0.0)
-        for eff_idx, is_vis, ev_ts in model_events:
-            if eff_idx > last_seen_idx:
-                seq += 1
-                last_seen_idx = eff_idx
-                if is_vis:
-                    turn_vis_count += 1
-                    last_vis_seq = seq
-                    if ev_ts > 0:
-                        state_vis_ts = ev_ts
-        state["last_seen_model_step_idx"] = last_seen_idx
-        state["turn_model_step_seq"] = seq
-        state["turn_visible_updates"] = turn_vis_count
-        state["last_visible_seq"] = last_vis_seq
-        if last_visible_ts > state_vis_ts:
-            state_vis_ts = last_visible_ts
-        state["last_visible_ts"] = state_vis_ts
-
-        turn_model_step_seq = seq
         eff_visible_count = max(visible_updates_count, turn_vis_count)
         eff_last_visible_ts = last_visible_ts or state_vis_ts
-        eff_turn_start_ts = turn_start_ts or float(state.get("turn_start_ts") or 0.0) or (
+        eff_turn_start_ts = state_turn_start_ts or (
             rio.parse_iso_ts(turn_steps[0].get("created_at")) if turn_steps else 0.0
         )
     else:
@@ -610,6 +642,7 @@ def analyze_progress_visibility(
     if breaker.get("tripped"):
         tripped_at = float(breaker.get("tripped_at") or 0.0)
         anchor_ts = max(eff_turn_start_ts, eff_last_visible_ts)
+        # Allow 5s forward skew in case the breaker file was stamped cleanly by another process.
         if tripped_at > anchor_ts and tripped_at <= now + 5:
             reason_code = str(breaker.get("reason") or "outage")[:80]
             blocker_reason = blocker_reason or f"открыт circuit breaker Codex ({reason_code})"
@@ -652,11 +685,8 @@ def analyze_progress_visibility(
     )
 
     return {
-        "total_model_steps": total_model_steps,
         "turn_model_step_seq": turn_model_step_seq,
         "visible_updates_count": eff_visible_count,
-        "last_visible_step_idx": last_visible_step_idx,
-        "last_visible_model_step": last_visible_model_step,
         "last_visible_seq": last_vis_seq,
         "silent_invocations": silent_invocations,
         "silent_board_comms": silent_board_comms,
@@ -696,16 +726,7 @@ def handle_pre_invocation(payload: dict[str, Any]) -> None:
         state["generation"] = int(state.get("generation") or 1) + 1
         state["tool_counts"] = {}
         state["lint_blocks"] = 0
-        state["last_progress_nudge_seq"] = 0
-        state["last_progress_nudge_kind"] = ""
-        state["last_seen_model_step_idx"] = -1
-        state["turn_model_step_seq"] = 0
-        state["turn_visible_updates"] = 0
-        state["last_visible_seq"] = 0
-        state["turn_start_ts"] = 0.0
-        state["last_visible_ts"] = 0.0
-        state["last_user_step_idx"] = None
-        state.pop("last_progress_nudge_model_step", None)
+        _reset_turn_progress_state(state)
 
         if STRONG_CORRECTION_RE.search(user_input):
             state["correction_active"] = True
@@ -758,12 +779,13 @@ def handle_pre_invocation(payload: dict[str, Any]) -> None:
     if trig:
         cur_seq = int(vis.get("turn_model_step_seq") or 0)
         last_vis_seq = int(vis.get("last_visible_seq") or 0)
-        last_nudge_seq = int(state.get("last_progress_nudge_seq") or 0)
+        last_nudge_seq = int(state.get("last_progress_nudge_seq") if state.get("last_progress_nudge_seq") is not None else -1)
         last_nudge_kind = str(state.get("last_progress_nudge_kind") or "")
+        # Require strict `>` so a SYSTEM_MESSAGE arriving after visible step `N` does not treat pre-nudge step `N` as post-nudge acknowledgement.
         no_prior_nudge_in_episode = (
-            last_nudge_seq <= 0
-            or last_vis_seq >= last_nudge_seq
-            or cur_seq < last_nudge_seq
+            (not last_nudge_kind)
+            or last_nudge_seq < 0
+            or last_vis_seq > last_nudge_seq
         )
         cooldown_ok = (
             no_prior_nudge_in_episode

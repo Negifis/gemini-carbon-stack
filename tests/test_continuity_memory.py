@@ -330,20 +330,32 @@ class ContinuityAndMemoryTestCase(unittest.TestCase):
         self._write_transcript_steps(short_steps)
         self.assertEqual(self.run_continuity_hook("PreInvocation", {"initialNumSteps": 3, "lastUserInput": turn}), {})
 
-        # 2. Visible start -> stage_complete (`install.py` sync after edits) + cooldown checks
+        # 2. Visible start -> stage_complete (`install.py` sync confirmed by exit 0); non-zero exit must NOT fire stage_complete
         stage_steps = short_steps + [
             {"step_index": 3, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 6), "content": "Начинаю правки модулей.", "tool_calls": [{"name": "edit_file", "args": {"Path": "a.py"}}]},
             {"step_index": 4, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 8), "content": "", "tool_calls": [{"name": "run_command", "args": {"CommandLine": "python -X utf8 install.py"}}]},
+            {"step_index": 5, "source": "MODEL", "type": "GENERIC", "created_at": self._iso_offset(now, 9), "content": "Command exited with code 0."},
         ]
         self.assertEqual(continuity.analyze_progress_visibility(stage_steps, now_ts=now + 10)["trigger"], "stage_complete")
 
-        # 3. Hypothesis change (failed test -> subsequent edit) and reset when test passes
+        failed_stage_steps = stage_steps[:4] + [
+            {"step_index": 4, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 8), "content": "", "tool_calls": [{"name": "run_command", "args": {"CommandLine": "git commit -m test"}}]},
+            {"step_index": 5, "source": "MODEL", "type": "GENERIC", "created_at": self._iso_offset(now, 9), "content": "Command exited with code 1."},
+        ]
+        self.assertIsNone(continuity.analyze_progress_visibility(failed_stage_steps, now_ts=now + 10)["trigger"])
+
+        # 3. Hypothesis change (failed test -> subsequent edit) and reset when passing test exits 0
         hyp_steps = stage_steps[:4] + [
             {"step_index": 4, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 8), "content": "", "tool_calls": [{"name": "run_command", "args": {"CommandLine": "pytest -q"}}]},
             {"step_index": 5, "source": "MODEL", "type": "GENERIC", "created_at": self._iso_offset(now, 9), "content": "Command exited with code 1."},
             {"step_index": 6, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 12), "content": "", "tool_calls": [{"name": "edit_file", "args": {"Path": "a.py"}}]},
         ]
         self.assertEqual(continuity.analyze_progress_visibility(hyp_steps, now_ts=now + 15)["trigger"], "hypothesis_change")
+        resolved_hyp_steps = hyp_steps + [
+            {"step_index": 7, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 16), "content": "", "tool_calls": [{"name": "run_command", "args": {"CommandLine": "pytest -q"}}]},
+            {"step_index": 8, "source": "MODEL", "type": "GENERIC", "created_at": self._iso_offset(now, 17), "content": "Command exited with code 0."},
+        ]
+        self.assertIsNone(continuity.analyze_progress_visibility(resolved_hyp_steps, now_ts=now + 18)["trigger"])
 
         # 4. Cooldown suppression: emit nudge once, verify next non-critical step within cooldown does not nag
         self._write_transcript_steps(hyp_steps)
@@ -379,6 +391,40 @@ class ContinuityAndMemoryTestCase(unittest.TestCase):
             {"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 5), "content": "", "tool_calls": [{"name": "swarm", "args": {"action": "add", "name": "impl-auth", "brief": "Implement auth endpoints before code review"}}]},
         ]
         self.assertEqual(continuity.analyze_progress_visibility(builder_steps, now_ts=now + 6)["trigger"], "complex_start")
+
+        # 5d. Blocker arriving right after a visible response (last_vis_seq == cur_seq) must NOT fire twice on the next silent step
+        seq_turn = "Тест строгого сравнения last_vis_seq > last_nudge_seq"
+        seq_steps = [
+            {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": self._iso_offset(now, 0), "content": seq_turn},
+            {"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 2), "content": "Начинаю работу над модулем.", "tool_calls": [{"name": "read_file", "args": {"Path": "a.py"}}]},
+            {"step_index": 2, "source": "SYSTEM_SDK", "type": "SYSTEM_MESSAGE", "created_at": self._iso_offset(now, 4), "content": "RESOURCE_EXHAUSTED (code 429): Individual quota reached"},
+        ]
+        self._write_transcript_steps(seq_steps)
+        blk1 = self.run_continuity_hook("PreInvocation", {"initialNumSteps": len(seq_steps), "lastUserInput": seq_turn})
+        self.assertIn("Блокер", blk1["injectSteps"][0]["systemMessage"]["systemMessage"])
+        # Next silent step at seq=2 sees last_vis_seq=1 == last_nudge_seq=1 (pre-nudge visible step), so cooldown suppresses repeat
+        seq_steps.append({"step_index": 3, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 6), "content": "", "tool_calls": [{"name": "read_file", "args": {"Path": "b.py"}}]})
+        self._write_transcript_steps(seq_steps)
+        self.assertEqual(self.run_continuity_hook("PreInvocation", {"initialNumSteps": len(seq_steps), "lastUserInput": seq_turn}), {})
+        # A visible response AFTER the nudge resets the episode cleanly
+        seq_steps.append({"step_index": 4, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 8), "content": "Переключил квоту, продолжаю.", "tool_calls": [{"name": "read_file", "args": {"Path": "c.py"}}]})
+        seq_steps.append({"step_index": 5, "source": "SYSTEM_SDK", "type": "SYSTEM_MESSAGE", "created_at": self._iso_offset(now, 10), "content": "RESOURCE_EXHAUSTED (code 429): Quota again"})
+        self._write_transcript_steps(seq_steps)
+        blk2 = self.run_continuity_hook("PreInvocation", {"initialNumSteps": len(seq_steps), "lastUserInput": seq_turn})
+        self.assertIn("Блокер", blk2["injectSteps"][0]["systemMessage"]["systemMessage"])
+
+        # Same cooldown suppression holds when a blocker arrives at cur_seq == 0 (before any PLANNER_RESPONSE)
+        zero_turn = "Блокер на нулевом шаге модели"
+        zero_steps = [
+            {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": self._iso_offset(now, 0), "content": zero_turn},
+            {"step_index": 1, "source": "SYSTEM_SDK", "type": "SYSTEM_MESSAGE", "created_at": self._iso_offset(now, 2), "content": "RESOURCE_EXHAUSTED (code 429): Quota at start"},
+        ]
+        self._write_transcript_steps(zero_steps)
+        z1 = self.run_continuity_hook("PreInvocation", {"initialNumSteps": len(zero_steps), "lastUserInput": zero_turn})
+        self.assertIn("Блокер", z1["injectSteps"][0]["systemMessage"]["systemMessage"])
+        zero_steps.append({"step_index": 2, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 4), "content": "", "tool_calls": [{"name": "read_file", "args": {"Path": "a.py"}}]})
+        self._write_transcript_steps(zero_steps)
+        self.assertEqual(self.run_continuity_hook("PreInvocation", {"initialNumSteps": len(zero_steps), "lastUserInput": zero_turn}), {})
 
         # 6. Multi-window (>120 lines) sliding regression: monotonic cooldown without complex_start misfire
         long_turn = "Длинная задача со скользящим окном >120 строк"
