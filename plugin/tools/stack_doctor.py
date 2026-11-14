@@ -165,7 +165,7 @@ def run_diagnostics(cwd: str = "") -> dict[str, Any]:
         },
         "progress_transparency": {
             "channel": "PLANNER_RESPONSE.content + PreInvocation continuity guard",
-            "swarm_sidecar_uri": "sidecar://swarm/swarm_board/?auto_open=false",
+            "swarm_sidecar_uri": rio.SWARM_SIDECAR_URI,
         },
         "codex_lane": codex_info,
         "memory": mem,

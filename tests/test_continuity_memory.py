@@ -253,17 +253,21 @@ class ContinuityAndMemoryTestCase(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def _iso_offset(self, base_ts: float, dt: float) -> str:
+        import time
+
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(base_ts + dt))
+
     def test_05_progress_visibility_ignores_worker_messages_and_resets_on_visible_content(self) -> None:
         import time
 
         now = time.time()
-        iso = lambda dt: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + dt))
         steps = [
-            {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": iso(0), "content": "Выполни сложную миграцию"},
-            {"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": iso(5), "content": "", "tool_calls": [{"name": "post_message", "args": {"text": "worker ping"}}]},
-            {"step_index": 2, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": iso(10), "content": "", "tool_calls": [{"name": "send_message", "args": {"Recipient": "sub-1", "Message": "do x"}}]},
-            {"step_index": 3, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": iso(15), "content": "", "tool_calls": [{"name": "read_board", "args": {"since": 1}}]},
-            {"step_index": 4, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": iso(20), "content": "", "tool_calls": [{"name": "swarm_wait", "args": {"since": 1}}]},
+            {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": self._iso_offset(now, 0), "content": "Выполни сложную миграцию"},
+            {"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 5), "content": "", "tool_calls": [{"name": "post_message", "args": {"text": "worker ping"}}]},
+            {"step_index": 2, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 10), "content": "", "tool_calls": [{"name": "send_message", "args": {"Recipient": "sub-1", "Message": "do x"}}]},
+            {"step_index": 3, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 15), "content": "", "tool_calls": [{"name": "read_board", "args": {"since": 1}}]},
+            {"step_index": 4, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 20), "content": "", "tool_calls": [{"name": "swarm_wait", "args": {"since": 1}}]},
         ]
         self._write_transcript_steps(steps)
 
@@ -277,7 +281,7 @@ class ContinuityAndMemoryTestCase(unittest.TestCase):
         )
         rep = json.loads(prog.stdout)
         self.assertEqual(rep["visible_updates_count"], 0)
-        self.assertEqual(rep["silent_worker_comms"], 4)
+        self.assertEqual(rep["silent_board_comms"], 4)
         self.assertEqual(rep["trigger"], "complex_start")
 
         out1 = self.run_continuity_hook("PreInvocation", {"initialNumSteps": len(steps), "lastUserInput": "Выполни сложную миграцию"})
@@ -291,7 +295,7 @@ class ContinuityAndMemoryTestCase(unittest.TestCase):
                 "step_index": 5,
                 "source": "MODEL",
                 "type": "PLANNER_RESPONSE",
-                "created_at": iso(25),
+                "created_at": self._iso_offset(now, 25),
                 "content": "Изучил модуль и перешёл к реализации изменений.",
                 "tool_calls": [{"name": "read_file", "args": {"Path": "main.py"}}],
             }
@@ -315,30 +319,29 @@ class ContinuityAndMemoryTestCase(unittest.TestCase):
         import continuity
 
         now = time.time()
-        iso = lambda dt: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + dt))
         turn = "Реализуй новый контур"
 
         # 1. Short simple task (2 read steps) -> zero nags
         short_steps = [
-            {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": iso(0), "content": turn},
-            {"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": iso(2), "content": "", "tool_calls": [{"name": "read_file", "args": {"Path": "a.py"}}]},
-            {"step_index": 2, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": iso(4), "content": "", "tool_calls": [{"name": "read_file", "args": {"Path": "b.py"}}]},
+            {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": self._iso_offset(now, 0), "content": turn},
+            {"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 2), "content": "", "tool_calls": [{"name": "read_file", "args": {"Path": "a.py"}}]},
+            {"step_index": 2, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 4), "content": "", "tool_calls": [{"name": "read_file", "args": {"Path": "b.py"}}]},
         ]
         self._write_transcript_steps(short_steps)
         self.assertEqual(self.run_continuity_hook("PreInvocation", {"initialNumSteps": 3, "lastUserInput": turn}), {})
 
         # 2. Visible start -> stage_complete (`install.py` sync after edits) + cooldown checks
         stage_steps = short_steps + [
-            {"step_index": 3, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": iso(6), "content": "Начинаю правки модулей.", "tool_calls": [{"name": "edit_file", "args": {"Path": "a.py"}}]},
-            {"step_index": 4, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": iso(8), "content": "", "tool_calls": [{"name": "run_command", "args": {"CommandLine": "python -X utf8 install.py"}}]},
+            {"step_index": 3, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 6), "content": "Начинаю правки модулей.", "tool_calls": [{"name": "edit_file", "args": {"Path": "a.py"}}]},
+            {"step_index": 4, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 8), "content": "", "tool_calls": [{"name": "run_command", "args": {"CommandLine": "python -X utf8 install.py"}}]},
         ]
         self.assertEqual(continuity.analyze_progress_visibility(stage_steps, now_ts=now + 10)["trigger"], "stage_complete")
 
-        # 3. Hypothesis change (failed test -> subsequent edit)
+        # 3. Hypothesis change (failed test -> subsequent edit) and reset when test passes
         hyp_steps = stage_steps[:4] + [
-            {"step_index": 4, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": iso(8), "content": "", "tool_calls": [{"name": "run_command", "args": {"CommandLine": "pytest -q"}}]},
-            {"step_index": 5, "source": "MODEL", "type": "GENERIC", "created_at": iso(9), "content": "Command exited with code 1."},
-            {"step_index": 6, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": iso(12), "content": "", "tool_calls": [{"name": "edit_file", "args": {"Path": "a.py"}}]},
+            {"step_index": 4, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 8), "content": "", "tool_calls": [{"name": "run_command", "args": {"CommandLine": "pytest -q"}}]},
+            {"step_index": 5, "source": "MODEL", "type": "GENERIC", "created_at": self._iso_offset(now, 9), "content": "Command exited with code 1."},
+            {"step_index": 6, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 12), "content": "", "tool_calls": [{"name": "edit_file", "args": {"Path": "a.py"}}]},
         ]
         self.assertEqual(continuity.analyze_progress_visibility(hyp_steps, now_ts=now + 15)["trigger"], "hypothesis_change")
 
@@ -346,30 +349,78 @@ class ContinuityAndMemoryTestCase(unittest.TestCase):
         self._write_transcript_steps(hyp_steps)
         nudge_hyp = self.run_continuity_hook("PreInvocation", {"initialNumSteps": len(hyp_steps), "lastUserInput": turn})
         self.assertIn("Смена гипотезы", nudge_hyp["injectSteps"][0]["systemMessage"]["systemMessage"])
-        hyp_steps.append({"step_index": 7, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": iso(16), "content": "", "tool_calls": [{"name": "edit_file", "args": {"Path": "a.py"}}]})
+        hyp_steps.append({"step_index": 7, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 16), "content": "", "tool_calls": [{"name": "edit_file", "args": {"Path": "a.py"}}]})
         self._write_transcript_steps(hyp_steps)
         self.assertEqual(self.run_continuity_hook("PreInvocation", {"initialNumSteps": len(hyp_steps), "lastUserInput": turn}), {})
 
-        # 5. Urgent `blocker` breaks cooldown immediately, and `verification_start` fires with Swarm UI pill when swarm active
-        hyp_steps.append({"step_index": 8, "source": "SYSTEM", "type": "SYSTEM_MESSAGE", "created_at": iso(18), "content": "RESOURCE_EXHAUSTED (code 429): Individual quota reached"})
+        # 5. Urgent `blocker` breaks cooldown (SYSTEM & SYSTEM_SDK), and `verification_start` includes Swarm UI pill
+        hyp_steps.append({"step_index": 8, "source": "SYSTEM_SDK", "type": "SYSTEM_MESSAGE", "created_at": self._iso_offset(now, 18), "content": "RESOURCE_EXHAUSTED (code 429): Individual quota reached"})
         self._write_transcript_steps(hyp_steps)
         nudge_blk = self.run_continuity_hook("PreInvocation", {"initialNumSteps": len(hyp_steps), "lastUserInput": turn})
         self.assertIn("Блокер", nudge_blk["injectSteps"][0]["systemMessage"]["systemMessage"])
 
         verify_steps = hyp_steps[:4] + [
-            {"step_index": 4, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": iso(10), "content": "", "tool_calls": [{"name": "swarm", "args": {"action": "add", "name": "simplify-reuse", "brief": "Simplify review"}}]},
+            {"step_index": 4, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 10), "content": "", "tool_calls": [{"name": "swarm", "args": {"action": "add", "name": "simplify-reuse", "brief": "SIMPLIFY_LENS: REUSE"}}]},
         ]
         vrep = continuity.analyze_progress_visibility(verify_steps, now_ts=now + 12)
         self.assertEqual(vrep["trigger"], "verification_start")
         self.assertIn("sidecar://swarm/swarm_board/", vrep["trigger_message"])
 
-        # 6. Worker/subagent transcript is completely ignored by PreInvocation progress tracker
+        # 5b. Paired visible report + verification launch suppresses duplicate nudge while keeping swarm_active
+        paired_verify_steps = short_steps[:1] + [
+            {"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 5), "content": "Запускаю финальное simplify-ревью.", "tool_calls": [{"name": "swarm", "args": {"action": "add", "name": "simplify-reuse", "brief": "SIMPLIFY_LENS: REUSE"}}]},
+        ]
+        prep = continuity.analyze_progress_visibility(paired_verify_steps, now_ts=now + 6)
+        self.assertIsNone(prep["trigger"])
+        self.assertTrue(prep["swarm_active"])
+
+        # 5c. Implementation swarm worker whose brief mentions "review" must NOT trigger verification_start
+        builder_steps = short_steps[:1] + [
+            {"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 5), "content": "", "tool_calls": [{"name": "swarm", "args": {"action": "add", "name": "impl-auth", "brief": "Implement auth endpoints before code review"}}]},
+        ]
+        self.assertEqual(continuity.analyze_progress_visibility(builder_steps, now_ts=now + 6)["trigger"], "complex_start")
+
+        # 6. Multi-window (>120 lines) sliding regression: monotonic cooldown without complex_start misfire
+        long_turn = "Длинная задача со скользящим окном >120 строк"
+        long_steps = [
+            {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": self._iso_offset(now, 0), "content": long_turn},
+            {"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 2), "content": "Стартовал анализ и перехожу к реализации.", "tool_calls": [{"name": "read_file", "args": {"Path": "m.py"}}]},
+        ]
+        self._write_transcript_steps(long_steps)
+        self.assertEqual(self.run_continuity_hook("PreInvocation", {"initialNumSteps": len(long_steps), "lastUserInput": long_turn}), {})
+
+        # Grow past 118 lines first, then step through 120..162 (exceeding 145 total lines & dropping step_index=1)
+        idx = 2
+        while len(long_steps) < 118:
+            long_steps.append({"step_index": idx, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, idx * 2), "content": "", "tool_calls": [{"name": "read_file", "args": {"Path": f"f{idx}.py"}}]})
+            long_steps.append({"step_index": idx + 1, "source": "MODEL", "type": "GENERIC", "created_at": self._iso_offset(now, idx * 2 + 1), "content": "ok"})
+            idx += 2
+
+        nudge_indices: list[int] = []
+        while idx <= 162:
+            long_steps.append({"step_index": idx, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, idx * 2), "content": "", "tool_calls": [{"name": "read_file", "args": {"Path": f"f{idx}.py"}}]})
+            long_steps.append({"step_index": idx + 1, "source": "MODEL", "type": "GENERIC", "created_at": self._iso_offset(now, idx * 2 + 1), "content": "ok"})
+            self._write_transcript_steps(long_steps)
+            out = self.run_continuity_hook("PreInvocation", {"initialNumSteps": len(long_steps), "lastUserInput": long_turn})
+            if out:
+                sys_msg = out["injectSteps"][0]["systemMessage"]["systemMessage"]
+                self.assertNotIn("Старт сложной задачи", sys_msg)
+                self.assertIn("Регулярный статус", sys_msg)
+                nudge_indices.append(idx)
+            idx += 2
+
+        self.assertGreater(len(long_steps), 145)
+        self.assertGreaterEqual(len(nudge_indices), 4)
+        for prev_i, cur_i in zip(nudge_indices, nudge_indices[1:]):
+            self.assertEqual((cur_i - prev_i) // 2, continuity.PROGRESS_NUDGE_COOLDOWN_STEPS)
+
+        # 7. Worker/subagent transcript is completely ignored by PreInvocation progress tracker
         worker_tp = self.root / "worker_transcript_full.jsonl"
         worker_steps = [
-            {"step_index": 0, "source": "SYSTEM", "type": "SYSTEM_MESSAGE", "created_at": iso(0), "content": "[Message] timestamp=2026-11-14T10:00:00Z sender=coord content=<swarm_worker> check files"},
-            {"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": iso(2), "content": "", "tool_calls": [{"name": "post_message", "args": {"text": "done"}}]},
-            {"step_index": 2, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": iso(4), "content": "", "tool_calls": [{"name": "swarm_wait", "args": {"since": 1}}]},
-            {"step_index": 3, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": iso(6), "content": "", "tool_calls": [{"name": "swarm_wait", "args": {"since": 2}}]},
+            {"step_index": 0, "source": "SYSTEM", "type": "SYSTEM_MESSAGE", "created_at": self._iso_offset(now, 0), "content": "[Message] timestamp=2026-11-14T10:00:00Z sender=coord content=<swarm_worker> check files"},
+            {"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 2), "content": "", "tool_calls": [{"name": "post_message", "args": {"text": "done"}}]},
+            {"step_index": 2, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 4), "content": "", "tool_calls": [{"name": "swarm_wait", "args": {"since": 1}}]},
+            {"step_index": 3, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 6), "content": "", "tool_calls": [{"name": "swarm_wait", "args": {"since": 2}}]},
         ]
         worker_tp.write_text("\n".join(json.dumps(s) for s in worker_steps) + "\n", encoding="utf-8")
         wout = self.run_continuity_hook("PreInvocation", {"transcriptPath": str(worker_tp), "initialNumSteps": 4, "lastUserInput": "check"})

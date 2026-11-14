@@ -35,6 +35,8 @@ NON_ENFORCEABLE_STOP_REASONS = frozenset(
     }
 )
 
+SWARM_SIDECAR_URI = "sidecar://swarm/swarm_board/?auto_open=false"
+
 
 def stack_home() -> pathlib.Path:
     override = os.environ.get("CARBON_STACK_HOME")

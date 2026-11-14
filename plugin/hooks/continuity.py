@@ -19,6 +19,7 @@ sys.path.insert(0, str(HOOKS_DIR))
 sys.path.insert(0, str(TOOLS_DIR))
 
 import carbon_memory
+import codex_lane
 import gate_inbox
 import runtime_io as rio
 
@@ -31,11 +32,12 @@ TREE_LOCK_TTL_SECONDS = 1800  # 30 minutes active heartbeat window
 
 PROGRESS_COMPLEX_START_STEPS = 3
 PROGRESS_HEARTBEAT_STEPS = 8
-PROGRESS_WORKER_SILENCE_STEPS = 3
+PROGRESS_BOARD_SILENCE_STEPS = 3
 PROGRESS_HEARTBEAT_SECONDS = 60
 PROGRESS_NUDGE_COOLDOWN_STEPS = 6
 
-WORKER_ONLY_TOOLS = frozenset({"post_message", "send_message", "swarm", "swarm_wait", "read_board"})
+# Swarm/subagent messaging channels write only to board.jsonl / inbox and never surface in main chat.
+BOARD_COMMS_TOOLS = frozenset({"post_message", "send_message", "swarm", "swarm_wait", "read_board"})
 
 TEST_RUNNER_RE = re.compile(
     r"\b(?:pytest|py\.test|unittest|npm\s+test|pnpm\s+test|yarn\s+test|cargo\s+test|go\s+test|dotnet\s+test)\b",
@@ -44,12 +46,12 @@ TEST_RUNNER_RE = re.compile(
 
 PROGRESS_BLOCKER_SYS_RE = re.compile(
     r"(?:RESOURCE_EXHAUSTED|code\s+429|quota[^\n.]{0,30}(?:exceeded|exhausted|reached|0%)|"
-    r"failed\s+to\s+start\s+execution|ERROR_MESSAGE|\[Code\s+Work\s+Gate\][^\n]*(?:блокир|block)|"
-    r"\[Continuity\s+Output\s+Lint\])",
+    r"failed\s+to\s+start\s+execution|ERROR_MESSAGE|\[Code\s+Work\s+Gate\][^\n]*(?:блокир|block))",
     re.IGNORECASE,
 )
 
 NONZERO_EXIT_RE = re.compile(r"Command\s+exited\s+with\s+code\s+(?!0\b)\d+", re.IGNORECASE)
+ZERO_EXIT_RE = re.compile(r"Command\s+exited\s+with\s+code\s+0\b", re.IGNORECASE)
 STAGE_CMD_RE = re.compile(
     r"\b(?:install\.py(?![^\n]*--(?:dry-run|diagnose)\b)|"
     r"git(?:\.exe)?\s+(?:-C\s+\S+\s+)?commit\b|"
@@ -57,8 +59,13 @@ STAGE_CMD_RE = re.compile(
     re.IGNORECASE,
 )
 VERIFY_CMD_RE = re.compile(r"codex_lane\.py[\"']?\s+review\b", re.IGNORECASE)
-SWARM_VERIFY_RE = re.compile(r"\b(?:simplify|review|adversarial)\b", re.IGNORECASE)
-SWARM_UI_PILL = "[Open the Swarm UI](sidecar://swarm/swarm_board/?auto_open=false)"
+CHIP_OPEN_CMD_RE = re.compile(r"\bchip_handoff\.py\s+open\b", re.IGNORECASE)
+SWARM_VERIFY_NAME_RE = re.compile(r"\b(?:simplify|review|adversarial)\b", re.IGNORECASE)
+SWARM_VERIFY_BRIEF_RE = re.compile(
+    r"(?:SIMPLIFY_LENS\s*:|SIMPLIFY_VERDICT\s*:|CLOSURE_VALIDATION\s*:|VERDICT\s*:\s*APPROVED|adversarial\s+(?:code\s+)?review)",
+    re.IGNORECASE,
+)
+SWARM_UI_PILL = f"[Open the Swarm UI]({rio.SWARM_SIDECAR_URI})"
 
 CANONICAL_SECTIONS = (
     "GOAL",
@@ -147,8 +154,15 @@ def load_session_state(session: str) -> dict[str, Any]:
         "correction_active": False,
         "strong_correction_streak": 0,
         "lint_blocks": 0,
-        "last_progress_nudge_model_step": 0,
+        "last_progress_nudge_seq": 0,
         "last_progress_nudge_kind": "",
+        "last_seen_model_step_idx": -1,
+        "turn_model_step_seq": 0,
+        "turn_visible_updates": 0,
+        "last_visible_seq": 0,
+        "turn_start_ts": 0.0,
+        "last_visible_ts": 0.0,
+        "last_user_step_idx": None,
         "tool_counts": {},
         "pending_warnings": [],
         "updated_ts": time.time(),
@@ -322,7 +336,7 @@ def _tc_args_dict(tc: dict[str, Any]) -> dict[str, Any]:
         try:
             parsed = json.loads(args)
             return parsed if isinstance(parsed, dict) else {}
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError):
             return {}
     return {}
 
@@ -365,21 +379,42 @@ def _build_progress_nudge(kind: str, reason: str, swarm_active: bool) -> str:
     )
 
 
-def analyze_progress_visibility(steps: list[dict[str, Any]], now_ts: float | None = None) -> dict[str, Any]:
+def analyze_progress_visibility(
+    steps: list[dict[str, Any]],
+    now_ts: float | None = None,
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Inspect user-turn transcript steps for user-visible `PLANNER_RESPONSE.content` vs silent worker/tool loops."""
     now = time.time() if now_ts is None else float(now_ts)
 
+    s0_idx = steps[0].get("step_index") if steps else None
+    s1_idx = steps[1].get("step_index") if len(steps) >= 2 else None
+    head_gapped = isinstance(s0_idx, int) and isinstance(s1_idx, int) and s1_idx > s0_idx + 1
+
     last_user_pos = -1
-    for i, st in enumerate(steps):
+    for i in range(1 if head_gapped else 0, len(steps)):
+        st = steps[i]
         if st.get("source") == "USER_EXPLICIT" and st.get("type") == "USER_INPUT":
             last_user_pos = i
+
     if last_user_pos >= 0:
         turn_steps = steps[last_user_pos + 1 :]
         turn_start_ts = rio.parse_iso_ts(steps[last_user_pos].get("created_at"))
+        u_raw = steps[last_user_pos].get("step_index")
+        user_step_idx = int(u_raw) if isinstance(u_raw, int) else None
+        window_truncated_turn = False
+    elif head_gapped:
+        # SAFETY: `read_transcript_steps` keeps `steps[0]` from file head; skip it across head gaps.
+        turn_steps = steps[1:]
+        turn_start_ts = 0.0
+        user_step_idx = None
+        window_truncated_turn = True
     else:
-        # SAFETY: `read_transcript_steps` keeps `steps[0]` from file head; skip `steps[0]` when `USER_INPUT` scrolled out.
-        turn_steps = steps[1:] if len(steps) > 1 else []
-        turn_start_ts = rio.parse_iso_ts(turn_steps[0].get("created_at")) if turn_steps else 0.0
+        has_indices = any(isinstance(st.get("step_index"), int) for st in steps)
+        turn_steps = steps if has_indices else (steps[1:] if len(steps) > 1 else [])
+        turn_start_ts = 0.0
+        user_step_idx = None
+        window_truncated_turn = True
 
     total_model_steps = 0
     visible_updates_count = 0
@@ -387,8 +422,7 @@ def analyze_progress_visibility(steps: list[dict[str, Any]], now_ts: float | Non
     last_visible_model_step = 0
     last_visible_ts = 0.0
     silent_invocations = 0
-    silent_tool_calls = 0
-    silent_worker_comms = 0
+    silent_board_comms = 0
     silent_mutations = 0
     complex_delegated = False
     verification_started = False
@@ -397,26 +431,36 @@ def analyze_progress_visibility(steps: list[dict[str, Any]], now_ts: float | Non
     stage_completed = False
     tests_ran = False
     failed_cmd_seen = False
+    pending_test_cmd = False
     hypothesis_shift = False
     swarm_active = False
+    model_events: list[tuple[int, bool, float]] = []
 
-    for st in turn_steps:
+    for pos, st in enumerate(turn_steps):
         src = st.get("source")
         tp = st.get("type")
         st_ts = rio.parse_iso_ts(st.get("created_at"))
 
         if src == "MODEL" and tp == "PLANNER_RESPONSE":
             total_model_steps += 1
+            raw_idx = st.get("step_index")
+            eff_idx = int(raw_idx) if isinstance(raw_idx, int) else pos
             visible_text = str(st.get("content") or "").strip()
             tcs = st.get("tool_calls") or []
-            if visible_text:
+            is_vis = bool(visible_text)
+            model_events.append((eff_idx, is_vis, st_ts))
+            if is_vis:
+                for tc in tcs:
+                    if isinstance(tc, dict) and str(tc.get("name") or "") == "swarm":
+                        action = str(_tc_args_dict(tc).get("action") or "").lower()
+                        if action in ("add", "model", "status", "title"):
+                            swarm_active = True
                 visible_updates_count += 1
-                last_visible_step_idx = int(st.get("step_index") or 0)
+                last_visible_step_idx = eff_idx
                 last_visible_model_step = total_model_steps
                 last_visible_ts = st_ts or last_visible_ts
                 silent_invocations = 0
-                silent_tool_calls = 0
-                silent_worker_comms = 0
+                silent_board_comms = 0
                 silent_mutations = 0
                 complex_delegated = False
                 verification_started = False
@@ -425,6 +469,7 @@ def analyze_progress_visibility(steps: list[dict[str, Any]], now_ts: float | Non
                 stage_completed = False
                 tests_ran = False
                 failed_cmd_seen = False
+                pending_test_cmd = False
                 hypothesis_shift = False
                 continue
 
@@ -432,14 +477,13 @@ def analyze_progress_visibility(steps: list[dict[str, Any]], now_ts: float | Non
                 continue
 
             silent_invocations += 1
-            silent_tool_calls += len(tcs)
             for tc in tcs:
                 if not isinstance(tc, dict):
                     continue
                 tname = str(tc.get("name") or "")
                 args = _tc_args_dict(tc)
-                if tname in WORKER_ONLY_TOOLS:
-                    silent_worker_comms += 1
+                if tname in BOARD_COMMS_TOOLS:
+                    silent_board_comms += 1
                 if tname in ("edit_file", "write_file"):
                     silent_mutations += 1
                     if failed_cmd_seen:
@@ -452,17 +496,16 @@ def analyze_progress_visibility(steps: list[dict[str, Any]], now_ts: float | Non
                         target_model = str(args.get("model") or "fallback")
                         blocker_reason = blocker_reason or f"переключение модели воркера на `{target_model}`"
                     elif action == "add":
-                        blob = " ".join(
-                            str(args.get(k) or "") for k in ("name", "brief", "tasks")
-                        )
-                        if SWARM_VERIFY_RE.search(blob):
+                        name_str = str(args.get("name") or "")
+                        brief_blob = " ".join(str(args.get(k) or "") for k in ("brief", "tasks"))
+                        if SWARM_VERIFY_NAME_RE.search(name_str) or SWARM_VERIFY_BRIEF_RE.search(brief_blob):
                             verification_started = True
                             verification_reason = verification_reason or "запуск swarm simplify/review"
                         else:
                             complex_delegated = True
                 elif tname == "invoke_subagent":
                     sub_type = str(args.get("TypeName") or "")
-                    if SWARM_VERIFY_RE.search(sub_type):
+                    if SWARM_VERIFY_NAME_RE.search(sub_type):
                         verification_started = True
                         verification_reason = verification_reason or f"субагент {sub_type}"
                     else:
@@ -478,10 +521,13 @@ def analyze_progress_visibility(steps: list[dict[str, Any]], now_ts: float | Non
                         stage_completed = True
                     if TEST_RUNNER_RE.search(cmd):
                         tests_ran = True
-                    if "codex" not in cmd.lower() and re.search(r"\bchip_handoff\.py\s+open\b", cmd, re.IGNORECASE):
+                        pending_test_cmd = True
+                    else:
+                        pending_test_cmd = False
+                    if "codex" not in cmd.lower() and CHIP_OPEN_CMD_RE.search(cmd):
                         complex_delegated = True
 
-        elif src == "SYSTEM" and tp == "SYSTEM_MESSAGE":
+        elif src in ("SYSTEM", "SYSTEM_SDK") and tp == "SYSTEM_MESSAGE":
             msg = str(st.get("content") or "")
             if "[Progress Visibility" not in msg and PROGRESS_BLOCKER_SYS_RE.search(msg):
                 blocker_reason = blocker_reason or "сбой/429 квота модели или блокировка гейта"
@@ -490,18 +536,85 @@ def analyze_progress_visibility(steps: list[dict[str, Any]], now_ts: float | Non
             msg = str(st.get("content") or "")
             if NONZERO_EXIT_RE.search(msg):
                 failed_cmd_seen = True
+                pending_test_cmd = False
+            elif ZERO_EXIT_RE.search(msg):
+                if pending_test_cmd:
+                    failed_cmd_seen = False
+                    hypothesis_shift = False
+                pending_test_cmd = False
+
+    if state is not None:
+        raw_prev_user = state.get("last_user_step_idx")
+        prev_user_idx = int(raw_prev_user) if isinstance(raw_prev_user, int) else None
+        raw_last_seen = state.get("last_seen_model_step_idx")
+        last_seen_idx = int(raw_last_seen) if raw_last_seen is not None else -1
+        need_turn_reset = (
+            (user_step_idx is not None and prev_user_idx is not None and user_step_idx != prev_user_idx)
+            or (not window_truncated_turn and not model_events and last_seen_idx >= 0)
+            or (bool(model_events) and model_events[-1][0] < last_seen_idx)
+        )
+        if need_turn_reset:
+            state["last_seen_model_step_idx"] = -1
+            state["turn_model_step_seq"] = 0
+            state["turn_visible_updates"] = 0
+            state["last_visible_seq"] = 0
+            state["last_progress_nudge_seq"] = 0
+            state["last_progress_nudge_kind"] = ""
+            state["turn_start_ts"] = 0.0
+            state["last_visible_ts"] = 0.0
+            last_seen_idx = -1
+
+        if user_step_idx is not None:
+            state["last_user_step_idx"] = user_step_idx
+        if turn_start_ts > 0:
+            state["turn_start_ts"] = turn_start_ts
+
+        seq = int(state.get("turn_model_step_seq") or 0)
+        turn_vis_count = int(state.get("turn_visible_updates") or 0)
+        last_vis_seq = int(state.get("last_visible_seq") or 0)
+        state_vis_ts = float(state.get("last_visible_ts") or 0.0)
+        for eff_idx, is_vis, ev_ts in model_events:
+            if eff_idx > last_seen_idx:
+                seq += 1
+                last_seen_idx = eff_idx
+                if is_vis:
+                    turn_vis_count += 1
+                    last_vis_seq = seq
+                    if ev_ts > 0:
+                        state_vis_ts = ev_ts
+        state["last_seen_model_step_idx"] = last_seen_idx
+        state["turn_model_step_seq"] = seq
+        state["turn_visible_updates"] = turn_vis_count
+        state["last_visible_seq"] = last_vis_seq
+        if last_visible_ts > state_vis_ts:
+            state_vis_ts = last_visible_ts
+        state["last_visible_ts"] = state_vis_ts
+
+        turn_model_step_seq = seq
+        eff_visible_count = max(visible_updates_count, turn_vis_count)
+        eff_last_visible_ts = last_visible_ts or state_vis_ts
+        eff_turn_start_ts = turn_start_ts or float(state.get("turn_start_ts") or 0.0) or (
+            rio.parse_iso_ts(turn_steps[0].get("created_at")) if turn_steps else 0.0
+        )
+    else:
+        turn_model_step_seq = total_model_steps
+        last_vis_seq = last_visible_model_step
+        eff_visible_count = visible_updates_count
+        eff_last_visible_ts = last_visible_ts
+        eff_turn_start_ts = turn_start_ts or (
+            rio.parse_iso_ts(turn_steps[0].get("created_at")) if turn_steps else 0.0
+        )
 
     # Also detect a freshly tripped Codex circuit breaker within the silent window
-    breaker = rio.read_json(rio.state_dir("gate") / "codex_lane.json", default={})
-    if isinstance(breaker, dict):
+    breaker = codex_lane.breaker_status()
+    if breaker.get("tripped"):
         tripped_at = float(breaker.get("tripped_at") or 0.0)
-        tripped_until = float(breaker.get("tripped_until") or 0.0)
-        anchor_ts = max(turn_start_ts, last_visible_ts)
-        if tripped_until > now and tripped_at > anchor_ts and tripped_at <= now + 5:
+        anchor_ts = max(eff_turn_start_ts, eff_last_visible_ts)
+        if tripped_at > anchor_ts and tripped_at <= now + 5:
             reason_code = str(breaker.get("reason") or "outage")[:80]
             blocker_reason = blocker_reason or f"открыт circuit breaker Codex ({reason_code})"
 
-    ref_ts = last_visible_ts or turn_start_ts
+    ref_ts = eff_last_visible_ts or eff_turn_start_ts
     elapsed_silent_sec = int(max(0.0, now - ref_ts)) if ref_ts > 0 else 0
 
     trigger_kind = ""
@@ -512,7 +625,7 @@ def analyze_progress_visibility(steps: list[dict[str, Any]], now_ts: float | Non
     elif verification_started:
         trigger_kind = "verification_start"
         trigger_reason = verification_reason or "финальная проверка"
-    elif visible_updates_count == 0 and (
+    elif eff_visible_count == 0 and (
         complex_delegated or silent_mutations >= 2 or silent_invocations >= PROGRESS_COMPLEX_START_STEPS
     ):
         trigger_kind = "complex_start"
@@ -524,13 +637,13 @@ def analyze_progress_visibility(steps: list[dict[str, Any]], now_ts: float | Non
         trigger_kind = "stage_complete"
         trigger_reason = "завершён существенный этап"
     elif (
-        silent_worker_comms >= PROGRESS_WORKER_SILENCE_STEPS
+        silent_board_comms >= PROGRESS_BOARD_SILENCE_STEPS
         or silent_invocations >= PROGRESS_HEARTBEAT_STEPS
         or (silent_invocations >= 5 and elapsed_silent_sec >= PROGRESS_HEARTBEAT_SECONDS)
     ):
         trigger_kind = "heartbeat"
-        if silent_worker_comms >= PROGRESS_WORKER_SILENCE_STEPS:
-            trigger_reason = f"выполнено {silent_worker_comms} тихих шагов с воркерами без статуса в чате"
+        if silent_board_comms >= PROGRESS_BOARD_SILENCE_STEPS:
+            trigger_reason = f"выполнено {silent_board_comms} тихих шагов с воркерами без статуса в чате"
         else:
             trigger_reason = f"выполнено {silent_invocations} тихих шагов без отчёта ({elapsed_silent_sec}с)"
 
@@ -540,12 +653,13 @@ def analyze_progress_visibility(steps: list[dict[str, Any]], now_ts: float | Non
 
     return {
         "total_model_steps": total_model_steps,
-        "visible_updates_count": visible_updates_count,
+        "turn_model_step_seq": turn_model_step_seq,
+        "visible_updates_count": eff_visible_count,
         "last_visible_step_idx": last_visible_step_idx,
         "last_visible_model_step": last_visible_model_step,
+        "last_visible_seq": last_vis_seq,
         "silent_invocations": silent_invocations,
-        "silent_tool_calls": silent_tool_calls,
-        "silent_worker_comms": silent_worker_comms,
+        "silent_board_comms": silent_board_comms,
         "silent_mutations": silent_mutations,
         "elapsed_silent_sec": elapsed_silent_sec,
         "swarm_active": swarm_active,
@@ -582,8 +696,16 @@ def handle_pre_invocation(payload: dict[str, Any]) -> None:
         state["generation"] = int(state.get("generation") or 1) + 1
         state["tool_counts"] = {}
         state["lint_blocks"] = 0
-        state["last_progress_nudge_model_step"] = 0
+        state["last_progress_nudge_seq"] = 0
         state["last_progress_nudge_kind"] = ""
+        state["last_seen_model_step_idx"] = -1
+        state["turn_model_step_seq"] = 0
+        state["turn_visible_updates"] = 0
+        state["last_visible_seq"] = 0
+        state["turn_start_ts"] = 0.0
+        state["last_visible_ts"] = 0.0
+        state["last_user_step_idx"] = None
+        state.pop("last_progress_nudge_model_step", None)
 
         if STRONG_CORRECTION_RE.search(user_input):
             state["correction_active"] = True
@@ -631,34 +753,35 @@ def handle_pre_invocation(payload: dict[str, Any]) -> None:
         )
 
     # Progress transparency check with cooldown (worker/swarm board traffic never resets silence)
-    vis = analyze_progress_visibility(steps)
+    vis = analyze_progress_visibility(steps, state=state)
     trig = vis.get("trigger")
     if trig:
-        cur_mstep = int(vis.get("total_model_steps") or 0)
-        last_vis_mstep = int(vis.get("last_visible_model_step") or 0)
-        last_nudge_step = int(state.get("last_progress_nudge_model_step") or 0)
+        cur_seq = int(vis.get("turn_model_step_seq") or 0)
+        last_vis_seq = int(vis.get("last_visible_seq") or 0)
+        last_nudge_seq = int(state.get("last_progress_nudge_seq") or 0)
         last_nudge_kind = str(state.get("last_progress_nudge_kind") or "")
         no_prior_nudge_in_episode = (
-            last_nudge_step <= 0
-            or last_vis_mstep >= last_nudge_step
-            or cur_mstep < last_nudge_step
+            last_nudge_seq <= 0
+            or last_vis_seq >= last_nudge_seq
+            or cur_seq < last_nudge_seq
         )
         cooldown_ok = (
             no_prior_nudge_in_episode
-            or (cur_mstep - last_nudge_step) >= PROGRESS_NUDGE_COOLDOWN_STEPS
+            or (cur_seq - last_nudge_seq) >= PROGRESS_NUDGE_COOLDOWN_STEPS
             or (trig in ("blocker", "verification_start") and trig != last_nudge_kind)
         )
         if cooldown_ok:
             injected.append(str(vis["trigger_message"]))
-            state["last_progress_nudge_model_step"] = cur_mstep
+            state["last_progress_nudge_seq"] = cur_seq
             state["last_progress_nudge_kind"] = trig
             rio.log_hook_event(
                 "continuity-events",
                 "progress_nudge",
                 session=session,
                 trigger=trig,
+                turn_seq=cur_seq,
                 silent_invocations=vis["silent_invocations"],
-                silent_worker_comms=vis["silent_worker_comms"],
+                silent_board_comms=vis["silent_board_comms"],
             )
 
     state["last_step_count"] = max(int(payload.get("initialNumSteps") or 0), len(steps))
@@ -801,26 +924,25 @@ def handle_stop(payload: dict[str, Any]) -> None:
         rio.emit_stop_allow()
         return
 
-    if state.get("correction_active"):
-        msg = str(payload.get("lastAssistantMessage") or "") or rio.last_assistant_message(steps)
-        lint_blocks = int(state.get("lint_blocks") or 0)
-        if (
-            msg
-            and not LINT_WAIVER_RE.search(msg)
-            and EDIT_RESIDUE_RE.search(msg)
-            and lint_blocks < MAX_LINT_BLOCKS_PER_EPISODE
-        ):
-            state["lint_blocks"] = lint_blocks + 1
-            save_session_state(session, state)
-            rio.log_hook_event("continuity-events", "output_lint_block", session=session, count=lint_blocks + 1)
-            rio.emit_stop_continue(
-                "[Continuity Output Lint] Финальный ответ после коррекции пользователя содержит описание "
-                "отвергнутых попыток/черновиков. Перепишите ответ начисто по текущему состоянию результата "
-                "(либо добавьте `[lint] intentional: <причина>`, если сравнение версий запрошено пользователем)."
-            )
-            return
-        state["correction_active"] = False
+    msg = str(payload.get("lastAssistantMessage") or "") or rio.last_assistant_message(steps)
+    lint_blocks = int(state.get("lint_blocks") or 0)
+    if (
+        msg
+        and not LINT_WAIVER_RE.search(msg)
+        and EDIT_RESIDUE_RE.search(msg)
+        and lint_blocks < MAX_LINT_BLOCKS_PER_EPISODE
+    ):
+        state["lint_blocks"] = lint_blocks + 1
         save_session_state(session, state)
+        rio.log_hook_event("continuity-events", "output_lint_block", session=session, count=lint_blocks + 1)
+        rio.emit_stop_continue(
+            "[Continuity Output Lint] Финальный ответ после коррекции пользователя содержит описание "
+            "отвергнутых попыток/черновиков. Перепишите ответ начисто по текущему состоянию результата "
+            "(либо добавьте `[lint] intentional: <причина>`, если сравнение версий запрошено пользователем)."
+        )
+        return
+    state["correction_active"] = False
+    save_session_state(session, state)
 
     touch_tree_lock(session, cwd, release=True)
     rio.emit_stop_allow()
