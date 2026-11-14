@@ -21,6 +21,7 @@ import runtime_io as rio
 
 MAX_BLOCKS_PER_CANDIDATE = 3
 MAX_BACKGROUND_WAITS = 8
+MAX_TOTAL_BACKGROUND_WAITS = 16
 MAX_REVIEW_ROUNDS = 3
 MAX_CLOSURE_PASSES = 2
 
@@ -134,8 +135,10 @@ def extract_subagent_final_texts(subagent_transcript_path: str | None) -> tuple[
 SWARM_ROLE_MEMBER_RE = re.compile(r"^(?:narrator|monitor)(?:-\d+)?$", re.IGNORECASE)
 MODEL_FAILURE_RE = re.compile(
     r"(?:RESOURCE_EXHAUSTED|quota[^\n]{0,30}(?:exceeded|exhausted|0%)|"
-    r"rate[ _-]limit[ _-]exceeded|429\s+too\s+many|model[^\n]{0,30}(?:unavailable|at\s+capacity)|"
-    r"overloaded|not\s+eligible|internal\s+server\s+error)",
+    r"rate[ _-]limit|429\b|503\b|502\b|"
+    r"model[^\n]{0,40}(?:unavailable|at\s+capacity|not\s+found|not\s+supported|invalid|unknown)|"
+    r"(?:unknown|invalid|unsupported)\s+model|"
+    r"overloaded|not\s+eligible|internal\s+server\s+error|deadline[ _-]exceeded|timed?\s*out)",
     re.IGNORECASE,
 )
 
@@ -162,10 +165,26 @@ def _infer_single_simplify_lens(name: str, brief_or_role: str, output_text: str)
 def _member_transcript_summary(member_tp: pathlib.Path | None, first_ts: float) -> dict[str, Any]:
     """Inspect a swarm member's system transcript for outputs, completion state, and model/runtime errors."""
     if member_tp is None or not member_tp.is_file():
-        return {"exists": False, "outputs": [], "has_error": False, "error_ts": 0.0, "parked_or_done": False, "start_ts": 0.0}
+        return {
+            "exists": False,
+            "outputs": [],
+            "has_error": False,
+            "error_ts": 0.0,
+            "parked_or_done": False,
+            "parked_ts": 0.0,
+            "start_ts": 0.0,
+        }
     m_steps = rio.read_transcript_steps(str(member_tp), max_lines=600)
     if not m_steps:
-        return {"exists": True, "outputs": [], "has_error": False, "error_ts": 0.0, "parked_or_done": False, "start_ts": 0.0}
+        return {
+            "exists": True,
+            "outputs": [],
+            "has_error": False,
+            "error_ts": 0.0,
+            "parked_or_done": False,
+            "parked_ts": 0.0,
+            "start_ts": 0.0,
+        }
 
     outputs: list[tuple[float, str]] = []
     has_error = False
@@ -199,13 +218,28 @@ def _member_transcript_summary(member_tp: pathlib.Path | None, first_ts: float) 
 
     last_st = m_steps[-1]
     last_type = str(last_st.get("type") or "")
+    last_content = str(last_st.get("content") or "")
+    prev_called_wait = len(m_steps) >= 2 and any(
+        isinstance(tc, dict) and tc.get("name") == "swarm_wait"
+        for tc in (m_steps[-2].get("tool_calls") or [])
+    )
     parked_or_done = False
     if last_st.get("source") == "MODEL" and last_type == "PLANNER_RESPONSE" and not (last_st.get("tool_calls") or []):
         parked_or_done = True
-    elif last_type == "GENERIC" and "swarm_wait" in str(last_st.get("content") or "") and str(last_st.get("status") or "") == "DONE":
+    elif (
+        last_type == "GENERIC"
+        and str(last_st.get("status") or "") == "DONE"
+        and (
+            "waiting for a message" in last_content.lower()
+            or "swarm_wait" in last_content.lower()
+            or prev_called_wait
+        )
+    ):
         parked_or_done = True
     elif has_error:
         parked_or_done = True
+
+    parked_ts = (rio.parse_iso_ts(last_st.get("created_at")) or error_ts) if parked_or_done else 0.0
 
     return {
         "exists": True,
@@ -213,6 +247,7 @@ def _member_transcript_summary(member_tp: pathlib.Path | None, first_ts: float) 
         "has_error": has_error,
         "error_ts": error_ts,
         "parked_or_done": parked_or_done,
+        "parked_ts": parked_ts,
         "start_ts": start_ts,
     }
 
@@ -324,12 +359,13 @@ def scan_swarm_activity(
                 if sonnet_q in ("0%", "0"):
                     sonnet_issue_verified = True
 
-            low_blob = blob.lower()
+            err_detail = (str((mdata or {}).get("error") or "") + "\n" + blob).strip()
             json_err = bool(mdata and mdata.get("error"))
             is_err = (g_status == "ERROR") or json_err or (
-                mdata is None and ("error" in low_blob or "failed" in low_blob or bool(MODEL_FAILURE_RE.search(blob)))
+                mdata is None and ("error" in blob.lower() or "failed" in blob.lower())
             )
-            if is_err:
+            # SECURITY INVARIANT: Only model/quota/availability failures count (never duplicate worker names or bad args).
+            if is_err and MODEL_FAILURE_RE.search(err_detail):
                 if cwg.OPUS_HIGH_MODEL in req_model:
                     _mark_opus_issue(call_ts)
                     review_failures.append(call_ts or time.time())
@@ -431,7 +467,7 @@ def scan_swarm_activity(
             if not btext:
                 continue
             if poster == "coordinator":
-                if any(mp.search(btext) for mp in mention_pats) or "@all" in btext.lower():
+                if any(mp.search(btext) for mp in mention_pats):
                     coord_posts.append((bts, btext))
             elif poster == mname:
                 # SECURITY INVARIANT: Only posts authored by `mname` itself count as worker output (never coordinator prompts).
@@ -478,8 +514,12 @@ def scan_swarm_activity(
         has_reply_since_assign = bool(
             combined_outputs and (not latest_assign_ts or combined_outputs[-1][0] >= latest_assign_ts - 1.0)
         )
+        parked_after_assign = bool(
+            tsum["parked_or_done"]
+            and (not latest_assign_ts or not tsum["parked_ts"] or tsum["parked_ts"] >= latest_assign_ts - 0.5)
+        )
 
-        if not killed and latest_assign_ts >= first_ts - 2.0 and not has_reply_since_assign and not tsum["parked_or_done"]:
+        if not killed and latest_assign_ts >= first_ts - 2.0 and not has_reply_since_assign and not parked_after_assign:
             in_flight_workers.append(f"swarm:{mname}")
             continue
 
@@ -564,6 +604,9 @@ def scan_swarm_activity(
                     }
                 )
 
+    worker_activity_count = sum(
+        1 for poster, btext, _ in parsed_board if btext and poster and poster != "coordinator"
+    )
     return {
         "sonnet_lenses": sonnet_lenses,
         "fallback_lenses": fallback_lenses,
@@ -575,6 +618,7 @@ def scan_swarm_activity(
         "opus_issue_ts": opus_issue_ts,
         "sonnet_issue_verified": sonnet_issue_verified,
         "board_head": board_head,
+        "worker_activity_count": worker_activity_count,
     }
 
 
@@ -978,6 +1022,7 @@ def retire_candidate(
         {
             "blocks": 0,
             "waits": 0,
+            "total_waits": 0,
             "closed_ts": time.time(),
             "last_receipt": receipt_summary,
             "block_nonce": "",
@@ -1013,7 +1058,7 @@ def format_block_message(
             f"Кандидат `PERSISTENT` (path floor `{floor}`). Обязательные условия: {reqs}.\n"
             f"- Для simplify запустите 3 read-only линзы (`reuse`, `quality`, `efficiency`) на `{cwg.SONNET_HIGH_MODEL}` через `swarm(action=\"add\", ..., model=\"{cwg.SONNET_HIGH_MODEL}\")`.\n"
             f"- Для внешнего ревью HIGH/XHIGH сначала проверьте `python -X utf8 \"{codex_script}\" check`; "
-            f"если доступно — запустите `python -X utf8 \"{codex_script}\" review --summary \"...\"` "
+            f"если доступно — запустите `python -X utf8 \"{codex_script}\" review --session \"{session}\" --summary \"...\"` "
             f"{'--xhigh ' if floor == 'XHIGH' else ''}(при недоступности Codex запустите внутреннее ревью на `{cwg.OPUS_HIGH_MODEL}`{xhigh_hint} через `swarm`, с эскалацией на `{cwg.CARBON_HIGH_MODEL}` при ошибке/квоте Opus).\n"
             f"- Завершите финальный ответ строкой `[gate] verified: {floor}; <кандидат и решающие проверки>`."
         )
@@ -1079,6 +1124,7 @@ def main() -> int:
             state["candidate_key"] = ckey
             state["blocks"] = 0
             state["waits"] = 0
+            state["total_waits"] = 0
             state["block_nonce"] = ""
 
         first_ts = float(marker.get("first_ts") or 0.0)
@@ -1127,10 +1173,21 @@ def main() -> int:
             in_flight = list(sub_ev.get("in_flight_subagents") or []) + list(
                 swarm_ev.get("in_flight_workers") or []
             )
-            progress_sig = f"{len(steps)}:{swarm_ev.get('board_head', 0)}"
+            # Only worker/subagent output advances `progress_sig` (never coordinator turn count), plus a hard per-candidate cap.
+            progress_sig = (
+                f"{swarm_ev.get('worker_activity_count', 0)}:"
+                f"{len(sub_ev.get('reviews', []))}:"
+                f"{len(sub_ev.get('fallback_lenses', {}))}"
+            )
             waits = 0 if state.get("last_wait_progress") != progress_sig else int(state.get("waits") or 0)
-            if (fully_idle is False or in_flight) and waits < MAX_BACKGROUND_WAITS:
+            total_waits = int(state.get("total_waits") or 0)
+            if (
+                (fully_idle is False or in_flight)
+                and waits < MAX_BACKGROUND_WAITS
+                and total_waits < MAX_TOTAL_BACKGROUND_WAITS
+            ):
                 state["waits"] = waits + 1
+                state["total_waits"] = total_waits + 1
                 state["last_wait_progress"] = progress_sig
                 rio.write_json(sfile, state)
                 rio.log_hook_event(
@@ -1138,6 +1195,7 @@ def main() -> int:
                     "background_wait",
                     session=session,
                     waits=waits + 1,
+                    total_waits=total_waits + 1,
                     fully_idle=fully_idle,
                     in_flight=in_flight,
                 )

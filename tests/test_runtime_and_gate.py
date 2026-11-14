@@ -930,6 +930,149 @@ class GateSubprocessTestCase(unittest.TestCase):
         self.assertEqual(blk_fake_opus["decision"], "continue")
         self.assertIn("without a verified `claude-opus-5-5-high` error/quota/availability failure", blk_fake_opus["reason"])
 
+    def test_12_opus_and_sonnet_round2_regressions(self) -> None:
+        sys.path.insert(0, str(HOOKS_DIR))
+        sys.path.insert(0, str(REPO_ROOT / "plugin" / "tools"))
+        import carbon_memory
+        import codex_lane
+        import cwg_mark
+        import runtime_io as rio
+
+        # 1. `read_jsonl` mid-size file (128 KB < size <= window) never duplicates line 0
+        mid_jsonl = self.root / "mid_transcript.jsonl"
+        payload_pad = "x" * 1800
+        raw_rows = [json.dumps({"idx": i, "pad": payload_pad}) for i in range(100)]
+        mid_jsonl.write_text("\n".join(raw_rows) + "\n", encoding="utf-8")
+        self.assertGreater(mid_jsonl.stat().st_size, 131072)
+        parsed_rows = rio.read_jsonl(mid_jsonl, max_lines=4000)
+        self.assertEqual([r["idx"] for r in parsed_rows], list(range(100)))
+
+        # 2. `git diff --output=...` and PowerShell `$(...)` subexpressions are NOT READ_ONLY
+        self.assertEqual(cwg_mark.classify_shell_command("git diff --output=src/app.py"), "MUTATING_OR_UNKNOWN")
+        self.assertEqual(cwg_mark.classify_shell_command("Get-Content $(Set-Content src\\x.py 'y')"), "MUTATING_OR_UNKNOWN")
+        self.assertEqual(cwg_mark.classify_shell_command('Get-Content "$(Set-Content src\\x.py \'y\')"'), "MUTATING_OR_UNKNOWN")
+
+        # 3. JSON quoted keys, unseparated prefixes (`PGPASSWORD`), and `HF_TOKEN` caught by secret guard
+        for leak in (
+            '{"password": "SuperSecretValue123"}',
+            '"api_key": "abcdefghijklmnop1234"',
+            "PGPASSWORD=SuperSecretValue123",
+            "HF_TOKEN=hf_abcdefghijklmnopqrstu",
+        ):
+            self.assertIsNotNone(carbon_memory.scan_for_secrets(leak), msg=leak)
+
+        # 4. Codex session isolation across two concurrent open sessions on the same git repo
+        os.environ["CARBON_STACK_HOME"] = str(self.stack_home)
+        sec = self.workspace / "jwt_verifier.py"
+        sec_code = "\n".join([f"def verify_{i}(t):\n    return bool(t)" for i in range(5)]) + "\n"
+        sec.write_text(sec_code, encoding="utf-8")
+        self.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {"toolCall": {"id": "m1", "name": "write_file", "args": {"Path": str(sec), "Content": sec_code}}, "error": ""},
+        )
+        self.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {"toolCall": {"id": "m2", "name": "run_command", "args": {"CommandLine": "pytest -q"}}, "error": ""},
+        )
+        self.add_sonnet_simplify_lenses()
+
+        # Record a Codex approval explicitly bound to a DIFFERENT session on the same repo -> must NOT satisfy self.conv_id
+        codex_lane.record_packet("cwg-othersess01", "REVIEW_ID: cwg-othersess01", str(self.workspace), effort="high", session="other-conv-999")
+        rollout = self.codex_sessions / "rollout-other-sess.jsonl"
+        now_iso = iso_now()
+        rollout.write_text(
+            "\n".join(
+                json.dumps(r)
+                for r in [
+                    {"type": "session_meta", "timestamp": now_iso, "payload": {"id": "s-other", "timestamp": now_iso}},
+                    {"type": "turn_context", "timestamp": now_iso, "payload": {"model": "gpt-6.1-sol", "effort": "high"}},
+                    {"type": "response_item", "timestamp": now_iso, "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-othersess01"}]}},
+                    {"type": "event_msg", "timestamp": iso_now(time.time() + 0.1), "payload": {"type": "task_complete", "last_agent_message": "VERDICT: APPROVED"}},
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        # 5. Duplicate-name parent `swarm` error with `model="claude-opus-5-5-high"` must NOT unlock Carbon review
+        self.steps.append(
+            {
+                "step_index": len(self.steps),
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": iso_now(),
+                "tool_calls": [{"name": "swarm", "args": {"action": "add", "name": "dup-worker", "model": "claude-opus-5-5-high", "brief": "review"}}],
+            }
+        )
+        self.steps.append(
+            {
+                "step_index": len(self.steps),
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "ERROR",
+                "created_at": iso_now(),
+                "content": '{"error": "worker dup-worker already exists"}',
+            }
+        )
+        self._flush_transcript()
+        self.add_swarm_worker(
+            name="carbon-after-dup-err",
+            model="gemini-4-carbon-high",
+            brief="Review.",
+            worker_post="@coordinator\nVERDICT: APPROVED",
+        )
+
+        # 6. Coordinator `@all` + worker parked on real `"Waiting for a message..."` does NOT hang Stop in infinite wait
+        parked_cid = self.add_swarm_worker(
+            name="silent-helper",
+            model="claude-sonnet-5-5-high",
+            brief="Helper.",
+            worker_post=None,
+        )
+        plogs = self.brain / parked_cid / ".system_generated" / "logs"
+        park_ts = iso_now(time.time() + 0.2)
+        psteps = [
+            {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE", "created_at": now_iso, "content": "Helper."},
+            {"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": park_ts, "tool_calls": [{"name": "swarm_wait", "args": {"since": 1}}]},
+            {"step_index": 2, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": park_ts, "content": "Waiting for a message that calls on you by name, or on @all posted after #1."},
+        ]
+        (plogs / "transcript_full.jsonl").write_text("\n".join(json.dumps(x) for x in psteps) + "\n", encoding="utf-8")
+        (plogs / "transcript.jsonl").write_text((plogs / "transcript_full.jsonl").read_text(encoding="utf-8"), encoding="utf-8")
+        self.append_board_post("coordinator", "@all status broadcast")
+
+        self.add_final_response("Попытка закрыть.\n[gate] verified: HIGH; jwt_verifier.py, pytest")
+        _, blk_r2 = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
+        self.assertEqual(blk_r2["decision"], "continue")
+        self.assertIn("without a verified `claude-opus-5-5-high` error/quota/availability failure", blk_r2["reason"])
+
+        # Also verify that if a genuinely unparked worker stays silent while coordinator `len(steps)` grows each turn,
+        # `MAX_BACKGROUND_WAITS` is strictly bounded (does NOT reset on coordinator turn growth).
+        stuck_cid = self.add_swarm_worker(
+            name="stuck-worker",
+            model="claude-opus-5-5-high",
+            brief="Review jwt_verifier.py.",
+            worker_post=None,
+        )
+        slogs = self.brain / stuck_cid / ".system_generated" / "logs"
+        ssteps = [
+            {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE", "created_at": iso_now(), "content": "Review."},
+            {"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": iso_now(), "tool_calls": [{"name": "read_file", "args": {"Path": str(sec)}}]},
+        ]
+        (slogs / "transcript_full.jsonl").write_text("\n".join(json.dumps(x) for x in ssteps) + "\n", encoding="utf-8")
+        (slogs / "transcript.jsonl").write_text((slogs / "transcript_full.jsonl").read_text(encoding="utf-8"), encoding="utf-8")
+
+        decisions = []
+        for turn_i in range(10):
+            self.add_final_response(f"Turn {turn_i} without worker progress.\n[gate] verified: HIGH; jwt_verifier.py, pytest")
+            _, out_dec = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
+            decisions.append(out_dec["decision"])
+        # First 8 waits allow background completion, 9th must block (`continue`) instead of resetting forever!
+        self.assertEqual(decisions[:8], ["allow"] * 8)
+        self.assertEqual(decisions[8], "continue")
+
 
 if __name__ == "__main__":
     unittest.main()

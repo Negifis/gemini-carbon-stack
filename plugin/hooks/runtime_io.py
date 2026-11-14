@@ -11,6 +11,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -100,7 +101,11 @@ def safe_key(value: str | None, fallback: str = "default") -> str:
     return f"{prefix}-{digest}"
 
 
-def project_key(cwd: str | None, workspace_paths: list[str] | None = None) -> str:
+def project_key(
+    cwd: str | None,
+    workspace_paths: list[str] | None = None,
+    known_git_root: str | None = None,
+) -> str:
     candidate = ""
     if workspace_paths:
         for wp in workspace_paths:
@@ -109,7 +114,7 @@ def project_key(cwd: str | None, workspace_paths: list[str] | None = None) -> st
                 break
     if not candidate:
         candidate = cwd or os.getcwd()
-    git_root = git_toplevel(candidate)
+    git_root = known_git_root if known_git_root is not None else git_toplevel(candidate)
     anchor = fold_path(git_root or candidate)
     base = pathlib.PurePosixPath(anchor).name or "root"
     digest = hashlib.sha256(anchor.encode("utf-8", errors="replace")).hexdigest()[:12]
@@ -333,14 +338,17 @@ def read_jsonl(path: str | pathlib.Path | None, max_lines: int | None = None) ->
         size = p.stat().st_size
         if max_lines is not None and max_lines > 0 and size > 131072:
             with p.open("rb") as fh:
-                first_line = fh.readline().decode("utf-8", errors="replace")
-                if max_lines == 1:
+                first_raw = fh.readline()
+                first_line = first_raw.decode("utf-8", errors="replace")
+                first_end = fh.tell()
+                if max_lines == 1 or first_end >= size:
                     return _parse_jsonl_lines([first_line])
-                window = min(size, max(65536, max_lines * 2048))
-                fh.seek(max(0, size - window))
+                window = max(65536, max_lines * 2048)
+                seek_pos = max(first_end, size - window)
+                fh.seek(seek_pos)
                 tail_chunk = fh.read().decode("utf-8", errors="replace")
             tail_lines = tail_chunk.splitlines()
-            if size > window and tail_lines:
+            if seek_pos > first_end and tail_lines:
                 tail_lines = tail_lines[1:]
             picked = [first_line] + tail_lines[-(max_lines - 1) :]
             return _parse_jsonl_lines(picked)
@@ -468,8 +476,6 @@ def resolve_command_cwd(cmd: str, default_cwd: str, fallback_dir: str = "") -> s
 
 
 def find_agy_cli() -> str | None:
-    import shutil
-
     on_path = shutil.which("agy") or shutil.which("agy.exe")
     if on_path:
         return on_path

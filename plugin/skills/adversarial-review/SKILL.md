@@ -17,6 +17,7 @@ python -X utf8 "<PLUGIN_ROOT>/hooks/codex_lane.py" check
 ```powershell
 python -X utf8 "<PLUGIN_ROOT>/hooks/codex_lane.py" review `
   --cwd "<путь к репозиторию>" `
+  --session "<conversation-id>" `
   --summary "<цель изменений, затронутые контракты и выполненные тесты>"
 ```
 Для `XHIGH` добавьте `--xhigh` (при post-ESCALATE проверке — `--closure`).

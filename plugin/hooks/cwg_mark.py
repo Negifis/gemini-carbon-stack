@@ -65,14 +65,21 @@ VALIDATION_SEGMENT_RE = re.compile(
 SKILL_MD_RE = re.compile(r"[/\\]skills[/\\](?P<skill>[A-Za-z0-9._-]+)[/\\]SKILL\.md$", re.IGNORECASE)
 
 
+def _strip_single_quoted(text: str) -> str:
+    return re.sub(r"'(?:''|[^'])*'", "''", text)
+
+
 def _strip_quoted(text: str) -> str:
     return re.sub(r"\"(?:\\.|[^\"])*\"|'(?:''|[^'])*'", '""', text)
 
 
 def _has_shell_chaining(stripped: str) -> bool:
     core = re.sub(r"^\s*\$null\s*\|\s*", "", stripped, flags=re.IGNORECASE)
+    # PowerShell executes `$(...)` subexpressions both outside quotes and inside double-quoted strings.
+    if re.search(r"\$\(", _strip_single_quoted(core)):
+        return True
     unquoted = _strip_quoted(core)
-    return bool(re.search(r"[;\r\n]|&&|\|\||(?<![|])\|(?![|])", unquoted))
+    return bool(re.search(r"[;\r\n`]|&&|\|\||(?<![|])\|(?![|])", unquoted))
 
 
 def _split_shell_segments(stripped: str) -> list[str]:
@@ -110,10 +117,11 @@ def classify_shell_command(cmd: str) -> str:
         re.search(r"(?<![0-9])>>?\s*(?!\$null\b|nul\b|/dev/null\b|&[12]\b)\S+", _strip_quoted(stripped), re.IGNORECASE)
     )
     chained = _has_shell_chaining(stripped)
+    has_output_flag = bool(re.search(r"(?:^|\s)(?:--output(?:=|\s)|-o(?:\s|$))", _strip_quoted(stripped), re.IGNORECASE))
     if not chained and not has_file_redirect:
         if "--merge" not in stripped.lower() and BOOKKEEPING_CMD_RE.match(stripped):
             return "BOOKKEEPING"
-        if READ_ONLY_CMD_RE.match(stripped):
+        if not has_output_flag and READ_ONLY_CMD_RE.match(stripped):
             return "READ_ONLY"
     if not has_file_redirect:
         segments = _split_shell_segments(stripped)

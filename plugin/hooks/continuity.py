@@ -132,7 +132,7 @@ def touch_tree_lock(session: str, cwd: str, workspace_paths: list[str] | None = 
     git_root = rio.git_toplevel(cwd)
     if not git_root:
         return None
-    pkey = rio.project_key(git_root, workspace_paths)
+    pkey = rio.project_key(git_root, workspace_paths, known_git_root=git_root)
     lp = tree_lock_path(pkey)
     now = time.time()
     existing = rio.read_json(lp, default={})

@@ -35,8 +35,12 @@ def handle_pre_invocation(payload: dict[str, Any]) -> None:
 
     notifications: list[str] = []
     with rio.file_lock(ch.chip_lock_path()):
-        for card in ch.load_all_cards():
-            if card.get("status") != "handed-off" or card.get("parent_notified"):
+        for pending in pending_cards:
+            cid = str(pending.get("chip_id") or "")
+            if not cid:
+                continue
+            card = rio.read_json(ch.card_path(cid), default=None)
+            if not isinstance(card, dict) or card.get("status") != "handed-off" or card.get("parent_notified"):
                 continue
             matches_parent = bool(card.get("parent_session") and card.get("parent_session") == session)
             if not matches_parent and not card.get("parent_session"):
@@ -44,7 +48,6 @@ def handle_pre_invocation(payload: dict[str, Any]) -> None:
                     git_root = rio.normalize_path(rio.git_toplevel(cwd) or "")
                 matches_parent = bool(git_root and card.get("repo_root") == git_root)
             if matches_parent:
-                cid = str(card["chip_id"])
                 script_norm = rio.normalize_path(TOOLS_DIR / "chip_handoff.py")
                 notifications.append(
                     f"[Chip Handoff Ready] Дочерняя задача `{cid}` ({card.get('title')}) передала результат: "

@@ -110,6 +110,22 @@ def reset_breaker() -> None:
             rio.write_json(bp, {"tripped": False})
 
 
+def _infer_single_open_session(cwd: str) -> str:
+    """Auto-bind to the active session when exactly one open candidate marker matches `cwd`'s git root."""
+    target_root = rio.fold_path(rio.git_toplevel(cwd) or cwd)
+    if not target_root:
+        return ""
+    matched: list[str] = []
+    for mf in rio.state_dir("gate", "markers").glob("*.json"):
+        mdata = rio.read_json(mf, default=None)
+        if not isinstance(mdata, dict) or mdata.get("closed"):
+            continue
+        mroot = rio.fold_path(str(mdata.get("git_root") or mdata.get("cwd") or ""))
+        if mroot == target_root and mdata.get("session"):
+            matched.append(str(mdata["session"]))
+    return matched[0] if len(matched) == 1 else ""
+
+
 def record_packet(
     review_id: str,
     prompt_text: str,
@@ -119,6 +135,7 @@ def record_packet(
     session: str = "",
 ) -> dict[str, Any]:
     now = time.time()
+    eff_session = session or _infer_single_open_session(cwd)
     digest = hashlib.sha256(prompt_text.encode("utf-8", errors="replace")).hexdigest()[:24]
     pkt = {
         "review_id": review_id,
@@ -126,7 +143,7 @@ def record_packet(
         "cwd": rio.normalize_path(cwd),
         "effort": effort.lower(),
         "phase": phase,
-        "session": session,
+        "session": eff_session,
         "created_ts": now,
     }
     rio.write_json(packets_dir() / f"{rio.safe_key(review_id)}.json", pkt)
@@ -283,6 +300,7 @@ def scan_verified_codex_reviews(
 ) -> list[dict[str, Any]]:
     """Return nonce- and workspace-bound Codex review verdicts from `~/.codex/sessions` rollout logs."""
     fold_target_root = rio.fold_path(git_root) if git_root else ""
+    cwd_root_cache: dict[str, str] = {}
     known_packets: dict[str, dict[str, Any]] = {}
     for pf in packets_dir().glob("*.json"):
         pdata = rio.read_json(pf, default=None)
@@ -291,11 +309,13 @@ def scan_verified_codex_reviews(
         if float(pdata.get("created_ts") or 0.0) < since_ts - 2.0:
             continue
         pkt_sess = str(pdata.get("session") or "")
-        if session and pkt_sess and pkt_sess != session:
+        if session and pkt_sess != session:
             continue
         pkt_cwd = str(pdata.get("cwd") or "")
         if fold_target_root and pkt_cwd:
-            pkt_root = rio.fold_path(rio.git_toplevel(pkt_cwd) or pkt_cwd)
+            if pkt_cwd not in cwd_root_cache:
+                cwd_root_cache[pkt_cwd] = rio.fold_path(rio.git_toplevel(pkt_cwd) or pkt_cwd)
+            pkt_root = cwd_root_cache[pkt_cwd]
             if pkt_root and pkt_root != fold_target_root:
                 continue
         known_packets[str(pdata["review_id"])] = pdata
