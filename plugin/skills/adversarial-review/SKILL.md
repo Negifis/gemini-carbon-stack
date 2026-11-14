@@ -22,6 +22,8 @@ python -X utf8 "<PLUGIN_ROOT>/hooks/codex_lane.py" review `
 ```
 Для `XHIGH` добавьте `--xhigh` (при post-ESCALATE проверке — `--closure`).
 
+- **Единая сессия чата в рамках кандидата:** 1-й раунд открывает новую сессию Codex и сохраняет её `session_id` в `state/gate/threads/`; все последующие раунды (`REVISE` -> раунды 2/3 и пост-эскалационный `--closure`) по тому же кандидату (`--session` + `git_root`) **автоматически продолжаются в том же самом чате** через `codex exec resume <session_id>` (`SESSION_MODE: resumed`). Передавайте `--new-session` только для принудительного сброса, а `--resume <id>` — для явного выбора сессии.
+
 ## Шаг 2. Внутренний межсемейный контур — `Claude Opus 5.5 (High)` -> эскалация на `Gemini 4 Carbon (High)`
 
 Используется при открытом circuit breaker / недоступности Codex либо при прямом запросе внутреннего ревью в Antigravity:
@@ -37,7 +39,7 @@ python -X utf8 "<PLUGIN_ROOT>/hooks/codex_lane.py" review `
        brief="Strictly read-only adversarial code review of <repo_path> (<files>). Do NOT modify any files. Verify invariants, security boundaries, failure modes, and tests. Post your report to @coordinator ending with exact standalone line `VERDICT: APPROVED` or `VERDICT: REVISE` (for XHIGH include `REVIEW_TIER: XHIGH`).",
    )
    ```
-   После получения вердикта освободите воркера через `swarm(action="kill", name="internal-reviewer")`.
+   При `REVISE` не убивайте воркера: после исправлений направляйте следующий раунд в тот же чат через `post_message("@internal-reviewer ...")`. Освобождайте воркера (`swarm(action="kill", name="internal-reviewer")`) только после финального вердикта по кандидату (`APPROVED` или завершения `--closure`).
 3. **Эскалация на `gemini-4-carbon-high`, если с Opus что-то не так:**
    - Если `claude-opus-5-5-high` имеет квоту `0%`, недоступен, вернул `ERROR_MESSAGE` / `RESOURCE_EXHAUSTED` или завис:
    - Переключите воркер на месте вызовом `swarm(action="model", name="internal-reviewer", model="gemini-4-carbon-high")` (сохраняя его контекст) либо вызовите резервный субагент `adversarial-reviewer` / `adversarial-reviewer-xhigh`.
@@ -45,6 +47,6 @@ python -X utf8 "<PLUGIN_ROOT>/hooks/codex_lane.py" review `
 
 ## Шаг 3. Обработка вердикта
 
-- `VERDICT: APPROVED` -> ревью завершено. Не запускайте лишних раундов; любая правка файлов после этого изменит SHA-256 и инвалидирует вердикт.
-- `VERDICT: REVISE` -> устраните подтверждённые дефекты, перезапустите тесты и выполните следующий раунд.
-- `VERDICT: ESCALATE` (на 3-м раунде) -> выполните до 2 проходов `CLOSURE_VALIDATION` (`READY` -> `[gate] pr-ready`, `BLOCKED` -> `[gate] draft-blocked`).
+- `VERDICT: APPROVED` -> ревью завершено (для внутреннего `swarm` закройте воркера через `kill`). Не запускайте лишних раундов; любая правка файлов после этого изменит SHA-256 и инвалидирует вердикт.
+- `VERDICT: REVISE` -> устраните подтверждённые дефекты, перезапустите тесты и выполните следующий раунд **в той же сессии ревьюера** (автоматический `codex exec resume` для Codex либо `post_message` существующему воркеру `swarm`).
+- `VERDICT: ESCALATE` (на 3-м раунде) -> выполните до 2 проходов `CLOSURE_VALIDATION` в той же сессии (`--closure` для Codex / `post_message` в `swarm`): `READY` -> `[gate] pr-ready`, `BLOCKED` -> `[gate] draft-blocked`.

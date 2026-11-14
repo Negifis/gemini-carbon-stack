@@ -1102,6 +1102,254 @@ class GateSubprocessTestCase(unittest.TestCase):
         self.assertEqual(decisions[:8], ["allow"] * 8)
         self.assertEqual(decisions[8], "continue")
 
+    def test_13_codex_same_session_multi_round_resume_and_turn_provenance(self) -> None:
+        sys.path.insert(0, str(HOOKS_DIR))
+        import codex_lane
+
+        # Part A: Multi-turn `rollout-*.jsonl` (Round 1 REVISE -> edit -> Resumed Round 2 APPROVED in SAME rollout file)
+        os.environ["CARBON_STACK_HOME"] = str(self.stack_home)
+        os.environ["CARBON_CODEX_SESSIONS_DIR"] = str(self.codex_sessions)
+
+        auth_flow = self.workspace / "auth_flow.py"
+        v1_code = "\n".join([f"def check_{i}(tok):\n    return tok == 'v1'" for i in range(5)]) + "\n"
+        auth_flow.write_text(v1_code, encoding="utf-8")
+        self.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {"toolCall": {"id": "r1_w", "name": "write_file", "args": {"Path": str(auth_flow), "Content": v1_code}}, "error": ""},
+        )
+        self.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {"toolCall": {"id": "r1_t", "name": "run_command", "args": {"CommandLine": "pytest -q"}}, "error": ""},
+        )
+
+        t1 = time.time()
+        codex_lane.record_packet("cwg-round1", "REVIEW_ID: cwg-round1", str(self.workspace), effort="high", session=self.conv_id)
+        shared_rollout = self.codex_sessions / "rollout-2026-11-14T16-30-00-resumed.jsonl"
+        turn1_records = [
+            {"type": "session_meta", "timestamp": iso_now(t1), "payload": {"id": "sess-same-chat-1", "timestamp": iso_now(t1)}},
+            {"type": "event_msg", "timestamp": iso_now(t1 + 0.01), "payload": {"type": "task_started"}},
+            {"type": "turn_context", "timestamp": iso_now(t1 + 0.02), "payload": {"model": "gpt-6.1-sol", "effort": "high"}},
+            {
+                "type": "response_item",
+                "timestamp": iso_now(t1 + 0.03),
+                "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-round1"}]},
+            },
+            {
+                "type": "event_msg",
+                "timestamp": iso_now(t1 + 0.05),
+                "payload": {"type": "task_complete", "last_agent_message": "[MEDIUM] Missing expiry.\nVERDICT: REVISE"},
+            },
+        ]
+        shared_rollout.write_text("\n".join(json.dumps(r) for r in turn1_records) + "\n", encoding="utf-8")
+
+        # Edit after Round 1 (new SHA-256 in content_marks) + pytest + 3 Sonnet lenses
+        time.sleep(0.06)
+        v2_code = v1_code + "\ndef check_expiry(ts):\n    return ts > 0\n"
+        auth_flow.write_text(v2_code, encoding="utf-8")
+        self.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {"toolCall": {"id": "r2_w", "name": "write_file", "args": {"Path": str(auth_flow), "Content": v2_code}}, "error": ""},
+        )
+        self.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {"toolCall": {"id": "r2_t", "name": "run_command", "args": {"CommandLine": "pytest -q"}}, "error": ""},
+        )
+        self.add_sonnet_simplify_lenses()
+
+        time.sleep(0.03)
+        t2 = time.time()
+        codex_lane.record_packet("cwg-round2", "REVIEW_ID: cwg-round2", str(self.workspace), effort="high", session=self.conv_id)
+        turn2_records = [
+            {"type": "event_msg", "timestamp": iso_now(t2 + 0.01), "payload": {"type": "task_started"}},
+            {"type": "turn_context", "timestamp": iso_now(t2 + 0.02), "payload": {"model": "gpt-6.1-sol", "effort": "high"}},
+            {
+                "type": "response_item",
+                "timestamp": iso_now(t2 + 0.03),
+                "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-round2"}]},
+            },
+            {
+                "type": "event_msg",
+                "timestamp": iso_now(t2 + 0.05),
+                "payload": {"type": "task_complete", "last_agent_message": "Fix verified.\nVERDICT: APPROVED"},
+            },
+        ]
+        with open(shared_rollout, "a", encoding="utf-8") as fh:
+            for rec in turn2_records:
+                fh.write(json.dumps(rec) + "\n")
+
+        scanned = codex_lane.scan_verified_codex_reviews(since_ts=t1 - 5.0, session=self.conv_id, git_root=str(self.workspace))
+        self.assertEqual([r["review_id"] for r in scanned], ["cwg-round1", "cwg-round2"])
+        self.assertEqual([r["verdict"] for r in scanned], ["REVISE", "APPROVED"])
+        self.assertEqual({r["session_id"] for r in scanned}, {"sess-same-chat-1"})
+        self.assertGreater(scanned[1]["launch_ts"], scanned[0]["launch_ts"])
+
+        self.add_final_response("Готово после второго раунда в той же сессии Codex.\n[gate] verified: HIGH; auth_flow.py, pytest + resumed codex review")
+        _, ok_resumed = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
+        self.assertEqual(ok_resumed, {"decision": "allow"})
+
+        # Part B: CLI auto-resume via mock `codex` binary + `_infer_single_open_session` via `paths` + candidate reset + dead-UUID fallback
+        mock_dir = self.root / "mock-codex"
+        mock_dir.mkdir()
+        invocations_log = mock_dir / "invocations.jsonl"
+        mock_py = mock_dir / "mock_codex.py"
+        mock_py.write_text(
+            "\n".join(
+                [
+                    "import json, os, pathlib, re, sys, time, uuid",
+                    "from datetime import datetime, timezone",
+                    "def iso(): return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')",
+                    "argv = sys.argv[1:]",
+                    "if argv[:2] == ['login', 'status']:",
+                    "    print('Logged in using ChatGPT')",
+                    "    sys.exit(0)",
+                    "log_p = pathlib.Path(os.environ['MOCK_CODEX_LOG'])",
+                    "sess_root = pathlib.Path(os.environ['CARBON_CODEX_SESSIONS_DIR'])",
+                    "prompt = sys.stdin.read() if '-' in argv else ''",
+                    "with open(log_p, 'a', encoding='utf-8') as lf:",
+                    "    lf.write(json.dumps({'argv': argv, 'cwd': os.getcwd(), 'prompt': prompt}) + '\\n')",
+                    "m_id = re.search(r'REVIEW_ID:\\s*([A-Za-z0-9_-]+)', prompt)",
+                    "rid = m_id.group(1) if m_id else 'cwg-unknown'",
+                    "if argv[:2] == ['exec', 'resume']:",
+                    "    sid = argv[-2]",
+                    "    if sid == 'dead-uuid':",
+                    "        sys.stderr.write('Error: session dead-uuid not found\\n')",
+                    "        sys.exit(1)",
+                    "    target = next((p for p in sess_root.rglob('rollout-*.jsonl') if sid in p.name or sid in p.read_text(encoding='utf-8')), None)",
+                    "    if target is None:",
+                    "        sys.stderr.write(f'Error: session {sid} missing\\n')",
+                    "        sys.exit(1)",
+                    "    with open(target, 'a', encoding='utf-8') as rf:",
+                    "        rf.write(json.dumps({'type': 'turn_context', 'timestamp': iso(), 'payload': {'model': 'gpt-6.1-sol', 'effort': 'high'}}) + '\\n')",
+                    "        rf.write(json.dumps({'type': 'response_item', 'timestamp': iso(), 'payload': {'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': prompt}]}}) + '\\n')",
+                    "        rf.write(json.dumps({'type': 'event_msg', 'timestamp': iso(), 'payload': {'type': 'task_complete', 'last_agent_message': 'VERDICT: APPROVED'}}) + '\\n')",
+                    "    print('VERDICT: APPROVED')",
+                    "    sys.exit(0)",
+                    "sid = f'sess-live-{uuid.uuid4().hex[:8]}'",
+                    "rf = sess_root / f'rollout-mock-{sid}.jsonl'",
+                    "rows = [",
+                    "    {'type': 'session_meta', 'timestamp': iso(), 'payload': {'id': sid, 'timestamp': iso()}},",
+                    "    {'type': 'turn_context', 'timestamp': iso(), 'payload': {'model': 'gpt-6.1-sol', 'effort': 'high'}},",
+                    "    {'type': 'response_item', 'timestamp': iso(), 'payload': {'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': prompt}]}},",
+                    "    {'type': 'event_msg', 'timestamp': iso(), 'payload': {'type': 'task_complete', 'last_agent_message': 'VERDICT: REVISE'}},",
+                    "]",
+                    "rf.write_text('\\n'.join(json.dumps(r) for r in rows) + '\\n', encoding='utf-8')",
+                    "print('VERDICT: REVISE')",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        if os.name == "nt":
+            mock_bin = mock_dir / "codex.cmd"
+            mock_bin.write_text(f'@echo off\r\n"{sys.executable}" -X utf8 "{mock_py}" %*\r\n', encoding="utf-8")
+        else:
+            mock_bin = mock_dir / "codex"
+            mock_bin.write_text(f'#!/bin/sh\nexec "{sys.executable}" -X utf8 "{mock_py}" "$@"\n', encoding="utf-8")
+            os.chmod(mock_bin, 0o755)
+
+        # Open marker whose cwd is outside the workspace repo while `paths` points inside self.workspace
+        cli_sess = "cli-same-session-7777"
+        outside_cwd = self.root / "empty-antigravity-cwd"
+        outside_cwd.mkdir()
+        marker_dir = self.stack_home / "state" / "gate" / "markers"
+        marker_dir.mkdir(parents=True, exist_ok=True)
+        marker_file = marker_dir / f"{cli_sess}.json"
+        t_cand1 = time.time()
+        marker_file.write_text(
+            json.dumps(
+                {
+                    "session": cli_sess,
+                    "first_ts": t_cand1,
+                    "last_ts": t_cand1,
+                    "cwd": str(outside_cwd).replace("\\", "/"),
+                    "git_root": "",
+                    "paths": [str(auth_flow).replace("\\", "/")],
+                    "closed": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        cli_env = dict(
+            os.environ,
+            CARBON_STACK_HOME=str(self.stack_home),
+            CARBON_CODEX_SESSIONS_DIR=str(self.codex_sessions),
+            CARBON_CODEX_BIN=str(mock_bin),
+            MOCK_CODEX_LOG=str(invocations_log),
+            PLUGIN_ROOT=str(REPO_ROOT / "plugin"),
+        )
+
+        def run_cli(*extra: str) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                [sys.executable, "-X", "utf8", str(HOOKS_DIR / "codex_lane.py"), "review", "--cwd", str(self.workspace), *extra],
+                capture_output=True,
+                text=True,
+                env=cli_env,
+                timeout=15,
+            )
+
+        # 1. Round 1 (no `--session`): auto-binds to `cli_sess` via marker `paths`, starts new session
+        p1 = run_cli("--summary", "Round 1")
+        self.assertEqual(p1.returncode, 0, msg=p1.stdout + p1.stderr)
+        self.assertIn("SESSION_MODE: new", p1.stdout)
+        sid1 = next(ln.split(":", 1)[1].strip() for ln in p1.stdout.splitlines() if ln.startswith("SESSION_ID:"))
+        self.assertTrue(sid1.startswith("sess-live-"))
+
+        # 2. Round 2 (same candidate): automatically resumes `sid1` WITHOUT `-s` or `-C`
+        p2 = run_cli("--summary", "Round 2")
+        self.assertEqual(p2.returncode, 0, msg=p2.stdout + p2.stderr)
+        self.assertIn("SESSION_MODE: resumed", p2.stdout)
+        self.assertIn(f"SESSION_ID: {sid1}", p2.stdout)
+
+        # 3. New candidate (`first_ts` changed): starts fresh Codex session instead of reusing previous candidate's chat
+        marker_file.write_text(
+            json.dumps(
+                {
+                    "session": cli_sess,
+                    "first_ts": t_cand1 + 120.0,
+                    "last_ts": t_cand1 + 120.0,
+                    "cwd": str(outside_cwd).replace("\\", "/"),
+                    "git_root": "",
+                    "paths": [str(auth_flow).replace("\\", "/")],
+                    "closed": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+        p3 = run_cli("--summary", "New candidate round 1")
+        self.assertEqual(p3.returncode, 0, msg=p3.stdout + p3.stderr)
+        self.assertIn("SESSION_MODE: new", p3.stdout)
+        sid3 = next(ln.split(":", 1)[1].strip() for ln in p3.stdout.splitlines() if ln.startswith("SESSION_ID:"))
+        self.assertNotEqual(sid3, sid1)
+
+        # 4. Deleted/invalid thread UUID triggers single graceful fallback to fresh `exec` without tripping breaker
+        thread_files = list((self.stack_home / "state" / "gate" / "threads").glob("*.json"))
+        self.assertTrue(thread_files)
+        for tf in thread_files:
+            tdata = json.loads(tf.read_text(encoding="utf-8"))
+            tdata["session_id"] = "dead-uuid"
+            tf.write_text(json.dumps(tdata), encoding="utf-8")
+        p4 = run_cli("--summary", "Dead uuid recovery")
+        self.assertEqual(p4.returncode, 0, msg=p4.stdout + p4.stderr)
+        self.assertIn("SESSION_MODE: new", p4.stdout)
+
+        inv_rows = [json.loads(ln) for ln in invocations_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        self.assertEqual(inv_rows[0]["argv"][0], "exec")
+        self.assertIn("-s", inv_rows[0]["argv"])
+        self.assertEqual(inv_rows[1]["argv"][:2], ["exec", "resume"])
+        self.assertNotIn("-s", inv_rows[1]["argv"])
+        self.assertNotIn("-C", inv_rows[1]["argv"])
+        self.assertIn("ROUND_MODE: continuation", inv_rows[1]["prompt"])
+        self.assertEqual(inv_rows[2]["argv"][0], "exec")
+        self.assertNotEqual(inv_rows[2]["argv"][1], "resume")
+        # Invocation 3 tried `exec resume dead-uuid`, invocation 4 fell back to fresh `exec`
+        self.assertEqual(inv_rows[3]["argv"][:2], ["exec", "resume"])
+        self.assertEqual(inv_rows[4]["argv"][0], "exec")
+
 
 if __name__ == "__main__":
     unittest.main()

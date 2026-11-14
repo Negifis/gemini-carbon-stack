@@ -54,6 +54,10 @@ def packets_dir() -> pathlib.Path:
     return cwg.gate_dir("packets")
 
 
+def threads_dir() -> pathlib.Path:
+    return cwg.gate_dir("threads")
+
+
 def codex_sessions_dir() -> pathlib.Path:
     override = os.environ.get("CARBON_CODEX_SESSIONS_DIR")
     if override:
@@ -116,15 +120,41 @@ def _infer_single_open_session(cwd: str) -> str:
     target_root = rio.fold_path(rio.git_toplevel(cwd) or cwd)
     if not target_root:
         return ""
+    root_prefix = target_root.rstrip("/") + "/"
     matched: list[str] = []
     for mf in rio.state_dir("gate", "markers").glob("*.json"):
         mdata = rio.read_json(mf, default=None)
         if not isinstance(mdata, dict) or mdata.get("closed"):
             continue
+        sess = str(mdata.get("session") or "")
+        if not sess:
+            continue
         mroot = rio.fold_path(str(mdata.get("git_root") or mdata.get("cwd") or ""))
-        if mroot == target_root and mdata.get("session"):
-            matched.append(str(mdata["session"]))
+        path_match = mroot == target_root
+        if not path_match:
+            for touched in mdata.get("paths") or []:
+                ftouched = rio.fold_path(str(touched))
+                if ftouched == target_root or ftouched.startswith(root_prefix):
+                    path_match = True
+                    break
+        if path_match and sess not in matched:
+            matched.append(sess)
     return matched[0] if len(matched) == 1 else ""
+
+
+def _candidate_first_ts(session: str) -> float:
+    if not session:
+        return 0.0
+    mdata = rio.read_json(cwg.marker_path(session), default=None)
+    if not isinstance(mdata, dict) or mdata.get("closed"):
+        return 0.0
+    return float(mdata.get("first_ts") or 0.0)
+
+
+def _thread_state_path(session: str, git_root: str) -> pathlib.Path:
+    raw_key = f"{session or 'nosession'}|{rio.fold_path(git_root)}"
+    digest = hashlib.sha256(raw_key.encode("utf-8", errors="replace")).hexdigest()[:20]
+    return threads_dir() / f"{digest}.json"
 
 
 def record_packet(
@@ -154,12 +184,13 @@ def record_packet(
 
 def sweep_old_packets() -> None:
     cutoff = time.time() - PACKET_TTL_SECONDS
-    for p in packets_dir().glob("*.json"):
-        try:
-            if p.stat().st_mtime < cutoff:
-                p.unlink()
-        except OSError:
-            pass
+    for base_dir in (packets_dir(), threads_dir()):
+        for p in base_dir.glob("*.json"):
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+            except OSError:
+                pass
 
 
 def detect_outage_from_output(output_text: str, exit_code: int = 0) -> str | None:
@@ -236,10 +267,17 @@ def _extract_rollout_texts_and_meta(rollout_file: pathlib.Path) -> dict[str, Any
     records = rio.read_jsonl(rollout_file)
     if not records:
         return None
+    try:
+        file_mtime = rollout_file.stat().st_mtime
+    except OSError:
+        file_mtime = 0.0
+
     user_texts: list[str] = []
     assistant_texts: list[tuple[float, str]] = []
-    effort = ""
-    model = ""
+    turns: list[dict[str, Any]] = []
+    current_turn: dict[str, Any] | None = None
+    cur_effort = ""
+    cur_model = ""
     session_id = ""
     started_ts = 0.0
     completed_ts = 0.0
@@ -253,8 +291,18 @@ def _extract_rollout_texts_and_meta(rollout_file: pathlib.Path) -> dict[str, Any
             session_id = str(payload.get("id") or payload.get("session_id") or session_id)
             started_ts = started_ts or rec_ts or rio.parse_iso_ts(payload.get("timestamp"))
         elif rtype == "turn_context":
-            effort = str(payload.get("effort") or effort).lower()
-            model = str(payload.get("model") or model)
+            cur_effort = str(payload.get("effort") or cur_effort).lower()
+            cur_model = str(payload.get("model") or cur_model)
+            if (
+                current_turn is not None
+                and not current_turn["closed"]
+                and not current_turn["assistant_messages"]
+            ):
+                current_turn["effort"] = cur_effort or current_turn["effort"]
+                current_turn["model"] = cur_model or current_turn["model"]
+        elif rtype == "event_msg" and payload.get("type") == "task_started":
+            if current_turn is not None:
+                current_turn["closed"] = True
         elif rtype == "response_item" and payload.get("type") == "message":
             role = payload.get("role")
             blocks = payload.get("content")
@@ -269,29 +317,69 @@ def _extract_rollout_texts_and_meta(rollout_file: pathlib.Path) -> dict[str, Any
             if joined:
                 if role == "user":
                     user_texts.append(joined)
+                    m_ids = REVIEW_ID_RE.findall(joined)
+                    if m_ids:
+                        if current_turn is not None:
+                            current_turn["closed"] = True
+                        current_turn = {
+                            "review_ids": m_ids,
+                            "started_ts": rec_ts or started_ts,
+                            "completed_ts": 0.0,
+                            "effort": cur_effort,
+                            "model": cur_model,
+                            "assistant_messages": [],
+                            "closed": False,
+                        }
+                        turns.append(current_turn)
                 elif role == "assistant":
-                    assistant_texts.append((rec_ts or rollout_file.stat().st_mtime, joined))
+                    msg_pair = (rec_ts or file_mtime, joined)
+                    assistant_texts.append(msg_pair)
+                    if current_turn is not None and not current_turn["closed"]:
+                        current_turn["assistant_messages"].append(msg_pair)
         elif rtype == "event_msg" and payload.get("type") == "task_complete":
-            completed_ts = rec_ts or rio.parse_iso_ts(payload.get("completed_at")) or rollout_file.stat().st_mtime
+            ts_done = rec_ts or rio.parse_iso_ts(payload.get("completed_at")) or file_mtime
+            completed_ts = ts_done
             last_msg = payload.get("last_agent_message")
             if isinstance(last_msg, str) and last_msg.strip():
-                assistant_texts.append((completed_ts, last_msg.strip()))
+                done_pair = (ts_done, last_msg.strip())
+                assistant_texts.append(done_pair)
+                if current_turn is not None and not current_turn["closed"]:
+                    current_turn["assistant_messages"].append(done_pair)
+            if current_turn is not None:
+                current_turn["completed_ts"] = ts_done
+                current_turn["closed"] = True
 
     if not started_ts:
-        try:
-            started_ts = rollout_file.stat().st_mtime
-        except OSError:
-            started_ts = 0.0
+        started_ts = file_mtime
     return {
         "path": str(rollout_file),
         "session_id": session_id,
-        "effort": effort,
-        "model": model,
+        "effort": cur_effort,
+        "model": cur_model,
         "started_ts": started_ts,
         "completed_ts": completed_ts or (assistant_texts[-1][0] if assistant_texts else started_ts),
         "user_blob": "\n".join(user_texts),
         "assistant_messages": assistant_texts,
+        "turns": turns,
     }
+
+
+def _recent_rollout_files(since_ts: float, limit: int = 40, newest_first: bool = False) -> list[pathlib.Path]:
+    root = codex_sessions_dir()
+    if not root.is_dir():
+        return []
+    min_mtime = max(0.0, since_ts - 5.0)
+    candidates: list[tuple[float, pathlib.Path]] = []
+    for rf in root.rglob("rollout-*.jsonl"):
+        try:
+            mt = rf.stat().st_mtime
+            if mt >= min_mtime:
+                candidates.append((mt, rf))
+        except OSError:
+            continue
+    candidates.sort(key=lambda pair: pair[0], reverse=newest_first)
+    picked = candidates[:limit] if newest_first else candidates[-limit:]
+    return [rf for _, rf in picked]
 
 
 def scan_verified_codex_reviews(
@@ -324,73 +412,132 @@ def scan_verified_codex_reviews(
     if not known_packets:
         return []
 
-    root = codex_sessions_dir()
-    if not root.is_dir():
-        return []
-
-    results: list[dict[str, Any]] = []
-    min_mtime = max(0.0, since_ts - 5.0)
-    candidates: list[tuple[float, pathlib.Path]] = []
-    for rf in root.rglob("rollout-*.jsonl"):
-        try:
-            mt = rf.stat().st_mtime
-            if mt >= min_mtime:
-                candidates.append((mt, rf))
-        except OSError:
-            continue
-    candidates.sort(key=lambda pair: pair[0])
-
-    for _, rf in candidates[-40:]:
+    by_review_id: dict[str, dict[str, Any]] = {}
+    for rf in _recent_rollout_files(since_ts, limit=40, newest_first=False):
         parsed = _extract_rollout_texts_and_meta(rf)
         if not parsed:
             continue
-        user_blob = parsed["user_blob"]
-        matched_ids = REVIEW_ID_RE.findall(user_blob)
-        bound_packet = None
-        for rid in matched_ids:
-            if rid in known_packets:
-                bound_packet = known_packets[rid]
-                break
-        if bound_packet is None:
-            continue
+        for turn in parsed.get("turns") or []:
+            bound_packet = next(
+                (known_packets[rid] for rid in (turn.get("review_ids") or []) if rid in known_packets),
+                None,
+            )
+            if bound_packet is None:
+                continue
 
-        # Inspect final assistant messages in this rollout for VERDICT or CLOSURE_VALIDATION
-        verdict = None
-        kind = None
-        verdict_ts = parsed["completed_ts"]
-        for msg_ts, msg in reversed(parsed["assistant_messages"]):
-            cm = cwg.CLOSURE_LINE_RE.search(msg)
-            if cm:
-                kind = "closure"
-                verdict = cm.group(1).upper()
-                verdict_ts = msg_ts or verdict_ts
-                break
-            vm = cwg.VERDICT_LINE_RE.search(msg)
-            if vm:
-                kind = "ordinary"
-                verdict = vm.group(1).upper()
-                verdict_ts = msg_ts or verdict_ts
-                break
+            verdict = None
+            kind = None
+            verdict_ts = float(turn.get("completed_ts") or parsed["completed_ts"] or 0.0)
+            for msg_ts, msg in reversed(turn.get("assistant_messages") or []):
+                cm = cwg.CLOSURE_LINE_RE.search(msg)
+                if cm:
+                    kind = "closure"
+                    verdict = cm.group(1).upper()
+                    verdict_ts = msg_ts or verdict_ts
+                    break
+                vm = cwg.VERDICT_LINE_RE.search(msg)
+                if vm:
+                    kind = "ordinary"
+                    verdict = vm.group(1).upper()
+                    verdict_ts = msg_ts or verdict_ts
+                    break
 
-        if verdict and kind:
-            pkt_ts = float(bound_packet.get("created_ts") or parsed["started_ts"] or 0.0)
-            eff = parsed["effort"] or bound_packet.get("effort") or "high"
-            results.append(
-                {
+            if verdict and kind:
+                pkt_ts = float(
+                    bound_packet.get("created_ts") or turn.get("started_ts") or parsed["started_ts"] or 0.0
+                )
+                eff = str(turn.get("effort") or parsed["effort"] or bound_packet.get("effort") or "high")
+                mdl = str(turn.get("model") or parsed["model"] or "")
+                eff_verdict_ts = max(pkt_ts, float(verdict_ts or pkt_ts))
+                rid_key = str(bound_packet["review_id"])
+                rec = {
                     "engine": "codex",
-                    "review_id": bound_packet["review_id"],
+                    "review_id": rid_key,
                     "session_id": parsed["session_id"],
                     "kind": kind,
                     "verdict": verdict,
                     "launch_ts": pkt_ts,
-                    "verdict_ts": max(pkt_ts, float(verdict_ts or pkt_ts)),
+                    "verdict_ts": eff_verdict_ts,
                     "xhigh": eff == "xhigh",
-                    "model": parsed["model"],
+                    "model": mdl,
                     "effort": eff,
                     "rollout_path": parsed["path"],
                 }
-            )
-    return results
+                prev = by_review_id.get(rid_key)
+                if prev is None or eff_verdict_ts >= float(prev.get("verdict_ts") or 0.0):
+                    by_review_id[rid_key] = rec
+    return sorted(by_review_id.values(), key=lambda r: (float(r["launch_ts"]), float(r["verdict_ts"])))
+
+
+def _resolve_resume_session(
+    git_root: str,
+    session: str,
+    candidate_first_ts: float,
+    explicit_resume: str = "",
+    force_new: bool = False,
+) -> str:
+    if force_new:
+        return ""
+    if explicit_resume.strip():
+        return explicit_resume.strip()
+
+    saved = rio.read_json(_thread_state_path(session, git_root), default=None)
+    if isinstance(saved, dict) and saved.get("session_id"):
+        saved_cand_ts = float(saved.get("candidate_first_ts") or 0.0)
+        if candidate_first_ts > 0.0:
+            if saved.get("session") == session and abs(saved_cand_ts - candidate_first_ts) < 1.0:
+                return str(saved["session_id"])
+        elif saved_cand_ts <= 0.0 and (time.time() - float(saved.get("updated_ts") or 0.0)) < 3600.0:
+            return str(saved["session_id"])
+
+    if session and candidate_first_ts > 0.0:
+        prior = scan_verified_codex_reviews(
+            since_ts=candidate_first_ts,
+            session=session,
+            git_root=git_root,
+        )
+        for prev in reversed(prior):
+            sid = str(prev.get("session_id") or "").strip()
+            if sid:
+                return sid
+    return ""
+
+
+def _find_session_id_for_review(review_id: str, since_ts: float) -> str:
+    if not review_id:
+        return ""
+    for rf in _recent_rollout_files(since_ts, limit=20, newest_first=True):
+        parsed = _extract_rollout_texts_and_meta(rf)
+        if not parsed or not parsed.get("session_id"):
+            continue
+        for turn in parsed.get("turns") or []:
+            if review_id in (turn.get("review_ids") or []):
+                return str(parsed["session_id"])
+    return ""
+
+
+def _build_codex_exec_cmd(
+    binary: str,
+    cwd: str,
+    effort: str,
+    model: str = "",
+    resume_session_id: str = "",
+) -> list[str]:
+    common_opts = [
+        "--skip-git-repo-check",
+        "-c",
+        "mcp_servers={}",
+        "-c",
+        f'model_reasoning_effort="{effort}"',
+        "--disable",
+        "codex_hooks",
+    ]
+    if model:
+        common_opts.extend(["-m", model])
+    if resume_session_id:
+        # INVARIANT: `codex exec resume` rejects `-s` and `-C`; rely on subprocess `cwd=cwd` and `--all`.
+        return [binary, "exec", "resume", "--all", *common_opts, resume_session_id, "-"]
+    return [binary, "exec", "-s", "read-only", "-C", cwd, *common_opts, "-"]
 
 
 def build_adversarial_prompt(
@@ -398,6 +545,7 @@ def build_adversarial_prompt(
     scope_summary: str,
     diff_text: str,
     phase: str,
+    is_resume: bool = False,
 ) -> str:
     if phase == "closure":
         verdict_rule = (
@@ -418,9 +566,16 @@ def build_adversarial_prompt(
             "Approve when no real correctness, security, concurrency, edge-case, or contract defects exist. "
             "Do not invent nitpicks to justify REVISE."
         )
+    round_mode = (
+        "ROUND_MODE: continuation (same review thread — verify whether prior findings are resolved, "
+        "check remediation delta for regressions, and do not invent nitpicks on unchanged code).\n"
+        if is_resume
+        else ""
+    )
     return (
         f"REVIEW_ID: {review_id}\n"
         "ROLE: Independent Adversarial Code Reviewer (Read-Only).\n"
+        f"{round_mode}"
         "RULES:\n"
         "1. Do NOT modify any files. Inspect repository files directly if needed for context.\n"
         "2. Verify invariants, failure paths, security boundaries, concurrency, and test coverage.\n"
@@ -431,90 +586,43 @@ def build_adversarial_prompt(
     )
 
 
-def cmd_review(args: argparse.Namespace) -> int:
-    health = check_health()
-    if not health.get("available"):
-        print(json.dumps(health, ensure_ascii=False, indent=2))
-        return 2
-
-    cwd = os.path.abspath(args.cwd or os.getcwd())
-    effort = "xhigh" if args.xhigh else "high"
-    phase = "closure" if args.closure else "ordinary"
-    review_id = args.review_id or f"cwg-{uuid.uuid4().hex[:12]}"
-
-    diff_text = ""
-    if args.diff_file and os.path.isfile(args.diff_file):
-        diff_text = pathlib.Path(args.diff_file).read_text(encoding="utf-8", errors="replace")
-    else:
-        rc, out, _ = rio.run_git(cwd, ["diff", "HEAD"], timeout=10.0)
-        if rc == 0 and isinstance(out, str) and out.strip():
-            diff_text = out
-        else:
-            rc2, out2, _ = rio.run_git(cwd, ["status", "--short"], timeout=5.0)
-            diff_text = str(out2 or "")
-
-    prompt = build_adversarial_prompt(
-        review_id=review_id,
-        scope_summary=args.summary or "Review current repository candidate changes.",
-        diff_text=diff_text,
-        phase=phase,
-    )
-    record_packet(
-        review_id=review_id,
-        prompt_text=prompt,
-        cwd=cwd,
-        effort=effort,
-        phase=phase,
-        session=args.session or "",
-    )
-
-    cmd = [
-        health["binary"],
-        "exec",
-        "--skip-git-repo-check",
-        "-s",
-        "read-only",
-        "-C",
-        cwd,
-        "-c",
-        "mcp_servers={}",
-        "-c",
-        f'model_reasoning_effort="{effort}"',
-        "--disable",
-        "codex_hooks",
-    ]
-    if args.model:
-        cmd.extend(["-m", args.model])
-    cmd.append("-")  # Read prompt cleanly from stdin bytes and close EOF immediately
-
+def _exec_codex_once(
+    cmd: list[str],
+    prompt: str,
+    cwd: str,
+    timeout: float,
+    review_id: str,
+    xhigh: bool,
+) -> tuple[int | None, str, str, bool, str | None]:
     kw = rio.subprocess_kwargs()
     kw.pop("stdin", None)
     try:
         proc = subprocess.run(
             cmd,
             input=prompt.encode("utf-8"),
-            timeout=float(args.timeout),
+            cwd=cwd,
+            timeout=timeout,
             **kw,
         )
     except subprocess.TimeoutExpired:
-        trip_breaker(f"codex_exec_timeout_{args.timeout}s")
+        trip_breaker(f"codex_exec_timeout_{int(timeout)}s")
         print(
             json.dumps(
                 {
                     "ok": False,
                     "review_id": review_id,
-                    "fallback": "adversarial-reviewer-xhigh" if args.xhigh else "adversarial-reviewer",
-                    "error": f"timeout_after_{args.timeout}s",
+                    "fallback": "adversarial-reviewer-xhigh" if xhigh else "adversarial-reviewer",
+                    "error": f"timeout_after_{int(timeout)}s",
                 },
                 ensure_ascii=False,
                 indent=2,
             )
         )
-        return 3
+        return None, "", "", False, "timeout"
     except Exception as exc:
         trip_breaker(f"codex_exec_error:{type(exc).__name__}")
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
-        return 3
+        return None, "", "", False, str(exc)
 
     stdout_text = (proc.stdout or b"").decode("utf-8", errors="replace")
     stderr_text = (proc.stderr or b"").decode("utf-8", errors="replace")
@@ -527,14 +635,98 @@ def cmd_review(args: argparse.Namespace) -> int:
         if (proc.returncode == 0 and has_structured_verdict)
         else detect_outage_from_output(combined, exit_code=proc.returncode)
     )
-    if outage or proc.returncode != 0:
-        trip_breaker(outage or f"codex_nonzero_exit_{proc.returncode}")
+    return proc.returncode, stdout_text, stderr_text, has_structured_verdict, outage
+
+
+def cmd_review(args: argparse.Namespace) -> int:
+    health = check_health()
+    if not health.get("available"):
+        print(json.dumps(health, ensure_ascii=False, indent=2))
+        return 2
+
+    cwd = os.path.abspath(args.cwd or os.getcwd())
+    git_root = rio.git_toplevel(cwd) or cwd
+    effort = "xhigh" if args.xhigh else "high"
+    phase = "closure" if args.closure else "ordinary"
+    review_id = args.review_id or f"cwg-{uuid.uuid4().hex[:12]}"
+    eff_session = args.session or _infer_single_open_session(cwd)
+    cand_first_ts = _candidate_first_ts(eff_session)
+    resume_sid = _resolve_resume_session(
+        git_root=git_root,
+        session=eff_session,
+        candidate_first_ts=cand_first_ts,
+        explicit_resume=getattr(args, "resume", "") or "",
+        force_new=bool(getattr(args, "new_session", False)),
+    )
+
+    diff_text = ""
+    if args.diff_file and os.path.isfile(args.diff_file):
+        diff_text = pathlib.Path(args.diff_file).read_text(encoding="utf-8", errors="replace")
+    else:
+        rc, out, _ = rio.run_git(cwd, ["diff", "HEAD"], timeout=10.0)
+        if rc == 0 and isinstance(out, str) and out.strip():
+            diff_text = out
+        else:
+            rc2, out2, _ = rio.run_git(cwd, ["status", "--short"], timeout=5.0)
+            diff_text = str(out2 or "")
+
+    scope_summary = args.summary or "Review current repository candidate changes."
+    launch_wall_ts = time.time()
+    rc = 1
+    stdout_text = ""
+    stderr_text = ""
+    outage: str | None = None
+    attempts = (resume_sid, "") if resume_sid else ("",)
+    for attempt_idx, cur_resume_sid in enumerate(attempts):
+        prompt = build_adversarial_prompt(
+            review_id=review_id,
+            scope_summary=scope_summary,
+            diff_text=diff_text,
+            phase=phase,
+            is_resume=bool(cur_resume_sid),
+        )
+        record_packet(
+            review_id=review_id,
+            prompt_text=prompt,
+            cwd=cwd,
+            effort=effort,
+            phase=phase,
+            session=eff_session,
+        )
+        launch_wall_ts = time.time()
+        cmd = _build_codex_exec_cmd(
+            health["binary"],
+            cwd=cwd,
+            effort=effort,
+            model=args.model,
+            resume_session_id=cur_resume_sid,
+        )
+        rc_opt, stdout_text, stderr_text, has_structured_verdict, outage = _exec_codex_once(
+            cmd, prompt, cwd, float(args.timeout), review_id, args.xhigh
+        )
+        if rc_opt is None:
+            return 3
+        rc = rc_opt
+        resume_sid = cur_resume_sid
+        # Graceful single fallback to a fresh session if resuming a deleted/unreadable thread UUID
+        if attempt_idx == 0 and cur_resume_sid and rc != 0 and not has_structured_verdict and not outage:
+            tpath = _thread_state_path(eff_session, git_root)
+            try:
+                if tpath.exists():
+                    tpath.unlink()
+            except OSError:
+                pass
+            continue
+        break
+
+    if outage or rc != 0:
+        trip_breaker(outage or f"codex_nonzero_exit_{rc}")
         print(
             json.dumps(
                 {
                     "ok": False,
                     "review_id": review_id,
-                    "exit_code": proc.returncode,
+                    "exit_code": rc,
                     "fallback": "adversarial-reviewer-xhigh" if args.xhigh else "adversarial-reviewer",
                     "error": (outage or stderr_text[-400:] or stdout_text[-400:]).strip(),
                 },
@@ -544,8 +736,25 @@ def cmd_review(args: argparse.Namespace) -> int:
         )
         return 2
 
+    actual_sid = _find_session_id_for_review(review_id, launch_wall_ts) or resume_sid
+    if actual_sid:
+        rio.write_json(
+            _thread_state_path(eff_session, git_root),
+            {
+                "session_id": actual_sid,
+                "last_review_id": review_id,
+                "session": eff_session,
+                "git_root": rio.normalize_path(git_root),
+                "candidate_first_ts": cand_first_ts,
+                "updated_ts": time.time(),
+            },
+        )
+
+    session_mode = "resumed" if resume_sid else "new"
     sys.stdout.write(
         f"REVIEW_ID: {review_id}\n"
+        f"SESSION_ID: {actual_sid}\n"
+        f"SESSION_MODE: {session_mode}\n"
         f"ENGINE: codex ({effort})\n"
         "--- CODEX REVIEW OUTPUT ---\n"
         f"{stdout_text.strip()}\n"
@@ -568,6 +777,8 @@ def main() -> int:
     rev.add_argument("--review-id", default="")
     rev.add_argument("--session", default="")
     rev.add_argument("--model", default="")
+    rev.add_argument("--resume", default="")
+    rev.add_argument("--new-session", action="store_true")
     rev.add_argument("--xhigh", action="store_true")
     rev.add_argument("--closure", action="store_true")
     rev.add_argument("--timeout", type=int, default=240)
@@ -584,6 +795,7 @@ def main() -> int:
                     "breaker": breaker_status(),
                     "binary": find_codex_binary(),
                     "sessions_dir_exists": codex_sessions_dir().is_dir(),
+                    "active_threads": len(list(threads_dir().glob("*.json"))),
                 },
                 ensure_ascii=False,
                 indent=2,
