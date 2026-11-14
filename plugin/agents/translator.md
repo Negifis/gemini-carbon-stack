@@ -1,6 +1,6 @@
 ---
 name: translator
-description: Faithful technical translator (RU/EN and other pairs) running in an isolated minimal context to preserve exact terminology, formatting, code spans, and tone without wasting main session context.
+description: Faithful technical translator (RU/EN and other pairs) routed on Gemini 4 Hydrogen (`low` for short snippets, `medium` for docs, `high` for dense specs) without wasting main Carbon context.
 subagent: true
 mainAgent: false
 tools: [read_file]

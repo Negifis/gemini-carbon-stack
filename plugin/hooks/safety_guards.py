@@ -12,7 +12,16 @@ HOOKS_DIR = pathlib.Path(__file__).resolve().parent
 TOOLS_DIR = HOOKS_DIR.parent / "tools"
 sys.path.insert(0, str(HOOKS_DIR))
 
+import cwg_common as cwg
 import runtime_io as rio
+
+HYDROGEN_POLICY_MSG = (
+    "[Model Policy Guard] Модели Gemini Flash отключены. Используйте `Gemini 4 Hydrogen` с уровнем размышления по сложности задачи: "
+    f"`{cwg.HYDROGEN_MODEL_BY_LEVEL['low']}` (атомарный smoke-check, <=150 строк перевода), "
+    f"`{cwg.HYDROGEN_MODEL_BY_LEVEL['medium']}` (стандартный UI/перевод/разведка), "
+    f"`{cwg.HYDROGEN_MODEL_BY_LEVEL['high']}` (сложные многошаговые сценарии и спецификации) "
+    f"или `{cwg.HYDROGEN_MODEL_BY_LEVEL['xhigh']}` (тяжёлая отладка состояний и гонок)."
+)
 
 CODE_EXTENSIONS = frozenset(
     {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".go", ".rs", ".java", ".c", ".cpp", ".cs", ".ps1", ".sh"}
@@ -160,14 +169,41 @@ def guard_shell_command(cmd: str, cwd: str) -> tuple[str, str | None]:
     return "allow", None
 
 
+def guard_swarm_invocation(args: dict[str, Any]) -> tuple[str, str | None]:
+    action = str(args.get("action") or "").strip().lower()
+    model = str(args.get("model") or "").strip()
+    if action in ("add", "model") and model and cwg.FLASH_MODEL_RE.search(model):
+        return "deny", HYDROGEN_POLICY_MSG
+    return "allow", None
+
+
 def guard_subagent_invocation(
     payload: dict[str, Any], args: dict[str, Any]
 ) -> tuple[str, str | None, dict[str, Any] | None]:
     transcript_path = payload.get("transcriptPath")
     prompt = str(args.get("Prompt") or "").strip()
+    req_model = str(args.get("Model") or "").strip().lower()
+    sub_type = str(args.get("TypeName") or "").strip().lower()
 
-    # 1. Prevent recursive subagent nesting unless explicitly waived
-    if rio.is_subagent_session(transcript_path) and "[allow-nested-subagent]" not in prompt:
+    # 1. Block deprecated Gemini Flash tiers (`flash` / `flash_lite`)
+    if req_model and cwg.FLASH_MODEL_RE.search(req_model):
+        suffix = (
+            "Для `browser` запустите swarm-воркера на `gemini-4-hydrogen-<low|medium|high|xhigh>`, который вызовет `invoke_subagent(TypeName='browser', Model='inherit')` (либо передайте `Model='inherit'` внутри Hydrogen-сессии)."
+            if sub_type == "browser"
+            else "Запустите задачу через `swarm(action='add', model='gemini-4-hydrogen-<low|medium|high|xhigh>')` или передайте `Model='inherit'` внутри Hydrogen-сессии."
+        )
+        return "deny", f"{HYDROGEN_POLICY_MSG} {suffix}", None
+
+    # 2. Prevent recursive subagent nesting unless top-level swarm worker delegates `browser` with `inherit`
+    steps_head = rio.read_transcript_steps(transcript_path, max_lines=5)
+    is_delegated = rio.is_subagent_session(transcript_path, steps=steps_head)
+    is_swarm_worker = rio.is_swarm_worker_session(
+        transcript_path,
+        steps=steps_head,
+        conversation_id=payload.get("conversationId") or payload.get("session_id"),
+    )
+    allow_swarm_browser = bool(is_swarm_worker and sub_type == "browser" and req_model in ("", "inherit"))
+    if is_delegated and not allow_swarm_browser and "[allow-nested-subagent]" not in prompt:
         return (
             "deny",
             "[Subagent Nesting Guard] Вложенный запуск субагента изнутри субагента заблокирован во избежание каскадного размножения контекстов. "
@@ -245,10 +281,22 @@ def main() -> int:
                 rio.emit_pre_tool(decision, reason=reason)
                 return 0
 
+        elif tool_name == "swarm":
+            decision, reason = guard_swarm_invocation(args)
+            if decision != "allow":
+                rio.log_hook_event("hygiene-events", "model_guard_deny", session=session, reason=reason or "")
+                rio.emit_pre_tool(decision, reason=reason)
+                return 0
+
         elif tool_name == "invoke_subagent":
             decision, reason, overwrite = guard_subagent_invocation(payload, args)
-            if decision != "allow" or overwrite:
-                rio.emit_pre_tool(decision, reason=reason, overwrite=overwrite)
+            if decision != "allow":
+                ev = "model_guard_deny" if "[Model Policy Guard]" in (reason or "") else "subagent_guard_deny"
+                rio.log_hook_event("hygiene-events", ev, session=session, reason=reason or "")
+                rio.emit_pre_tool(decision, reason=reason)
+                return 0
+            if overwrite:
+                rio.emit_pre_tool("allow", overwrite=overwrite)
                 return 0
 
         rio.emit_pre_tool("allow")

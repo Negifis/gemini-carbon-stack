@@ -2,7 +2,7 @@
 
 Самостоятельная нативная инженерная операционная система для **Gemini 4 Carbon** в среде исполнения **Google Antigravity 2.0** (`hub-2.32.1` + `agy` CLI `1.2.10` на Windows NT).
 
-Спроектирована как функциональный эквивалент гарантий `Negifis/claude-code-stack` (ревизия `5310f797208af6462dad48eb944869c92a1edf14`), переосмысленный под реальные механизмы Antigravity (`hooks.json` protojson contract, системные транскрипты `transcript_full.jsonl` и `.system_generated/swarm/`, межмодельную маршрутизацию `Claude Sonnet 5.5 High` / `Claude Opus 5.5 High` / `Gemini 4 Carbon High` / `OpenAI Codex CLI`, встроенных субагентов `browser` / `image-generator` / `research` и плагинную архитектуру `~/.gemini/config/plugins/`).
+Спроектирована как функциональный эквивалент гарантий `Negifis/claude-code-stack` (ревизия `5310f797208af6462dad48eb944869c92a1edf14`), переосмысленный под реальные механизмы Antigravity (`hooks.json` protojson contract, системные транскрипты `transcript_full.jsonl` и `.system_generated/swarm/`, межмодельную маршрутизацию `Claude Sonnet 5.5 High` / `Claude Opus 5.5 High` / `Gemini 4 Carbon High` / `Gemini 4 Hydrogen (Low..XHigh)` / `OpenAI Codex CLI`, встроенных субагентов `browser` / `image-generator` / `research` и плагинную архитектуру `~/.gemini/config/plugins/`).
 
 ## Структура репозитория
 

@@ -121,6 +121,17 @@ REVIEW_TIER_XHIGH_RE = re.compile(
 SONNET_HIGH_MODEL = "claude-sonnet-5-5-high"
 OPUS_HIGH_MODEL = "claude-opus-5-5-high"
 CARBON_HIGH_MODEL = "gemini-4-carbon-high"
+HYDROGEN_LOW_MODEL = "gemini-4-hydrogen-low"
+HYDROGEN_MEDIUM_MODEL = "gemini-4-hydrogen-medium"
+HYDROGEN_HIGH_MODEL = "gemini-4-hydrogen-high"
+HYDROGEN_XHIGH_MODEL = "gemini-4-hydrogen-xhigh"
+HYDROGEN_MODEL_BY_LEVEL = {
+    "low": HYDROGEN_LOW_MODEL,
+    "medium": HYDROGEN_MEDIUM_MODEL,
+    "high": HYDROGEN_HIGH_MODEL,
+    "xhigh": HYDROGEN_XHIGH_MODEL,
+}
+FLASH_MODEL_RE = re.compile(r"\bflash(?:[-_]lite)?\b", re.IGNORECASE)
 
 SIMPLIFY_LENSES = ("reuse", "quality", "efficiency")
 SIMPLIFY_LENS_AGENTS = frozenset(
@@ -135,7 +146,6 @@ XHIGH_NATIVE_REVIEWER = "adversarial-reviewer-xhigh"
 SIMPLIFY_REVIEWER = "simplify-reviewer"
 ANTHROPIC_EPHEMERAL_TTL_SECONDS = 300
 SWARM_CACHE_SAFE_TTL_SECONDS = 270
-SWARM_ROLE_MEMBER_RE = re.compile(r"^(?:narrator|monitor)(?:-\d+)?$", re.IGNORECASE)
 
 
 def gate_dir(*parts: str) -> pathlib.Path:
@@ -412,28 +422,11 @@ def clear_swarm_rounds(session: str) -> None:
     unlink_quiet(swarm_rounds_path(session))
 
 
-def swarm_dir(brain_root: pathlib.Path, session: str) -> pathlib.Path:
-    return brain_root / session / ".system_generated" / "swarm"
-
-
-def member_transcript_path(brain_root: pathlib.Path, cid: str) -> pathlib.Path:
-    return brain_root / cid / ".system_generated" / "logs" / "transcript.jsonl"
-
-
-def load_swarm_members(brain_root: pathlib.Path, session: str) -> dict[str, Any]:
-    doc = rio.read_json(swarm_dir(brain_root, session) / "members.json", default=None)
-    if isinstance(doc, dict) and isinstance(doc.get("members"), dict):
-        return doc["members"]
-    return doc if isinstance(doc, dict) else {}
-
-
-def is_swarm_role_member(name: str, meta: dict[str, Any] | None = None) -> bool:
-    role_val = str((meta or {}).get("role") or "worker").strip().lower()
-    return (
-        name == "coordinator"
-        or role_val in ("coordinator", "narrator", "monitor")
-        or bool(SWARM_ROLE_MEMBER_RE.match(name))
-    )
+swarm_dir = rio.swarm_dir
+member_transcript_path = rio.member_transcript_path
+load_swarm_members = rio.load_swarm_members
+is_swarm_role_member = rio.is_swarm_role_member
+is_swarm_member_killed = rio.is_swarm_member_killed
 
 
 def claimed_by_other_sessions(my_session: str, paths: list[str], ttl: float = 600.0) -> set[str]:

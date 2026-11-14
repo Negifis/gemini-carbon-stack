@@ -23,6 +23,10 @@ SUBAGENT_MSG_RE = re.compile(
     r"(?:\s+priority=\S+)?\s+content=(?P<body>.*)",
     re.DOTALL,
 )
+SWARM_BOARD_WAKE_BODY_RE = re.compile(
+    r"\A\[swarm\]\s+new board message\s+#\d+\s*(?:</SYSTEM_MESSAGE>)?\s*\Z"
+)
+SWARM_ROLE_MEMBER_RE = re.compile(r"^(?:narrator|monitor)(?:-\d+)?$", re.IGNORECASE)
 
 NON_ENFORCEABLE_STOP_REASONS = frozenset(
     {
@@ -379,19 +383,154 @@ def read_transcript_steps(transcript_path: str | None, max_lines: int = 4000) ->
     return read_jsonl(tp, max_lines=max_lines)
 
 
-def subagent_parent_id(transcript_path: str | None, steps: list[dict[str, Any]] | None = None) -> str | None:
+def _is_system_message(step: dict[str, Any] | None) -> bool:
+    return bool(step and step.get("source") == "SYSTEM" and step.get("type") == "SYSTEM_MESSAGE")
+
+
+def _first_system_content(
+    transcript_path: str | None, steps: list[dict[str, Any]] | None = None
+) -> str | None:
     items = steps if steps is not None else read_transcript_steps(transcript_path, max_lines=5)
-    if not items:
-        return None
-    first = items[0]
-    if first.get("source") == "SYSTEM" and first.get("type") == "SYSTEM_MESSAGE":
-        content = str(first.get("content") or "")
-        m = SUBAGENT_MSG_RE.search(content)
-        if m:
-            return m.group("sender")
-        if "<swarm_worker>" in content or "post_message" in content or "swarm_wait" in content:
-            return "swarm-coordinator"
+    if items and _is_system_message(items[0]):
+        return str(items[0].get("content") or "")
     return None
+
+
+def subagent_parent_id(transcript_path: str | None, steps: list[dict[str, Any]] | None = None) -> str | None:
+    content = _first_system_content(transcript_path, steps=steps)
+    if content is None:
+        return None
+    m = SUBAGENT_MSG_RE.search(content)
+    if m:
+        return m.group("sender")
+    if content.lstrip().startswith("<swarm_worker>") or "post_message" in content or "swarm_wait" in content:
+        return "swarm-coordinator"
+    return None
+
+
+def swarm_dir(brain_root: pathlib.Path, session: str) -> pathlib.Path:
+    return brain_root / session / ".system_generated" / "swarm"
+
+
+def member_transcript_path(brain_root: pathlib.Path, cid: str) -> pathlib.Path:
+    return brain_root / cid / ".system_generated" / "logs" / "transcript.jsonl"
+
+
+def load_swarm_members(brain_root: pathlib.Path, session: str) -> dict[str, Any]:
+    doc = read_json(swarm_dir(brain_root, session) / "members.json", default=None)
+    if isinstance(doc, dict) and isinstance(doc.get("members"), dict):
+        return doc["members"]
+    return doc if isinstance(doc, dict) else {}
+
+
+def is_swarm_role_member(name: str, meta: dict[str, Any] | None = None) -> bool:
+    role_val = str((meta or {}).get("role") or "worker").strip().lower()
+    return (
+        name == "coordinator"
+        or role_val in ("coordinator", "narrator", "monitor")
+        or bool(SWARM_ROLE_MEMBER_RE.match(name))
+    )
+
+
+def is_swarm_member_killed(meta: dict[str, Any] | None) -> bool:
+    if not isinstance(meta, dict):
+        return False
+    return bool(
+        meta.get("killed")
+        or str(meta.get("phase") or "").strip().upper() == "KILLED"
+        or str(meta.get("desired_state") or "").strip().upper() == "KILLED"
+    )
+
+
+def _swarm_brain_and_cid(
+    transcript_path: str | None, conversation_id: str | None = None
+) -> tuple[pathlib.Path | None, str]:
+    req_cid = str(conversation_id or "").strip()
+    derived_brain: pathlib.Path | None = None
+    derived_cid = ""
+    if transcript_path:
+        try:
+            tp = pathlib.Path(str(transcript_path)).resolve()
+            if len(tp.parts) >= 5 and tp.parent.name == "logs" and tp.parents[1].name == ".system_generated":
+                derived_cid = tp.parents[2].name
+                derived_brain = tp.parents[3]
+        except (OSError, ValueError, RuntimeError):
+            pass
+    if req_cid and derived_cid and req_cid != derived_cid:
+        return None, ""
+    worker_cid = req_cid or derived_cid
+    if not worker_cid:
+        return None, ""
+    if derived_brain is None:
+        env_dir = os.environ.get("ANTIGRAVITY_BRAIN_ROOT", "").strip()
+        if env_dir:
+            derived_brain = pathlib.Path(env_dir).expanduser().resolve()
+        else:
+            default_brain = (pathlib.Path.home() / ".gemini" / "antigravity" / "brain").resolve()
+            if default_brain.is_dir():
+                derived_brain = default_brain
+    return derived_brain, worker_cid
+
+
+def _has_active_worker_entry(members: dict[str, Any], worker_cid: str) -> bool:
+    for name, meta in members.items():
+        if not isinstance(meta, dict) or is_swarm_member_killed(meta) or is_swarm_role_member(name, meta):
+            continue
+        cid = str(meta.get("conversation_id") or meta.get("conversationId") or "").strip()
+        if cid == worker_cid:
+            return True
+    return False
+
+
+def _is_registered_swarm_worker(
+    brain_root: pathlib.Path | None,
+    worker_cid: str,
+    candidate_sessions: list[str] | tuple[str, ...],
+) -> bool:
+    if brain_root is None or not worker_cid:
+        return False
+    seen: set[str] = set()
+    for sid in candidate_sessions:
+        clean_sid = (sid or "").strip()
+        if not clean_sid or clean_sid in seen:
+            continue
+        seen.add(clean_sid)
+        if _has_active_worker_entry(load_swarm_members(brain_root, clean_sid), worker_cid):
+            return True
+    # Peer-sender step-0 on >128KB transcripts may omit step-1 coordinator sender; scan swarm registries on disk.
+    try:
+        for mf in brain_root.glob("*/.system_generated/swarm/members.json"):
+            sid = mf.parents[2].name
+            if sid in seen:
+                continue
+            seen.add(sid)
+            if _has_active_worker_entry(load_swarm_members(brain_root, sid), worker_cid):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def is_swarm_worker_session(
+    transcript_path: str | None,
+    steps: list[dict[str, Any]] | None = None,
+    conversation_id: str | None = None,
+) -> bool:
+    items = steps if steps is not None else read_transcript_steps(transcript_path, max_lines=5)
+    if not items or not _is_system_message(items[0]):
+        return False
+    m0 = SUBAGENT_MSG_RE.search(str(items[0].get("content") or ""))
+    if not m0 or not SWARM_BOARD_WAKE_BODY_RE.match(m0.group("body") or ""):
+        return False
+
+    candidate_sids = [m0.group("sender")]
+    if len(items) > 1 and _is_system_message(items[1]):
+        m1 = SUBAGENT_MSG_RE.search(str(items[1].get("content") or ""))
+        if m1:
+            candidate_sids.append(m1.group("sender"))
+
+    brain_root, worker_cid = _swarm_brain_and_cid(transcript_path, conversation_id=conversation_id)
+    return _is_registered_swarm_worker(brain_root, worker_cid, candidate_sids)
 
 
 def is_subagent_session(transcript_path: str | None, steps: list[dict[str, Any]] | None = None) -> bool:

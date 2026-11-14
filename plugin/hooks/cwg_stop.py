@@ -481,7 +481,7 @@ def scan_swarm_activity(
 
         cur_model = str(minfo.get("model") or "").strip().lower()
         mcid = str(minfo.get("conversation_id") or "").strip()
-        killed = bool(minfo.get("killed"))
+        killed = cwg.is_swarm_member_killed(minfo)
         group_prefix = mname.rsplit("-", 1)[0] if re.search(r"-\d+$", mname) else ""
 
         # Coordinator assignment posts targeting this worker (`coord_posts` drives in-flight; `broadcast_posts` also updates launch windows)
@@ -586,7 +586,7 @@ def scan_swarm_activity(
                     eff_lts = win_ts or tsum["start_ts"] or first_ts
                     if cur_model == cwg.SONNET_HIGH_MODEL:
                         sonnet_lenses[slens] = max(sonnet_lenses.get(slens, 0.0), eff_lts)
-                    else:
+                    elif cur_model == cwg.CARBON_HIGH_MODEL:
                         fallback_lenses[slens] = max(fallback_lenses.get(slens, 0.0), eff_lts)
             continue
 
@@ -598,10 +598,12 @@ def scan_swarm_activity(
                     eff_lts = win_ts or tsum["start_ts"] or first_ts
                     if cur_model == cwg.SONNET_HIGH_MODEL:
                         sonnet_combined_ts = max(sonnet_combined_ts, eff_lts)
-                    else:
+                    elif cur_model == cwg.CARBON_HIGH_MODEL:
                         fallback_combined_ts = max(fallback_combined_ts, eff_lts)
             continue
 
+        if cur_model not in (cwg.OPUS_HIGH_MODEL, cwg.CARBON_HIGH_MODEL):
+            continue
         eng = "internal-opus" if cur_model == cwg.OPUS_HIGH_MODEL else "internal-carbon"
         escalated_from_opus = cwg.OPUS_HIGH_MODEL in prior_reqs
         for w_idx in sorted(bucketed_outputs):

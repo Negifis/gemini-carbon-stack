@@ -23,6 +23,12 @@ description: Frontend UI/UX engineering and live browser verification workflow f
 **Сгенерированный JSX/HTML/CSS без запуска не считается проверенным интерфейсом.**
 
 1. Соберите фронтенд (`npm run build` / typecheck) и при необходимости поднимите локальный dev-сервер в фоне (`run_command` с `IsDaemon: true`).
-2. Делегируйте визуальную и интерактивную проверку встроенному субагенту `browser` (`Model: "flash"` по умолчанию), указав точный URL, сценарий кликов/ввода, проверку консоли на ошибки и проверку desktop/mobile размеров.
-3. Если нужно сравнить рендер с макетом, скопируйте референс в `<Artifact Directory Path>/browser_sandbox/references/<filename>` перед вызовом `browser`.
-4. Сверяйте отчёт `browser` с системным сообщением `BROWSER_HOST_FACTS` (посещённые origin и реальный путь к скриншоту) и осматривайте скриншот мультимодально через `read_file`.
+2. Делегируйте визуальную и интерактивную проверку встроенному субагенту `browser` **на `Gemini 4 Hydrogen` (никогда не `Model="flash"`)**:
+   - Если текущая сессия работает не на Hydrogen (например, на `Gemini 4 Carbon`), запустите `swarm`-воркера `browser-qa` на модели по сложности сценария:
+     - `gemini-4-hydrogen-low` — одиночный smoke-check URL и скриншот;
+     - `gemini-4-hydrogen-medium` — стандартная интерактивная QA (клики, формы, `loading`/`empty`/`populated`/`error`, консоль, desktop/mobile);
+     - `gemini-4-hydrogen-high` — многошаговые SPA/auth-потоки, каскадные формы, воспроизведение регрессий;
+     - `gemini-4-hydrogen-xhigh` — тяжёлая отладка гонок состояния, WebSocket/streaming UI.
+   - Воркер `browser-qa` вызывает `invoke_subagent(TypeName="browser", Model="inherit")`, передав точный URL, сценарий кликов/ввода, проверку консоли на ошибки и проверку desktop/mobile размеров (либо вызывайте `Model="inherit"` напрямую, если сама сессия уже запущена на Hydrogen).
+3. Если нужно сравнить рендер с макетом или загрузить файл, положите его в `browser_sandbox/{references,uploads}/<filename>` **той же сессии-вызывателя** (для swarm-воркера — в `<brain>/<worker_conv_id>/browser_sandbox/...`).
+4. Сверяйте отчёт `browser` с системным сообщением `BROWSER_HOST_FACTS` (посещённые origin и путь к скриншоту в сессии вызывателя) и осматривайте скриншот мультимодально через `read_file`.

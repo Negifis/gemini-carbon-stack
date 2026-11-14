@@ -51,7 +51,7 @@
     "enabled": true,
     "PreToolUse": [
       {
-        "matcher": "edit_file|write_file|run_command|invoke_subagent",
+        "matcher": "edit_file|write_file|run_command|invoke_subagent|swarm",
         "hooks": [
           {
             "type": "command",

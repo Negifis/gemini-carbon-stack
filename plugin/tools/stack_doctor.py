@@ -165,6 +165,11 @@ def run_diagnostics(cwd: str = "") -> dict[str, Any]:
                 "primary_model": cwg.OPUS_HIGH_MODEL,
                 "escalation_model": cwg.CARBON_HIGH_MODEL,
             },
+            "auxiliary_hydrogen": {
+                "replaces": "gemini-flash (disabled)",
+                "models_by_complexity": dict(cwg.HYDROGEN_MODEL_BY_LEVEL),
+                "roles": ["browser", "translator", "auxiliary_exploration"],
+            },
         },
         "codex_lane": codex_info,
         "memory": mem,

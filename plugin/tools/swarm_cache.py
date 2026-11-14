@@ -45,15 +45,25 @@ def resolve_brain_root(brain_root_arg: str = "") -> pathlib.Path:
     return (pathlib.Path.home() / ".gemini" / "antigravity" / "brain").resolve()
 
 
-def _matches_label(worker_name: str, label: str) -> bool:
+def _matches_label(worker_name: str, label: str, model: str = "") -> bool:
     clean = (label or "").strip().lower()
     if not clean:
         return True
     low = (worker_name or "").strip().lower()
-    if clean == "simplify":
-        return "simplify" in low
-    if clean == "review":
-        return "simplify" not in low
+    model_low = (model or "").strip().lower()
+    is_simplify = "simplify" in low or any(k in low for k in cwg.SIMPLIFY_LENSES)
+    if clean in ("simplify", "review"):
+        if model_low and (model_low in cwg.HYDROGEN_MODEL_BY_LEVEL.values() or cwg.FLASH_MODEL_RE.search(model_low)):
+            return False
+        if clean == "simplify":
+            return is_simplify
+        return not is_simplify and (
+            model_low == cwg.OPUS_HIGH_MODEL
+            or "review" in low
+            or "adversarial" in low
+            or "critic" in low
+            or "verifier" in low
+        )
     return clean in low
 
 
@@ -136,15 +146,15 @@ def inspect_swarm_workers(
             continue
         if cwg.is_swarm_role_member(name, meta):
             continue
-        if bool(meta.get("killed")):
-            if _matches_label(name, label):
+        model = str(meta.get("model") or "").strip().lower()
+        if cwg.is_swarm_member_killed(meta):
+            if _matches_label(name, label, model):
                 killed_count += 1
             continue
-        if not _matches_label(name, label):
+        if not _matches_label(name, label, model):
             continue
 
         cid = str(meta.get("conversation_id") or meta.get("conversationId") or "").strip()
-        model = str(meta.get("model") or "").strip().lower()
         tinfo = (
             _inspect_worker_transcript(cwg.member_transcript_path(brain_root, cid))
             if cid
