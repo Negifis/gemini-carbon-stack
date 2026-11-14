@@ -495,8 +495,7 @@ def analyze_progress_visibility(
     stage_completed = False
     tests_ran = False
     failed_cmd_seen = False
-    pending_test_cmd = False
-    pending_stage_cmd = False
+    pending_tc_kinds: list[tuple[bool, bool, bool]] = []
     hypothesis_shift = False
     swarm_active = False
     model_events: list[tuple[int, bool, float]] = []
@@ -514,10 +513,16 @@ def analyze_progress_visibility(
             tcs = st.get("tool_calls") or []
             is_vis = bool(visible_text)
             model_events.append((eff_idx, is_vis, st_ts))
+            pending_tc_kinds.clear()
             if is_vis:
                 for tc in tcs:
-                    if isinstance(tc, dict) and str(tc.get("name") or "") == "swarm" and _is_swarm_active_action(_tc_args_dict(tc)):
+                    if not isinstance(tc, dict):
+                        pending_tc_kinds.append((False, False, False))
+                        continue
+                    tname_vis = str(tc.get("name") or "")
+                    if tname_vis == "swarm" and _is_swarm_active_action(_tc_args_dict(tc)):
                         swarm_active = True
+                    pending_tc_kinds.append((tname_vis == "run_command", False, False))
                 visible_updates_count += 1
                 last_visible_model_step = total_model_steps
                 last_visible_ts = st_ts or last_visible_ts
@@ -531,8 +536,6 @@ def analyze_progress_visibility(
                 stage_completed = False
                 tests_ran = False
                 failed_cmd_seen = False
-                pending_test_cmd = False
-                pending_stage_cmd = False
                 hypothesis_shift = False
                 continue
 
@@ -542,6 +545,7 @@ def analyze_progress_visibility(
             silent_invocations += 1
             for tc in tcs:
                 if not isinstance(tc, dict):
+                    pending_tc_kinds.append((False, False, False))
                     continue
                 tname = str(tc.get("name") or "")
                 args = _tc_args_dict(tc)
@@ -551,6 +555,7 @@ def analyze_progress_visibility(
                     silent_mutations += 1
                     if failed_cmd_seen:
                         hypothesis_shift = True
+                    pending_tc_kinds.append((False, False, False))
                 elif tname == "swarm":
                     action = str(args.get("action") or "").lower()
                     if _is_swarm_active_action(args):
@@ -566,6 +571,7 @@ def analyze_progress_visibility(
                             verification_reason = verification_reason or "запуск swarm simplify/review"
                         else:
                             complex_delegated = True
+                    pending_tc_kinds.append((False, False, False))
                 elif tname == "invoke_subagent":
                     sub_type = str(args.get("TypeName") or "")
                     if SWARM_VERIFY_NAME_RE.search(sub_type):
@@ -573,44 +579,50 @@ def analyze_progress_visibility(
                         verification_reason = verification_reason or f"субагент {sub_type}"
                     else:
                         complex_delegated = True
+                    pending_tc_kinds.append((False, False, False))
                 elif tname in ("run_workflow", "exit_plan_mode"):
                     complex_delegated = True
+                    pending_tc_kinds.append((False, False, False))
                 elif tname == "run_command":
                     cmd = str(args.get("CommandLine") or "")
                     if VERIFY_CMD_RE.search(cmd):
                         verification_started = True
                         verification_reason = verification_reason or "внешний Codex review"
-                    pending_stage_cmd = bool(STAGE_CMD_RE.search(cmd))
-                    if TEST_RUNNER_RE.search(cmd):
+                    is_stage = bool(STAGE_CMD_RE.search(cmd))
+                    is_test = bool(TEST_RUNNER_RE.search(cmd))
+                    if is_test:
                         tests_ran = True
-                        pending_test_cmd = True
-                    else:
-                        pending_test_cmd = False
+                    pending_tc_kinds.append((True, is_stage, is_test))
                     # Codex CLI invocations should not also count as worktree chip delegation.
                     if "codex" not in cmd.lower() and CHIP_OPEN_CMD_RE.search(cmd):
                         complex_delegated = True
+                else:
+                    pending_tc_kinds.append((False, False, False))
 
         elif src in ("SYSTEM", "SYSTEM_SDK") and tp == "SYSTEM_MESSAGE":
             msg = str(st.get("content") or "")
-            if "[Progress Visibility" not in msg and PROGRESS_BLOCKER_SYS_RE.search(msg):
+            stripped_msg = msg.lstrip()
+            if (
+                "[Progress Visibility" not in msg
+                and not stripped_msg.startswith(("Plan mode is off", "[plan review]"))
+                and PROGRESS_BLOCKER_SYS_RE.search(msg)
+            ):
                 blocker_reason = blocker_reason or "сбой/429 квота модели или блокировка гейта"
 
         elif tp == "GENERIC":
             msg = str(st.get("content") or "")
-            if NONZERO_EXIT_RE.search(msg):
-                failed_cmd_seen = True
-                if pending_stage_cmd:
-                    stage_completed = False
-                pending_test_cmd = False
-                pending_stage_cmd = False
-            elif ZERO_EXIT_RE.search(msg):
-                if pending_stage_cmd:
-                    stage_completed = True
-                if pending_test_cmd:
-                    failed_cmd_seen = False
-                    hypothesis_shift = False
-                pending_test_cmd = False
-                pending_stage_cmd = False
+            is_cmd, is_stage_cmd, is_test_cmd = pending_tc_kinds.pop(0) if pending_tc_kinds else (True, False, False)
+            if is_cmd:
+                if NONZERO_EXIT_RE.search(msg):
+                    failed_cmd_seen = True
+                    if is_stage_cmd:
+                        stage_completed = False
+                elif ZERO_EXIT_RE.search(msg):
+                    if is_stage_cmd:
+                        stage_completed = True
+                    if is_test_cmd:
+                        failed_cmd_seen = False
+                        hypothesis_shift = False
 
     if state is not None:
         turn_model_step_seq, turn_vis_count, last_vis_seq, state_vis_ts, state_turn_start_ts = (

@@ -344,6 +344,32 @@ class ContinuityAndMemoryTestCase(unittest.TestCase):
         ]
         self.assertIsNone(continuity.analyze_progress_visibility(failed_stage_steps, now_ts=now + 10)["trigger"])
 
+        # 2b. Parallel commands in one PLANNER_RESPONSE: exit 0 of `git status` must NOT confirm `git commit` exit 1
+        parallel_stage_steps = stage_steps[:4] + [
+            {
+                "step_index": 4,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": self._iso_offset(now, 8),
+                "content": "",
+                "tool_calls": [
+                    {"name": "run_command", "args": {"CommandLine": "git status --short"}},
+                    {"name": "run_command", "args": {"CommandLine": "git commit -m wip"}},
+                ],
+            },
+            {"step_index": 5, "source": "MODEL", "type": "GENERIC", "created_at": self._iso_offset(now, 9), "content": "Command exited with code 0."},
+            {"step_index": 6, "source": "MODEL", "type": "GENERIC", "created_at": self._iso_offset(now, 10), "content": "Command exited with code 1."},
+        ]
+        self.assertIsNone(continuity.analyze_progress_visibility(parallel_stage_steps, now_ts=now + 11)["trigger"])
+
+        # 2c. read_file returning text containing `Command exited with code 1.` must NOT set failed_cmd_seen
+        read_fake_fail_steps = stage_steps[:4] + [
+            {"step_index": 4, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 8), "content": "", "tool_calls": [{"name": "read_file", "args": {"Path": "tests/sample.py"}}]},
+            {"step_index": 5, "source": "MODEL", "type": "GENERIC", "created_at": self._iso_offset(now, 9), "content": 'text = "Command exited with code 1."'},
+            {"step_index": 6, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 10), "content": "", "tool_calls": [{"name": "edit_file", "args": {"Path": "a.py"}}]},
+        ]
+        self.assertIsNone(continuity.analyze_progress_visibility(read_fake_fail_steps, now_ts=now + 11)["trigger"])
+
         # 3. Hypothesis change (failed test -> subsequent edit) and reset when passing test exits 0
         hyp_steps = stage_steps[:4] + [
             {"step_index": 4, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": self._iso_offset(now, 8), "content": "", "tool_calls": [{"name": "run_command", "args": {"CommandLine": "pytest -q"}}]},
