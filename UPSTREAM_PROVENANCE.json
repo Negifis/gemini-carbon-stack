@@ -1,0 +1,19 @@
+{
+  "stack_name": "gemini-carbon-stack",
+  "stack_version": "1.0.0",
+  "upstream_repository": "https://github.com/Negifis/claude-code-stack",
+  "upstream_revision": "5310f797208af6462dad48eb944869c92a1edf14",
+  "upstream_commit_date": "2026-11-10",
+  "local_claude_stack_observed_revision": "6c08404",
+  "local_claude_stack_modified": false,
+  "target_host": {
+    "product": "Google Antigravity 2.0",
+    "language_server_version": "hub-2.32.1",
+    "cli_binary": "agy",
+    "cli_version": "1.2.10",
+    "primary_model": "Gemini 4 Carbon (High)",
+    "os": "Windows NT 10.0.26340.0",
+    "python_version": "3.13.4",
+    "codex_cli_version": "0.160.0"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "name": "gemini-carbon-stack",
+  "displayName": "Gemini Carbon Engineering Stack",
+  "version": "1.0.0",
+  "description": "Gemini-native autonomous engineering system for Google Antigravity 2.0: deterministic Code Work Gate, independent Codex & native review provenance, canonical continuity, local secret-safe durable memory, worktree safety, and multi-session chip handoff.",
+  "logo": "assets/logo.svg",
+  "author": {
+    "name": "Gemini Carbon Engineering"
+  },
+  "suggestedPrompts": [
+    "Запусти /stack-doctor для проверки состояния Gemini Carbon Stack",
+    "Выполни /task-start для начала работы над новой инженерной задачей",
+    "Сохрани текущее состояние задачи через /checkpoint"
+  ]
+}
