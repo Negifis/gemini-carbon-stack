@@ -39,6 +39,7 @@ OUTAGE_PATTERNS = tuple(
         r"429 too many requests",
         r"connection refused",
         r"timed out waiting for model",
+        r"workspace routing discovery failed",
     )
 )
 

@@ -675,6 +675,9 @@ class GateSubprocessTestCase(unittest.TestCase):
         self.assertIsNotNone(
             codex_lane.detect_outage_from_output("ERROR: You have hit your usage limit for today", exit_code=1)
         )
+        self.assertIsNotNone(
+            codex_lane.detect_outage_from_output("workspace routing discovery failed", exit_code=1)
+        )
 
     def test_09_claude_sonnet_lenses_and_opus_to_carbon_escalation(self) -> None:
         # Part A: STANDARD multi-line edit enforces all 3 `claude-sonnet-5-5-high` lenses

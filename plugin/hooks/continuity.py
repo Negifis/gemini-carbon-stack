@@ -29,6 +29,37 @@ CHECKPOINT_EDIT_NUDGE = 8
 MAX_LINT_BLOCKS_PER_EPISODE = 2
 TREE_LOCK_TTL_SECONDS = 1800  # 30 minutes active heartbeat window
 
+PROGRESS_COMPLEX_START_STEPS = 3
+PROGRESS_HEARTBEAT_STEPS = 8
+PROGRESS_WORKER_SILENCE_STEPS = 3
+PROGRESS_HEARTBEAT_SECONDS = 60
+PROGRESS_NUDGE_COOLDOWN_STEPS = 6
+
+WORKER_ONLY_TOOLS = frozenset({"post_message", "send_message", "swarm", "swarm_wait", "read_board"})
+
+TEST_RUNNER_RE = re.compile(
+    r"\b(?:pytest|py\.test|unittest|npm\s+test|pnpm\s+test|yarn\s+test|cargo\s+test|go\s+test|dotnet\s+test)\b",
+    re.IGNORECASE,
+)
+
+PROGRESS_BLOCKER_SYS_RE = re.compile(
+    r"(?:RESOURCE_EXHAUSTED|code\s+429|quota[^\n.]{0,30}(?:exceeded|exhausted|reached|0%)|"
+    r"failed\s+to\s+start\s+execution|ERROR_MESSAGE|\[Code\s+Work\s+Gate\][^\n]*(?:блокир|block)|"
+    r"\[Continuity\s+Output\s+Lint\])",
+    re.IGNORECASE,
+)
+
+NONZERO_EXIT_RE = re.compile(r"Command\s+exited\s+with\s+code\s+(?!0\b)\d+", re.IGNORECASE)
+STAGE_CMD_RE = re.compile(
+    r"\b(?:install\.py(?![^\n]*--(?:dry-run|diagnose)\b)|"
+    r"git(?:\.exe)?\s+(?:-C\s+\S+\s+)?commit\b|"
+    r"chip_handoff\.py\s+(?:merge|close)\b)",
+    re.IGNORECASE,
+)
+VERIFY_CMD_RE = re.compile(r"codex_lane\.py[\"']?\s+review\b", re.IGNORECASE)
+SWARM_VERIFY_RE = re.compile(r"\b(?:simplify|review|adversarial)\b", re.IGNORECASE)
+SWARM_UI_PILL = "[Open the Swarm UI](sidecar://swarm/swarm_board/?auto_open=false)"
+
 CANONICAL_SECTIONS = (
     "GOAL",
     "STATUS",
@@ -116,6 +147,8 @@ def load_session_state(session: str) -> dict[str, Any]:
         "correction_active": False,
         "strong_correction_streak": 0,
         "lint_blocks": 0,
+        "last_progress_nudge_model_step": 0,
+        "last_progress_nudge_kind": "",
         "tool_counts": {},
         "pending_warnings": [],
         "updated_ts": time.time(),
@@ -281,9 +314,250 @@ def detect_compaction(payload: dict[str, Any], state: dict[str, Any], steps: lis
     return False
 
 
+def _tc_args_dict(tc: dict[str, Any]) -> dict[str, Any]:
+    args = tc.get("args")
+    if isinstance(args, dict):
+        return args
+    if isinstance(args, str) and args.strip().startswith("{"):
+        try:
+            parsed = json.loads(args)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _build_progress_nudge(kind: str, reason: str, swarm_active: bool) -> str:
+    base_footer = (
+        "Выведите краткий отчёт (2–4 строки на русском языке по сути, БЕЗ перечисления вызовов инструментов) "
+        "в `content` ЭТОГО ЖЕ ответа параллельно со следующими `tool_calls`, не останавливая автономное выполнение. "
+        "Записи в `swarm` board (`post_message`/`send_message`) пользователю не видны."
+    )
+    if kind == "blocker":
+        return (
+            f"[Progress Visibility — Блокер / переключение] Обнаружено: {reason}. "
+            f"Сообщите пользователю о проблеме и выбранном обходе прямо сейчас. {base_footer}"
+        )
+    if kind == "verification_start":
+        pill_hint = f" Если открыт `swarm`, приложите `{SWARM_UI_PILL}`." if swarm_active else ""
+        return (
+            f"[Progress Visibility — Начало проверки] Запущена финальная верификация/ревью ({reason}). "
+            f"Кратко уведомите пользователя о старте проверки и её контуре.{pill_hint} {base_footer}"
+        )
+    if kind == "complex_start":
+        return (
+            "[Progress Visibility — Старт сложной задачи] В текущем ходе ещё не было видимых сообщений пользователю. "
+            f"Кратко обозначьте цель и ближайший этап работ. {base_footer}"
+        )
+    if kind == "hypothesis_change":
+        return (
+            "[Progress Visibility — Смена гипотезы] После сбоя команды/теста начаты новые правки. "
+            f"Кратко поясните выявленную причину и скорректированный подход. {base_footer}"
+        )
+    if kind == "stage_complete":
+        return (
+            "[Progress Visibility — Этап выполнен] Завершён существенный этап работ или серия правок с тестами. "
+            f"Кратко подведите итог этапа и назовите следующий шаг. {base_footer}"
+        )
+    return (
+        f"[Progress Visibility — Регулярный статус] {reason}. "
+        f"Дайте краткую живую сводку текущего прогресса и оставшейся работы. {base_footer}"
+    )
+
+
+def analyze_progress_visibility(steps: list[dict[str, Any]], now_ts: float | None = None) -> dict[str, Any]:
+    """Inspect user-turn transcript steps for user-visible `PLANNER_RESPONSE.content` vs silent worker/tool loops."""
+    now = time.time() if now_ts is None else float(now_ts)
+
+    last_user_pos = -1
+    for i, st in enumerate(steps):
+        if st.get("source") == "USER_EXPLICIT" and st.get("type") == "USER_INPUT":
+            last_user_pos = i
+    if last_user_pos >= 0:
+        turn_steps = steps[last_user_pos + 1 :]
+        turn_start_ts = rio.parse_iso_ts(steps[last_user_pos].get("created_at"))
+    else:
+        # SAFETY: `read_transcript_steps` keeps `steps[0]` from file head; skip `steps[0]` when `USER_INPUT` scrolled out.
+        turn_steps = steps[1:] if len(steps) > 1 else []
+        turn_start_ts = rio.parse_iso_ts(turn_steps[0].get("created_at")) if turn_steps else 0.0
+
+    total_model_steps = 0
+    visible_updates_count = 0
+    last_visible_step_idx = -1
+    last_visible_model_step = 0
+    last_visible_ts = 0.0
+    silent_invocations = 0
+    silent_tool_calls = 0
+    silent_worker_comms = 0
+    silent_mutations = 0
+    complex_delegated = False
+    verification_started = False
+    verification_reason = ""
+    blocker_reason = ""
+    stage_completed = False
+    tests_ran = False
+    failed_cmd_seen = False
+    hypothesis_shift = False
+    swarm_active = False
+
+    for st in turn_steps:
+        src = st.get("source")
+        tp = st.get("type")
+        st_ts = rio.parse_iso_ts(st.get("created_at"))
+
+        if src == "MODEL" and tp == "PLANNER_RESPONSE":
+            total_model_steps += 1
+            visible_text = str(st.get("content") or "").strip()
+            tcs = st.get("tool_calls") or []
+            if visible_text:
+                visible_updates_count += 1
+                last_visible_step_idx = int(st.get("step_index") or 0)
+                last_visible_model_step = total_model_steps
+                last_visible_ts = st_ts or last_visible_ts
+                silent_invocations = 0
+                silent_tool_calls = 0
+                silent_worker_comms = 0
+                silent_mutations = 0
+                complex_delegated = False
+                verification_started = False
+                verification_reason = ""
+                blocker_reason = ""
+                stage_completed = False
+                tests_ran = False
+                failed_cmd_seen = False
+                hypothesis_shift = False
+                continue
+
+            if not tcs:
+                continue
+
+            silent_invocations += 1
+            silent_tool_calls += len(tcs)
+            for tc in tcs:
+                if not isinstance(tc, dict):
+                    continue
+                tname = str(tc.get("name") or "")
+                args = _tc_args_dict(tc)
+                if tname in WORKER_ONLY_TOOLS:
+                    silent_worker_comms += 1
+                if tname in ("edit_file", "write_file"):
+                    silent_mutations += 1
+                    if failed_cmd_seen:
+                        hypothesis_shift = True
+                elif tname == "swarm":
+                    action = str(args.get("action") or "").lower()
+                    if action in ("add", "model", "status", "title"):
+                        swarm_active = True
+                    if action == "model":
+                        target_model = str(args.get("model") or "fallback")
+                        blocker_reason = blocker_reason or f"переключение модели воркера на `{target_model}`"
+                    elif action == "add":
+                        blob = " ".join(
+                            str(args.get(k) or "") for k in ("name", "brief", "tasks")
+                        )
+                        if SWARM_VERIFY_RE.search(blob):
+                            verification_started = True
+                            verification_reason = verification_reason or "запуск swarm simplify/review"
+                        else:
+                            complex_delegated = True
+                elif tname == "invoke_subagent":
+                    sub_type = str(args.get("TypeName") or "")
+                    if SWARM_VERIFY_RE.search(sub_type):
+                        verification_started = True
+                        verification_reason = verification_reason or f"субагент {sub_type}"
+                    else:
+                        complex_delegated = True
+                elif tname in ("run_workflow", "exit_plan_mode"):
+                    complex_delegated = True
+                elif tname == "run_command":
+                    cmd = str(args.get("CommandLine") or "")
+                    if VERIFY_CMD_RE.search(cmd):
+                        verification_started = True
+                        verification_reason = verification_reason or "внешний Codex review"
+                    if STAGE_CMD_RE.search(cmd):
+                        stage_completed = True
+                    if TEST_RUNNER_RE.search(cmd):
+                        tests_ran = True
+                    if "codex" not in cmd.lower() and re.search(r"\bchip_handoff\.py\s+open\b", cmd, re.IGNORECASE):
+                        complex_delegated = True
+
+        elif src == "SYSTEM" and tp == "SYSTEM_MESSAGE":
+            msg = str(st.get("content") or "")
+            if "[Progress Visibility" not in msg and PROGRESS_BLOCKER_SYS_RE.search(msg):
+                blocker_reason = blocker_reason or "сбой/429 квота модели или блокировка гейта"
+
+        elif tp == "GENERIC":
+            msg = str(st.get("content") or "")
+            if NONZERO_EXIT_RE.search(msg):
+                failed_cmd_seen = True
+
+    # Also detect a freshly tripped Codex circuit breaker within the silent window
+    breaker = rio.read_json(rio.state_dir("gate") / "codex_lane.json", default={})
+    if isinstance(breaker, dict):
+        tripped_at = float(breaker.get("tripped_at") or 0.0)
+        tripped_until = float(breaker.get("tripped_until") or 0.0)
+        anchor_ts = max(turn_start_ts, last_visible_ts)
+        if tripped_until > now and tripped_at > anchor_ts and tripped_at <= now + 5:
+            reason_code = str(breaker.get("reason") or "outage")[:80]
+            blocker_reason = blocker_reason or f"открыт circuit breaker Codex ({reason_code})"
+
+    ref_ts = last_visible_ts or turn_start_ts
+    elapsed_silent_sec = int(max(0.0, now - ref_ts)) if ref_ts > 0 else 0
+
+    trigger_kind = ""
+    trigger_reason = ""
+    if blocker_reason:
+        trigger_kind = "blocker"
+        trigger_reason = blocker_reason
+    elif verification_started:
+        trigger_kind = "verification_start"
+        trigger_reason = verification_reason or "финальная проверка"
+    elif visible_updates_count == 0 and (
+        complex_delegated or silent_mutations >= 2 or silent_invocations >= PROGRESS_COMPLEX_START_STEPS
+    ):
+        trigger_kind = "complex_start"
+        trigger_reason = "старт многошаговой задачи"
+    elif hypothesis_shift:
+        trigger_kind = "hypothesis_change"
+        trigger_reason = "смена гипотезы после сбоя"
+    elif stage_completed or (silent_mutations >= 5 and tests_ran):
+        trigger_kind = "stage_complete"
+        trigger_reason = "завершён существенный этап"
+    elif (
+        silent_worker_comms >= PROGRESS_WORKER_SILENCE_STEPS
+        or silent_invocations >= PROGRESS_HEARTBEAT_STEPS
+        or (silent_invocations >= 5 and elapsed_silent_sec >= PROGRESS_HEARTBEAT_SECONDS)
+    ):
+        trigger_kind = "heartbeat"
+        if silent_worker_comms >= PROGRESS_WORKER_SILENCE_STEPS:
+            trigger_reason = f"выполнено {silent_worker_comms} тихих шагов с воркерами без статуса в чате"
+        else:
+            trigger_reason = f"выполнено {silent_invocations} тихих шагов без отчёта ({elapsed_silent_sec}с)"
+
+    trigger_message = (
+        _build_progress_nudge(trigger_kind, trigger_reason, swarm_active) if trigger_kind else ""
+    )
+
+    return {
+        "total_model_steps": total_model_steps,
+        "visible_updates_count": visible_updates_count,
+        "last_visible_step_idx": last_visible_step_idx,
+        "last_visible_model_step": last_visible_model_step,
+        "silent_invocations": silent_invocations,
+        "silent_tool_calls": silent_tool_calls,
+        "silent_worker_comms": silent_worker_comms,
+        "silent_mutations": silent_mutations,
+        "elapsed_silent_sec": elapsed_silent_sec,
+        "swarm_active": swarm_active,
+        "trigger": trigger_kind or None,
+        "trigger_reason": trigger_reason,
+        "trigger_message": trigger_message,
+    }
+
+
 def handle_pre_invocation(payload: dict[str, Any]) -> None:
     transcript_path = payload.get("transcriptPath")
-    steps = rio.read_transcript_steps(transcript_path, max_lines=60)
+    steps = rio.read_transcript_steps(transcript_path, max_lines=120)
     if rio.is_subagent_session(transcript_path, steps=steps):
         rio.emit_json({})
         return
@@ -308,6 +582,8 @@ def handle_pre_invocation(payload: dict[str, Any]) -> None:
         state["generation"] = int(state.get("generation") or 1) + 1
         state["tool_counts"] = {}
         state["lint_blocks"] = 0
+        state["last_progress_nudge_model_step"] = 0
+        state["last_progress_nudge_kind"] = ""
 
         if STRONG_CORRECTION_RE.search(user_input):
             state["correction_active"] = True
@@ -353,6 +629,37 @@ def handle_pre_invocation(payload: dict[str, Any]) -> None:
             f"[Continuity] Выполнено >= {CHECKPOINT_EDIT_NUDGE} правок без обновления checkpoint. "
             f"Для длительной задачи обновите каноническое состояние (`python -X utf8 \"{cp_script}\" checkpoint ...` или `/checkpoint`)."
         )
+
+    # Progress transparency check with cooldown (worker/swarm board traffic never resets silence)
+    vis = analyze_progress_visibility(steps)
+    trig = vis.get("trigger")
+    if trig:
+        cur_mstep = int(vis.get("total_model_steps") or 0)
+        last_vis_mstep = int(vis.get("last_visible_model_step") or 0)
+        last_nudge_step = int(state.get("last_progress_nudge_model_step") or 0)
+        last_nudge_kind = str(state.get("last_progress_nudge_kind") or "")
+        no_prior_nudge_in_episode = (
+            last_nudge_step <= 0
+            or last_vis_mstep >= last_nudge_step
+            or cur_mstep < last_nudge_step
+        )
+        cooldown_ok = (
+            no_prior_nudge_in_episode
+            or (cur_mstep - last_nudge_step) >= PROGRESS_NUDGE_COOLDOWN_STEPS
+            or (trig in ("blocker", "verification_start") and trig != last_nudge_kind)
+        )
+        if cooldown_ok:
+            injected.append(str(vis["trigger_message"]))
+            state["last_progress_nudge_model_step"] = cur_mstep
+            state["last_progress_nudge_kind"] = trig
+            rio.log_hook_event(
+                "continuity-events",
+                "progress_nudge",
+                session=session,
+                trigger=trig,
+                silent_invocations=vis["silent_invocations"],
+                silent_worker_comms=vis["silent_worker_comms"],
+            )
 
     state["last_step_count"] = max(int(payload.get("initialNumSteps") or 0), len(steps))
     save_session_state(session, state)
@@ -422,9 +729,7 @@ def handle_pre_tool(payload: dict[str, Any]) -> None:
 
     if tool_name == "run_command":
         cmd_str = str(args.get("CommandLine") or "")
-        is_test_runner = bool(
-            re.search(r"\b(?:pytest|py\.test|unittest|npm\s+test|pnpm\s+test|yarn\s+test|cargo\s+test|go\s+test|dotnet\s+test)\b", cmd_str, re.IGNORECASE)
-        )
+        is_test_runner = bool(TEST_RUNNER_RE.search(cmd_str))
         if not is_test_runner:
             if new_count == CMD_REPEAT_WARN_LIMIT:
                 warns = list(state.get("pending_warnings") or [])
@@ -483,8 +788,10 @@ def handle_stop(payload: dict[str, Any]) -> None:
         return
 
     session = rio.session_key(payload)
+    cwd = rio.effective_cwd(payload)
     state = load_session_state(session)
     if not state.get("correction_active"):
+        touch_tree_lock(session, cwd, release=True)
         rio.emit_stop_allow()
         return
 
@@ -601,8 +908,15 @@ def cmd_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_progress(args: argparse.Namespace) -> int:
+    steps = rio.read_transcript_steps(args.transcript, max_lines=120)
+    report = analyze_progress_visibility(steps)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0
+
+
 def main() -> int:
-    if len(sys.argv) > 1 and sys.argv[1] in ("checkpoint", "show"):
+    if len(sys.argv) > 1 and sys.argv[1] in ("checkpoint", "show", "progress"):
         parser = argparse.ArgumentParser(prog="continuity")
         sub = parser.add_subparsers(dest="subcmd", required=True)
 
@@ -625,9 +939,14 @@ def main() -> int:
         sh = sub.add_parser("show")
         sh.add_argument("--cwd", default="")
 
+        pr = sub.add_parser("progress")
+        pr.add_argument("--transcript", required=True)
+
         parsed = parser.parse_args()
         if parsed.subcmd == "checkpoint":
             return cmd_checkpoint(parsed)
+        if parsed.subcmd == "progress":
+            return cmd_progress(parsed)
         return cmd_show(parsed)
 
     event = rio.parse_event_arg()
