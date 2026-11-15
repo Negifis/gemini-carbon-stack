@@ -1,6 +1,6 @@
 ---
 name: stack-doctor
-description: Run comprehensive diagnostics (`/stack-doctor`) on the Gemini Carbon Engineering Stack: validates plugin installation, live Antigravity Language Server ingestion, hooks, Codex lane, local FTS5 memory, active chips, and gate inbox.
+description: Triggered by /stack-doctor to run health diagnostics on gemini-carbon-stack installation, hooks, Codex lane, and Language Server.
 ---
 
 # `/stack-doctor` — Диагностика инженерного стека

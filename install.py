@@ -12,6 +12,7 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import time
 from typing import Any
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent
@@ -123,9 +124,9 @@ def preflight_check(config_dir: pathlib.Path) -> dict[str, Any]:
             kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
         proc = subprocess.run([agy_bin, "plugin", "validate", str(SOURCE_PLUGIN_DIR)], **kw)
         out = (((proc.stdout or b"") + b"\n" + (proc.stderr or b"")).decode("utf-8", errors="replace")).strip()
-        agy_validation = {"ran": True, "ok": proc.returncode == 0, "output": out[:400]}
+        agy_validation = {"ran": True, "ok": proc.returncode == 0, "output": out}
         if proc.returncode != 0:
-            errors.append(f"`agy plugin validate` failed: {out[:240]}")
+            errors.append(f"`agy plugin validate` failed: {out}")
     elif not agy_bin:
         warnings.append("`agy` CLI binary not found on PATH; skipped `agy plugin validate`.")
 
@@ -140,15 +141,60 @@ def preflight_check(config_dir: pathlib.Path) -> dict[str, Any]:
     }
 
 
+def _atomic_copy_file(src_file: pathlib.Path, dst_file: pathlib.Path) -> None:
+    dst_file.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst_file.with_name(f".{dst_file.name}.agy-tmp-{os.getpid()}")
+    try:
+        shutil.copy2(src_file, tmp)
+        for attempt in range(4):
+            try:
+                os.replace(tmp, dst_file)
+                return
+            except PermissionError:
+                if attempt == 3:
+                    shutil.copy2(src_file, dst_file)
+                    return
+                time.sleep(0.05 * (attempt + 1))
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
 def copy_clean_tree(src: pathlib.Path, dst: pathlib.Path) -> None:
-    if dst.exists():
-        shutil.rmtree(dst)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(
-        src,
-        dst,
-        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo", ".DS_Store"),
-    )
+    if not dst.is_dir():
+        if dst.exists():
+            dst.unlink()
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(
+            src,
+            dst,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo", ".DS_Store"),
+        )
+        return
+
+    # INVARIANT: Synchronize live plugin trees in-place so active PreToolUse hook scripts never vanish
+    # and Windows Language Server directory watches on `skills/*` do not fail with WinError 32 on rmdir.
+    src_map = tree_manifest(src)
+    dst_map = tree_manifest(dst)
+    for rel, src_hash in src_map.items():
+        if dst_map.get(rel) != src_hash:
+            _atomic_copy_file(src / rel, dst / rel)
+
+    for rel in sorted(set(dst_map) - set(src_map)):
+        stale = dst / rel
+        if stale.exists():
+            stale.unlink()
+
+    for dirpath, _, _ in os.walk(dst, topdown=False):
+        cur = pathlib.Path(dirpath)
+        if cur == dst:
+            continue
+        rel_dir = cur.relative_to(dst)
+        if cur.name in SKIP_NAMES or not (src / rel_dir).is_dir():
+            shutil.rmtree(cur, ignore_errors=True)
 
 
 def create_backup(config_dir: pathlib.Path, stack_home: pathlib.Path) -> dict[str, Any]:
@@ -356,7 +402,7 @@ def perform_diagnose(config_dir: pathlib.Path, stack_home: pathlib.Path) -> dict
     kw: dict[str, Any] = {"stdin": subprocess.DEVNULL, "capture_output": True, "timeout": 12.0, "env": env}
     if os.name == "nt":
         kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-    proc = subprocess.run([sys.executable, "-X", "utf8", str(doctor_script)], **kw)
+    proc = subprocess.run([sys.executable, "-X", "utf8", str(doctor_script), "--compact"], **kw)
     try:
         doctor_out = json.loads((proc.stdout or b"{}").decode("utf-8", errors="replace"))
     except Exception:
@@ -373,6 +419,12 @@ def perform_diagnose(config_dir: pathlib.Path, stack_home: pathlib.Path) -> dict
     }
 
 
+def _dump_cli_json(obj: dict[str, Any], pretty: bool = False) -> str:
+    if pretty:
+        return json.dumps(obj, ensure_ascii=False, indent=2)
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="install.py", description="Gemini Carbon Engineering Stack Installer")
     parser.add_argument("--dry-run", action="store_true", help="Inspect and report planned actions without writing")
@@ -387,18 +439,19 @@ def main() -> int:
     parser.add_argument("--force-foreign", action="store_true", help="Allow replacing foreign uiux-design.md after backup")
     parser.add_argument("--target-config-dir", default="", help="Override ~/.gemini/config (for isolated tests)")
     parser.add_argument("--stack-home", default="", help="Override ~/.gemini/carbon-stack (for isolated tests)")
+    parser.add_argument("--pretty", action="store_true", help="Format JSON output with indentation")
 
     args = parser.parse_args()
     config_dir, stack_home = resolve_paths(args.target_config_dir, args.stack_home)
 
     if args.diagnose:
         res = perform_diagnose(config_dir, stack_home)
-        print(json.dumps(res, ensure_ascii=False, indent=2))
+        print(_dump_cli_json(res, pretty=bool(args.pretty)))
         return 0 if res.get("ok") else 1
 
     if args.rollback:
         res = perform_rollback(config_dir, stack_home, backup_selector=args.rollback)
-        print(json.dumps(res, ensure_ascii=False, indent=2))
+        print(_dump_cli_json(res, pretty=bool(args.pretty)))
         return 0 if res.get("ok") else 1
 
     res = perform_install(
@@ -407,7 +460,7 @@ def main() -> int:
         dry_run=bool(args.dry_run),
         force_foreign=bool(args.force_foreign),
     )
-    print(json.dumps(res, ensure_ascii=False, indent=2))
+    print(_dump_cli_json(res, pretty=bool(args.pretty)))
     return 0 if res.get("ok") else 1
 
 

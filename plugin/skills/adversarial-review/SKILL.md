@@ -1,6 +1,6 @@
 ---
 name: adversarial-review
-description: Run independent read-only adversarial code review (`/adversarial-review`): primary external OpenAI Codex lane (`codex_lane.py`) unchanged; internal review lane on Claude Opus 5.5 High (`claude-opus-5-5-high`) with automatic escalation to Gemini 4 Carbon High (`gemini-4-carbon-high`) on Opus error/quota/stall.
+description: Triggered by /adversarial-review or HIGH/XHIGH changes requiring independent read-only review (codex_lane.py or Claude Opus 5.5 High swarm).
 ---
 
 # `/adversarial-review` — Независимое критическое ревью кода

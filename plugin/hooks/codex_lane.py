@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import os
 import pathlib
 import re
@@ -257,7 +256,7 @@ def check_health() -> dict[str, Any]:
             return {
                 "available": False,
                 "lane": "native-fallback",
-                "reason": f"codex_not_logged_in: {combined[:160]}",
+                "reason": f"codex_not_logged_in: {combined}",
             }
         return {
             "available": True,
@@ -626,22 +625,18 @@ def _exec_codex_once(
         )
     except subprocess.TimeoutExpired:
         trip_breaker(f"codex_exec_timeout_{int(timeout)}s")
-        print(
-            json.dumps(
-                {
-                    "ok": False,
-                    "review_id": review_id,
-                    "fallback": "adversarial-reviewer-xhigh" if xhigh else "adversarial-reviewer",
-                    "error": f"timeout_after_{int(timeout)}s",
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
+        rio.print_cli_json(
+            {
+                "ok": False,
+                "review_id": review_id,
+                "fallback": "adversarial-reviewer-xhigh" if xhigh else "adversarial-reviewer",
+                "error": f"timeout_after_{int(timeout)}s",
+            },
         )
         return None
     except Exception as exc:
         trip_breaker(f"codex_exec_error:{type(exc).__name__}")
-        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        rio.print_cli_json({"ok": False, "error": str(exc)})
         return None
 
     stdout_text = (proc.stdout or b"").decode("utf-8", errors="replace")
@@ -661,7 +656,7 @@ def _exec_codex_once(
 def cmd_review(args: argparse.Namespace) -> int:
     health = check_health()
     if not health.get("available"):
-        print(json.dumps(health, ensure_ascii=False, indent=2))
+        rio.print_cli_json(health, pretty=args.pretty)
         return 2
 
     cwd = os.path.abspath(args.cwd or os.getcwd())
@@ -744,19 +739,19 @@ def cmd_review(args: argparse.Namespace) -> int:
     assert exec_res is not None
     if exec_res.outage or exec_res.rc != 0:
         trip_breaker(exec_res.outage or f"codex_nonzero_exit_{exec_res.rc}")
-        print(
-            json.dumps(
-                {
-                    "ok": False,
-                    "review_id": review_id,
-                    "exit_code": exec_res.rc,
-                    "fallback": "adversarial-reviewer-xhigh" if args.xhigh else "adversarial-reviewer",
-                    "error": (exec_res.outage or exec_res.stderr[-400:] or exec_res.stdout[-400:]).strip(),
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-        )
+        err_detail = (exec_res.stderr or exec_res.stdout or "").strip()
+        if exec_res.outage and err_detail and exec_res.outage not in err_detail:
+            err_msg = f"{exec_res.outage}: {err_detail}"
+        else:
+            err_msg = (exec_res.outage or err_detail).strip()
+        err_obj = {
+            "ok": False,
+            "review_id": review_id,
+            "exit_code": exec_res.rc,
+            "fallback": "adversarial-reviewer-xhigh" if args.xhigh else "adversarial-reviewer",
+            "error": err_msg,
+        }
+        rio.print_cli_json(err_obj, pretty=args.pretty)
         return 2
 
     actual_sid = _find_session_id_for_review(review_id, launch_wall_ts) or used_resume_sid
@@ -789,8 +784,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="codex_lane")
     sub = parser.add_subparsers(dest="subcommand", required=True)
 
-    sub.add_parser("check", help="Check Codex CLI availability, auth, and circuit breaker")
-    sub.add_parser("status", help="Show circuit breaker and recent rollout status")
+    chk = sub.add_parser("check", help="Check Codex CLI availability, auth, and circuit breaker")
+    chk.add_argument("--pretty", action="store_true")
+    stp = sub.add_parser("status", help="Show circuit breaker and recent rollout status")
+    stp.add_argument("--pretty", action="store_true")
     sub.add_parser("reset", help="Clear circuit breaker")
 
     rev = sub.add_parser("review", help="Execute isolated read-only Codex adversarial review")
@@ -805,30 +802,26 @@ def main() -> int:
     rev.add_argument("--xhigh", action="store_true")
     rev.add_argument("--closure", action="store_true")
     rev.add_argument("--timeout", type=int, default=240)
+    rev.add_argument("--pretty", action="store_true")
 
     args = parser.parse_args()
     if args.subcommand == "check":
         res = check_health()
-        print(json.dumps(res, ensure_ascii=False, indent=2))
+        rio.print_cli_json(res, pretty=args.pretty)
         return 0 if res.get("available") else 1
     if args.subcommand == "status":
         sweep_expired_gate_files()
-        print(
-            json.dumps(
-                {
-                    "breaker": breaker_status(),
-                    "binary": find_codex_binary(),
-                    "sessions_dir_exists": codex_sessions_dir().is_dir(),
-                    "active_threads": len(list(threads_dir().glob("*.json"))),
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-        )
+        st_obj = {
+            "breaker": breaker_status(),
+            "binary": find_codex_binary(),
+            "sessions_dir_exists": codex_sessions_dir().is_dir(),
+            "active_threads": len(list(threads_dir().glob("*.json"))),
+        }
+        rio.print_cli_json(st_obj, pretty=args.pretty)
         return 0
     if args.subcommand == "reset":
         reset_breaker()
-        print(json.dumps({"reset": True}))
+        rio.print_cli_json({"reset": True})
         return 0
     if args.subcommand == "review":
         return cmd_review(args)

@@ -1,6 +1,6 @@
 ---
 name: project-memory
-description: Durable local FTS5 engineering memory (`carbon_memory.py`) for storing, recalling, superseding, and exporting verified project/global gotchas, risks, decisions, constraints, and commands without leaking secrets.
+description: CLI reference for carbon_memory.py (SQLite FTS5 durable facts and export-nlm). Load ONLY when storing, superseding, or recalling memory entries.
 ---
 
 # Project & Global Engineering Memory

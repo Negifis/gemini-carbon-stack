@@ -438,7 +438,7 @@ class GateSubprocessTestCase(unittest.TestCase):
         _, allowed = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
         self.assertEqual(allowed, {"decision": "allow"})
 
-    def test_04_ordinary_standard_edit_requires_simplify(self) -> None:
+    def test_04_ordinary_standard_edit_proportional_and_project_opt_in(self) -> None:
         app = self.workspace / "app.py"
         big_code = "\n".join([f"def fn_{i}(x):\n    return x + {i}" for i in range(6)]) + "\n"
         app.write_text(big_code, encoding="utf-8")
@@ -452,7 +452,27 @@ class GateSubprocessTestCase(unittest.TestCase):
             "PostToolUse",
             {"toolCall": {"id": "c1", "name": "run_command", "args": {"CommandLine": "python -m unittest"}}, "error": ""},
         )
+        # Default STANDARD closes with local unittest alone (no automatic swarm simplify required)
         self.add_final_response("Реализовано.\n[gate] verified: STANDARD; app.py, unittest ok")
+        _, ok_default = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
+        self.assertEqual(ok_default, {"decision": "allow"})
+
+        # With .agents/carbon-gate.json opt-in, STANDARD enforces Sonnet simplify
+        gate_cfg = self.workspace / ".agents" / "carbon-gate.json"
+        gate_cfg.parent.mkdir(parents=True, exist_ok=True)
+        gate_cfg.write_text(json.dumps({"require_simplify_on_standard": True}), encoding="utf-8")
+        app.write_text(big_code + "\ndef extra(y):\n    return y\n", encoding="utf-8")
+        self.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {"toolCall": {"id": "w2", "name": "write_file", "args": {"Path": str(app), "Content": app.read_text()}}, "error": ""},
+        )
+        self.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {"toolCall": {"id": "c2", "name": "run_command", "args": {"CommandLine": "python -m unittest"}}, "error": ""},
+        )
+        self.add_final_response("Реализовано по политике.\n[gate] verified: STANDARD; app.py, unittest ok")
         _, blk = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
         self.assertEqual(blk["decision"], "continue")
         self.assertIn("claude-sonnet-5-5-high", blk["reason"])
@@ -688,7 +708,12 @@ class GateSubprocessTestCase(unittest.TestCase):
         )
 
     def test_09_claude_sonnet_lenses_and_opus_to_carbon_escalation(self) -> None:
-        # Part A0: Non-small STANDARD edit accepts 1 combined `simplify-reviewer` on `claude-sonnet-5-5-high`, never on Carbon without Sonnet failure
+        # Enable project opt-in for STANDARD simplify verification via .agents/carbon-gate.json
+        gate_cfg = self.workspace / ".agents" / "carbon-gate.json"
+        gate_cfg.parent.mkdir(parents=True, exist_ok=True)
+        gate_cfg.write_text(json.dumps({"require_simplify_on_standard": True}), encoding="utf-8")
+
+        # Part A0: Opt-in STANDARD edit accepts 1 combined `simplify-reviewer` on `claude-sonnet-5-5-high`, never on Carbon without Sonnet failure
         helper = self.workspace / "report_helper.py"
         helper_code = "\n".join([f"def fmt_{i}(x):\n    return str(x + {i})" for i in range(6)]) + "\n"
         helper.write_text(helper_code, encoding="utf-8")
@@ -894,13 +919,13 @@ class GateSubprocessTestCase(unittest.TestCase):
         self.assertAlmostEqual(rio.parse_iso_ts(naive_local), float(int(now)), delta=1.5)
 
         # 2. Shell command classifier blocks chained/piped mutations and `echo pytest` / `--merge`
-        self.assertEqual(cwg_mark.classify_shell_command(r"git status; Remove-Item src\app.py"), "MUTATING_OR_UNKNOWN")
-        self.assertEqual(cwg_mark.classify_shell_command("Get-Content a.py | Set-Content b.py"), "MUTATING_OR_UNKNOWN")
-        self.assertEqual(cwg_mark.classify_shell_command('git diff && python -c "open(\'x\',\'w\')"'), "MUTATING_OR_UNKNOWN")
-        self.assertEqual(cwg_mark.classify_shell_command("echo pytest"), "MUTATING_OR_UNKNOWN")
+        self.assertEqual(cwg_mark.classify_shell_command(r"git status; Remove-Item src\app.py"), "MUTATING")
+        self.assertEqual(cwg_mark.classify_shell_command("Get-Content a.py | Set-Content b.py"), "MUTATING")
+        self.assertEqual(cwg_mark.classify_shell_command('git diff && python -c "open(\'x\',\'w\')"'), "MUTATING")
+        self.assertEqual(cwg_mark.classify_shell_command("echo pytest"), "UNCERTAIN")
         self.assertEqual(
             cwg_mark.classify_shell_command("python -X utf8 chip_handoff.py close --chip c1 --accept --merge"),
-            "MUTATING_OR_UNKNOWN",
+            "MUTATING",
         )
         self.assertEqual(cwg_mark.classify_shell_command("pytest -q"), "VALIDATION")
 
@@ -1039,12 +1064,12 @@ class GateSubprocessTestCase(unittest.TestCase):
         self.assertEqual([r["idx"] for r in parsed_rows], list(range(100)))
 
         # 2. `git diff --output=...`, PowerShell `$(...)` / `(...)` / `@(...)`, and `rg --pre` are NOT READ_ONLY
-        self.assertEqual(cwg_mark.classify_shell_command("git diff --output=src/app.py"), "MUTATING_OR_UNKNOWN")
-        self.assertEqual(cwg_mark.classify_shell_command("Get-Content $(Set-Content src\\x.py 'y')"), "MUTATING_OR_UNKNOWN")
-        self.assertEqual(cwg_mark.classify_shell_command('Get-Content "$(Set-Content src\\x.py \'y\')"'), "MUTATING_OR_UNKNOWN")
-        self.assertEqual(cwg_mark.classify_shell_command("Test-Path (New-Item src\\new.py -Force)"), "MUTATING_OR_UNKNOWN")
-        self.assertEqual(cwg_mark.classify_shell_command("Get-Content @(Remove-Item src\\app.py)"), "MUTATING_OR_UNKNOWN")
-        self.assertEqual(cwg_mark.classify_shell_command("rg --pre C:\\t\\x.bat foo"), "MUTATING_OR_UNKNOWN")
+        self.assertEqual(cwg_mark.classify_shell_command("git diff --output=src/app.py"), "MUTATING")
+        self.assertEqual(cwg_mark.classify_shell_command("Get-Content $(Set-Content src\\x.py 'y')"), "MUTATING")
+        self.assertEqual(cwg_mark.classify_shell_command('Get-Content "$(Set-Content src\\x.py \'y\')"'), "MUTATING")
+        self.assertEqual(cwg_mark.classify_shell_command("Test-Path (New-Item src\\new.py -Force)"), "MUTATING")
+        self.assertEqual(cwg_mark.classify_shell_command("Get-Content @(Remove-Item src\\app.py)"), "MUTATING")
+        self.assertEqual(cwg_mark.classify_shell_command("rg --pre C:\\t\\x.bat foo"), "UNCERTAIN")
 
         # 3. JSON quoted keys, unseparated prefixes (`PGPASSWORD`), Stripe/Telegram/HF secrets caught by secret guard
         for leak in (

@@ -9,11 +9,12 @@
 - `install.py` — безопасный идемпотентный установщик с preflight-проверками, валидацией через `agy plugin validate`, резервным копированием, `--dry-run`, `--diagnose` и `--rollback`.
 - `plugin/` — нативный плагин-бандл Antigravity (`gemini-carbon-stack`):
   - `plugin.json`, `hooks.json` — манифест плагина и 4 группы runtime-хуков (`continuity`, `safety-and-quality-guards`, `chip-handoff`, `code-work-gate`).
-  - `hooks/` — исполняемые модули гейта, межмодельной верификации (`codex_lane.py` + `swarm` `members.json`/`board.jsonl`), continuity, защиты от циклов, контроля плотности комментариев, безопасности git worktree и межсессионной передачи задач.
+  - `hooks/` — исполняемые модули риск-ориентированного гейта, межмодельной верификации (`codex_lane.py` + `swarm` `members.json`/`board.jsonl`), минимального `handoff` (`continuity.py`), защиты от циклов, безопасности git worktree и межсессионной передачи задач.
   - `tools/` — локальная FTS5-память с защитой от секретов (`carbon_memory.py`), оркестратор изолированных задач (`chip_handoff.py`), быстрый AST/git-grep поиск (`code_search.py`), контроль 5-минутного TTL кэша `swarm` и инкрементальных диффов (`swarm_cache.py`), безопасное управление worktrees/junctions (`worktree_guard.py`), самодиагностика (`stack_doctor.py`), диагностика файловых дескрипторов Windows (`file-holders.ps1`) и векторизация SVG (`vectorize.mjs`).
-  - `rules/AGENTS.md` — компактная глобальная конституция Gemini Carbon и правила Windows PowerShell 5.1.
+  - `rules/` — компактная всегда активная конституция `AGENTS.md` (~3.4 KB) и селективные правила по нативным триггерам Antigravity (`high-risk-verification.md` `glob`, `multi-agent-routing.md` `model_decision`, `deep-audit.md` `manual`).
   - `agents/` — 8 специализированных read-only субагентов (`simplify-reviewer`, `simplify-reuse-reviewer`, `simplify-quality-reviewer`, `simplify-efficiency-reviewer`, `adversarial-reviewer`, `adversarial-reviewer-xhigh`, `code-explorer`, `translator`).
-  - `skills/` — 19 прогрессивных навыков и slash-команд (`/task-start`, `/checkpoint`, `/rebuild`, `/adversarial-review`, `/verify-ready`, `/stack-doctor` и профильные дисциплины).
+  - `skills/` — 19 прогрессивных навыков и slash-команд (`/task-start`, `/checkpoint`, `/rebuild`, `/adversarial-review`, `/verify-ready`, `/stack-doctor` и профильные дисциплины) с компактными описаниями.
+  - Опциональная проектная политика `.agents/carbon-gate.json` для переопределения порогов риска (`default_code_risk`, `*_risk_globs`, `require_*_on_standard`).
 - `rules/uiux-design.md` — контекстное правило фронтенда (`trigger: glob`), активируемое только на файлах UI/разметки.
 - `tests/` — полный набор модульных, негативных и live-интеграционных тестов.
 - `ARCHITECTURE.md` — описание архитектуры, межмодельной маршрутизации и реальных границ гарантий.

@@ -82,12 +82,9 @@ def candidate_restored_to_clean_head(marker: dict[str, Any]) -> tuple[bool, str]
 def read_checks_evidence(session: str, first_ts: float) -> dict[str, Any]:
     path = cwg.checks_ledger_path(session)
     checks: list[dict[str, Any]] = []
-    skills_read: set[str] = set()
     for rec in rio.read_jsonl(path):
         ts = float(rec.get("ts") or 0.0)
-        if rec.get("kind") == "skill_read" and rec.get("skill"):
-            skills_read.add(str(rec["skill"]))
-        elif rec.get("kind") == "check" and ts >= first_ts - 1.0:
+        if rec.get("kind") == "check" and ts >= first_ts - 1.0:
             checks.append(rec)
     passed = [c for c in checks if c.get("passed")]
     failed = [c for c in checks if not c.get("passed")]
@@ -99,7 +96,6 @@ def read_checks_evidence(session: str, first_ts: float) -> dict[str, Any]:
         "failed_count": len(failed),
         "latest_pass_ts": latest_pass_ts,
         "latest_fail_ts": latest_fail_ts,
-        "skills_read": skills_read,
     }
 
 
@@ -852,10 +848,14 @@ def validate_candidate_closure(
     sub_ev: dict[str, Any],
     swarm_ev: dict[str, Any],
     codex_reviews: list[dict[str, Any]],
+    ctx: dict[str, Any] | None = None,
 ) -> tuple[bool, str]:
     wclass = cwg.candidate_class(marker)
-    floor = cwg.candidate_floor(marker)
-    small = cwg.is_small_edit(marker)
+    cctx = ctx or cwg.resolve_candidate_context(marker)
+    cwd = cctx["cwd"]
+    dpaths = cctx["dpaths"]
+    policy = cctx["policy"]
+    floor = cctx["floor"]
 
     if receipt is None:
         if wclass == cwg.WORK_OPERATIONAL:
@@ -895,18 +895,26 @@ def validate_candidate_closure(
             )
     effective_risk = cwg.max_risk([floor, declared_risk])
 
-    # 1. Deterministic Check Verification (STANDARD / HIGH / XHIGH)
-    if effective_risk in ("STANDARD", "HIGH", "XHIGH") and rkind in ("verified", "pr-ready"):
+    # 1. Deterministic Check Verification (always fail if a run validation command failed; require check pass when applicable)
+    if rkind in ("verified", "pr-ready") and checks_ev["latest_fail_ts"] > checks_ev["latest_pass_ts"]:
+        return (
+            False,
+            "latest validation/test command failed with no subsequent passing verification run",
+        )
+
+    if effective_risk == floor and cctx["require_tests"] is not None:
+        require_checks = bool(cctx["require_tests"])
+    else:
+        require_checks = cwg.requires_tests(
+            effective_risk, cwd=cwd, paths=dpaths, policy=policy, git_root=cctx["git_root"]
+        )
+
+    if require_checks and rkind in ("verified", "pr-ready"):
         last_durable = float(marker.get("last_durable_ts") or marker.get("first_ts") or 0.0)
         if len(checks_ev["checks"]) == 0:
             return (
                 False,
                 f"{effective_risk} candidate has zero executed verification/test commands recorded in runtime",
-            )
-        if checks_ev["latest_fail_ts"] > checks_ev["latest_pass_ts"]:
-            return (
-                False,
-                "latest validation/test command failed with no subsequent passing verification run",
             )
         if checks_ev["passed_count"] == 0 or checks_ev["latest_pass_ts"] < last_durable - 1.0:
             return (
@@ -914,9 +922,11 @@ def validate_candidate_closure(
                 "last passing test/verification command ran BEFORE the latest file edit; re-verify current bytes",
             )
 
-    # 2. Proportionate 3-Lens Simplify Verification on `claude-sonnet-5-5-high` (non-small STANDARD, HIGH, XHIGH)
-    needs_simplify = (effective_risk in ("HIGH", "XHIGH")) or (
-        effective_risk == "STANDARD" and not small
+    # 2. Proportionate Simplify Verification (`HIGH`/`XHIGH` 3 lenses, or `STANDARD` via project opt-in)
+    needs_simplify = (
+        bool(cctx["needs_simplify"])
+        if effective_risk == floor
+        else (bool(cctx["needs_simplify"]) or cwg.requires_simplify(effective_risk, policy))
     )
     required_lenses = set(cwg.SIMPLIFY_LENSES)
     raw_sonnet_map: dict[str, float] = dict(swarm_ev.get("sonnet_lenses") or {})
@@ -1067,12 +1077,18 @@ def validate_candidate_closure(
     ):
         closure_ready_rev = latest_cls_rev
 
+    needs_review = (
+        bool(cctx["needs_review"])
+        if effective_risk == floor
+        else (bool(cctx["needs_review"]) or cwg.requires_review(effective_risk, policy))
+    )
+
     if rkind == "verified":
         if closure_ready_rev is not None:
             return True, "verified"
         if latest_ord_verdict and latest_ord_verdict != "APPROVED":
             return False, f"invoked adversarial review ended in `{latest_ord_verdict}`, not `APPROVED`"
-        if effective_risk in ("HIGH", "XHIGH"):
+        if needs_review:
             if latest_ord_verdict != "APPROVED" or latest_ord_rev is None:
                 return (
                     False,
@@ -1152,10 +1168,20 @@ def format_block_message(
     marker: dict[str, Any],
     session: str,
     nonce: str,
+    ctx: dict[str, Any] | None = None,
 ) -> str:
     wclass = cwg.candidate_class(marker)
-    floor = cwg.candidate_floor(marker)
-    small = cwg.is_small_edit(marker)
+    cctx = ctx or cwg.resolve_candidate_context(marker)
+    policy = cctx["policy"]
+    req_tests = cctx["require_tests"]
+    has_tests = (
+        bool(req_tests)
+        if req_tests is not None
+        else cwg.requires_tests(
+            cctx["floor"], cwd=cctx["cwd"], paths=cctx["dpaths"], policy=policy, git_root=cctx["git_root"]
+        )
+    )
+    floor = cctx["floor"]
     inbox_script = rio.normalize_path(rio.plugin_root() / "hooks" / "gate_inbox.py")
     codex_script = rio.normalize_path(rio.plugin_root() / "hooks" / "codex_lane.py")
 
@@ -1166,26 +1192,35 @@ def format_block_message(
             "или `[gate] no-change: <причина>`, если изменений не произошло."
         )
     else:
-        reqs = cwg.receipt_requirements_summary(floor, small)
+        reqs = cwg.receipt_requirements_summary(floor, policy, has_tests=has_tests)
         xhigh_hint = " с `REVIEW_TIER: XHIGH`" if floor == "XHIGH" else ""
-        if floor == "STANDARD" and not small:
-            simplify_hint = (
-                f"- Для simplify (`STANDARD > 3` строк) запустите 1 объединённый read-only воркер `simplify-reviewer` "
-                f"(`SIMPLIFY_LENS: ALL`) на `{cwg.SONNET_HIGH_MODEL}` через `swarm(action=\"add\", name=\"simplify-reviewer\", model=\"{cwg.SONNET_HIGH_MODEL}\")`.\n"
-            )
-        elif floor in ("HIGH", "XHIGH"):
-            simplify_hint = (
-                f"- Для simplify (`{floor}`) запустите строго 3 отдельные параллельные линзы (`reuse`, `quality`, `efficiency`) "
-                f"на `{cwg.SONNET_HIGH_MODEL}` через `swarm(action=\"add\", ..., model=\"{cwg.SONNET_HIGH_MODEL}\")`.\n"
-            )
+        if cctx["needs_simplify"]:
+            if floor == "STANDARD":
+                simplify_hint = (
+                    f"- Для simplify (`STANDARD` по политике проекта) запустите 1 объединённый read-only воркер `simplify-reviewer` "
+                    f"(`SIMPLIFY_LENS: ALL`) на `{cwg.SONNET_HIGH_MODEL}` через `swarm(action=\"add\", name=\"simplify-reviewer\", model=\"{cwg.SONNET_HIGH_MODEL}\")`.\n"
+                )
+            else:
+                simplify_hint = (
+                    f"- Для simplify (`{floor}`) запустите строго 3 отдельные параллельные линзы (`reuse`, `quality`, `efficiency`) "
+                    f"на `{cwg.SONNET_HIGH_MODEL}` через `swarm(action=\"add\", ..., model=\"{cwg.SONNET_HIGH_MODEL}\")`.\n"
+                )
         else:
             simplify_hint = ""
+
+        if cctx["needs_review"]:
+            review_hint = (
+                f"- Для независимого ревью сначала проверьте `python -X utf8 \"{codex_script}\" check`; "
+                f"если доступно — запустите `python -X utf8 \"{codex_script}\" review --session \"{session}\" --summary \"...\"` "
+                f"{'--xhigh ' if floor == 'XHIGH' else ''}(при недоступности Codex запустите внутреннее ревью на `{cwg.OPUS_HIGH_MODEL}`{xhigh_hint} через `swarm`, с эскалацией на `{cwg.CARBON_HIGH_MODEL}` при ошибке/квоте Opus).\n"
+            )
+        else:
+            review_hint = ""
+
         guidance = (
-            f"Кандидат `PERSISTENT` (path floor `{floor}`). Обязательные условия: {reqs}.\n"
+            f"Кандидат `PERSISTENT` (риск `{floor}`). Обязательные условия: {reqs}.\n"
             f"{simplify_hint}"
-            f"- Для внешнего ревью HIGH/XHIGH сначала проверьте `python -X utf8 \"{codex_script}\" check`; "
-            f"если доступно — запустите `python -X utf8 \"{codex_script}\" review --session \"{session}\" --summary \"...\"` "
-            f"{'--xhigh ' if floor == 'XHIGH' else ''}(при недоступности Codex запустите внутреннее ревью на `{cwg.OPUS_HIGH_MODEL}`{xhigh_hint} через `swarm`, с эскалацией на `{cwg.CARBON_HIGH_MODEL}` при ошибке/квоте Opus).\n"
+            f"{review_hint}"
             f"- Завершите финальный ответ строкой `[gate] verified: {floor}; <кандидат и решающие проверки>`."
         )
 
@@ -1256,6 +1291,7 @@ def main() -> int:
         first_ts = float(marker.get("first_ts") or 0.0)
         assistant_msg = str(payload.get("lastAssistantMessage") or "") or rio.last_assistant_message(steps)
         receipt = cwg.parse_terminal_receipt(assistant_msg)
+        cctx: dict[str, Any] | None = None
 
         if receipt and receipt.get("kind") == "anomaly-reported":
             ok_anom, anom_note = gate_inbox.verify_anomaly_report(
@@ -1269,6 +1305,7 @@ def main() -> int:
                 rio.emit_stop_allow()
                 return 0
             valid, reason = False, anom_note
+            cctx = cwg.resolve_candidate_context(marker)
         else:
             checks_ev = read_checks_evidence(session, first_ts)
             sub_ev = scan_native_subagents(steps, transcript_path, first_ts)
@@ -1278,8 +1315,9 @@ def main() -> int:
                 session=session,
                 git_root=str(marker.get("git_root") or ""),
             )
+            cctx = cwg.resolve_candidate_context(marker)
             valid, reason = validate_candidate_closure(
-                receipt, marker, checks_ev, sub_ev, swarm_ev, codex_revs
+                receipt, marker, checks_ev, sub_ev, swarm_ev, codex_revs, ctx=cctx
             )
 
             if valid:
@@ -1290,7 +1328,7 @@ def main() -> int:
                     "close",
                     session=session,
                     receipt=rkind,
-                    floor=cwg.candidate_floor(marker),
+                    floor=cctx["floor"],
                 )
                 rio.emit_stop_allow()
                 return 0
@@ -1348,7 +1386,7 @@ def main() -> int:
             session=session,
             block=blocks + 1,
             reason=reason,
-            floor=cwg.candidate_floor(marker),
+            floor=cctx["floor"],
         )
         msg = format_block_message(
             reason=reason,
@@ -1356,6 +1394,7 @@ def main() -> int:
             marker=marker,
             session=session,
             nonce=nonce,
+            ctx=cctx,
         )
         rio.emit_stop_continue(msg)
     except Exception as exc:

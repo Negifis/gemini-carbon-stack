@@ -105,20 +105,50 @@ def safe_key(value: str | None, fallback: str = "default") -> str:
     return f"{prefix}-{digest}"
 
 
+def is_plugin_runtime_dir(path: str | pathlib.Path | None) -> bool:
+    norm = normalize_path(path)
+    if not norm:
+        return False
+    folded = fold_path(norm)
+    proot = fold_path(plugin_root())
+    if proot and (folded == proot or folded.startswith(proot + "/")):
+        return True
+    low = "/" + norm.lower().lstrip("/")
+    if "/.gemini/config/plugins/" in low or low.endswith("/.gemini/config/plugins"):
+        return True
+    if os.name == "nt" and "/appdata/local/programs/antigravity" in low:
+        return True
+    return False
+
+
 def project_key(
     cwd: str | None,
     workspace_paths: list[str] | None = None,
     known_git_root: str | None = None,
+    session: str = "",
 ) -> str:
     candidate = ""
+    has_explicit_ws = False
     if workspace_paths:
         for wp in workspace_paths:
-            if wp:
-                candidate = wp
+            if isinstance(wp, str) and wp.strip():
+                candidate = wp.strip()
+                has_explicit_ws = True
                 break
+    if not candidate and cwd and str(cwd).strip():
+        cand_str = str(cwd).strip()
+        if not is_plugin_runtime_dir(cand_str):
+            candidate = cand_str
+
+    # INVARIANT: Workspace-less chats must never share the installed plugin directory's project_key.
     if not candidate:
-        candidate = cwd or os.getcwd()
+        sid = safe_key(session, "ephemeral")
+        digest = hashlib.sha256(f"ephemeral-session:{sid}".encode("utf-8", errors="replace")).hexdigest()[:12]
+        return f"ephemeral-{sid[:24]}-{digest}"
+
     git_root = known_git_root if known_git_root is not None else git_toplevel(candidate)
+    if git_root and is_plugin_runtime_dir(git_root) and not has_explicit_ws:
+        git_root = None
     anchor = fold_path(git_root or candidate)
     base = pathlib.PurePosixPath(anchor).name or "root"
     digest = hashlib.sha256(anchor.encode("utf-8", errors="replace")).hexdigest()[:12]
@@ -138,16 +168,33 @@ def session_key(payload: dict[str, Any] | None) -> str:
 
 
 def effective_cwd(payload: dict[str, Any] | None) -> str:
-    if isinstance(payload, dict):
-        cwd = payload.get("cwd")
-        if isinstance(cwd, str) and cwd.strip() and os.path.isdir(cwd):
-            return os.path.abspath(cwd)
-        wps = payload.get("workspacePaths")
-        if isinstance(wps, list):
-            for wp in wps:
-                if isinstance(wp, str) and wp.strip() and os.path.isdir(wp):
-                    return os.path.abspath(wp)
-    return os.getcwd()
+    if not isinstance(payload, dict):
+        cwd0 = os.getcwd()
+        return "" if is_plugin_runtime_dir(cwd0) else cwd0
+
+    valid_wps: list[str] = []
+    wps = payload.get("workspacePaths")
+    if isinstance(wps, list):
+        for wp in wps:
+            if isinstance(wp, str) and wp.strip() and os.path.isdir(wp):
+                valid_wps.append(os.path.abspath(wp))
+
+    raw_cwd = payload.get("cwd")
+    if isinstance(raw_cwd, str) and raw_cwd.strip() and os.path.isdir(raw_cwd):
+        abs_cwd = os.path.abspath(raw_cwd)
+        if not is_plugin_runtime_dir(abs_cwd):
+            return abs_cwd
+        folded_cwd = fold_path(abs_cwd)
+        for wp in valid_wps:
+            fwp = fold_path(wp)
+            if folded_cwd == fwp or folded_cwd.startswith(fwp + "/"):
+                return abs_cwd
+
+    if valid_wps:
+        return valid_wps[0]
+
+    fallback = os.getcwd()
+    return "" if is_plugin_runtime_dir(fallback) else fallback
 
 
 def read_hook_stdin() -> tuple[dict[str, Any] | None, str | None]:
@@ -168,10 +215,19 @@ def read_hook_stdin() -> tuple[dict[str, Any] | None, str | None]:
     return data, None
 
 
-def emit_json(obj: dict[str, Any]) -> None:
-    text = json.dumps(obj, ensure_ascii=False)
-    sys.stdout.buffer.write((text + "\n").encode("utf-8"))
+def dump_cli_json(payload: Any, pretty: bool = False) -> str:
+    if pretty:
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def print_cli_json(payload: Any, pretty: bool = False) -> None:
+    sys.stdout.buffer.write((dump_cli_json(payload, pretty=pretty) + "\n").encode("utf-8"))
     sys.stdout.buffer.flush()
+
+
+def emit_json(obj: dict[str, Any]) -> None:
+    print_cli_json(obj, pretty=False)
 
 
 def emit_default_for_event(event: str) -> None:
@@ -339,6 +395,10 @@ def read_jsonl(path: str | pathlib.Path | None, max_lines: int | None = None) ->
     if not p.is_file():
         return []
     try:
+        if max_lines == 1:
+            with p.open("rb") as fh:
+                first_line = fh.readline().decode("utf-8", errors="replace")
+            return _parse_jsonl_lines([first_line])
         size = p.stat().st_size
         if max_lines is not None and max_lines > 0 and size > 131072:
             with p.open("rb") as fh:
@@ -390,7 +450,7 @@ def _is_system_message(step: dict[str, Any] | None) -> bool:
 def _first_system_content(
     transcript_path: str | None, steps: list[dict[str, Any]] | None = None
 ) -> str | None:
-    items = steps if steps is not None else read_transcript_steps(transcript_path, max_lines=5)
+    items = steps if steps is not None else read_transcript_steps(transcript_path, max_lines=1)
     if items and _is_system_message(items[0]):
         return str(items[0].get("content") or "")
     return None
@@ -634,16 +694,56 @@ def capture_worktree_tree_oid(git_root: str, timeout: float = 15.0) -> tuple[str
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def mutation_stamp_path(session: str) -> pathlib.Path:
+    return state_dir("continuity", "stamps") / f"{safe_key(session)}.stamp"
+
+
+def bump_mutation_stamp(session: str) -> None:
+    if not session or session == "unknown":
+        return
+    sp = mutation_stamp_path(session)
+    try:
+        cur = int(sp.read_text(encoding="ascii").strip() or "0") if sp.is_file() else 0
+    except (OSError, ValueError):
+        cur = 0
+    try:
+        sp.write_text(f"{cur + 1}\n", encoding="ascii")
+    except OSError:
+        pass
+
+
+def read_mutation_stamp(session: str) -> int:
+    if not session or session == "unknown":
+        return 0
+    sp = mutation_stamp_path(session)
+    try:
+        return int(sp.read_text(encoding="ascii").strip() or "0") if sp.is_file() else 0
+    except (OSError, ValueError):
+        return 0
+
+
 def resolve_command_cwd(cmd: str, default_cwd: str, fallback_dir: str = "") -> str:
     for pat in (CD_LEADING_RE, GIT_DASH_C_RE):
         m = pat.search(cmd or "") if pat is GIT_DASH_C_RE else pat.match(cmd or "")
         if m:
             raw_dir = m.group("dir").strip()
-            candidate = raw_dir if os.path.isabs(raw_dir) else os.path.join(default_cwd, raw_dir)
-            if os.path.isdir(candidate):
+            if os.path.isabs(raw_dir):
+                candidate = raw_dir
+            elif default_cwd:
+                candidate = os.path.join(default_cwd, raw_dir)
+            else:
+                candidate = ""
+            if candidate and os.path.isdir(candidate):
                 return os.path.abspath(candidate)
-    if fallback_dir and os.path.isdir(fallback_dir) and not git_toplevel(default_cwd):
-        return os.path.abspath(fallback_dir)
+    if fallback_dir and os.path.isdir(fallback_dir):
+        if not default_cwd:
+            return os.path.abspath(fallback_dir)
+        f_def = fold_path(default_cwd)
+        f_fb = fold_path(fallback_dir)
+        if (f_def == f_fb or f_def.startswith(f_fb + "/")) and (pathlib.Path(fallback_dir) / ".git").exists():
+            return default_cwd
+        if not git_toplevel(default_cwd):
+            return os.path.abspath(fallback_dir)
     return default_cwd
 
 

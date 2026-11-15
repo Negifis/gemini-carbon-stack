@@ -27,18 +27,6 @@
         ]
       }
     ],
-    "PostToolUse": [
-      {
-        "matcher": "edit_file|write_file|run_command",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python -X utf8 hooks/continuity.py --event PostToolUse",
-            "timeout": 8
-          }
-        ]
-      }
-    ],
     "Stop": [
       {
         "type": "command",
@@ -51,7 +39,7 @@
     "enabled": true,
     "PreToolUse": [
       {
-        "matcher": "edit_file|write_file|run_command|invoke_subagent|swarm",
+        "matcher": "run_command|invoke_subagent|swarm",
         "hooks": [
           {
             "type": "command",
@@ -90,7 +78,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "edit_file|write_file|run_command|invoke_subagent|run_workflow|swarm",
+        "matcher": "run_command",
         "hooks": [
           {
             "type": "command",
@@ -102,7 +90,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "edit_file|write_file|run_command|invoke_subagent|run_workflow|swarm|read_file",
+        "matcher": "edit_file|write_file|run_command",
         "hooks": [
           {
             "type": "command",

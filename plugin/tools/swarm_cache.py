@@ -430,6 +430,7 @@ def main() -> int:
     st.add_argument("--ttl", type=int, default=cwg.SWARM_CACHE_SAFE_TTL_SECONDS)
     st.add_argument("--label", default="")
     st.add_argument("--brain-root", default="")
+    st.add_argument("--pretty", action="store_true")
 
     pr = sub.add_parser("prepare", help="Record round worktree OID and write full/incremental diff under scratch/")
     pr.add_argument("--session", required=True)
@@ -439,6 +440,7 @@ def main() -> int:
     pr.add_argument("--brain-root", default="")
     pr.add_argument("--reset", action="store_true")
     pr.add_argument("--paths", nargs="*", default=[])
+    pr.add_argument("--pretty", action="store_true")
 
     args = parser.parse_args()
     broot = resolve_brain_root(args.brain_root)
@@ -450,7 +452,7 @@ def main() -> int:
             ttl_seconds=args.ttl,
             label=args.label,
         )
-        rio.emit_json(out)
+        rio.print_cli_json(out, pretty=args.pretty)
         return 0
 
     out = prepare_round(
@@ -462,7 +464,7 @@ def main() -> int:
         paths=list(args.paths or []),
         reset=bool(args.reset),
     )
-    rio.emit_json(out)
+    rio.print_cli_json(out, pretty=args.pretty)
     return 0 if out.get("ok") else 1
 
 

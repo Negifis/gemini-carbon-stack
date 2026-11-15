@@ -1,20 +1,14 @@
 ---
 name: verify-ready
-description: Pre-closure readiness check (`/verify-ready`): audits current candidate risk floor, executed runtime checks, 3 Sonnet High simplify lenses, Codex / Opus High -> Carbon High review freshness against SHA-256 fingerprints, and dirty/chip state.
+description: Triggered by /verify-ready to audit pre-closure readiness (risk level, checks, Sonnet lenses, and review SHA-256 freshness).
 ---
 
 # `/verify-ready` — Проверка готовности результата перед закрытием
 
-Выполните перед формированием финального ответа по сложной задаче:
-
-1. **Проверьте чистоту и полноту изменений:**
-   - `git status --short` и `git diff --stat` — нет ли забытых временных файлов, отладочных принтов, секретов или задетых пользовательских файлов.
-2. **Проверьте актуальность тестов:**
-   - Все решающие тесты и проверки типов были запущены и прошли успешно **после самой последней правки файлов**.
-3. **Проверьте выполнение требований Code Work Gate по уровню риска:**
-   - `LOW`: проверена разметка и ссылки.
-   - `STANDARD` (не малая правка `> 3` строк): пройден 1 объединённый `simplify-reviewer` (или 3 линзы) на `claude-sonnet-5-5-high`.
-   - `HIGH` / `XHIGH`: пройдены строго 3 отдельные simplify-линзы (`claude-sonnet-5-5-high`) + получен свежий `VERDICT: APPROVED` от `codex_lane.py` либо от внутреннего `claude-opus-5-5-high` (или эскалированного `gemini-4-carbon-high` при подтверждённом сбое Opus) на текущем SHA-256 содержимого файлов, а завершённые `swarm`-воркеры остановлены через `kill`.
-4. **Проверьте незакрытые делегированные задачи:**
-   - `chip_handoff.py status` — все дочерние чипы приняты (`accepted`) или явно задокументированы.
-5. Сформируйте лаконичный финальный ответ с корректной последней строкой `[gate] ...`.
+1. **Чистота дерева:** проверьте `git status --short` и `git diff --stat` (нет временных файлов, секретов и лишних правок).
+2. **Решающие проверки:** тесты/проверки сборки и типов прошли успешно **после самой последней правки файлов**.
+3. **Соответствие уровню риска Code Work Gate:**
+   - `LOW`: проверены разметка и ссылки.
+   - `STANDARD`: пройдены применимые локальные тесты/проверки (без авто-`swarm`, если политика `.agents/carbon-gate.json` не требует `simplify`).
+   - `HIGH` / `XHIGH`: пройдены 3 отдельные simplify-линзы (`claude-sonnet-5-5-high`) и получен свежий `VERDICT: APPROVED` (`codex_lane.py` или `claude-opus-5-5-high` -> `gemini-4-carbon-high` при сбое Opus) на текущем SHA-256 файлов; завершённые воркеры остановлены (`kill`).
+4. **Чипы и квитанция:** убедитесь через `chip_handoff.py status`, что дочерние чипы закрыты, и завершите ответ строкой `[gate] ...`.

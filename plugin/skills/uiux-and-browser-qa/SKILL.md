@@ -1,6 +1,6 @@
 ---
 name: uiux-and-browser-qa
-description: Frontend UI/UX engineering and live browser verification workflow for Gemini Carbon: design-system alignment, real interactive state coverage, accessibility, and mandatory live verification via the native `browser` subagent.
+description: Frontend UI states, accessibility, and live browser subagent QA (BROWSER_HOST_FACTS). Load ONLY for web/app UI work.
 ---
 
 # UI/UX Engineering & Live Browser Verification

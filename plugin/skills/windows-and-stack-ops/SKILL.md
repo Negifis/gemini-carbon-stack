@@ -1,6 +1,6 @@
 ---
 name: windows-and-stack-ops
-description: Windows NT / PowerShell 5.1 operational patterns, stdin pipe discipline, Restart Manager file-lock inspection (`file-holders.ps1`), NTFS junction safety (`worktree_guard.py`), fast native search (`code_search.py`), and TTL-aware swarm incremental diffs (`swarm_cache.py`).
+description: Windows file-lock inspection (file-holders.ps1), NTFS junction recovery (worktree_guard.py), and swarm_cache.py CLI. Do NOT load for ordinary PowerShell commands.
 ---
 
 # Windows Runtime & Stack Operations

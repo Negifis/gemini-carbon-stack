@@ -1,6 +1,6 @@
 ---
 name: chip-handoff
-description: Multi-session and isolated-worktree task handoff workflow (`chip_handoff.py`): registers independent child tasks, isolates git branches/worktrees, returns verified results to parent, and recovers interrupted work.
+description: Parallel git-worktree child-task workflow (chip_handoff.py). Load ONLY when splitting concurrent coding tasks across worktrees.
 ---
 
 # Chip Handoff & Multi-Session Orchestration

@@ -19,6 +19,9 @@ MAX_CHIP_STOP_REMINDERS = 2
 
 
 def handle_pre_invocation(payload: dict[str, Any]) -> None:
+    if not any(ch.chips_dir().glob("*.json")):
+        rio.emit_json({})
+        return
     if rio.is_subagent_session(payload.get("transcriptPath")):
         rio.emit_json({})
         return
@@ -71,6 +74,9 @@ def handle_stop(payload: dict[str, Any]) -> None:
         return
 
     cwd = rio.effective_cwd(payload)
+    if not cwd or not any(ch.chips_dir().glob("*.json")):
+        rio.emit_stop_allow()
+        return
     child_card = ch.find_card_for_cwd(cwd)
     if child_card and child_card.get("status") in ("open", "rework"):
         rem = int(child_card.get("stop_reminders") or 0)

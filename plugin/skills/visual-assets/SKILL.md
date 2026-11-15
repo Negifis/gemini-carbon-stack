@@ -1,6 +1,6 @@
 ---
 name: visual-assets
-description: Raster illustration generation and clean CSS-tokenized SVG vectorization pipeline using Antigravity's native `image-generator` subagent and `tools/vectorize.mjs`.
+description: Raster asset generation and CSS-tokenized SVG vectorization (image-generator + vectorize.mjs). Load ONLY when creating icons or illustrations.
 ---
 
 # Visual Assets & Theme-Aware SVG Pipeline

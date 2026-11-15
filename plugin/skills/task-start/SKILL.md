@@ -1,6 +1,6 @@
 ---
 name: task-start
-description: Start structured engineering work on an issue, feature, or bug (`/task-start`): audits git state, recalls project memory, checks active chips/locks, decides branch/worktree isolation, and records initial canonical goal.
+description: Triggered by /task-start to audit tree locks, recall project memory, and initialize handoff before a multi-session feature.
 ---
 
 # `/task-start` — Запуск работы над инженерной задачей

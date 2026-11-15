@@ -21,10 +21,13 @@ def main() -> int:
         return 0
 
     try:
+        session = rio.session_key(payload)
+        if not cwg.pending_notes_path(session).is_file():
+            rio.emit_json({})
+            return 0
         if rio.is_subagent_session(payload.get("transcriptPath")):
             rio.emit_json({})
             return 0
-        session = rio.session_key(payload)
         notes = cwg.pop_pending_notes(session)
         if notes:
             rio.emit_inject_system("\n".join(notes))

@@ -1,6 +1,6 @@
 ---
 name: subagent-delegation
-description: Multi-model subagent, workflow, and swarm routing for Gemini 4 Carbon in Antigravity: Sonnet 5.5 High simplify lenses, Codex external review, Opus 5.5 High -> Carbon High internal review escalation, and strict scope ownership.
+description: Detailed protocol for multi-worker swarm orchestration and Hydrogen browser/translator delegation. Do NOT load when working without subagents.
 ---
 
 # Subagent Delegation & Multi-Model Routing (Gemini Carbon)

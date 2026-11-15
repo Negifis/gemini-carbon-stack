@@ -1,6 +1,6 @@
 ---
 name: writing-quality
-description: Unified Russian and English technical & product writing discipline (merging text-quality and human-writing): natural rhythm, concrete facts, clean typography, zero AI clichés, and zero edit-history residue.
+description: Editorial guide for standalone long-form articles, READMEs, and product copy. Do NOT load for normal chat replies or code edits.
 ---
 
 # Writing Quality & Natural Engineering Prose

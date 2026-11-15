@@ -1,26 +1,32 @@
 ---
 name: checkpoint
-description: Save or update the Canonical Engineering State checkpoint (`/checkpoint`) so goals, active constraints, cancelled hypotheses, progress, and next actions survive context compaction and restarts.
+description: Triggered by /checkpoint to save repo-backed handoff state (goal, decisions, remaining steps) via continuity.py.
 ---
 
-# `/checkpoint` — Сохранение канонического состояния
+# `/checkpoint` — Сохранение минимального handoff-состояния
 
-Зафиксируйте актуальное состояние задачи на основе **реальных фактов на диске** (`git status`, пройденные тесты, открытые чипы):
+Фиксируйте состояние на диске только в ключевых точках (пауза, передача между сессиями, сложный этап), не копируя исходники и длинные логи:
+
+## Компактный repo-backed handoff (рекомендуется)
+
+```powershell
+python -X utf8 "<PLUGIN_ROOT>/hooks/continuity.py" handoff `
+  --cwd "<рабочая директория>" `
+  --status "<IN_PROGRESS | VERIFYING | BLOCKED | COMPLETED>" `
+  --goal "<цель задачи>" `
+  --decisions "<принятые решения и инварианты>" `
+  --superseded "<отменённые гипотезы — не возвращать>" `
+  --next "<следующий конкретный шаг>"
+```
+
+## Полный канонический чекпоинт (при необходимости длинного многоэтапного трекинга)
 
 ```powershell
 python -X utf8 "<PLUGIN_ROOT>/hooks/continuity.py" checkpoint `
   --cwd "<рабочая директория>" `
-  --goal "<цель задачи>" `
-  --status "<IN_PROGRESS | VERIFYING | BLOCKED | COMPLETED>" `
-  --authoritative "<действующие требования и архитектурные контракты>" `
-  --superseded "<отменённые требования и опровергнутые гипотезы>" `
-  --completed "<завершённые и проверенные шаги>" `
-  --current "<ветка, изменённые файлы, результаты последних проверок>" `
-  --delegated "<активные субагенты или чипы>" `
-  --next-action "<следующий конкретный шаг>" `
-  --acceptance "<критерии готовности>" `
-  --blockers "<блокеры или 'нет'>" `
-  --stop-condition "<условие завершения>"
+  --goal "<цель>" --status "<IN_PROGRESS | BLOCKED | COMPLETED>" `
+  --authoritative "<действующие требования>" --superseded "<отменённое>" `
+  --completed "<проверенные шаги>" --next-action "<следующий шаг>"
 ```
 
-Если пользователь попросил сохранить видимый чекпоинт прямо в репозитории проекта, добавьте флаг `--mirror-workspace` (запишет копию в `.agents/CHECKPOINT.md`). После записи выведите пользователю краткую сводку сохранённого состояния.
+Добавьте `--mirror-workspace`, чтобы сохранить `.agents/CHECKPOINT.md` в репозитории.

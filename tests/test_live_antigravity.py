@@ -85,7 +85,7 @@ class LiveHooksJsonExecutionTestCase(unittest.TestCase):
                                 self.assertEqual(parsed, {})
                             executed += 1
 
-            self.assertGreaterEqual(executed, 12)
+            self.assertGreaterEqual(executed, 11)
 
 
 if __name__ == "__main__":

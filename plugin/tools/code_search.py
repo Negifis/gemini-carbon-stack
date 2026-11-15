@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import ast
-import json
 import os
 import pathlib
 import re
@@ -205,39 +204,36 @@ def main() -> int:
     srch.add_argument("--fixed", action="store_true")
     srch.add_argument("--ext", default="", help="Comma-separated extensions, e.g. .py,.ts")
     srch.add_argument("--limit", type=int, default=60)
+    srch.add_argument("--pretty", action="store_true")
 
     sym = sub.add_parser("symbols", help="Locate AST / structural symbol definitions with exact line ranges")
     sym.add_argument("query", nargs="?", default="")
     sym.add_argument("--cwd", default="")
     sym.add_argument("--limit", type=int, default=50)
+    sym.add_argument("--pretty", action="store_true")
 
-    sub.add_parser("engines", help="Report available search engines (Jev, ripgrep, git-grep)")
+    eng = sub.add_parser("engines", help="Report available search engines (Jev, ripgrep, git-grep)")
+    eng.add_argument("--pretty", action="store_true")
 
     args = parser.parse_args()
     if args.cmd == "grep":
-        print(
-            json.dumps(
-                text_search(args.pattern, cwd=args.cwd, limit=args.limit, fixed=args.fixed, ext=args.ext),
-                ensure_ascii=False,
-                indent=2,
-            )
+        rio.print_cli_json(
+            text_search(args.pattern, cwd=args.cwd, limit=args.limit, fixed=args.fixed, ext=args.ext),
+            pretty=args.pretty,
         )
         return 0
     if args.cmd == "symbols":
-        print(json.dumps(symbol_search(args.query, cwd=args.cwd, limit=args.limit), ensure_ascii=False, indent=2))
+        rio.print_cli_json(symbol_search(args.query, cwd=args.cwd, limit=args.limit), pretty=args.pretty)
         return 0
     if args.cmd == "engines":
-        print(
-            json.dumps(
-                {
-                    "jev": find_jev(),
-                    "ripgrep": find_rg(),
-                    "git": shutil.which("git"),
-                    "python_ast": True,
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
+        rio.print_cli_json(
+            {
+                "jev": find_jev(),
+                "ripgrep": find_rg(),
+                "git": shutil.which("git"),
+                "python_ast": True,
+            },
+            pretty=args.pretty,
         )
         return 0
     return 0

@@ -198,7 +198,7 @@ class SafetyAndChipsTestCase(unittest.TestCase):
         self.assertEqual(nested_res["decision"], "deny")
         self.assertIn("Subagent Nesting Guard", nested_res["reason"])
 
-    def test_04_comment_density_and_self_narration_guard_with_fail_open_cap(self) -> None:
+    def test_04_comment_hygiene_edits_are_non_blocking(self) -> None:
         target = str(self.repo / "service.py")
         narration = self.run_safety_hook(
             "edit_file",
@@ -208,20 +208,14 @@ class SafetyAndChipsTestCase(unittest.TestCase):
                 "Replacement": "# Added this to fix the issue per review\nVALUE = 2",
             },
         )
-        self.assertEqual(narration["decision"], "deny")
-        self.assertIn("Comment Density Guard", narration["reason"])
+        self.assertEqual(narration["decision"], "allow")
 
-        # Strike 2 also denies; Strike 3 fails open so legitimate edge cases never deadlock
-        strike2 = self.run_safety_hook(
-            "edit_file",
-            {"Path": target, "Target": "VALUE = 1", "Replacement": "# Updated per review\nVALUE = 2"},
+        big_comment_block = "\n".join(["# explanatory comment"] * 10 + [f"x_{i} = {i}" for i in range(6)])
+        dense = self.run_safety_hook(
+            "write_file",
+            {"Path": target, "Content": big_comment_block},
         )
-        self.assertEqual(strike2["decision"], "deny")
-        strike3 = self.run_safety_hook(
-            "edit_file",
-            {"Path": target, "Target": "VALUE = 1", "Replacement": "# Updated per review\nVALUE = 2"},
-        )
-        self.assertEqual(strike3["decision"], "allow")
+        self.assertEqual(dense["decision"], "allow")
 
     def test_05_chip_handoff_open_finish_parent_notification_recover_and_accept(self) -> None:
         # 1. Open chip

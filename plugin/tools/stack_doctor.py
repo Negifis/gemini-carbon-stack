@@ -71,6 +71,19 @@ def query_live_ls_plugin(plugin_name: str = "gemini-carbon-stack") -> dict[str, 
         name = item.get("name") or meta.get("name") or item.get("id")
         if name == plugin_name:
             plugin_path = item.get("path") or meta.get("path") or ""
+            rule_triggers: dict[str, Any] = {}
+            for r in item.get("rules") or []:
+                if isinstance(r, dict):
+                    ps = (r.get("scope") or {}).get("projectScope") or {}
+                    raw_path = (
+                        ps.get("filePath")
+                        or r.get("absolutePath")
+                        or r.get("memoryId")
+                        or r.get("path")
+                        or ""
+                    )
+                    rname = str(r.get("name") or (pathlib.Path(str(raw_path)).name if raw_path else "") or "?")
+                    rule_triggers[rname] = ps.get("trigger") or r.get("trigger") or "unknown"
             return {
                 "connected": True,
                 "ingested": True,
@@ -78,6 +91,7 @@ def query_live_ls_plugin(plugin_name: str = "gemini-carbon-stack") -> dict[str, 
                 "skills_count": len(item.get("skills") or []),
                 "agents_count": len(item.get("agents") or []),
                 "rules_count": len(item.get("rules") or []),
+                "rule_triggers": rule_triggers,
                 "has_hooks": bool(
                     item.get("hooksJson")
                     or item.get("hooks")
@@ -88,7 +102,7 @@ def query_live_ls_plugin(plugin_name: str = "gemini-carbon-stack") -> dict[str, 
     return {"connected": True, "ingested": False}
 
 
-def run_diagnostics(cwd: str = "") -> dict[str, Any]:
+def run_diagnostics(cwd: str = "", compact: bool = False) -> dict[str, Any]:
     installed_dir = pathlib.Path.home() / ".gemini" / "config" / "plugins" / "gemini-carbon-stack"
     bundle_dir = installed_dir if installed_dir.is_dir() else rio.plugin_root()
 
@@ -109,7 +123,7 @@ def run_diagnostics(cwd: str = "") -> dict[str, Any]:
         )
         agy_validate_ok = proc.returncode == 0
         agy_validate_msg = (
-            ((proc.stdout or b"") + b"\n" + (proc.stderr or b"")).decode("utf-8", errors="replace").strip()[:300]
+            ((proc.stdout or b"") + b"\n" + (proc.stderr or b"")).decode("utf-8", errors="replace").strip()
         )
 
     err_log = rio.state_dir("logs") / "hook-errors.jsonl"
@@ -133,7 +147,7 @@ def run_diagnostics(cwd: str = "") -> dict[str, Any]:
         and (agy_validate_ok in (True, None))
     )
 
-    return {
+    report: dict[str, Any] = {
         "ok": ok,
         "installed_in_global_config": installed_dir.is_dir(),
         "bundle_dir": rio.normalize_path(bundle_dir),
@@ -148,13 +162,20 @@ def run_diagnostics(cwd: str = "") -> dict[str, Any]:
             "agents": len(agents),
             "rules": len(rules),
         },
-        "skills": skills,
-        "agents": agents,
         "rules": rules,
-        "model_routing": {
+        "codex_lane": codex_info,
+        "memory": mem,
+        "active_chips": chips_info.get("active_count", 0),
+        "gate_inbox": inbox_note or "clean",
+        "logged_hook_errors": recent_errors,
+    }
+    if not compact or not ok:
+        report["skills"] = skills
+        report["agents"] = agents
+        report["model_routing"] = {
             "simplify_lenses": {
                 "lenses": list(cwg.SIMPLIFY_LENSES),
-                "standard_mode": "single_combined (simplify-reviewer)",
+                "standard_mode": "opt_in single_combined (simplify-reviewer) via .agents/carbon-gate.json",
                 "high_xhigh_mode": "three_parallel_lenses (reuse, quality, efficiency)",
                 "primary_model": cwg.SONNET_HIGH_MODEL,
                 "fallback_model": cwg.CARBON_HIGH_MODEL,
@@ -170,21 +191,18 @@ def run_diagnostics(cwd: str = "") -> dict[str, Any]:
                 "models_by_complexity": dict(cwg.HYDROGEN_MODEL_BY_LEVEL),
                 "roles": ["browser", "translator", "auxiliary_exploration"],
             },
-        },
-        "codex_lane": codex_info,
-        "memory": mem,
-        "active_chips": chips_info.get("active_count", 0),
-        "gate_inbox": inbox_note or "clean",
-        "logged_hook_errors": recent_errors,
-    }
+        }
+    return report
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(prog="stack_doctor")
     parser.add_argument("--cwd", default="")
+    parser.add_argument("--compact", action="store_true", help="Omit verbose static listings when healthy")
+    parser.add_argument("--pretty", action="store_true", help="Format JSON output with indentation")
     args = parser.parse_args()
-    report = run_diagnostics(cwd=args.cwd)
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+    report = run_diagnostics(cwd=args.cwd, compact=bool(args.compact))
+    rio.print_cli_json(report, pretty=args.pretty)
     return 0 if report.get("ok") else 1
 
 

@@ -1,43 +1,24 @@
 ---
 name: canonical-state
-description: Canonical task state management, compaction resilience, requirement replacement, and post-correction output hygiene for long-running multi-step engineering tasks.
+description: Schema reference for multi-session handoff files and requirement-replacement recovery. Do NOT load on single-session tasks.
 ---
 
-# Canonical State & Compaction Resilience
+# Canonical State & Minimal Handoff
 
-Этот навык объединяет управление каноническим состоянием задачи, защиту от потери контекста при сжатии (`compaction`) и чистоту финального ответа после корректировок пользователя.
+Механизм компактной передачи состояния между компакциями и сессиями без записи состояния после каждого вызова инструмента.
 
-## 1. Каноническая структура состояния
+## 1. Минимальный repo-backed handoff (`handoff.json` + живой `git`)
 
-Хранится автоматически по ключу проекта в `~/.gemini/carbon-stack/state/continuity/checkpoints/<project-key>.md` (и при `--mirror-workspace` в `.agents/CHECKPOINT.md`). Обновляется командой `/checkpoint` или напрямую:
+Команда `/checkpoint` или `continuity.py handoff` сохраняет компактные метаданные (цель, статус, принятые решения, отменённые требования, следующие шаги) в `state/continuity/handoffs/<pkey>.json`.
 
-```powershell
-python -X utf8 "<PLUGIN_ROOT>/hooks/continuity.py" checkpoint `
-  --cwd "<путь>" `
-  --goal "<актуальная цель>" `
-  --status "IN_PROGRESS" `
-  --authoritative "<действующие требования и архитектурные решения>" `
-  --superseded "<отменённые требования и опровергнутые гипотезы — НЕ ВОЗВРАЩАТЬ>" `
-  --completed "<что уже реализовано и проверено>" `
-  --current "<текущее состояние файлов, ошибок и тестов>" `
-  --delegated "<субагенты / чипы и их зоны ответственности>" `
-  --next-action "<следующий конкретный шаг>" `
-  --acceptance "<критерии приёмки>" `
-  --blockers "<блокеры или 'нет'>" `
-  --stop-condition "<условие полного завершения>"
-```
+При восстановлении (`SessionStart --source resume` или обнаружение `SYSTEM / CHECKPOINT` компакции в `PreInvocation`) `continuity.py` собирает минимальный дайджест прямо из живого репозитория:
+- ветка, ограниченный `git status --short` и `git diff --stat`;
+- открытый кандидат гейта (`task_class`, `risk`, затронутые файлы);
+- записанные решения, `SUPERSEDED` и `NEXT ACTION` (строго без исходников и длинных логов).
 
-## 2. Поведение при сжатии контекста и перезапуске
+## 2. Замена требований и чистота ответа (Output Lint)
 
-- При `SessionStart` и при обнаружении сжатия контекста в `PreInvocation` хук `continuity.py` автоматически инжектирует сохранённый блок состояния.
-- Раздел **`AUTHORITATIVE STATE`** имеет приоритет над старыми воспоминаниями истории диалога.
-- Раздел **`SUPERSEDED / CANCELLED`** содержит явно отменённые пользователем требования и опровергнутые гипотезы — их запрещено возвращать в код или план после сжатия контекста.
-- Перед продолжением правок после перезапуска всегда сверяйте `CURRENT STATE` с фактическим `git status --short` и `git diff`.
-
-## 3. Замена требований и чистота ответа (Output Lint)
-
-- Когда пользователь отменяет или меняет требование («нет, переделай», «вместо этого...»), старое требование переносится в `SUPERSEDED / CANCELLED`.
-- При двух сильных корректировках подряд выполните процедуру `/rebuild` (чистая пересборка состояния от файлов на диске).
-- В финальном ответе описывайте **только итоговое действующее решение** без пересказа отвергнутых черновиков («в предыдущей попытке я написал X, но потом исправил на Y»), иначе `continuity.py` на `Stop` попросит переписать ответ начисто.
+- При явной отмене требования пользователем («отмена», «вместо этого...») перенесите отклонённый вариант в `superseded` и не возвращайте его после сжатия контекста.
+- В финальном ответе описывайте итоговое решение без пересказа отвергнутых черновиков (при необходимости сравнения добавьте `[lint] intentional: <причина>`).
 
 См. шаблоны в `references/checkpoint-template.md` и `references/subagent-packet.md`.

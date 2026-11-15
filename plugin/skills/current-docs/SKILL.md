@@ -1,6 +1,6 @@
 ---
 name: current-docs
-description: Protocol for verifying up-to-date library, framework, SDK, and CLI documentation against the exact installed version using local manifests, Context7 MCP, and official references.
+description: External library/SDK version verification via manifests and Context7 MCP. Load ONLY when checking unfamiliar or version-sensitive APIs.
 ---
 
 # Current Documentation Verification

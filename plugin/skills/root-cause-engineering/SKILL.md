@@ -1,6 +1,6 @@
 ---
 name: root-cause-engineering
-description: Disciplined root-cause diagnosis for bugs, flaky tests, build failures, and runtime regressions: reproduce first, trace invariants, falsify hypotheses, and ban symptom masking.
+description: Hypothesis-falsification runbook for flaky, non-reproducible, or multi-layer regressions. Do NOT load for straightforward bug fixes.
 ---
 
 # Root-Cause Engineering
