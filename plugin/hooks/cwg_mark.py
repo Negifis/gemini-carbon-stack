@@ -7,6 +7,7 @@ import hashlib
 import os
 import pathlib
 import re
+import stat
 import sys
 import time
 import uuid
@@ -25,9 +26,58 @@ CACHE_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 
+def _exe_pat(names_pat: str, ext_pat: str = r"(?:\.exe)?", allow_dq_vars: bool = False) -> str:
+    # INVARIANT: Allow quoted/path-qualified Windows executables while keeping `dq_char` branches disjoint (O(N)) and blocking `$`/backticks on allowlists.
+    dq_char = r'(?:`[^\r\n]|""|[^"`\r\n])' if allow_dq_vars else r'[^"`$\r\n]'
+    dq_sep = r"`?[/\\]" if allow_dq_vars else r"[/\\]"
+    return (
+        r"(?:"
+        rf"'(?:(?:''|[^'\r\n])*[/\\])?(?:{names_pat}){ext_pat}'(?=$|[\s|;&])"
+        rf'|"(?:{dq_char}*{dq_sep})?(?:{names_pat}){ext_pat}"(?=$|[\s|;&])'
+        rf"|(?:[^\s|;&\"'`$()\r\n]*[/\\])?(?:{names_pat}){ext_pat}(?![\w.-])"
+        r")"
+    )
+
+
+def _py_interp_pat(allow_dq_vars: bool = False) -> str:
+    py_tok = _exe_pat(r"python(?:\d+(?:\.\d+)?)?", allow_dq_vars=allow_dq_vars)
+    launcher_tok = _exe_pat("py", allow_dq_vars=allow_dq_vars)
+    return rf"(?:{py_tok}|{launcher_tok}(?:\s+-3(?:\.\d+)?)?)"
+
+
+_EXT_PY = r"\.py"
+_EXT_CMD_EXE = r"(?:\.cmd|\.exe)?"
+_PY_INTERP_PAT = _py_interp_pat()
+_PY_MUT_INTERP_PAT = _py_interp_pat(allow_dq_vars=True)
+_PY_SAFE_FLAGS_PAT = r"(?:-(?:X\s+utf8|[uBEsSO])\s+)*"
+_PY_ANY_FLAGS_PAT = r"(?:-(?:X\s+(?!-\w+\s)\S+|\w+)\s+)*"
+_PY_MUT_CLAUSE_PREFIX = (
+    rf"^\s*(?:\$[A-Za-z_]\w*\s*=\s*)?(?:\$null\s*\|\s*)?(?:&\s*)?{_PY_MUT_INTERP_PAT}\s+{_PY_ANY_FLAGS_PAT}"
+)
+_INSTALL_DIAG_TAIL = r"[^\r\n|;&]*(?<!\S)(?:--diagnose|--dry-run)(?=$|[\s|;&])"
+_WT_MUT_TAIL = r"[^\r\n;|&]*\b(?:snapshot|remove|restore)\b"
+_CHIP_MUT_TAIL = r"[^\r\n;|&]*--merge\b"
+
+_BK_SCRIPTS_TOK = _exe_pat("carbon_memory|gate_inbox|chip_handoff|swarm_cache", _EXT_PY)
+_CONTINUITY_TOK = _exe_pat("continuity", _EXT_PY)
+_CODEX_LANE_TOK = _exe_pat("codex_lane", _EXT_PY)
+_GIT_TOK = _exe_pat("git")
+_RG_TOK = _exe_pat("rg")
+_CODEX_TOK = _exe_pat("codex", _EXT_CMD_EXE)
+_AGY_TOK = _exe_pat("agy", _EXT_CMD_EXE)
+_RO_SCRIPTS_TOK = _exe_pat("code_search|stack_doctor", _EXT_PY)
+_WT_GUARD_TOK = _exe_pat("worktree_guard", _EXT_PY)
+_WT_GUARD_MUT_TOK = _exe_pat("worktree_guard", _EXT_PY, allow_dq_vars=True)
+_CHIP_MUT_TOK = _exe_pat("chip_handoff", _EXT_PY, allow_dq_vars=True)
+_INSTALL_TOK = _exe_pat("install", _EXT_PY)
+_INSTALL_MUT_TOK = _exe_pat("install", _EXT_PY, allow_dq_vars=True)
+_RUNNERS_TOK = _exe_pat(r"pytest|py\.test|mypy|flake8")
+_RUFF_TOK = _exe_pat("ruff")
+
 BOOKKEEPING_CMD_RE = re.compile(
-    r"^\s*(?:\$null\s*\|\s*)?(?:&\s*)?(?:python|py(?:\s+-3)?)(?:\.exe)?\s+(?:-X\s+utf8\s+)?"
-    r"[\"']?[^\s|;&\"']*(?:(?:carbon_memory|gate_inbox|chip_handoff|swarm_cache)\.py[\"']?|(?:continuity\.py[\"']?\s+(?:checkpoint|show|handoff)|codex_lane\.py[\"']?\s+(?:check|status|reset|review)))(?:\s+[^|;&\r\n]*)?$",
+    rf"^\s*(?:\$null\s*\|\s*)?(?:&\s*)?{_PY_INTERP_PAT}\s+{_PY_SAFE_FLAGS_PAT}"
+    rf"(?:{_BK_SCRIPTS_TOK}|{_CONTINUITY_TOK}\s+(?:checkpoint|show|handoff)\b|{_CODEX_LANE_TOK}\s+(?:check|status|reset|review)\b)"
+    r"(?:\s+[^|;&\r\n]*)?$",
     re.IGNORECASE,
 )
 
@@ -45,26 +95,27 @@ PS_SAFE_FILTER_RE = re.compile(
 READ_ONLY_CMD_RE = re.compile(
     r"^\s*(?:\$null\s*\|\s*)?(?:"
     r"(?:"
-    r"git(?:\.exe)?\s+(?:--no-pager\s+)?(?:-C\s+[\"']?[^\"'|;&\r\n]+[\"']?\s+)?(?:status|diff|log|show|rev-parse|ls-files|ls-tree|check-ignore|remote\s+-v|worktree\s+list)"
-    r"|rg(?:\.exe)?\b"
+    rf"(?:&\s*)?{_GIT_TOK}\s+(?:--no-pager\s+)?(?:-C\s+[\"']?[^\"'|;&\r\n]+[\"']?\s+)?(?:status|diff|log|show|rev-parse|ls-files|ls-tree|check-ignore|remote\s+-v|worktree\s+list)"
+    rf"|(?:&\s*)?{_RG_TOK}"
     r"|findstr(?:\.exe)?\b"
     r"|where(?:\.exe)?\b"
     r"|Get-ChildItem\b|gci\b|Get-Content\b|gc\b|Select-String\b|sls\b|Get-Command\b|gcm\b|Test-Path\b|Get-Item\b|gi\b"
     r"|Get-ItemProperty\b|gp\b|Get-ItemPropertyValue\b|gpv\b|Get-CimInstance\b|gcim\b|Get-WmiObject\b|gwmi\b"
     r"|Get-WinEvent\b|Get-EventLog\b|Get-Process\b|gps\b|Get-Service\b|gsv\b|Get-Location\b|gl\b|Write-Output\b"
-    r"|codex(?:\.cmd|\.exe)?\s+(?:--version|login\s+status|exec\b[^|;&\r\n]*-s\s+read-only\b)"
-    r"|agy(?:\.exe|\.cmd)?\s+(?:--help|--version|plugin\s+(?:list|help))"
-    r"|(?:python|py(?:\s+-3)?)(?:\.exe)?\s+(?:-X\s+utf8\s+)?[\"']?[^\s|;&\"']*(?:code_search\.py|stack_doctor\.py|worktree_guard\.py[\"']?\s+(?:audit|status))\b"
+    rf"|(?:&\s*)?{_CODEX_TOK}\s+(?:--version|login\s+status|exec\b[^|;&\r\n]*-s\s+read-only\b)"
+    rf"|(?:&\s*)?{_AGY_TOK}\s+(?:--help|--version|plugin\s+(?:list|help))"
+    rf"|(?:&\s*)?{_PY_INTERP_PAT}\s+{_PY_SAFE_FLAGS_PAT}(?:{_RO_SCRIPTS_TOK}|{_WT_GUARD_TOK}\s+(?:audit|status)\b)"
     r")(?:\s+[^|;&\r\n]*)?"
-    r"|git(?:\.exe)?\s+(?:--no-pager\s+)?(?:-C\s+[\"']?[^\"'|;&\r\n]+[\"']?\s+)?branch(?:\s+(?:--list|-l|-a|--all|-r|--remotes|-v|-vv|--show-current|--no-color))*"
+    rf"|(?:&\s*)?{_GIT_TOK}\s+(?:--no-pager\s+)?(?:-C\s+[\"']?[^\"'|;&\r\n]+[\"']?\s+)?branch(?:\s+(?:--list|-l|-a|--all|-r|--remotes|-v|-vv|--show-current|--no-color))*"
     r")$",
     re.IGNORECASE,
 )
 
 VALIDATION_SEGMENT_RE = re.compile(
     r"^\s*(?:\$null\s*\|\s*)?(?:&\s*)?(?:"
-    r"(?:pytest|py\.test|mypy|ruff\s+check|flake8)(?:\.exe)?\b"
-    r"|(?:python|py(?:\s+-3)?)(?:\.exe)?\s+(?:-X\s+utf8\s+)?(?:-m\s+(?:pytest|unittest|py_compile|compileall|mypy|ruff|flake8)\b|[\"']?[^\s|;&\"']*install\.py[\"']?\s+[^\r\n|;&]*(?:--diagnose|--dry-run)\b)"
+    rf"{_RUNNERS_TOK}"
+    rf"|{_RUFF_TOK}\s+check\b"
+    rf"|{_PY_INTERP_PAT}\s+{_PY_SAFE_FLAGS_PAT}(?:-m\s+(?:pytest|unittest|py_compile|compileall|mypy|ruff|flake8)\b|{_INSTALL_TOK}\s+{_INSTALL_DIAG_TAIL})"
     r"|npm(?:\.cmd)?\s+(?:test|run\s+(?:test|lint|build|typecheck|check))\b"
     r"|pnpm(?:\.cmd)?\s+(?:test|lint|build|typecheck)\b"
     r"|yarn(?:\.cmd)?\s+(?:test|lint|build|typecheck)\b"
@@ -72,7 +123,7 @@ VALIDATION_SEGMENT_RE = re.compile(
     r"|cargo(?:\.exe)?\s+(?:test|check|clippy)\b"
     r"|go(?:\.exe)?\s+(?:test|vet)\b"
     r"|dotnet(?:\.exe)?\s+(?:test|build)\b"
-    r"|[\"']?[^\s|;&\"']*agy(?:\.exe|\.cmd)?[\"']?\s+plugin\s+validate\b"
+    rf"|{_AGY_TOK}\s+plugin\s+validate\b"
     r")",
     re.IGNORECASE,
 )
@@ -100,13 +151,17 @@ MUTATING_PKG_RE = re.compile(
 )
 
 MUTATING_STACK_RE = re.compile(
-    r"(?:\bworktree_guard\.py\b[^\r\n;|&]*\b(?:snapshot|remove|restore)\b|"
-    r"\bchip_handoff\.py\b[^\r\n;|&]*--merge\b)",
+    rf"(?:\bworktree_guard\.py\b{_WT_MUT_TAIL}|\bchip_handoff\.py\b{_CHIP_MUT_TAIL})",
+    re.IGNORECASE,
+)
+
+MUTATING_STACK_SEG_RE = re.compile(
+    rf"{_PY_MUT_CLAUSE_PREFIX}(?:{_WT_GUARD_MUT_TOK}{_WT_MUT_TAIL}|{_CHIP_MUT_TOK}{_CHIP_MUT_TAIL})",
     re.IGNORECASE,
 )
 
 INSTALL_PY_RE = re.compile(
-    r"(?:python|py(?:\s+-3)?)(?:\.exe)?\s+(?:-X\s+utf8\s+)?[\"']?[^\s|;&\"']*install\.py\b(?![^\r\n|;&]*(?:--diagnose|--dry-run)\b)",
+    rf"{_PY_MUT_CLAUSE_PREFIX}{_INSTALL_MUT_TOK}(?!{_INSTALL_DIAG_TAIL})",
     re.IGNORECASE,
 )
 
@@ -144,7 +199,10 @@ HTTP_MUTATING_RE = re.compile(
     re.IGNORECASE,
 )
 
-INLINE_PY_RE = re.compile(r"\b(?:python|py(?:\s+-3)?)(?:\.exe)?\s+(?:-(?:X\s+\S+|\w+)\s+)*-c\b", re.IGNORECASE)
+INLINE_PY_RE = re.compile(
+    rf"(?:^|[;&|({{\s]){_PY_MUT_INTERP_PAT}\s+{_PY_ANY_FLAGS_PAT}-c\b",
+    re.IGNORECASE,
+)
 INLINE_PY_WRITE_RE = re.compile(
     r"\.write(?:_text|_bytes|lines)?\b|open\s*\(|\b(?:unlink|remove|rename|replace|rmdir|shutil|subprocess|os\.system|"
     r"urllib|http\.client|requests|httpx|socket|winreg|ctypes|sqlite3|runpy)\b|\.(?:mkdir|makedirs|touch)\s*\(",
@@ -358,6 +416,14 @@ def _split_ps_clauses(core: str) -> list[str]:
     return [seg for _, seg in _split_shell_segments(core, split_subclauses=True)]
 
 
+def _all_ps_clauses(core: str, subexprs: list[str] | None = None) -> list[str]:
+    subs = _extract_ps_subexprs(core) if subexprs is None else subexprs
+    clauses = _split_ps_clauses(core)
+    for sub in subs:
+        clauses.extend(_split_ps_clauses(sub))
+    return clauses
+
+
 _OUTPUT_FLAG_RE = re.compile(r"(?:^|\s)(?:--output(?:=|\s)|-o(?:\s|$)|-outfile(?:\s|$))", re.IGNORECASE)
 
 
@@ -380,16 +446,27 @@ def _shell_scan_surfaces(
     )
 
 
-def _has_non_cmdlet_mutation(core: str, unquoted_surface: str, scan_surface: str, no_single_surface: str) -> bool:
+def _has_non_cmdlet_mutation(
+    core: str,
+    unquoted_surface: str,
+    scan_surface: str,
+    no_single_surface: str,
+    subexprs: list[str] | None = None,
+) -> bool:
     if HTTP_CMD_RE.search(unquoted_surface) and HTTP_MUTATING_RE.search(core):
         return True
-    return bool(
+    if (
         MUTATING_GIT_RE.search(scan_surface)
         or MUTATING_PKG_RE.search(scan_surface)
         or MUTATING_STACK_RE.search(scan_surface)
         or SYSTEM_OR_NET_MUTATING_RE.search(no_single_surface)
-        or INSTALL_PY_RE.search(unquoted_surface)
-    )
+    ):
+        return True
+    low_core = core.lower()
+    if not any(k in low_core for k in ("install.py", "worktree_guard.py", "chip_handoff.py")):
+        return False
+    # INVARIANT: Match quoted script paths (`install.py`, `worktree_guard.py`, `chip_handoff.py`) on raw clauses before `_strip_quoted` erases `'...'`.
+    return any(INSTALL_PY_RE.match(cl) or MUTATING_STACK_SEG_RE.match(cl) for cl in _all_ps_clauses(core, subexprs))
 
 
 def _has_output_flag(seg: str, seg_unq: str) -> bool:
@@ -413,7 +490,7 @@ def _has_mutating_shell_pattern(
     if (
         has_file_redirect
         or MUTATING_CMDLET_RE.search(scan_surface)
-        or _has_non_cmdlet_mutation(core, unquoted_surface, scan_surface, no_single_surface)
+        or _has_non_cmdlet_mutation(core, unquoted_surface, scan_surface, no_single_surface, subs)
     ):
         return True
     all_segs = [seg for _, seg in segments]
@@ -425,34 +502,55 @@ def _has_mutating_shell_pattern(
     return False
 
 
+def _is_bookkeeping_segment(seg: str) -> bool:
+    low = seg.lower()
+    return "--merge" not in low and "--mirror-workspace" not in low and bool(BOOKKEEPING_CMD_RE.match(seg))
+
+
 def _classify_non_mutating_segments(segments: list[tuple[str, str]]) -> str:
     if not segments:
         return "READ_ONLY"
-    if len(segments) == 1:
-        seg = segments[0][1]
-        if "--merge" not in seg.lower() and "--mirror-workspace" not in seg.lower() and BOOKKEEPING_CMD_RE.match(seg):
-            return "BOOKKEEPING"
-        if READ_ONLY_CMD_RE.match(seg) or NAV_SEGMENT_RE.match(seg):
-            return "READ_ONLY"
+    val_count = 0
+    last_val_idx = -1
+    saw_bookkeeping = False
+    has_or_chain = False
+    n_segs = len(segments)
+    for idx, (op, seg) in enumerate(segments):
+        if op == "||":
+            has_or_chain = True
+        if op in ("", ";", "&&") and seg.strip().lower() == "$null" and idx + 1 < n_segs and segments[idx + 1][0] == "|":
+            continue
+        if idx > 0 and op == "|" and PS_SAFE_FILTER_RE.match(seg):
+            continue
+        if _is_bookkeeping_segment(seg):
+            saw_bookkeeping = True
+            continue
         if VALIDATION_SEGMENT_RE.match(seg):
-            return "VALIDATION"
+            is_null_pipe = (
+                op == "|"
+                and idx > 0
+                and segments[idx - 1][0] in ("", ";", "&&")
+                and segments[idx - 1][1].strip().lower() == "$null"
+            )
+            if op not in ("", ";", "&&") and not is_null_pipe:
+                return "UNCERTAIN"
+            val_count += 1
+            last_val_idx = idx
+            continue
+        if READ_ONLY_CMD_RE.match(seg) or NAV_SEGMENT_RE.match(seg):
+            continue
         return "UNCERTAIN"
+    if val_count:
+        # SAFETY: Conditional `||`, trailing segments/pipes, or multiple runners can skip or mask a test exit code.
+        return "VALIDATION" if (not has_or_chain and val_count == 1 and last_val_idx == n_segs - 1) else "UNCERTAIN"
+    if saw_bookkeeping:
+        return "BOOKKEEPING"
+    return "READ_ONLY"
 
-    saw_validation = False
-    saw_ro_or_nav = False
-    for op, seg in segments:
-        if op == "|" and PS_SAFE_FILTER_RE.match(seg):
-            continue
-        if VALIDATION_SEGMENT_RE.match(seg):
-            saw_validation = True
-            continue
-        if READ_ONLY_CMD_RE.match(seg) or NAV_SEGMENT_RE.match(seg):
-            saw_ro_or_nav = True
-            continue
-        return "UNCERTAIN"
-    if saw_validation:
-        return "VALIDATION"
-    return "READ_ONLY" if saw_ro_or_nav else "UNCERTAIN"
+
+def _has_validation_segment(cmd: str) -> bool:
+    core = _strip_null_pipe(cmd)
+    return bool(core) and any(VALIDATION_SEGMENT_RE.match(seg) for _, seg in _split_shell_segments(core))
 
 
 def classify_shell_command(cmd: str) -> str:
@@ -500,18 +598,25 @@ NON_GIT_SKIP_DIRS = frozenset(
 )
 
 
+MAX_HASHED_SNAPSHOT_BYTES = 2_000_000
+
+
 def _file_entry_token(
     full: str, prefix: str = "", stat_result: os.stat_result | None = None
 ) -> str:
-    if stat_result is None and not os.path.isfile(full):
-        return f"{prefix}absent"
     try:
-        st = stat_result if stat_result is not None else os.stat(full)
-        if st.st_size <= 2_000_000:
+        st = stat_result if stat_result is not None else os.lstat(full)
+        if stat.S_ISLNK(st.st_mode) or getattr(st, "st_reparse_tag", 0) != 0:
+            return f"{prefix}link:{st.st_size}:{st.st_mtime_ns}"
+        if not stat.S_ISREG(st.st_mode):
+            return f"{prefix}dir:{st.st_mtime_ns}"
+        if st.st_size <= MAX_HASHED_SNAPSHOT_BYTES:
             with open(full, "rb") as fh:
                 digest = hashlib.sha256(fh.read()).hexdigest()[:20]
             return f"{prefix}{st.st_size}:{digest}"
-        return f"{prefix}{st.st_size}:{st.st_mtime_ns}"
+        return f"{prefix}large:{st.st_size}:{st.st_mtime_ns}"
+    except FileNotFoundError:
+        return f"{prefix}absent"
     except OSError:
         return f"{prefix}stat_err"
 
@@ -632,6 +737,40 @@ def take_git_snapshot(
     }
 
 
+def _strip_git_xy_prefix(tok: str) -> str:
+    return tok[3:] if len(tok) >= 3 and tok[2] == ":" else tok
+
+
+def _git_entry_unchanged_on_disk(path: str, b_tok: str, a_tok: str | None = None) -> bool:
+    b_xy = b_tok[:2] if len(b_tok) >= 3 and b_tok[2] == ":" else ""
+    b_ctok = _strip_git_xy_prefix(b_tok)
+    if b_ctok == "stat_err" or b_ctok.startswith(("link:", "dir:", "large:")):
+        return False
+    if b_ctok == "absent" and "D" not in b_xy:
+        return False
+    if a_tok is not None:
+        a_xy = a_tok[:2] if len(a_tok) >= 3 and a_tok[2] == ":" else ""
+        if b_ctok == "absent":
+            return "D" in a_xy and _strip_git_xy_prefix(a_tok) == "absent"
+        return _strip_git_xy_prefix(a_tok) == b_ctok
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return b_ctok == "absent"
+    except OSError:
+        return False
+    if (
+        b_ctok == "absent"
+        or stat.S_ISLNK(st.st_mode)
+        or not stat.S_ISREG(st.st_mode)
+        or getattr(st, "st_reparse_tag", 0) != 0
+        or st.st_size > MAX_HASHED_SNAPSHOT_BYTES
+        or not b_ctok.startswith(f"{st.st_size}:")
+    ):
+        return False
+    return _file_entry_token(path, stat_result=st) == b_ctok
+
+
 def diff_git_snapshots(before: dict[str, Any] | None, after: dict[str, Any] | None) -> tuple[list[str], bool]:
     """Return `(changed_durable_paths, unmeasured)`."""
     if not isinstance(before, dict) or not isinstance(after, dict):
@@ -649,32 +788,50 @@ def diff_git_snapshots(before: dict[str, Any] | None, after: dict[str, Any] | No
     changed: set[str] = set()
     b_entries: dict[str, str] = before.get("entries") or {}
     a_entries: dict[str, str] = after.get("entries") or {}
+    if not after.get("in_git"):
+        for path, tok in a_entries.items():
+            if b_entries.get(path) != tok:
+                changed.add(path)
+        for path in b_entries:
+            if path not in a_entries:
+                changed.add(path)
+        return sorted(changed), False
+
+    # INVARIANT: Pure `git add` / `git commit` of already-dirty working-tree files keeps on-disk SHA-256 identical
+    # and must be treated as OPERATIONAL rather than reopening a PERSISTENT code-edit candidate.
+    unchanged_clean: set[str] = set()
     for path, tok in a_entries.items():
-        if b_entries.get(path) != tok:
+        b_tok = b_entries.get(path)
+        if b_tok is None or not _git_entry_unchanged_on_disk(path, b_tok, tok):
             changed.add(path)
-    for path in b_entries:
+    for path, b_tok in b_entries.items():
         if path not in a_entries:
-            changed.add(path)
+            if _git_entry_unchanged_on_disk(path, b_tok):
+                unchanged_clean.add(path)
+            else:
+                changed.add(path)
 
     # INVARIANT: Files modified & committed during a shell command leave status clean, so diff HEAD transitions explicitly.
-    if after.get("in_git"):
-        b_head = str(before.get("head") or "")
-        a_head = str(after.get("head") or "")
-        root = str(after.get("root") or "")
-        if a_head and a_head != b_head and root:
-            diff_args = ["diff-tree", "--no-commit-id", "--name-only", "-r", "-z"]
-            if b_head:
-                diff_args.extend([b_head, a_head])
-            else:
-                diff_args.extend(["--root", a_head])
-            rc, out, _ = rio.run_git(root, diff_args, timeout=4.0, text=False)
-            if rc == 0 and isinstance(out, (bytes, bytearray)):
-                for rel_b in bytes(out).split(b"\0"):
-                    if not rel_b:
-                        continue
-                    rel = rel_b.decode("utf-8", errors="replace")
-                    if not CACHE_PATH_RE.search(rel.replace("\\", "/")):
-                        changed.add(rio.normalize_path(os.path.join(root, rel)))
+    b_head = str(before.get("head") or "")
+    a_head = str(after.get("head") or "")
+    root = str(after.get("root") or "")
+    if a_head and a_head != b_head and root:
+        diff_args = ["diff-tree", "--no-commit-id", "--name-only", "-r", "-z"]
+        if b_head:
+            diff_args.extend([b_head, a_head])
+        else:
+            diff_args.extend(["--root", a_head])
+        rc, out, _ = rio.run_git(root, diff_args, timeout=4.0, text=False)
+        if rc != 0 or not isinstance(out, (bytes, bytearray)):
+            return sorted(changed), True
+        for rel_b in bytes(out).split(b"\0"):
+            if not rel_b:
+                continue
+            rel = rel_b.decode("utf-8", errors="replace")
+            if not CACHE_PATH_RE.search(rel.replace("\\", "/")):
+                norm_p = rio.normalize_path(os.path.join(root, rel))
+                if norm_p not in unchanged_clean:
+                    changed.add(norm_p)
 
     return sorted(changed), False
 
@@ -771,7 +928,7 @@ def update_candidate_marker(
             mark_obj["unknown"] = True
         if not marks or marks[-1].get("fp") != fp or mark_obj.get("unknown") or marks[-1].get("unknown"):
             marks.append(mark_obj)
-        marker["content_marks"] = marks[-32:]
+        cwg.trim_content_marks(marker, marks)
     elif operational_mutation:
         marker["operational"] = True
         dpaths = cwg.durable_paths(marker.get("paths"))
@@ -781,17 +938,17 @@ def update_candidate_marker(
             last_fp = marks[-1].get("fp") if marks and isinstance(marks[-1], dict) else None
             if not fp:
                 marks.append({"ts": now, "fp": None, "unknown": True, "cause": cause_label[:120]})
-                marker["content_marks"] = marks[-32:]
+                cwg.trim_content_marks(marker, marks)
             elif fp != last_fp:
                 marks.append({"ts": now, "fp": fp, "cause": cause_label[:120]})
                 marker["last_durable_ts"] = now
-                marker["content_marks"] = marks[-32:]
+                cwg.trim_content_marks(marker, marks)
             elif marks and marks[-1].get("unknown"):
-                # Clear legacy unknown flag when SHA-256 fingerprint is confirmed identical
+                # INVARIANT: Clear legacy unknown flag when SHA-256 fingerprint is confirmed identical.
                 cleaned = dict(marks[-1])
                 cleaned.pop("unknown", None)
                 marks[-1] = cleaned
-                marker["content_marks"] = marks[-32:]
+                cwg.trim_content_marks(marker, marks)
 
     rio.write_json(mp, marker)
     return before_open, marker
@@ -1137,10 +1294,7 @@ def _has_opaque_script_or_exec(cmd: str) -> bool:
     core = _strip_null_pipe(cmd)
     if not core:
         return False
-    clauses = _split_ps_clauses(core)
-    for sub in _extract_ps_subexprs(core):
-        clauses.extend(_split_ps_clauses(sub))
-    for raw_clause in clauses:
+    for raw_clause in _all_ps_clauses(core):
         s = raw_clause.strip()
         while s:
             m_kw = _PS_CONTROL_KW_RE.match(s)
@@ -1202,7 +1356,7 @@ def is_ephemeral_only_shell_mutation(
     unquoted = _strip_quoted(core)
     unquoted_surface, scan_surface, no_single_surface = _shell_scan_surfaces(core, no_single, unquoted, subexprs)
 
-    if _has_non_cmdlet_mutation(core, unquoted_surface, scan_surface, no_single_surface):
+    if _has_non_cmdlet_mutation(core, unquoted_surface, scan_surface, no_single_surface, subexprs):
         return False
 
     vars_map: dict[str, str] = {}
@@ -1554,7 +1708,7 @@ def handle_post_tool(payload: dict[str, Any]) -> None:
     if failed:
         codex_lane.record_from_command(cmd, error_text, exit_code=1)
 
-    if policy == "VALIDATION":
+    if policy == "VALIDATION" or (failed and policy == "UNCERTAIN" and _has_validation_segment(cmd)):
         rio.append_jsonl(
             cwg.checks_ledger_path(session),
             {

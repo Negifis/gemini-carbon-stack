@@ -6,10 +6,11 @@ description: Triggered by /adversarial-review or HIGH/XHIGH changes requiring in
 # `/adversarial-review` — Независимое критическое ревью кода
 
 Один независимый review-движок на раунд, максимум 3 обычных раунда, строгая криптографическая/системная проверка происхождения вердикта хуком `cwg_stop.py`.
+**Инвариант порядка:** для `HIGH`/`XHIGH` ревью запускается **строго ПОСЛЕ полного завершения всех 3 линз `simplify`** (запуск ревью одновременно с `simplify` блокируется `cwg_stop.py`).
 
-## Шаг 1. Основной внешний контур — OpenAI Codex CLI (без изменений)
+## Шаг 1. Приоритет №1 (всегда основной контур) — OpenAI Codex CLI (`codex_lane.py`)
 
-Сначала проверьте состояние внешнего контура Codex:
+Всегда начинайте с проверки и запуска внешнего контура Codex (переход на внутренние модели при доступном Codex запрещён и блокируется `cwg_stop.py`):
 ```powershell
 python -X utf8 "<PLUGIN_ROOT>/hooks/codex_lane.py" check
 ```
@@ -24,9 +25,9 @@ python -X utf8 "<PLUGIN_ROOT>/hooks/codex_lane.py" review `
 
 - **Единая сессия чата в рамках кандидата:** 1-й раунд открывает новую сессию Codex и сохраняет её `session_id` в `state/gate/threads/`; все последующие раунды (`REVISE` -> раунды 2/3 и пост-эскалационный `--closure`) по тому же кандидату (`--session` + `git_root`) **автоматически продолжаются в том же самом чате** через `codex exec resume <session_id>` (`SESSION_MODE: resumed`). Передавайте `--new-session` только для принудительного сброса, а `--resume <id>` — для явного выбора сессии.
 
-## Шаг 2. Внутренний межсемейный контур — `Claude Opus 5.5 (High)` -> эскалация на `Gemini 4 Carbon (High)`
+## Шаг 2. Приоритет №2 (только при подтверждённой недоступности Codex) — `Claude Opus 5.5 (High)` -> эскалация на `Gemini 4 Carbon (High)`
 
-Используется при открытом circuit breaker / недоступности Codex либо при прямом запросе внутреннего ревью в Antigravity:
+Используется **ИСКЛЮЧИТЕЛЬНО** при открытом circuit breaker / подтверждённом сбое или недоступности `codex_lane.py` (`available: false`):
 
 1. Проверьте квоту `claude-opus-5-5-high` через `swarm(action="models", all=True)`.
 2. Если `claude-opus-5-5-high` доступен — запустите read-only воркера в `swarm`, закреплённого на **`claude-opus-5-5-high`**:

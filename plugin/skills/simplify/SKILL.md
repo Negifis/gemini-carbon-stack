@@ -23,4 +23,5 @@ python -X utf8 "<PLUGIN_ROOT>/tools/swarm_cache.py" prepare --session "<conversa
 
 - **Раунд 1 (`initial_spawn`):** передайте воркерам `<full_diff_path>` и список затронутых файлов.
 - **Раунд 2+ (`<= 270s` vs `> 270s`):** при `resume_in_place` продолжайте в тех же чатах через `post_message(...)` с `<incremental_diff_path>`; при `rotate_incremental` закройте старых воркеров (`swarm(action="kill", ...)`) и запустите `<name>-r<N>` только с инкрементальным диффом и замечаниями прошлого раунда.
-- При подтверждённом сбое/нулевой квоте `claude-sonnet-5-5-high` переключайтесь на `gemini-4-carbon-high` (или субагенты `simplify-*-reviewer`). После правок перезапустите тесты.
+- **При подтверждённом сбое/нулевой квоте `claude-sonnet-5-5-high`** переключайтесь строго на **`Gemini 4 Hydrogen (XHigh)`** (`swarm(action="add", ..., model="gemini-4-hydrogen-xhigh")`), никогда не на `gemini-4-carbon-high` и не на прямой `invoke_subagent` из Carbon-сессии (чтобы не сжигать квоту Carbon). После правок перезапустите тесты.
+- **Строгий порядок перед ревью:** все 3 линзы `simplify` должны **полностью завершиться ДО запуска `adversarial-review`**. Никогда не запускайте `simplify` и `adversarial-review` одновременно в одном ходе: `cwg_stop.py` отклоняет ревью, запущенное параллельно с `simplify` или до его завершения.

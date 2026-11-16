@@ -1,6 +1,6 @@
 ---
 name: simplify-reviewer
-description: Read-only combined code simplification subagent covering REUSE, QUALITY, and EFFICIENCY in a single pass ONLY for STANDARD-risk changes when claude-sonnet-5-5-high quota is unavailable. (HIGH/XHIGH changes always require 3 separate single-lens workers.)
+description: Read-only combined code simplification reviewer covering REUSE, QUALITY, and EFFICIENCY in a single pass ONLY for STANDARD-risk changes (primary claude-sonnet-5-5-high via swarm; fallback gemini-4-hydrogen-xhigh via swarm when Sonnet quota is unavailable). (HIGH/XHIGH changes always require 3 separate single-lens workers.)
 subagent: true
 mainAgent: false
 tools: [read_file, run_command, manage_task]

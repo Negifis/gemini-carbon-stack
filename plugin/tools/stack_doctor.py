@@ -135,7 +135,8 @@ def run_diagnostics(cwd: str = "", compact: bool = False) -> dict[str, Any]:
         "breaker": codex_lane.breaker_status(),
     }
     chips_info = chip_handoff.recover_chips()
-    inbox_note = gate_inbox.unresolved_summary()
+    handler_sess = gate_inbox.get_handler_session()
+    inbox_note = gate_inbox.unresolved_summary(handler_session=handler_sess)
     ls_info = query_live_ls_plugin("gemini-carbon-stack")
 
     ok = bool(
@@ -166,6 +167,7 @@ def run_diagnostics(cwd: str = "", compact: bool = False) -> dict[str, Any]:
         "codex_lane": codex_info,
         "memory": mem,
         "active_chips": chips_info.get("active_count", 0),
+        "gate_anomaly_handler": handler_sess or None,
         "gate_inbox": inbox_note or "clean",
         "logged_hook_errors": recent_errors,
     }
@@ -178,7 +180,7 @@ def run_diagnostics(cwd: str = "", compact: bool = False) -> dict[str, Any]:
                 "standard_mode": "opt_in single_combined (simplify-reviewer) via .agents/carbon-gate.json",
                 "high_xhigh_mode": "three_parallel_lenses (reuse, quality, efficiency)",
                 "primary_model": cwg.SONNET_HIGH_MODEL,
-                "fallback_model": cwg.CARBON_HIGH_MODEL,
+                "fallback_model": cwg.SIMPLIFY_FALLBACK_MODEL,
                 "prompt_cache_ttl_seconds": cwg.SWARM_CACHE_SAFE_TTL_SECONDS,
             },
             "external_review": "codex-cli (unchanged)",
@@ -189,7 +191,7 @@ def run_diagnostics(cwd: str = "", compact: bool = False) -> dict[str, Any]:
             "auxiliary_hydrogen": {
                 "replaces": "gemini-flash (disabled)",
                 "models_by_complexity": dict(cwg.HYDROGEN_MODEL_BY_LEVEL),
-                "roles": ["browser", "translator", "auxiliary_exploration"],
+                "roles": ["browser", "translator", "auxiliary_exploration", "simplify_fallback"],
             },
         }
     return report

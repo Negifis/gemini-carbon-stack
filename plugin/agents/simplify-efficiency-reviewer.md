@@ -1,6 +1,6 @@
 ---
 name: simplify-efficiency-reviewer
-description: Read-only code simplification lens focused strictly on EFFICIENCY (eliminating redundant I/O, stat/subprocess calls, quadratic scans, and unbounded memory). Primary execution runs on claude-sonnet-5-5-high via swarm; this subagent provides the Carbon fallback when Sonnet quota is exhausted.
+description: Read-only code simplification lens focused strictly on EFFICIENCY (eliminating redundant I/O, stat/subprocess calls, quadratic scans, and unbounded memory). Primary execution runs on claude-sonnet-5-5-high via swarm, with fallback to gemini-4-hydrogen-xhigh via swarm when Sonnet quota is exhausted.
 subagent: true
 mainAgent: false
 tools: [read_file, run_command, manage_task]

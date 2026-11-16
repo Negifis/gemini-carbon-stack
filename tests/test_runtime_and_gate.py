@@ -237,7 +237,7 @@ class GateSubprocessTestCase(unittest.TestCase):
                 }
             )
         if worker_post is not None:
-            reply_ts = now_ts + 0.1
+            reply_ts = now_ts + 0.001
             wsteps.append(
                 {
                     "step_index": len(wsteps),
@@ -254,7 +254,7 @@ class GateSubprocessTestCase(unittest.TestCase):
                     "source": "MODEL",
                     "type": "PLANNER_RESPONSE",
                     "status": "DONE",
-                    "created_at": iso_now(reply_ts + 0.02),
+                    "created_at": iso_now(reply_ts + 0.001),
                     "content": transcript_echo or "Posted report to swarm board.",
                 }
             )
@@ -263,6 +263,7 @@ class GateSubprocessTestCase(unittest.TestCase):
         wtext = "\n".join(json.dumps(s, ensure_ascii=False) for s in wsteps) + "\n"
         (wlogs / "transcript.jsonl").write_text(wtext, encoding="utf-8")
         (wlogs / "transcript_full.jsonl").write_text(wtext, encoding="utf-8")
+        time.sleep(0.003)
         return wcid
 
     def switch_swarm_worker_model(self, name: str, new_model: str, worker_post: str | None = None) -> None:
@@ -310,7 +311,7 @@ class GateSubprocessTestCase(unittest.TestCase):
                 for ln in (wlogs / "transcript.jsonl").read_text(encoding="utf-8").splitlines()
                 if ln.strip()
             ]
-            reply_ts = now_ts + 0.1
+            reply_ts = now_ts + 0.001
             existing.append(
                 {
                     "step_index": len(existing),
@@ -327,7 +328,7 @@ class GateSubprocessTestCase(unittest.TestCase):
                     "source": "MODEL",
                     "type": "PLANNER_RESPONSE",
                     "status": "DONE",
-                    "created_at": iso_now(reply_ts + 0.02),
+                    "created_at": iso_now(reply_ts + 0.001),
                     "content": "Completed escalated review.",
                 }
             )
@@ -335,6 +336,7 @@ class GateSubprocessTestCase(unittest.TestCase):
             (wlogs / "transcript.jsonl").write_text(wtext, encoding="utf-8")
             (wlogs / "transcript_full.jsonl").write_text(wtext, encoding="utf-8")
             self.append_board_post(name, worker_post, ts=reply_ts)
+            time.sleep(0.003)
 
     def add_sonnet_simplify_lenses(
         self,
@@ -354,6 +356,7 @@ class GateSubprocessTestCase(unittest.TestCase):
             os.environ,
             CARBON_STACK_HOME=str(self.stack_home),
             CARBON_CODEX_SESSIONS_DIR=str(self.codex_sessions),
+            CARBON_CODEX_BIN=getattr(self, "codex_bin", str(self.root / "no-codex-bin")),
             PLUGIN_ROOT=str(REPO_ROOT / "plugin"),
         )
         if isinstance(payload, dict):
@@ -729,7 +732,7 @@ class GateSubprocessTestCase(unittest.TestCase):
         )
         self.add_swarm_worker(
             name="simplify-reviewer",
-            model="gemini-4-carbon-high",
+            model="gemini-4-hydrogen-xhigh",
             brief="Combined STANDARD simplify review.",
             worker_post="@coordinator\nSIMPLIFY_LENS: ALL\nSIMPLIFY_VERDICT: CLEAN",
         )
@@ -765,8 +768,8 @@ class GateSubprocessTestCase(unittest.TestCase):
 
         # Negative A1: Only 2 of 3 Sonnet lenses (`reuse`, `quality`) -> blocked naming missing `efficiency`
         self.add_sonnet_simplify_lenses(lenses=("reuse", "quality"))
-        # Negative A2: Running the 3rd lens on `gemini-4-carbon-high` WITHOUT a verified Sonnet issue -> still blocked!
-        self.add_sonnet_simplify_lenses(lenses=("efficiency",), model="gemini-4-carbon-high")
+        # Negative A2: Running the 3rd lens on `gemini-4-hydrogen-xhigh` WITHOUT a verified Sonnet issue -> still blocked!
+        self.add_sonnet_simplify_lenses(lenses=("efficiency",), model="gemini-4-hydrogen-xhigh")
         self.add_final_response("Готово.\n[gate] verified: STANDARD; service.py, pytest")
         _, blk_lens = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
         self.assertEqual(blk_lens["decision"], "continue")
@@ -1715,6 +1718,2946 @@ class GateSubprocessTestCase(unittest.TestCase):
         self.add_final_response("Проверено Opus + Sonnet.\n[gate] verified: HIGH; auth_helper.py + pytest + Sonnet + Opus")
         _, allowed = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
         self.assertEqual(allowed, {"decision": "allow"})
+
+    def test_17_simplify_before_review_and_codex_priority_enforcement(self) -> None:
+        sys.path.insert(0, str(HOOKS_DIR))
+        import codex_lane
+        import cwg_stop
+
+        os.environ["CARBON_STACK_HOME"] = str(self.stack_home)
+        os.environ["CARBON_CODEX_SESSIONS_DIR"] = str(self.codex_sessions)
+
+        # Unit check for `_is_verified_codex_cmd_outage`: non-codex commands, echoed/quoted command literals,
+        # python -c, chained commands, bad CLI flags, and quoted `"ok": false` in review prose must NOT fake Codex outage
+        self.assertFalse(
+            cwg_stop._is_verified_codex_cmd_outage(
+                "Get-Content C:\\plugin\\hooks\\codex_lane.py", "ERROR", "Cannot find path"
+            )
+        )
+        self.assertFalse(
+            cwg_stop._is_verified_codex_cmd_outage(
+                "Write-Output 'python codex_lane.py check'\nWrite-Output '{\"available\": false, \"lane\": \"native-fallback\", \"reason\": \"codex_outage\"}'",
+                "DONE",
+                'python codex_lane.py check\n{"available": false, "lane": "native-fallback", "reason": "codex_outage"}',
+            )
+        )
+        self.assertFalse(
+            cwg_stop._is_verified_codex_cmd_outage(
+                "Write-Output 'python codex_lane.py check'",
+                "DONE",
+                '{"available": false, "lane": "native-fallback", "reason": "codex_outage"}',
+            )
+        )
+        self.assertFalse(
+            cwg_stop._is_verified_codex_cmd_outage(
+                "python -c \"print('codex_lane.py check')\"",
+                "DONE",
+                '{"available": false, "lane": "native-fallback", "reason": "codex_outage"}',
+            )
+        )
+        self.assertFalse(
+            cwg_stop._is_verified_codex_cmd_outage(
+                "python -X utf8 codex_lane.py check; Write-Output '{\"available\": false, \"lane\": \"native-fallback\"}'",
+                "DONE",
+                '{"available": false, "lane": "native-fallback", "reason": "codex_outage"}',
+            )
+        )
+        self.assertFalse(
+            cwg_stop._is_verified_codex_cmd_outage(
+                "python -X utf8 plugin/hooks/codex_lane.py check \"x\\\"; Write-Output 'quota exceeded'; #\"",
+                "ERROR",
+                "quota exceeded",
+            )
+        )
+        self.assertFalse(
+            cwg_stop._is_verified_codex_cmd_outage(
+                "python -X utf8 codex_lane.py review --bad-option",
+                "ERROR",
+                "usage: codex_lane review\ncodex_lane review: error: unrecognized arguments: --bad-option",
+            )
+        )
+        self.assertFalse(
+            cwg_stop._is_verified_codex_cmd_outage(
+                "python -X utf8 plugin/hooks/codex_lane.py review --bad-option 'quota exceeded'",
+                "ERROR",
+                "usage: codex_lane review\ncodex_lane: error: unrecognized arguments: --bad-option quota exceeded",
+            )
+        )
+        self.assertFalse(
+            cwg_stop._is_verified_codex_cmd_outage(
+                "codex exec --bad-option 'quota exceeded'",
+                "ERROR",
+                "error: unexpected argument '--bad-option' found: quota exceeded\nUsage: codex exec [OPTIONS]",
+            )
+        )
+        self.assertFalse(
+            cwg_stop._is_verified_codex_cmd_outage(
+                "python -X utf8 codex_lane.py review --session s1",
+                "DONE",
+                'REVIEW_ID: cwg-1\n--- CODEX REVIEW OUTPUT ---\nFound {"ok": false} in payload.\nVERDICT: REVISE',
+            )
+        )
+        self.assertTrue(
+            cwg_stop._is_verified_codex_cmd_outage(
+                "python -X utf8 codex_lane.py check",
+                "ERROR",
+                '{"available": false, "lane": "native-fallback", "reason": "codex_outage"}',
+            )
+        )
+        self.assertTrue(
+            cwg_stop._is_verified_codex_cmd_outage(
+                'python -X utf8 "C:\\plugin\\hooks\\codex_lane.py" check --json',
+                "ERROR",
+                '{"available": false, "lane": "native-fallback", "reason": "codex_outage"}',
+            )
+        )
+        self.assertTrue(
+            cwg_stop._is_verified_codex_cmd_outage(
+                "$null | python -X utf8 'C:\\plugin\\hooks\\codex_lane.py' review --session s1",
+                "ERROR",
+                '{"ok": false, "review_id": "cwg-1", "fallback": "adversarial-reviewer", "error": "timeout_after_240s"}',
+            )
+        )
+
+        # Configure an available Codex binary so primary Codex lane is healthy (`codex_issue == False`)
+        fake_codex = self.root / ("codex.cmd" if os.name == "nt" else "codex")
+        fake_codex.write_text("echo ok\n", encoding="utf-8")
+        self.codex_bin = str(fake_codex)
+        codex_lane.reset_breaker()
+
+        # Unit check for multi-round `simplify -> REVISE -> edit -> simplify -> REVISE -> edit -> simplify -> ESCALATE -> READY`:
+        # Prior valid rounds from earlier candidate versions must have positive simplify_history evidence, must NOT be wiped by the latest simplify, and a 4th round must exceed MAX_REVIEW_ROUNDS.
+        multi_marker = {
+            "session": "s-multi",
+            "first_ts": 10.0,
+            "last_ts": 90.0,
+            "last_durable_ts": 90.0,
+            "cwd": str(self.workspace).replace("\\", "/"),
+            "git_root": str(self.workspace).replace("\\", "/"),
+            "paths": [str(self.workspace / "auth_priority.py").replace("\\", "/")],
+            "content_marks": [
+                {"ts": 10.0, "fp": "fp-v1"},
+                {"ts": 50.0, "fp": "fp-v2"},
+                {"ts": 90.0, "fp": "fp-v3"},
+            ],
+        }
+        multi_checks = {"checks": [{"ts": 95.0, "ok": True}], "passed_count": 1, "latest_pass_ts": 95.0, "latest_fail_ts": 0.0}
+        multi_sub = {"fallback_lenses": {}, "fallback_lenses_end": {}, "simplify_history": [], "reviews": [], "review_failures": []}
+        multi_swarm_no_prior_simplify = {
+            "sonnet_lenses": {"reuse": 100.0, "quality": 100.0, "efficiency": 100.0},
+            "sonnet_lenses_end": {"reuse": 105.0, "quality": 105.0, "efficiency": 105.0},
+            "simplify_history": [
+                {"tier": "sonnet", "kind": "lens", "lens": lens, "launch_ts": 100.0, "end_ts": 105.0}
+                for lens in ("reuse", "quality", "efficiency")
+            ],
+            "reviews": [],
+            "review_failures": [],
+        }
+        multi_swarm = {
+            "sonnet_lenses": {"reuse": 100.0, "quality": 100.0, "efficiency": 100.0},
+            "sonnet_lenses_end": {"reuse": 105.0, "quality": 105.0, "efficiency": 105.0},
+            "simplify_history": [
+                {"tier": "sonnet", "kind": "lens", "lens": lens, "launch_ts": lts, "end_ts": ets}
+                for lts, ets in ((20.0, 25.0), (60.0, 65.0), (100.0, 105.0))
+                for lens in ("reuse", "quality", "efficiency")
+            ],
+            "reviews": [],
+            "review_failures": [],
+        }
+        multi_revs = [
+            {"engine": "codex", "kind": "ordinary", "verdict": "REVISE", "launch_ts": 30.0, "verdict_ts": 35.0},
+            {"engine": "codex", "kind": "ordinary", "verdict": "REVISE", "launch_ts": 70.0, "verdict_ts": 75.0},
+            {"engine": "codex", "kind": "ordinary", "verdict": "ESCALATE", "launch_ts": 110.0, "verdict_ts": 115.0},
+            {"engine": "codex", "kind": "closure", "verdict": "READY", "launch_ts": 120.0, "verdict_ts": 125.0},
+        ]
+        # Without simplify_history for v1 and v2, closure must be rejected
+        ok_no_hist, _ = cwg_stop.validate_candidate_closure(
+            {"kind": "verified", "risk": "HIGH"},
+            multi_marker,
+            multi_checks,
+            multi_sub,
+            multi_swarm_no_prior_simplify,
+            multi_revs,
+        )
+        self.assertFalse(ok_no_hist)
+        self.assertEqual(
+            cwg_stop.validate_candidate_closure(
+                {"kind": "verified", "risk": "HIGH"}, multi_marker, multi_checks, multi_sub, multi_swarm, multi_revs
+            ),
+            (True, "verified"),
+        )
+        self.assertEqual(
+            cwg_stop.validate_candidate_closure(
+                {"kind": "pr-ready", "risk": "HIGH"}, multi_marker, multi_checks, multi_sub, multi_swarm, multi_revs
+            ),
+            (True, "pr-ready"),
+        )
+        # Re-running simplify after 3 rounds must NOT reset MAX_REVIEW_ROUNDS when a 4th ordinary review is added
+        revs_4 = multi_revs[:3] + [
+            {"engine": "codex", "kind": "ordinary", "verdict": "APPROVED", "launch_ts": 130.0, "verdict_ts": 135.0}
+        ]
+        ok_4, why_4 = cwg_stop.validate_candidate_closure(
+            {"kind": "verified", "risk": "HIGH"}, multi_marker, multi_checks, multi_sub, multi_swarm, revs_4
+        )
+        self.assertFalse(ok_4)
+        self.assertIn("MAX_REVIEW_ROUNDS", why_4)
+
+        sec = self.workspace / "auth_priority.py"
+        code = "def check_auth(token: str) -> bool:\n    return token.startswith('ok_')\n"
+        sec.write_text(code, encoding="utf-8")
+        self.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {"toolCall": {"id": "p1", "name": "write_file", "args": {"Path": str(sec), "Content": code}}, "error": ""},
+        )
+        self.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {"toolCall": {"id": "p2", "name": "run_command", "args": {"CommandLine": "pytest -q"}}, "error": ""},
+        )
+
+        # Negative 1: Running adversarial review + CLOSURE_VALIDATION: READY BEFORE simplify lenses is rejected for both `pr-ready` and `verified`!
+        t_early = time.time()
+        ts_cls = t_early + 0.005
+        codex_lane.record_packet("cwg-early-cls", "REVIEW_ID: cwg-early-cls", str(self.workspace), effort="high", phase="closure", session=self.conv_id)
+        (self.codex_sessions / "rollout-early-cls.jsonl").write_text(
+            "\n".join(
+                json.dumps(r)
+                for r in [
+                    {"type": "session_meta", "timestamp": iso_now(ts_cls), "payload": {"id": "s-early", "timestamp": iso_now(ts_cls)}},
+                    {"type": "turn_context", "timestamp": iso_now(ts_cls), "payload": {"model": "gpt-6.1-sol", "effort": "high"}},
+                    {"type": "response_item", "timestamp": iso_now(ts_cls), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-early-cls"}]}},
+                    {"type": "event_msg", "timestamp": iso_now(ts_cls + 0.0005), "payload": {"type": "task_complete", "last_agent_message": "CLOSURE_VALIDATION: READY"}},
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        ts_app = t_early + 0.007
+        codex_lane.record_packet("cwg-early-app", "REVIEW_ID: cwg-early-app", str(self.workspace), effort="high", session=self.conv_id)
+        (self.codex_sessions / "rollout-early-app.jsonl").write_text(
+            "\n".join(
+                json.dumps(r)
+                for r in [
+                    {"type": "session_meta", "timestamp": iso_now(ts_app), "payload": {"id": "s-early", "timestamp": iso_now(ts_app)}},
+                    {"type": "turn_context", "timestamp": iso_now(ts_app), "payload": {"model": "gpt-6.1-sol", "effort": "high"}},
+                    {"type": "response_item", "timestamp": iso_now(ts_app), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-early-app"}]}},
+                    {"type": "event_msg", "timestamp": iso_now(ts_app + 0.0005), "payload": {"type": "task_complete", "last_agent_message": "VERDICT: APPROVED"}},
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        time.sleep(0.01)
+        self.add_sonnet_simplify_lenses()
+        self.add_final_response("Ревью и closure были до simplify.\n[gate] pr-ready: HIGH; auth_priority.py")
+        _, blk_pr_order = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
+        self.assertEqual(blk_pr_order["decision"], "continue")
+        self.assertIn("adversarial review ran simultaneously with or before simplify lenses", blk_pr_order["reason"])
+
+        self.add_final_response("Ревью было до simplify.\n[gate] verified: HIGH; auth_priority.py, pytest + codex")
+        _, blk_order = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
+        self.assertEqual(blk_order["decision"], "continue")
+        self.assertIn("adversarial review ran simultaneously with or before simplify lenses", blk_order["reason"])
+
+        # Negative 2: PostToolUse (`cwg_mark.py`) on a bad CLI option containing 'quota exceeded' must NOT trip circuit breaker,
+        # and running internal review (`claude-opus-5-5-high`) AFTER simplify while Codex is available must be rejected in Stop!
+        self.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {
+                "toolCall": {
+                    "id": "cx-bad-arg",
+                    "name": "run_command",
+                    "args": {"CommandLine": "python -X utf8 plugin/hooks/codex_lane.py review --bad-option 'quota exceeded'"},
+                },
+                "error": "usage: codex_lane review\ncodex_lane: error: unrecognized arguments: --bad-option quota exceeded",
+            },
+        )
+        self.assertFalse(codex_lane.breaker_status().get("tripped"))
+        self.add_swarm_worker(
+            name="internal-opus-while-codex-up",
+            model="claude-opus-5-5-high",
+            brief="Read-only review while Codex is available.",
+            worker_post="@coordinator\nVERDICT: APPROVED",
+        )
+        self.add_final_response("Внутреннее ревью при живом Codex.\n[gate] verified: HIGH; auth_priority.py, pytest + opus")
+        _, blk_codex_prio = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
+        self.assertEqual(blk_codex_prio["decision"], "continue")
+        self.assertIn("internal review ran while primary Codex lane (`codex_lane.py`) is available", blk_codex_prio["reason"])
+
+        # Negative 2b: Same-session Codex review packet bound to a DIFFERENT git repo (`other_repo`) must NOT satisfy `self.workspace`!
+        other_repo = self.root / "other-repo"
+        self._init_git_repo(other_repo, {"other.py": "x = 1\n"}, "init other")
+        t_other = time.time()
+        codex_lane.record_packet("cwg-other-repo", "REVIEW_ID: cwg-other-repo", str(other_repo), effort="high", session=self.conv_id)
+        (self.codex_sessions / "rollout-other-repo.jsonl").write_text(
+            "\n".join(
+                json.dumps(r)
+                for r in [
+                    {"type": "session_meta", "timestamp": iso_now(t_other), "payload": {"id": "s-other-repo", "timestamp": iso_now(t_other)}},
+                    {"type": "turn_context", "timestamp": iso_now(t_other), "payload": {"model": "gpt-6.1-sol", "effort": "high"}},
+                    {"type": "response_item", "timestamp": iso_now(t_other), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-other-repo"}]}},
+                    {"type": "event_msg", "timestamp": iso_now(t_other + 0.001), "payload": {"type": "task_complete", "last_agent_message": "VERDICT: APPROVED"}},
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        scanned_ids = [
+            r["review_id"]
+            for r in codex_lane.scan_verified_codex_reviews(
+                since_ts=t_early, session=self.conv_id, git_root=str(self.workspace)
+            )
+        ]
+        self.assertNotIn("cwg-other-repo", scanned_ids)
+
+        # Positive 3: Running Codex review on `self.workspace` AFTER simplify lenses have completed closes HIGH cleanly (with all earlier pre-simplify rollouts still on disk)!
+        t_after = time.time()
+        codex_lane.record_packet(
+            "cwg-after-sim",
+            "REVIEW_ID: cwg-after-sim",
+            str(self.workspace),
+            effort="high",
+            session=self.conv_id,
+        )
+        rollout_after = self.codex_sessions / "rollout-after.jsonl"
+        rollout_after.write_text(
+            "\n".join(
+                json.dumps(r)
+                for r in [
+                    {"type": "session_meta", "timestamp": iso_now(t_after), "payload": {"id": "s-after", "timestamp": iso_now(t_after)}},
+                    {"type": "turn_context", "timestamp": iso_now(t_after), "payload": {"model": "gpt-6.1-sol", "effort": "high"}},
+                    {"type": "response_item", "timestamp": iso_now(t_after), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-after-sim"}]}},
+                    {"type": "event_msg", "timestamp": iso_now(t_after + 0.001), "payload": {"type": "task_complete", "last_agent_message": "VERDICT: APPROVED"}},
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.add_final_response("Сначала simplify, затем Codex.\n[gate] verified: HIGH; auth_priority.py, pytest + simplify + codex")
+        _, ok_codex = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
+        self.assertEqual(ok_codex, {"decision": "allow"})
+
+    def test_18_anomaly_handler_routing_and_anom_273f8782_fixes(self) -> None:
+        sys.path.insert(0, str(HOOKS_DIR))
+        import codex_lane
+        import cwg_mark
+        import cwg_stop
+
+        os.environ["CARBON_STACK_HOME"] = str(self.stack_home)
+        os.environ["CARBON_CODEX_SESSIONS_DIR"] = str(self.codex_sessions)
+
+        # 1. Multiline `Set-Location` + `swarm_cache.py prepare` + final `unittest` classifies as VALIDATION (fix for 6dedf3f67800),
+        # while any trailing segment/pipe or `||` after/before `unittest` is UNCERTAIN so exit-code masking never records `passed=True`.
+        multiline_val = (
+            "Set-Location 'C:\\repo'\n"
+            "python -X utf8 'C:\\plugin\\tools\\swarm_cache.py' prepare --session s1 --cwd 'C:\\repo' --label simplify\n"
+            "$null | python -X utf8 -m unittest discover -s tests -v"
+        )
+        multiline_masked = (
+            "Set-Location 'C:\\repo'\n"
+            "python -X utf8 -m unittest discover -s tests -v\n"
+            "python -X utf8 'C:\\plugin\\tools\\swarm_cache.py' prepare --session s1 --cwd 'C:\\repo' --label simplify"
+        )
+        multiline_bk = (
+            "Set-Location 'C:\\repo'\n"
+            "python -X utf8 'C:\\plugin\\tools\\swarm_cache.py' prepare --session s1 --cwd 'C:\\repo' --label simplify"
+        )
+        multiline_merge = (
+            "Set-Location 'C:\\repo'\n"
+            "python -X utf8 'C:\\plugin\\tools\\chip_handoff.py' close --chip c1 --merge"
+        )
+        self.assertEqual(cwg_mark.classify_shell_command(multiline_val), "VALIDATION")
+        self.assertEqual(cwg_mark.classify_shell_command(multiline_masked), "UNCERTAIN")
+        self.assertEqual(cwg_mark.classify_shell_command("pytest -q | Select-Object -First 5"), "UNCERTAIN")
+        self.assertEqual(cwg_mark.classify_shell_command("git status || pytest -q"), "UNCERTAIN")
+        self.assertEqual(cwg_mark.classify_shell_command("Write-Output left || $null | pytest -q"), "UNCERTAIN")
+        self.assertEqual(cwg_mark.classify_shell_command(multiline_bk), "BOOKKEEPING")
+        self.assertNotIn(cwg_mark.classify_shell_command(multiline_merge), ("READ_ONLY", "BOOKKEEPING", "VALIDATION"))
+
+        # Masked exit 0 on `multiline_masked` or `Write-Output left || $null | pytest -q` must NOT record `passed=True`
+        self.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {"toolCall": {"id": "m-mask-ok", "name": "run_command", "args": {"CommandLine": multiline_masked}}, "error": ""},
+        )
+        self.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {"toolCall": {"id": "m-or-null-ok", "name": "run_command", "args": {"CommandLine": "Write-Output left || $null | pytest -q"}}, "error": ""},
+        )
+        self.assertEqual(cwg_stop.read_checks_evidence(self.conv_id, 0.0)["passed_count"], 0)
+        self.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {"toolCall": {"id": "m-mask-err", "name": "run_command", "args": {"CommandLine": multiline_masked}}, "error": "exit status 1"},
+        )
+        self.assertGreater(cwg_stop.read_checks_evidence(self.conv_id, 0.0)["latest_fail_ts"], 0.0)
+        self.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {"toolCall": {"id": "m-val-ok", "name": "run_command", "args": {"CommandLine": multiline_val}}, "error": ""},
+        )
+        ev_after_val = cwg_stop.read_checks_evidence(self.conv_id, 0.0)
+        self.assertEqual(ev_after_val["passed_count"], 1)
+        self.assertGreaterEqual(ev_after_val["latest_pass_ts"], ev_after_val["latest_fail_ts"])
+
+        # 2. Exact `anom-273f8782` reproduction: disqualified internal review + 3 Codex ordinary rounds + 3 closure passes ending READY
+        fake_codex = self.root / "fake-codex-18.cmd"
+        fake_codex.write_text("@echo off\r\nexit /b 0\r\n", encoding="utf-8")
+        os.environ["CARBON_CODEX_BIN"] = str(fake_codex)
+        self.codex_bin = str(fake_codex)
+        codex_lane.reset_breaker()
+
+        cand_marker = {
+            "session": "s-anom-repro",
+            "first_ts": 10.0,
+            "last_ts": 170.0,
+            "last_durable_ts": 170.0,
+            "cwd": str(self.workspace).replace("\\", "/"),
+            "git_root": str(self.workspace).replace("\\", "/"),
+            "paths": [str(self.workspace / "auth_guard.py").replace("\\", "/")],
+            "content_marks": [
+                {"ts": 10.0, "fp": "fp-1"},
+                {"ts": 50.0, "fp": "fp-2"},
+                {"ts": 90.0, "fp": "fp-3"},
+                {"ts": 130.0, "fp": "fp-4"},
+                {"ts": 150.0, "fp": "fp-5"},
+                {"ts": 170.0, "fp": "fp-6"},
+            ],
+        }
+        cand_checks = {"checks": [{"ts": 172.0, "ok": True}], "passed_count": 1, "latest_pass_ts": 172.0, "latest_fail_ts": 0.0}
+        # Disqualified native review ran while Codex was available -> must NOT inflate MAX_REVIEW_ROUNDS=3
+        cand_sub = {
+            "fallback_lenses": {"reuse": 174.0, "quality": 174.0, "efficiency": 174.0},
+            "fallback_lenses_end": {"reuse": 178.0, "quality": 178.0, "efficiency": 178.0},
+            "simplify_history": [
+                {"tier": "fallback", "kind": "lens", "lens": lens, "launch_ts": lts, "end_ts": ets}
+                for lts, ets in ((20.0, 25.0), (60.0, 65.0), (100.0, 105.0), (135.0, 140.0), (155.0, 160.0), (174.0, 178.0))
+                for lens in ("reuse", "quality", "efficiency")
+            ],
+            "reviews": [
+                {
+                    "engine": "native",
+                    "model": "gemini-4-carbon-high",
+                    "kind": "ordinary",
+                    "verdict": "APPROVED",
+                    "launch_ts": 26.0,
+                    "verdict_ts": 28.0,
+                }
+            ],
+            "review_failures": [],
+        }
+        cand_swarm = {
+            "sonnet_lenses": {},
+            "sonnet_lenses_end": {},
+            "simplify_history": [],
+            "reviews": [],
+            "review_failures": [],
+            "sonnet_issue_verified": True,
+        }
+        cand_codex_revs = [
+            {"engine": "codex", "kind": "ordinary", "verdict": "REVISE", "launch_ts": 30.0, "verdict_ts": 35.0},
+            {"engine": "codex", "kind": "ordinary", "verdict": "REVISE", "launch_ts": 70.0, "verdict_ts": 75.0},
+            {"engine": "codex", "kind": "ordinary", "verdict": "ESCALATE", "launch_ts": 110.0, "verdict_ts": 115.0},
+            {"engine": "codex", "kind": "closure", "verdict": "BLOCKED", "launch_ts": 142.0, "verdict_ts": 145.0},
+            {"engine": "codex", "kind": "closure", "verdict": "BLOCKED", "launch_ts": 162.0, "verdict_ts": 165.0},
+            {"engine": "codex", "kind": "closure", "verdict": "READY", "launch_ts": 180.0, "verdict_ts": 185.0},
+        ]
+        self.assertEqual(
+            cwg_stop.validate_candidate_closure(
+                {"kind": "verified", "risk": "HIGH"}, cand_marker, cand_checks, cand_sub, cand_swarm, cand_codex_revs
+            ),
+            (True, "verified"),
+        )
+        self.assertEqual(
+            cwg_stop.validate_candidate_closure(
+                {"kind": "pr-ready", "risk": "HIGH"}, cand_marker, cand_checks, cand_sub, cand_swarm, cand_codex_revs
+            ),
+            (True, "pr-ready"),
+        )
+        # Without READY (3 BLOCKED closure passes), `verified` still enforces MAX_CLOSURE_PASSES=2 while `draft-blocked` is allowed
+        blocked_3_revs = cand_codex_revs[:-1] + [
+            {"engine": "codex", "kind": "closure", "verdict": "BLOCKED", "launch_ts": 180.0, "verdict_ts": 185.0}
+        ]
+        ok_b3, why_b3 = cwg_stop.validate_candidate_closure(
+            {"kind": "verified", "risk": "HIGH"}, cand_marker, cand_checks, cand_sub, cand_swarm, blocked_3_revs
+        )
+        self.assertFalse(ok_b3)
+        self.assertIn("MAX_CLOSURE_PASSES", why_b3)
+        self.assertEqual(
+            cwg_stop.validate_candidate_closure(
+                {"kind": "draft-blocked", "risk": "HIGH"}, cand_marker, cand_checks, cand_sub, cand_swarm, blocked_3_revs
+            ),
+            (True, "draft-blocked"),
+        )
+
+        # Late Codex outage (`codex_issue_ts=200.0`) must NOT retroactively legalize an earlier internal review (`launch_ts=26.0` or `180.0`):
+        # (a) 3 Codex rounds + READY still stays at 3 eligible ordinary rounds (not 4), AND
+        # (b) an early internal APPROVED (`180.0`) before the outage (`200.0`) stays rejected until a post-outage review (`205.0`) runs!
+        late_outage_swarm = dict(cand_swarm, codex_cmd_failed=True, codex_issue_ts=200.0, opus_issue_verified=True, opus_issue_ts=179.0)
+        self.assertEqual(
+            cwg_stop.validate_candidate_closure(
+                {"kind": "verified", "risk": "HIGH"}, cand_marker, cand_checks, cand_sub, late_outage_swarm, cand_codex_revs
+            ),
+            (True, "verified"),
+        )
+        pre_outage_internal = dict(
+            cand_sub,
+            reviews=[
+                {
+                    "engine": "internal-opus",
+                    "model": "claude-opus-5-5-high",
+                    "kind": "ordinary",
+                    "verdict": "APPROVED",
+                    "launch_ts": 180.0,
+                    "verdict_ts": 185.0,
+                }
+            ],
+        )
+        ok_pre_out, why_pre_out = cwg_stop.validate_candidate_closure(
+            {"kind": "verified", "risk": "HIGH"}, cand_marker, cand_checks, pre_outage_internal, late_outage_swarm, []
+        )
+        self.assertFalse(ok_pre_out)
+        self.assertIn("before primary Codex lane", why_pre_out)
+
+        post_outage_internal = dict(
+            cand_sub,
+            reviews=[
+                {
+                    "engine": "internal-opus",
+                    "model": "claude-opus-5-5-high",
+                    "kind": "ordinary",
+                    "verdict": "APPROVED",
+                    "launch_ts": 205.0,
+                    "verdict_ts": 210.0,
+                }
+            ],
+        )
+        self.assertEqual(
+            cwg_stop.validate_candidate_closure(
+                {"kind": "verified", "risk": "HIGH"}, cand_marker, cand_checks, post_outage_internal, late_outage_swarm, []
+            ),
+            (True, "verified"),
+        )
+
+        # Sub-second pre-outage launch (`199.75` vs outage at `200.0`) and same-batch concurrent launch (`t=180.0` request -> `t=200.0` GENERIC outage)
+        # must both be rejected across the full transcript scan -> closure validation path!
+        near_miss_internal = dict(
+            cand_sub,
+            reviews=[
+                {
+                    "engine": "internal-opus",
+                    "model": "claude-opus-5-5-high",
+                    "kind": "ordinary",
+                    "verdict": "APPROVED",
+                    "launch_ts": 199.75,
+                    "verdict_ts": 202.0,
+                }
+            ],
+        )
+        ok_near, _ = cwg_stop.validate_candidate_closure(
+            {"kind": "verified", "risk": "HIGH"}, cand_marker, cand_checks, near_miss_internal, late_outage_swarm, []
+        )
+        self.assertFalse(ok_near)
+
+        sub_early_id = "sub-batch-early"
+        sub_early_tp = self.brain / sub_early_id / ".system_generated" / "logs" / "transcript.jsonl"
+        sub_early_tp.parent.mkdir(parents=True, exist_ok=True)
+        sub_early_tp.write_text(
+            json.dumps(
+                {
+                    "step_index": 0,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": iso_now(185.0),
+                    "content": "VERDICT: APPROVED",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        batch_steps: list[dict] = [
+            {
+                "step_index": 0,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": iso_now(180.0),
+                "tool_calls": [
+                    {"name": "swarm", "args": {"action": "models", "all": True}},
+                    {"name": "run_command", "args": {"CommandLine": "python -X utf8 plugin/hooks/codex_lane.py review"}},
+                    {
+                        "name": "invoke_subagent",
+                        "args": {"TypeName": "adversarial-reviewer", "Role": "Early Concurrent Rev", "Prompt": "Review"},
+                    },
+                ],
+            },
+            {
+                "step_index": 1,
+                "source": "TOOL",
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": iso_now(180.1),
+                "content": json.dumps(
+                    {
+                        "models": ["claude-opus-5-5-high", "claude-sonnet-5-5-high"],
+                        "quotas": {
+                            "claude-opus-5-5-high": {"quota_remaining": "0%"},
+                            "claude-sonnet-5-5-high": {"quota_remaining": "0%"},
+                        },
+                    }
+                ),
+            },
+            {
+                "step_index": 2,
+                "source": "TOOL",
+                "type": "GENERIC",
+                "status": "ERROR",
+                "created_at": iso_now(200.0),
+                "content": '{"ok": false, "error": "quota exceeded", "fallback": "adversarial-reviewer"}',
+            },
+            {
+                "step_index": 3,
+                "source": "TOOL",
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": iso_now(180.2),
+                "content": json.dumps(
+                    {"conversationId": sub_early_id, "logAbsoluteUri": f"file:///{str(sub_early_tp).replace(chr(92), '/')}"}
+                ),
+            },
+        ]
+        scanned_sw_batch = cwg_stop.scan_swarm_activity(batch_steps, str(self.transcript), 10.0)
+        scanned_sub_batch = cwg_stop.scan_native_subagents(batch_steps, str(self.transcript), 10.0)
+        scanned_sub_batch["fallback_lenses"] = cand_sub["fallback_lenses"]
+        scanned_sub_batch["fallback_lenses_end"] = cand_sub["fallback_lenses_end"]
+        scanned_sub_batch["simplify_history"] = cand_sub["simplify_history"]
+        self.assertAlmostEqual(scanned_sw_batch["codex_issue_ts"], 200.0, places=2)
+        self.assertEqual(scanned_sw_batch["codex_issue_step"], 2)
+        ok_conc, why_conc = cwg_stop.validate_candidate_closure(
+            {"kind": "verified", "risk": "HIGH"}, cand_marker, cand_checks, scanned_sub_batch, scanned_sw_batch, []
+        )
+        self.assertFalse(ok_conc)
+        self.assertIn("before primary Codex lane", why_conc)
+
+        sub_late_id = "sub-after-outage"
+        sub_late_tp = self.brain / sub_late_id / ".system_generated" / "logs" / "transcript.jsonl"
+        sub_late_tp.parent.mkdir(parents=True, exist_ok=True)
+        sub_late_tp.write_text(
+            json.dumps(
+                {
+                    "step_index": 0,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": iso_now(205.0),
+                    "content": "VERDICT: APPROVED",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        batch_steps.extend(
+            [
+                {
+                    "step_index": 4,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": iso_now(201.0),
+                    "tool_calls": [
+                        {
+                            "name": "invoke_subagent",
+                            "args": {"TypeName": "adversarial-reviewer", "Role": "Post Outage Rev", "Prompt": "Review"},
+                        }
+                    ],
+                },
+                {
+                    "step_index": 5,
+                    "source": "TOOL",
+                    "type": "GENERIC",
+                    "status": "DONE",
+                    "created_at": iso_now(201.1),
+                    "content": json.dumps(
+                        {"conversationId": sub_late_id, "logAbsoluteUri": f"file:///{str(sub_late_tp).replace(chr(92), '/')}"}
+                    ),
+                },
+            ]
+        )
+        scanned_sub_after = cwg_stop.scan_native_subagents(batch_steps, str(self.transcript), 10.0)
+        scanned_sub_after["fallback_lenses"] = cand_sub["fallback_lenses"]
+        scanned_sub_after["fallback_lenses_end"] = cand_sub["fallback_lenses_end"]
+        scanned_sub_after["simplify_history"] = cand_sub["simplify_history"]
+        self.assertEqual(
+            cwg_stop.validate_candidate_closure(
+                {"kind": "verified", "risk": "HIGH"}, cand_marker, cand_checks, scanned_sub_after, scanned_sw_batch, []
+            ),
+            (True, "verified"),
+        )
+
+        # Voluntarily invoked ineligible/REVISE review on STANDARD candidate is still surfaced cleanly
+        std_marker = dict(cand_marker, paths=[str(self.workspace / "app.py").replace("\\", "/")])
+        std_sub_revise = dict(
+            cand_sub,
+            reviews=[{"engine": "internal-opus", "kind": "ordinary", "verdict": "REVISE", "launch_ts": 180.0, "verdict_ts": 185.0}],
+        )
+        ok_std_rev, why_std_rev = cwg_stop.validate_candidate_closure(
+            {"kind": "verified", "risk": "STANDARD"}, std_marker, cand_checks, std_sub_revise, cand_swarm, []
+        )
+        self.assertFalse(ok_std_rev)
+        self.assertIn("invoked adversarial review ended in `REVISE`", why_std_rev)
+
+        # 3. End-to-end cross-chat Anomaly Handler routing (`set-handler` -> `report` -> `send_message` enforcement -> `PreInvocation` digest -> `resolve`)
+        env = dict(
+            os.environ,
+            CARBON_STACK_HOME=str(self.stack_home),
+            CARBON_CODEX_SESSIONS_DIR=str(self.codex_sessions),
+            CARBON_CODEX_BIN=str(fake_codex),
+            ANTIGRAVITY_BRAIN_ROOT=str(self.brain),
+            PLUGIN_ROOT=str(REPO_ROOT / "plugin"),
+        )
+        handler_cid = "handler-chat-001"
+        set_proc = subprocess.run(
+            [
+                sys.executable,
+                "-X",
+                "utf8",
+                str(HOOKS_DIR / "gate_inbox.py"),
+                "set-handler",
+                "--session",
+                handler_cid,
+                "--repo",
+                str(self.workspace),
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(set_proc.returncode, 0)
+        self.assertEqual(json.loads(set_proc.stdout)["handler_session"], handler_cid)
+
+        doc = self.workspace / "README.md"
+        doc.write_text("# Doc\n", encoding="utf-8")
+        self.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {"toolCall": {"id": "d18", "name": "write_file", "args": {"Path": str(doc), "Content": "# Doc\n"}}, "error": ""},
+        )
+        self.add_final_response("Черновик без квитанции.")
+        _, blk1 = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
+        self.assertEqual(blk1["decision"], "continue")
+        self.assertIn(f'send_message(Recipient="{handler_cid}"', blk1["reason"])
+        self.assertIn(f"conversation://{handler_cid}", blk1["reason"])
+
+        state_file = self.stack_home / "state" / "gate" / "states" / f"{self.conv_id}.json"
+        nonce = json.loads(state_file.read_text(encoding="utf-8"))["block_nonce"]
+
+        rep_proc = subprocess.run(
+            [
+                sys.executable,
+                "-X",
+                "utf8",
+                str(HOOKS_DIR / "gate_inbox.py"),
+                "report",
+                "--session",
+                self.conv_id,
+                "--nonce",
+                nonce,
+                "--block",
+                "synthetic gate contradiction",
+                "--facts",
+                "transcript steps verify checks passed",
+                "--did",
+                "ran unittest",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(rep_proc.returncode, 0, msg=rep_proc.stderr)
+        rep_out = json.loads(rep_proc.stdout)
+        rep_id = rep_out["report_id"]
+        self.assertEqual(rep_out["handler_session"], handler_cid)
+        self.assertTrue(rep_out["notify_required"])
+        self.assertIn(rep_id, rep_out["send_message_payload"])
+
+        # Failed `send_message` (`GENERIC status=ERROR`) BEFORE closing must NOT count as delivered -> triggers the 1 bounded reminder
+        self.steps.extend(
+            [
+                {
+                    "step_index": len(self.steps),
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": iso_now(),
+                    "tool_calls": [
+                        {
+                            "name": "send_message",
+                            "args": {"Recipient": handler_cid, "Message": rep_out["send_message_payload"]},
+                        }
+                    ],
+                },
+                {
+                    "step_index": len(self.steps) + 1,
+                    "source": "TOOL",
+                    "type": "GENERIC",
+                    "status": "ERROR",
+                    "created_at": iso_now(),
+                    "content": "Recipient unavailable",
+                },
+            ]
+        )
+        self.add_final_response(f"Зафиксировал аномалию с ошибкой отправки.\n[gate] anomaly-reported: {rep_id}; synthetic contradiction")
+        _, rem_blk = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
+        self.assertEqual(rem_blk["decision"], "continue")
+        self.assertIn(handler_cid, rem_blk["reason"])
+        self.assertIn("send_message", rem_blk["reason"])
+        self.assertEqual(json.loads(state_file.read_text(encoding="utf-8"))["block_nonce"], nonce)
+
+        # Now invoke `send_message` with `GENERIC status=DONE` and close -> Stop allows and marks `notified_handler: True`
+        self.steps.extend(
+            [
+                {
+                    "step_index": len(self.steps),
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": iso_now(),
+                    "tool_calls": [
+                        {
+                            "name": "send_message",
+                            "args": {"Recipient": handler_cid, "Message": rep_out["send_message_payload"]},
+                        }
+                    ],
+                },
+                {
+                    "step_index": len(self.steps) + 1,
+                    "source": "TOOL",
+                    "type": "GENERIC",
+                    "status": "DONE",
+                    "created_at": iso_now(),
+                    "content": f'Message sent to "{handler_cid}".',
+                },
+            ]
+        )
+        self.add_final_response(
+            f"Уведомил дежурный чат ([Чат аномалий](conversation://{handler_cid})).\n[gate] anomaly-reported: {rep_id}; synthetic contradiction"
+        )
+        _, allow_after_msg = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
+        self.assertEqual(allow_after_msg, {"decision": "allow"})
+
+        show_proc = subprocess.run(
+            [sys.executable, "-X", "utf8", str(HOOKS_DIR / "gate_inbox.py"), "show", "--id", rep_id],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(show_proc.returncode, 0)
+        stored_rec = json.loads(show_proc.stdout)
+        self.assertTrue(stored_rec["notified_handler"])
+        self.assertTrue(stored_rec["transcript"].endswith("transcript_full.jsonl"))
+        self.assertIn("marker", stored_rec["forensics"])
+
+        # Handler chat receives unresolved anomaly digest on `PreInvocation`, and gets `{}` once resolved
+        h_logs = self.brain / handler_cid / ".system_generated" / "logs"
+        h_logs.mkdir(parents=True, exist_ok=True)
+        h_tp = h_logs / "transcript.jsonl"
+        h_tp.write_text(
+            json.dumps({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE", "content": "Solve anomalies"})
+            + "\n",
+            encoding="utf-8",
+        )
+        pre_in = json.dumps(
+            {
+                "conversationId": handler_cid,
+                "workspacePaths": [str(self.workspace)],
+                "transcriptPath": str(h_tp),
+                "hookEventName": "PreInvocation",
+                "cwd": str(self.workspace),
+            }
+        ).encode("utf-8")
+        pre_proc = subprocess.run(
+            [sys.executable, "-X", "utf8", str(HOOKS_DIR / "cwg_pre_invocation.py"), "--event", "PreInvocation"],
+            input=pre_in,
+            capture_output=True,
+            env=env,
+            timeout=10,
+        )
+        self.assertEqual(pre_proc.returncode, 0)
+        pre_json = json.loads(pre_proc.stdout.decode("utf-8"))
+        injected_msg = pre_json["injectSteps"][0]["systemMessage"]["systemMessage"]
+        self.assertIn("Gate Anomaly Handler — 1 unresolved report(s)", injected_msg)
+        self.assertIn(rep_id, injected_msg)
+
+        res_proc = subprocess.run(
+            [
+                sys.executable,
+                "-X",
+                "utf8",
+                str(HOOKS_DIR / "gate_inbox.py"),
+                "resolve",
+                "--id",
+                rep_id,
+                "--note",
+                "Root cause fixed and unit-tested",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(res_proc.returncode, 0)
+        self.assertEqual(json.loads(res_proc.stdout)["resolved_by"], handler_cid)
+
+        # Interleaved `mark_handler_notified` on an unnotified resolved report preserves `resolved=True` under `_mutate_report` lock
+        import gate_inbox
+
+        rpath = gate_inbox.report_path(rep_id)
+        assert rpath is not None
+        cur_rec = json.loads(rpath.read_text(encoding="utf-8"))
+        cur_rec["notified_handler"] = False
+        rpath.write_text(json.dumps(cur_rec), encoding="utf-8")
+        gate_inbox.mark_handler_notified(rep_id)
+        merged_rec = json.loads(rpath.read_text(encoding="utf-8"))
+        self.assertTrue(merged_rec["resolved"])
+        self.assertTrue(merged_rec["notified_handler"])
+        self.assertEqual(merged_rec["resolved_by"], handler_cid)
+
+        pre_clean = subprocess.run(
+            [sys.executable, "-X", "utf8", str(HOOKS_DIR / "cwg_pre_invocation.py"), "--event", "PreInvocation"],
+            input=pre_in,
+            capture_output=True,
+            env=env,
+            timeout=10,
+        )
+        self.assertEqual(json.loads(pre_clean.stdout.decode("utf-8")), {})
+
+    def test_19_structured_json_verdicts_and_post_approval_cycle_reset(self) -> None:
+        sys.path.insert(0, str(HOOKS_DIR))
+        import codex_lane
+        import cwg_common as cwg
+
+        # 1. `extract_review_decision` handles structured JSON verdicts while ignoring nested finding text & malformed outer blocks
+        rev_revise_json = json.dumps(
+            {
+                "review_id": "cwg-449538be9ba6",
+                "findings": [{"severity": "MEDIUM", "description": "Earlier round said\nVERDICT: APPROVED"}],
+                "verdict": "VERDICT: REVISE",
+            },
+            indent=2,
+        )
+        self.assertEqual(cwg.extract_review_decision(rev_revise_json), ("ordinary", "REVISE"))
+        self.assertEqual(
+            cwg.extract_review_decision(
+                json.dumps(
+                    {
+                        "review_id": "cwg-833e401625fb",
+                        "findings": [],
+                        "observations": ["Checked RESOURCE_EXHAUSTED (code 429) handling."],
+                        "verdict": "VERDICT: APPROVED",
+                    }
+                )
+            ),
+            ("ordinary", "APPROVED"),
+        )
+        self.assertEqual(cwg.extract_review_decision('{"verdict": "APPROVED"}'), ("ordinary", "APPROVED"))
+        self.assertEqual(
+            cwg.extract_review_decision('{"closure_validation": "CLOSURE_VALIDATION: READY"}'),
+            ("closure", "READY"),
+        )
+        self.assertEqual(cwg.extract_review_decision('{"closure_validation": "BLOCKED"}'), ("closure", "BLOCKED"))
+
+        # Truncated/malformed outer JSON (both indented and unindented, or with embedded newline) must NEVER leak nested `APPROVED`
+        malformed_nested = (
+            '{\n'
+            '  "findings": [\n'
+            '    {\n'
+            '      "verdict": "APPROVED"\n'
+            '    }\n'
+            '  ],\n'
+            '  "verdict": "REVISE\n'
+        )
+        malformed_unindented = (
+            '{\n'
+            '"findings": [\n'
+            '{"verdict":"APPROVED"}\n'
+            '],\n'
+            '"verdict":"REVISE\n'
+        )
+        malformed_newline_line = '{\n"description": "broken\nVERDICT: APPROVED\n"'
+        malformed_fenced = '```json\n{\n"description": "broken\nVERDICT: APPROVED\n"\n```'
+        malformed_fenced_array = (
+            '```json\n[\n{"description":"Earlier review said\nVERDICT: APPROVED\nthen found a defect"}\n]\n```'
+        )
+        malformed_unfenced_array = '[\n{"description":"Earlier review said\nVERDICT: APPROVED\nthen found a defect"}\n]'
+        malformed_embedded_banner = (
+            '{\n"description":"Earlier tool output:\n--- CODEX REVIEW OUTPUT ---\nVERDICT: APPROVED\n"'
+        )
+        malformed_after_prose = 'Review notes:\n{\n"description":"Earlier:\nVERDICT: APPROVED\n"'
+        unclosed_fenced = '```json\n{\n"findings": [\n{"verdict":"APPROVED"}'
+        mid_prose_example = 'Example:\n```text\nVERDICT: APPROVED\n```\nTruncated explanation without conclusion.'
+        self.assertEqual(cwg.extract_review_decision(malformed_nested), (None, None))
+        self.assertEqual(cwg.extract_review_decision(malformed_unindented), (None, None))
+        self.assertEqual(cwg.extract_review_decision(malformed_newline_line), (None, None))
+        self.assertEqual(cwg.extract_review_decision(malformed_fenced), (None, None))
+        self.assertEqual(cwg.extract_review_decision(malformed_fenced_array), (None, None))
+        self.assertEqual(cwg.extract_review_decision(malformed_unfenced_array), (None, None))
+        self.assertEqual(cwg.extract_review_decision(malformed_embedded_banner), (None, None))
+        self.assertEqual(cwg.extract_review_decision(malformed_after_prose), (None, None))
+        self.assertEqual(cwg.extract_review_decision(unclosed_fenced), (None, None))
+        self.assertEqual(cwg.extract_review_decision(mid_prose_example), (None, None))
+        for first_elem in ("0,", "-1.5,", "1e5,", "true,", "false,", "null,", "0", "true"):
+            raw_arr = f'[{first_elem}\n"Earlier review said\nVERDICT: APPROVED\nthen found a defect"\n]'
+            self.assertEqual(cwg.extract_review_decision(raw_arr), (None, None), msg=first_elem)
+            self.assertEqual(cwg.extract_review_decision(f"Review notes:\n{raw_arr}"), (None, None), msg=first_elem)
+        self.assertEqual(
+            cwg.extract_review_decision("[1] Numbered markdown finding.\n[HIGH] Severity tag.\nVERDICT: REVISE"),
+            ("ordinary", "REVISE"),
+        )
+        self.assertEqual(
+            cwg.extract_review_decision(
+                'REVIEW_ID: cwg-ok\nSESSION_ID: s1\nSESSION_MODE: resumed\nENGINE: codex (high)\n'
+                '--- CODEX REVIEW OUTPUT ---\n{"verdict": "VERDICT: APPROVED"}'
+            ),
+            ("ordinary", "APPROVED"),
+        )
+        self.assertEqual(
+            cwg.extract_review_decision('Summary:\n```json\n{\n  "verdict": "VERDICT: APPROVED"\n}\n```'),
+            ("ordinary", "APPROVED"),
+        )
+
+        # JSON approval mentioning `RESOURCE_EXHAUSTED` in observations with exit_code=0 must NOT trigger false outage
+        json_with_quota_prose = json.dumps(
+            {
+                "review_id": "cwg-ok",
+                "observations": ["Handles RESOURCE_EXHAUSTED and rate limit exceeded strings safely."],
+                "verdict": "VERDICT: APPROVED",
+            }
+        )
+        self.assertIsNone(codex_lane.detect_outage_from_output(json_with_quota_prose, exit_code=0))
+
+        # 2. Multi-turn Codex rollout with JSON `REVISE` -> JSON `APPROVED`, followed by post-approval durable edit -> fresh cycle
+        fake_codex = self.root / "codex.cmd"
+        fake_codex.write_text("@echo off\n", encoding="utf-8")
+        self.codex_bin = str(fake_codex)
+
+        sec = self.workspace / "auth_policy.py"
+        rollout_file = self.codex_sessions / "rollout-json-cycle.jsonl"
+        rollout_rows: list[dict] = [
+            {
+                "type": "session_meta",
+                "timestamp": iso_now(),
+                "payload": {"id": "codex-sess-json-01", "timestamp": iso_now()},
+            }
+        ]
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CARBON_STACK_HOME": str(self.stack_home),
+                "CARBON_CODEX_SESSIONS_DIR": str(self.codex_sessions),
+            },
+        ):
+            def _append_codex_turn(rid: str, msg_text: str) -> None:
+                codex_lane.record_packet(rid, f"REVIEW_ID: {rid}", str(self.workspace), effort="high", session=self.conv_id)
+                t_start = time.time()
+                rollout_rows.extend(
+                    [
+                        {
+                            "type": "turn_context",
+                            "timestamp": iso_now(t_start),
+                            "payload": {"model": "gpt-5.4", "effort": "high"},
+                        },
+                        {
+                            "type": "response_item",
+                            "timestamp": iso_now(t_start),
+                            "payload": {
+                                "type": "message",
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": f"REVIEW_ID: {rid}"}],
+                            },
+                        },
+                        {
+                            "type": "event_msg",
+                            "timestamp": iso_now(t_start + 0.001),
+                            "payload": {"type": "task_complete", "last_agent_message": msg_text},
+                        },
+                    ]
+                )
+                rollout_file.write_text("\n".join(json.dumps(r) for r in rollout_rows) + "\n", encoding="utf-8")
+                time.sleep(0.01)
+
+            def _edit_and_test(ver: int) -> None:
+                code = f"def allow_user(u: str) -> bool:\n    return u == 'admin_v{ver}'\n"
+                sec.write_text(code, encoding="utf-8")
+                self.run_hook(
+                    "cwg_mark.py",
+                    "PostToolUse",
+                    {"toolCall": {"id": f"w{ver}", "name": "write_file", "args": {"Path": str(sec), "Content": code}}, "error": ""},
+                )
+                self.run_hook(
+                    "cwg_mark.py",
+                    "PostToolUse",
+                    {"toolCall": {"id": f"t{ver}", "name": "run_command", "args": {"CommandLine": "pytest -q"}}, "error": ""},
+                )
+                time.sleep(0.005)
+                self.add_sonnet_simplify_lenses()
+                time.sleep(0.005)
+
+            # Cycle 1: Round 1 (plain REVISE) -> Round 2 (JSON REVISE) -> Round 3 (JSON APPROVED)
+            _edit_and_test(1)
+            _append_codex_turn("cwg-jsonr1", "Found issue 1.\nVERDICT: REVISE")
+            _edit_and_test(2)
+            _append_codex_turn("cwg-jsonr2", rev_revise_json.replace("cwg-449538be9ba6", "cwg-jsonr2"))
+            _edit_and_test(3)
+            _append_codex_turn(
+                "cwg-jsonr3",
+                json.dumps({"review_id": "cwg-jsonr3", "findings": [], "verdict": "VERDICT: APPROVED"}),
+            )
+
+            # Post-approval edit v4 invalidates Round 3's `APPROVED`
+            _edit_and_test(4)
+            self.add_final_response("Попытка закрыть без ревью v4.\n[gate] verified: HIGH; auth_policy.py, pytest")
+            _, blk_stale = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
+            self.assertEqual(blk_stale["decision"], "continue")
+            self.assertIn("`APPROVED` verdict is stale", blk_stale["reason"])
+
+            # Running post-edit Round 4 (JSON APPROVED) starts a fresh cycle (`1/3`) and closes cleanly without tripping `MAX_REVIEW_ROUNDS=3`
+            _append_codex_turn(
+                "cwg-jsonr4",
+                json.dumps({"review_id": "cwg-jsonr4", "findings": [], "verdict": "VERDICT: APPROVED"}),
+            )
+            self.add_final_response("Ревью v4 пройдено.\n[gate] verified: HIGH; auth_policy.py, pytest, codex")
+            _, allow_v4 = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
+            self.assertEqual(allow_v4, {"decision": "allow"})
+
+            # Over-limit 4-round non-approved cycle (`REVISE` x3 -> 4th `APPROVED`) on a new candidate CANNOT be laundered by a 5th round
+            _edit_and_test(5)
+            _append_codex_turn("cwg-ov1", "VERDICT: REVISE")
+            _edit_and_test(6)
+            _append_codex_turn("cwg-ov2", "VERDICT: REVISE")
+            _edit_and_test(7)
+            _append_codex_turn("cwg-ov3", "VERDICT: REVISE")
+            _edit_and_test(8)
+            _append_codex_turn("cwg-ov4", "VERDICT: APPROVED")
+            _edit_and_test(9)
+            _append_codex_turn("cwg-ov5", "VERDICT: APPROVED")
+            self.add_final_response("Попытка обойти MAX_REVIEW_ROUNDS.\n[gate] verified: HIGH; auth_policy.py, pytest, codex")
+            _, blk_over = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
+            self.assertEqual(blk_over["decision"], "continue")
+            self.assertIn("MAX_REVIEW_ROUNDS=3", blk_over["reason"])
+
+            # Mid-review durable edit (`launch_ts < edit_ts <= verdict_ts`) means Round 3 `APPROVED` arrived already stale
+            # and MUST NOT reset `MAX_REVIEW_ROUNDS` for a 4th round
+            import cwg_stop
+
+            mid_marker = {
+                "work_class": "PERSISTENT",
+                "cwd": str(self.workspace),
+                "git_root": str(self.workspace),
+                "durable_paths": [str(sec)],
+                "first_ts": 10.0,
+                "last_durable_ts": 60.0,
+                "content_marks": [
+                    {"ts": 10.0, "fp": "fp-r1"},
+                    {"ts": 25.0, "fp": "fp-r2"},
+                    {"ts": 45.0, "fp": "fp-r3"},
+                    {"ts": 60.0, "fp": "fp-mid-edit"},
+                ],
+            }
+            mid_checks = {"checks": [{"passed": True, "ts": 85.0}], "passed_count": 1, "latest_pass_ts": 85.0, "latest_fail_ts": 0.0}
+            mid_swarm = {
+                "reviews": [],
+                "sonnet_lenses": {"reuse": 86.0, "quality": 86.0, "efficiency": 86.0},
+                "sonnet_lenses_end": {"reuse": 87.0, "quality": 87.0, "efficiency": 87.0},
+                "simplify_history": [
+                    {"kind": "lens", "lens": lns, "tier": "sonnet", "launch_ts": base_t, "end_ts": base_t + 1.0}
+                    for base_t in (12.0, 27.0, 47.0, 86.0)
+                    for lns in ("reuse", "quality", "efficiency")
+                ],
+            }
+            mid_sub = {"reviews": [], "fallback_lenses": {}, "fallback_lenses_end": {}, "simplify_history": []}
+            mid_revs = [
+                {"engine": "codex", "kind": "ordinary", "verdict": "REVISE", "launch_ts": 15.0, "verdict_ts": 20.0},
+                {"engine": "codex", "kind": "ordinary", "verdict": "REVISE", "launch_ts": 30.0, "verdict_ts": 35.0},
+                {"engine": "codex", "kind": "ordinary", "verdict": "APPROVED", "launch_ts": 50.0, "verdict_ts": 70.0},
+                {"engine": "codex", "kind": "ordinary", "verdict": "APPROVED", "launch_ts": 90.0, "verdict_ts": 95.0},
+            ]
+            ok_mid, reason_mid = cwg_stop.validate_candidate_closure(
+                {"kind": "verified", "risk": "HIGH"}, mid_marker, mid_checks, mid_sub, mid_swarm, mid_revs
+            )
+            self.assertFalse(ok_mid)
+            self.assertIn("MAX_REVIEW_ROUNDS=3", reason_mid)
+
+    def test_20_windows_quoted_executable_paths_in_cwg_mark(self) -> None:
+        import io
+        import tokenize
+
+        sys.path.insert(0, str(HOOKS_DIR))
+        import cwg_mark
+
+        # Enforce Python <3.12 f-string compatibility (no backslashes inside `{...}`) across all shipped plugin scripts
+        f_start_tok = getattr(tokenize, "FSTRING_START", None)
+        f_end_tok = getattr(tokenize, "FSTRING_END", None)
+        f_mid_tok = getattr(tokenize, "FSTRING_MIDDLE", None)
+        for py_file in sorted((REPO_ROOT / "plugin").rglob("*.py")):
+            src = py_file.read_text(encoding="utf-8")
+            compile(src, str(py_file), "exec")
+            if f_start_tok is not None:
+                expr_depths: list[int] = []
+                in_fstr = 0
+                for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+                    if tok.type == f_start_tok:
+                        in_fstr += 1
+                    elif tok.type == f_end_tok:
+                        in_fstr = max(0, in_fstr - 1)
+                    elif in_fstr and tok.type == tokenize.OP and tok.string == "{" and len(expr_depths) < in_fstr:
+                        expr_depths.append(1)
+                    elif expr_depths:
+                        if tok.type == tokenize.OP and tok.string == "{":
+                            expr_depths[-1] += 1
+                        elif tok.type == tokenize.OP and tok.string == "}":
+                            expr_depths[-1] -= 1
+                            if expr_depths[-1] == 0:
+                                expr_depths.pop()
+                                continue
+                        if tok.type != f_mid_tok and "\\" in tok.string:
+                            self.fail(f"Python <3.12 incompatible backslash in f-string expression: {py_file}:{tok.start[0]}")
+
+        py_abs = r"C:\Users\in\AppData\Local\Programs\Python\Python312\python.exe"
+        py_x86 = r"C:\Program Files (x86)\Python312\python.exe"
+        rg_abs = r"C:\tools\ripgrep-15.1.0-x86_64-pc-windows-msvc\ripgrep-15.1.0-x86_64-pc-windows-msvc\rg.exe"
+
+        self.assertEqual(
+            cwg_mark.classify_shell_command(
+                f"Set-Location 'C:\\repo'; $null | & '{py_abs}' -X utf8 -m unittest discover -s tests -q"
+            ),
+            "VALIDATION",
+        )
+        self.assertEqual(
+            cwg_mark.classify_shell_command(f'$null | & "{py_x86}" -X utf8 -m pytest -q'),
+            "VALIDATION",
+        )
+        self.assertEqual(
+            cwg_mark.classify_shell_command(
+                f"$null | & '{py_abs}' -X utf8 'C:\\Users\\in\\repo\\install.py' --diagnose --pretty"
+            ),
+            "VALIDATION",
+        )
+        self.assertEqual(cwg_mark.classify_shell_command(r".venv\Scripts\pytest.exe -q"), "VALIDATION")
+        self.assertEqual(cwg_mark.classify_shell_command(r"& 'C:\repo\.venv\Scripts\ruff.exe' check src"), "VALIDATION")
+
+        self.assertEqual(
+            cwg_mark.classify_shell_command(
+                f"$null | & '{py_abs}' -X utf8 'C:\\Users\\in\\.gemini\\config\\plugins\\gemini-carbon-stack\\hooks\\codex_lane.py' review --closure"
+            ),
+            "BOOKKEEPING",
+        )
+        self.assertEqual(
+            cwg_mark.classify_shell_command(
+                f"$null | & '{py_abs}' -X utf8 'C:\\Users\\in\\.gemini\\config\\plugins\\gemini-carbon-stack\\hooks\\gate_inbox.py' list"
+            ),
+            "BOOKKEEPING",
+        )
+        self.assertEqual(
+            cwg_mark.classify_shell_command(f"$null | & '{rg_abs}' -n extract_review_decision plugin"),
+            "READ_ONLY",
+        )
+        self.assertEqual(
+            cwg_mark.classify_shell_command(
+                f"$null | & '{py_abs}' -X utf8 'C:\\Users\\in\\.gemini\\config\\plugins\\gemini-carbon-stack\\tools\\stack_doctor.py' --pretty"
+            ),
+            "READ_ONLY",
+        )
+
+        # Spoofed basenames, non-.exe wrappers, dynamic allowlist paths, and flag prefix spoofing fail closed
+        self.assertEqual(cwg_mark.classify_shell_command("& 'C:\\tmp\\evil_python.exe' -m unittest"), "UNCERTAIN")
+        self.assertEqual(cwg_mark.classify_shell_command("'evil''python.exe' -m unittest"), "UNCERTAIN")
+        self.assertEqual(cwg_mark.classify_shell_command("pytest.bat -q"), "UNCERTAIN")
+        self.assertEqual(cwg_mark.classify_shell_command('& "$env:FOO\\python.exe" -m unittest'), "UNCERTAIN")
+        self.assertEqual(
+            cwg_mark.classify_shell_command(f"& '{py_abs}' 'C:\\tmp\\fake_install.py' --diagnose"),
+            "UNCERTAIN",
+        )
+
+        # Quoted mutating scripts and inline `-c` writes remain `MUTATING`, while literal string output stays `READ_ONLY`
+        self.assertEqual(
+            cwg_mark.classify_shell_command(f"$null | & '{py_abs}' -X utf8 'C:\\repo\\install.py' --force"),
+            "MUTATING",
+        )
+        self.assertEqual(
+            cwg_mark.classify_shell_command(f"& '{py_abs}' 'C:\\repo\\install.py' --diagnose-fake"),
+            "MUTATING",
+        )
+        self.assertEqual(
+            cwg_mark.classify_shell_command('& "$env:LOCALAPPDATA\\Python\\python.exe" "$HOME\\install.py" --force'),
+            "MUTATING",
+        )
+        self.assertEqual(
+            cwg_mark.classify_shell_command(f"& '{py_abs}' 'C:\\repo\\worktree_guard.py' remove C:\\wt"),
+            "MUTATING",
+        )
+        self.assertEqual(
+            cwg_mark.classify_shell_command(f"& '{py_abs}' 'C:\\repo\\chip_handoff.py' --merge chip-1"),
+            "MUTATING",
+        )
+        self.assertEqual(
+            cwg_mark.classify_shell_command(f"& '{py_abs}' -X utf8 -c \"open('x','w').write('1')\""),
+            "MUTATING",
+        )
+        self.assertEqual(cwg_mark.classify_shell_command('Write-Output "python install.py --force"'), "READ_ONLY")
+
+        # Linear-time non-backtracking regression check on repeated PS backtick escapes and `-x -u` Python flag pairs
+        t0 = time.perf_counter()
+        escaped_arg = "".join(f"`n{i}" for i in range(32))
+        self.assertEqual(cwg_mark.classify_shell_command(f'Write-Output "{escaped_arg} C:\\foo"'), "READ_ONLY")
+        many_flags = " ".join(["-x -u"] * 24)
+        self.assertEqual(cwg_mark.classify_shell_command(f"python {many_flags} -m unittest"), "UNCERTAIN")
+        self.assertLess(time.perf_counter() - t0, 0.25)
+
+        # End-to-end hook ledger check: quoted `& 'C:\...\python.exe' -X utf8 -m unittest` records fresh pass after edit
+        mod = self.workspace / "service.py"
+        code = "def compute() -> int:\n    return 42\n"
+        mod.write_text(code, encoding="utf-8")
+        self.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {"toolCall": {"id": "w_abs", "name": "write_file", "args": {"Path": str(mod), "Content": code}}, "error": ""},
+        )
+        time.sleep(0.01)
+        self.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {
+                "toolCall": {
+                    "id": "t_abs",
+                    "name": "run_command",
+                    "args": {"CommandLine": f"Set-Location '{self.workspace}'; $null | & '{py_abs}' -X utf8 -m unittest -q"},
+                },
+                "error": "",
+            },
+        )
+        self.add_final_response("Готово.\n[gate] verified: STANDARD; service.py, unittest")
+        _, allow_out = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
+        self.assertEqual(allow_out, {"decision": "allow"})
+
+    def test_21_codex_guardian_subagent_rollout_exclusion_and_verdictless_resume_fallback(self) -> None:
+        auth_flow = self.workspace / "auth_guard.py"
+        auth_flow.write_text("TOKEN = 'v1'\n", encoding="utf-8")
+
+        mock_dir = self.root / "mock-codex-guardian"
+        mock_dir.mkdir()
+        invocations_log = self.root / "guardian_invocations.jsonl"
+        mock_py = mock_dir / "mock_codex_guardian.py"
+        mock_py.write_text(
+            "\n".join(
+                [
+                    "import datetime, json, os, pathlib, sys, time, uuid",
+                    "argv = sys.argv[1:]",
+                    "prompt = sys.stdin.read()",
+                    "log_p = pathlib.Path(os.environ['MOCK_CODEX_LOG'])",
+                    "with open(log_p, 'a', encoding='utf-8') as f:",
+                    "    f.write(json.dumps({'argv': argv, 'prompt': prompt}) + '\\n')",
+                    "if argv == ['--version']:",
+                    "    print('codex-cli 0.159.0')",
+                    "    sys.exit(0)",
+                    "if argv[:2] == ['login', 'status']:",
+                    "    print('Logged in using ChatGPT')",
+                    "    sys.exit(0)",
+                    "sess_root = pathlib.Path(os.environ['CARBON_CODEX_SESSIONS_DIR'])",
+                    "sess_root.mkdir(parents=True, exist_ok=True)",
+                    "def iso(offset=0.0):",
+                    "    return (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=offset)).isoformat()",
+                    "if len(argv) >= 2 and argv[0] == 'exec' and argv[1] == 'resume':",
+                    "    pos = [a for a in argv[2:] if a != '-' and not a.startswith('-') and '=' not in a]",
+                    "    sid = pos[-1] if pos else ''",
+                    "    if sid == 'sess-compacted-allow':",
+                    "        print('{\"outcome\":\"allow\"}')",
+                    "        sys.exit(0)",
+                    "    if sid.startswith('sess-guard-'):",
+                    "        sys.stderr.write('ERROR: resumed guardian subagent instead of primary!\\n')",
+                    "        sys.exit(1)",
+                    "    target = next((p for p in sess_root.rglob(f'*{sid}*.jsonl')), None)",
+                    "    if target is None:",
+                    "        sys.stderr.write(f'Error: session {sid} missing\\n')",
+                    "        sys.exit(1)",
+                    "    with open(target, 'a', encoding='utf-8') as rf:",
+                    "        rf.write(json.dumps({'type': 'turn_context', 'timestamp': iso(), 'payload': {'model': 'gpt-6.1-sol', 'effort': 'high'}}) + '\\n')",
+                    "        rf.write(json.dumps({'type': 'response_item', 'timestamp': iso(), 'payload': {'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': prompt}]}}) + '\\n')",
+                    "        rf.write(json.dumps({'type': 'event_msg', 'timestamp': iso(), 'payload': {'type': 'task_complete', 'last_agent_message': 'CLOSURE_VALIDATION: READY'}}) + '\\n')",
+                    "    print('CLOSURE_VALIDATION: READY')",
+                    "    sys.exit(0)",
+                    "sid = f'sess-live-{uuid.uuid4().hex[:8]}'",
+                    "gid = f'sess-guard-{uuid.uuid4().hex[:8]}'",
+                    "rf_live = sess_root / f'rollout-primary-{sid}.jsonl'",
+                    "rf_guard = sess_root / f'rollout-guardian-{gid}.jsonl'",
+                    "rf_live.write_text('\\n'.join(json.dumps(r) for r in [",
+                    "    {'type': 'session_meta', 'timestamp': iso(), 'payload': {'id': sid, 'session_id': sid, 'source': 'exec', 'thread_source': 'user', 'timestamp': iso()}},",
+                    "    {'type': 'turn_context', 'timestamp': iso(), 'payload': {'model': 'gpt-6.1-sol', 'effort': 'high'}},",
+                    "    {'type': 'response_item', 'timestamp': iso(), 'payload': {'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': prompt}]}},",
+                    "    {'type': 'event_msg', 'timestamp': iso(), 'payload': {'type': 'task_complete', 'last_agent_message': 'CLOSURE_VALIDATION: READY'}},",
+                    "]) + '\\n', encoding='utf-8')",
+                    "time.sleep(0.02)",
+                    "rf_guard.write_text('\\n'.join(json.dumps(r) for r in [",
+                    "    {'type': 'session_meta', 'timestamp': iso(1.0), 'payload': {'id': gid, 'session_id': sid, 'parent_thread_id': sid, 'source': {'subagent': {'other': 'guardian'}}, 'thread_source': 'guardian_review', 'timestamp': iso(1.0)}},",
+                    "    {'type': 'response_item', 'timestamp': iso(1.0), 'payload': {'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': prompt}]}},",
+                    "    {'type': 'event_msg', 'timestamp': iso(1.0), 'payload': {'type': 'task_complete', 'last_agent_message': '{\"outcome\":\"allow\"}'}},",
+                    "]) + '\\n', encoding='utf-8')",
+                    "print('CLOSURE_VALIDATION: READY')",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        if os.name == "nt":
+            mock_bin = mock_dir / "codex.cmd"
+            mock_bin.write_text(f'@echo off\r\n"{sys.executable}" -X utf8 "{mock_py}" %*\r\n', encoding="utf-8")
+        else:
+            mock_bin = mock_dir / "codex"
+            mock_bin.write_text(f'#!/bin/sh\nexec "{sys.executable}" -X utf8 "{mock_py}" "$@"\n', encoding="utf-8")
+            os.chmod(mock_bin, 0o755)
+
+        cli_sess = "cli-guardian-sess-9999"
+        marker_dir = self.stack_home / "state" / "gate" / "markers"
+        marker_dir.mkdir(parents=True, exist_ok=True)
+        t_cand = time.time()
+        (marker_dir / f"{cli_sess}.json").write_text(
+            json.dumps(
+                {
+                    "session": cli_sess,
+                    "first_ts": t_cand,
+                    "last_ts": t_cand,
+                    "cwd": str(self.workspace).replace("\\", "/"),
+                    "git_root": str(self.workspace).replace("\\", "/"),
+                    "paths": [str(auth_flow).replace("\\", "/")],
+                    "closed": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+        cli_env = dict(
+            os.environ,
+            CARBON_STACK_HOME=str(self.stack_home),
+            CARBON_CODEX_SESSIONS_DIR=str(self.codex_sessions),
+            CARBON_CODEX_BIN=str(mock_bin),
+            MOCK_CODEX_LOG=str(invocations_log),
+            PLUGIN_ROOT=str(REPO_ROOT / "plugin"),
+        )
+
+        def run_cli(*extra: str) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                [
+                    sys.executable,
+                    "-X",
+                    "utf8",
+                    str(HOOKS_DIR / "codex_lane.py"),
+                    "review",
+                    "--cwd",
+                    str(self.workspace),
+                    "--session",
+                    cli_sess,
+                    "--closure",
+                    *extra,
+                ],
+                capture_output=True,
+                text=True,
+                env=cli_env,
+                timeout=15,
+            )
+
+        # 1. Newer guardian rollout (`sess-guard-*`) is ignored; primary `sess-live-*` is persisted
+        p1 = run_cli("--summary", "Guardian exclusion")
+        self.assertEqual(p1.returncode, 0, msg=p1.stdout + p1.stderr)
+        sid_live = next(ln.split(":", 1)[1].strip() for ln in p1.stdout.splitlines() if ln.startswith("SESSION_ID:"))
+        self.assertTrue(sid_live.startswith("sess-live-"), msg=p1.stdout)
+
+        # 2. Poisoned thread state pointing to `sess-guard-*` is unwrapped via `parent_thread_id` to `sid_live`
+        guard_files = list(self.codex_sessions.glob("rollout-guardian-*.jsonl"))
+        self.assertEqual(len(guard_files), 1)
+        gid_poison = json.loads(guard_files[0].read_text(encoding="utf-8").splitlines()[0])["payload"]["id"]
+        thread_files = list((self.stack_home / "state" / "gate" / "threads").glob("*.json"))
+        self.assertEqual(len(thread_files), 1)
+        tdata = json.loads(thread_files[0].read_text(encoding="utf-8"))
+        tdata["session_id"] = gid_poison
+        thread_files[0].write_text(json.dumps(tdata), encoding="utf-8")
+
+        p2 = run_cli("--summary", "Unwrap poisoned guardian thread")
+        self.assertEqual(p2.returncode, 0, msg=p2.stdout + p2.stderr)
+        self.assertIn("SESSION_MODE: resumed", p2.stdout)
+        self.assertIn(f"SESSION_ID: {sid_live}", p2.stdout)
+
+        # 3. Verdict-less `rc == 0` resume (`{"outcome":"allow"}`) falls back once to fresh primary `exec` with a new REVIEW_ID
+        tdata["session_id"] = "sess-compacted-allow"
+        thread_files[0].write_text(json.dumps(tdata), encoding="utf-8")
+        p3 = run_cli("--summary", "Compacted verdict-less fallback")
+        self.assertEqual(p3.returncode, 0, msg=p3.stdout + p3.stderr)
+        self.assertIn("SESSION_MODE: new", p3.stdout)
+        self.assertIn("CLOSURE_VALIDATION: READY", p3.stdout)
+        sid_new = next(ln.split(":", 1)[1].strip() for ln in p3.stdout.splitlines() if ln.startswith("SESSION_ID:"))
+        self.assertTrue(sid_new.startswith("sess-live-"))
+        self.assertNotEqual(sid_new, sid_live)
+
+        inv_rows = [json.loads(ln) for ln in invocations_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        # Last two invocations: `exec resume sess-compacted-allow`, then fresh `exec` with distinct REVIEW_ID
+        self.assertEqual(inv_rows[-2]["argv"][:2], ["exec", "resume"])
+        self.assertEqual(inv_rows[-1]["argv"][0], "exec")
+        self.assertNotEqual(inv_rows[-1]["argv"][1], "resume")
+        rid_attempt0 = next(ln for ln in inv_rows[-2]["prompt"].splitlines() if ln.startswith("REVIEW_ID:"))
+        rid_attempt1 = next(ln for ln in inv_rows[-1]["prompt"].splitlines() if ln.startswith("REVIEW_ID:"))
+        self.assertNotEqual(rid_attempt0, rid_attempt1)
+
+        # 4. Conflicting parent (`REVISE`, verdict_ts=t+40) vs child subagent (`APPROVED`, verdict_ts=t+50) on same REVIEW_ID
+        #    under BOTH mtime orderings (child->parent and parent->child), plus child-only `APPROVED` without parent verdict.
+        sys.path.insert(0, str(HOOKS_DIR))
+        import codex_lane
+        import cwg_stop
+
+        conflict_sessions = self.root / "conflict-codex-sessions"
+        conflict_sessions.mkdir()
+        t_base = time.time()
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CARBON_STACK_HOME": str(self.stack_home),
+                "CARBON_CODEX_SESSIONS_DIR": str(conflict_sessions),
+                "PLUGIN_ROOT": str(REPO_ROOT / "plugin"),
+            },
+        ):
+            codex_lane.record_packet(
+                "cwg-conflict01",
+                "REVIEW_ID: cwg-conflict01",
+                str(self.workspace),
+                effort="high",
+                session="sess-conflict",
+            )
+            codex_lane.record_packet(
+                "cwg-childonly1",
+                "REVIEW_ID: cwg-childonly1",
+                str(self.workspace),
+                effort="high",
+                session="sess-conflict",
+            )
+            rf_parent = conflict_sessions / "rollout-parent-p1.jsonl"
+            rf_child = conflict_sessions / "rollout-child-c1.jsonl"
+            rf_orphan_child = conflict_sessions / "rollout-child-only.jsonl"
+            rf_parent.write_text(
+                "\n".join(
+                    json.dumps(r)
+                    for r in [
+                        {
+                            "type": "session_meta",
+                            "timestamp": iso_now(t_base + 1.0),
+                            "payload": {"id": "p-1", "session_id": "p-1", "source": "exec", "thread_source": "user"},
+                        },
+                        {
+                            "type": "response_item",
+                            "timestamp": iso_now(t_base + 2.0),
+                            "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-conflict01"}]},
+                        },
+                        {
+                            "type": "event_msg",
+                            "timestamp": iso_now(t_base + 40.0),
+                            "payload": {"type": "task_complete", "last_agent_message": "VERDICT: REVISE"},
+                        },
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            rf_child.write_text(
+                "\n".join(
+                    json.dumps(r)
+                    for r in [
+                        {
+                            "type": "session_meta",
+                            "timestamp": iso_now(t_base + 3.0),
+                            "payload": {
+                                "id": "c-1",
+                                "session_id": "p-1",
+                                "parent_thread_id": "p-1",
+                                "source": {"subagent": {"other": "guardian"}},
+                                "thread_source": "guardian_review",
+                            },
+                        },
+                        {
+                            "type": "response_item",
+                            "timestamp": iso_now(t_base + 4.0),
+                            "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-conflict01"}]},
+                        },
+                        {
+                            "type": "event_msg",
+                            "timestamp": iso_now(t_base + 50.0),
+                            "payload": {"type": "task_complete", "last_agent_message": "VERDICT: APPROVED"},
+                        },
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            rf_orphan_child.write_text(
+                "\n".join(
+                    json.dumps(r)
+                    for r in [
+                        {
+                            "type": "session_meta",
+                            "timestamp": iso_now(t_base + 5.0),
+                            "payload": {
+                                "id": "c-2",
+                                "session_id": "p-missing",
+                                "parent_thread_id": "p-missing",
+                                "source": {"subagent": {"other": "worker"}},
+                            },
+                        },
+                        {
+                            "type": "response_item",
+                            "timestamp": iso_now(t_base + 6.0),
+                            "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-childonly1"}]},
+                        },
+                        {
+                            "type": "event_msg",
+                            "timestamp": iso_now(t_base + 60.0),
+                            "payload": {"type": "task_complete", "last_agent_message": "VERDICT: APPROVED"},
+                        },
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            # Order A: child processed BEFORE parent (`mtime(child) < mtime(parent)`)
+            os.utime(rf_child, (t_base + 10.0, t_base + 10.0))
+            os.utime(rf_parent, (t_base + 20.0, t_base + 20.0))
+            os.utime(rf_orphan_child, (t_base + 30.0, t_base + 30.0))
+            res_a = codex_lane.scan_verified_codex_reviews(
+                since_ts=t_base - 5.0, session="sess-conflict", git_root=str(self.workspace)
+            )
+            self.assertEqual([(r["review_id"], r["verdict"], r["session_id"]) for r in res_a], [("cwg-conflict01", "REVISE", "p-1")])
+
+            # Order B: parent processed BEFORE child (`mtime(parent) < mtime(child)`)
+            os.utime(rf_parent, (t_base + 10.0, t_base + 10.0))
+            os.utime(rf_child, (t_base + 25.0, t_base + 25.0))
+            res_b = codex_lane.scan_verified_codex_reviews(
+                since_ts=t_base - 5.0, session="sess-conflict", git_root=str(self.workspace)
+            )
+            self.assertEqual([(r["review_id"], r["verdict"], r["session_id"]) for r in res_b], [("cwg-conflict01", "REVISE", "p-1")])
+
+            # 5. Subagent trailing `[gate] no-change` step after `send_message` delivery does NOT inflate `fallback_lenses_end`
+            #    when delegated inside a `gemini-4-hydrogen-xhigh` swarm worker (and main Carbon coordinator calls are never credited).
+            hyd_host_cid = self.add_swarm_worker(
+                name="simplify-host-21",
+                model="gemini-4-hydrogen-xhigh",
+                brief="Hydrogen XHigh simplify delegator.",
+                worker_post=None,
+            )
+            hyd_host_tp = self.brain / hyd_host_cid / ".system_generated" / "logs" / "transcript.jsonl"
+            hyd_wake_step = {
+                "step_index": 0,
+                "source": "SYSTEM",
+                "type": "SYSTEM_MESSAGE",
+                "status": "DONE",
+                "created_at": iso_now(t_base + 0.5),
+                "content": f"[Message] timestamp={iso_now(t_base + 0.5)} sender={self.conv_id} priority=MESSAGE_PRIORITY_HIGH content=[swarm] new board message #1",
+            }
+            sub_cid = "sub-reuse-trailing-idle"
+            sub_logs = self.brain / sub_cid / ".system_generated" / "logs"
+            sub_logs.mkdir(parents=True)
+            sub_tp = sub_logs / "transcript.jsonl"
+            sub_tp.write_text(
+                "\n".join(
+                    json.dumps(s)
+                    for s in [
+                        {
+                            "step_index": 0,
+                            "source": "MODEL",
+                            "type": "PLANNER_RESPONSE",
+                            "status": "DONE",
+                            "created_at": iso_now(t_base + 5.0),
+                            "tool_calls": [
+                                {"name": "send_message", "args": {"Recipient": hyd_host_cid, "Message": "SIMPLIFY_LENS: REUSE\nSIMPLIFY_VERDICT: CLEAN"}}
+                            ],
+                        },
+                        {
+                            "step_index": 1,
+                            "source": "MODEL",
+                            "type": "PLANNER_RESPONSE",
+                            "status": "DONE",
+                            "created_at": iso_now(t_base + 45.0),
+                            "content": "[gate] no-change: read-only lens",
+                        },
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            parent_steps = [
+                hyd_wake_step,
+                {
+                    "step_index": 1,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": iso_now(t_base + 1.0),
+                    "tool_calls": [{"name": "invoke_subagent", "args": {"TypeName": "simplify-reuse-reviewer", "Role": "Reuse", "Prompt": "check"}}],
+                },
+                {
+                    "step_index": 2,
+                    "source": "MODEL",
+                    "type": "GENERIC",
+                    "status": "DONE",
+                    "created_at": iso_now(t_base + 2.0),
+                    "content": json.dumps({"conversationId": sub_cid, "logAbsoluteUri": sub_tp.as_uri()}),
+                },
+                {
+                    "step_index": 3,
+                    "source": "SYSTEM",
+                    "type": "SYSTEM_MESSAGE",
+                    "status": "DONE",
+                    "created_at": iso_now(t_base + 6.0),
+                    "content": f"[Message] timestamp={iso_now(t_base + 5.0)} sender={sub_cid} priority=MESSAGE_PRIORITY_HIGH content=SIMPLIFY_LENS: REUSE\nSIMPLIFY_VERDICT: CLEAN",
+                },
+            ]
+            sub_ev_carbon = cwg_stop.scan_native_subagents(parent_steps[1:], str(self.transcript), t_base)
+            self.assertEqual(sub_ev_carbon["fallback_lenses"], {})
+            sub_ev = cwg_stop.scan_native_subagents(parent_steps, str(hyd_host_tp), t_base)
+            self.assertAlmostEqual(sub_ev["fallback_lenses_end"]["reuse"], t_base + 5.0, places=2)
+
+            # 5b. Immediate post-`send_message` sign-off repeating identical verdict (plus `</SYSTEM_MESSAGE>`) keeps `deliv_ts`,
+            #     whereas a late verdict change (`ACTIONABLE_FIXES` -> `CLEAN`) advances `end_ts` to the changed chunk's timestamp.
+            sub_echo_cid = "sub-quality-signoff-echo"
+            sub_echo_tp = self.brain / sub_echo_cid / ".system_generated" / "logs" / "transcript.jsonl"
+            sub_echo_tp.parent.mkdir(parents=True)
+            sub_echo_tp.write_text(
+                "\n".join(
+                    json.dumps(s)
+                    for s in [
+                        {
+                            "step_index": 0,
+                            "source": "MODEL",
+                            "type": "PLANNER_RESPONSE",
+                            "status": "DONE",
+                            "created_at": iso_now(t_base + 4.0),
+                            "tool_calls": [
+                                {"name": "send_message", "args": {"Recipient": hyd_host_cid, "Message": "SIMPLIFY_LENS: QUALITY\nSIMPLIFY_VERDICT: CLEAN"}}
+                            ],
+                        },
+                        {
+                            "step_index": 1,
+                            "source": "MODEL",
+                            "type": "GENERIC",
+                            "status": "DONE",
+                            "created_at": iso_now(t_base + 5.0),
+                            "content": "Message sent.",
+                        },
+                        {
+                            "step_index": 2,
+                            "source": "MODEL",
+                            "type": "PLANNER_RESPONSE",
+                            "status": "DONE",
+                            "created_at": iso_now(t_base + 45.0),
+                            "content": "Relayed report.\nSIMPLIFY_LENS: QUALITY\nSIMPLIFY_VERDICT: CLEAN",
+                        },
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            sub_flip_cid = "sub-eff-late-flip"
+            sub_flip_tp = self.brain / sub_flip_cid / ".system_generated" / "logs" / "transcript.jsonl"
+            sub_flip_tp.parent.mkdir(parents=True)
+            sub_flip_tp.write_text(
+                "\n".join(
+                    json.dumps(s)
+                    for s in [
+                        {
+                            "step_index": 0,
+                            "source": "MODEL",
+                            "type": "PLANNER_RESPONSE",
+                            "status": "DONE",
+                            "created_at": iso_now(t_base + 5.0),
+                            "tool_calls": [
+                                {
+                                    "name": "send_message",
+                                    "args": {"Recipient": hyd_host_cid, "Message": "SIMPLIFY_LENS: EFFICIENCY\nSIMPLIFY_VERDICT: ACTIONABLE_FIXES"},
+                                }
+                            ],
+                        },
+                        {
+                            "step_index": 1,
+                            "source": "MODEL",
+                            "type": "PLANNER_RESPONSE",
+                            "status": "DONE",
+                            "created_at": iso_now(t_base + 45.0),
+                            "content": "SIMPLIFY_LENS: EFFICIENCY\nSIMPLIFY_VERDICT: CLEAN",
+                        },
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            parent_steps_5b = [
+                hyd_wake_step,
+                {
+                    "step_index": 1,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": iso_now(t_base + 1.0),
+                    "tool_calls": [
+                        {"name": "invoke_subagent", "args": {"TypeName": "simplify-quality-reviewer", "Role": "Quality", "Prompt": "check"}},
+                        {"name": "invoke_subagent", "args": {"TypeName": "simplify-efficiency-reviewer", "Role": "Efficiency", "Prompt": "check"}},
+                    ],
+                },
+                {
+                    "step_index": 2,
+                    "source": "MODEL",
+                    "type": "GENERIC",
+                    "status": "DONE",
+                    "created_at": iso_now(t_base + 2.0),
+                    "content": json.dumps({"conversationId": sub_echo_cid, "logAbsoluteUri": sub_echo_tp.as_uri()}),
+                },
+                {
+                    "step_index": 3,
+                    "source": "MODEL",
+                    "type": "GENERIC",
+                    "status": "DONE",
+                    "created_at": iso_now(t_base + 2.0),
+                    "content": json.dumps({"conversationId": sub_flip_cid, "logAbsoluteUri": sub_flip_tp.as_uri()}),
+                },
+                {
+                    "step_index": 4,
+                    "source": "SYSTEM",
+                    "type": "SYSTEM_MESSAGE",
+                    "status": "DONE",
+                    "created_at": iso_now(t_base + 6.0),
+                    "content": f"<SYSTEM_MESSAGE>\n[Message] timestamp={iso_now(t_base + 5.0)} sender={sub_echo_cid} priority=MESSAGE_PRIORITY_HIGH content=SIMPLIFY_LENS: QUALITY\nSIMPLIFY_VERDICT: CLEAN\n</SYSTEM_MESSAGE>",
+                },
+                {
+                    "step_index": 5,
+                    "source": "SYSTEM",
+                    "type": "SYSTEM_MESSAGE",
+                    "status": "DONE",
+                    "created_at": iso_now(t_base + 6.0),
+                    "content": f"<SYSTEM_MESSAGE>\n[Message] timestamp={iso_now(t_base + 5.0)} sender={sub_flip_cid} priority=MESSAGE_PRIORITY_HIGH content=SIMPLIFY_LENS: EFFICIENCY\nSIMPLIFY_VERDICT: ACTIONABLE_FIXES\n</SYSTEM_MESSAGE>",
+                },
+            ]
+            sub_ev_5b = cwg_stop.scan_native_subagents(parent_steps_5b, str(hyd_host_tp), t_base)
+            self.assertAlmostEqual(sub_ev_5b["fallback_lenses_end"]["quality"], t_base + 5.0, places=2)
+            self.assertAlmostEqual(sub_ev_5b["fallback_lenses_end"]["efficiency"], t_base + 45.0, places=2)
+
+            # 6. Native reviewer sending `VERDICT: REVISE` at t+115 then final `VERDICT: APPROVED` at t+160 across a t+120 edit:
+            #    `verdict_ts` MUST bind to t+160 (the `APPROVED` chunk), preventing `MAX_REVIEW_ROUNDS=3` reset bypass.
+            rev_flip_cid = "sub-rev-late-approve"
+            rev_flip_tp = self.brain / rev_flip_cid / ".system_generated" / "logs" / "transcript.jsonl"
+            rev_flip_tp.parent.mkdir(parents=True)
+            rev_flip_tp.write_text(
+                "\n".join(
+                    json.dumps(s)
+                    for s in [
+                        {
+                            "step_index": 0,
+                            "source": "MODEL",
+                            "type": "PLANNER_RESPONSE",
+                            "status": "DONE",
+                            "created_at": iso_now(t_base + 115.0),
+                            "tool_calls": [
+                                {"name": "send_message", "args": {"Recipient": self.conv_id, "Message": "VERDICT: REVISE"}}
+                            ],
+                        },
+                        {
+                            "step_index": 1,
+                            "source": "MODEL",
+                            "type": "PLANNER_RESPONSE",
+                            "status": "DONE",
+                            "created_at": iso_now(t_base + 160.0),
+                            "content": "VERDICT: APPROVED",
+                        },
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            parent_steps_6 = [
+                {
+                    "step_index": 0,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": iso_now(t_base + 110.0),
+                    "tool_calls": [
+                        {"name": "invoke_subagent", "args": {"TypeName": "adversarial-reviewer", "Role": "R3", "Prompt": "Review"}}
+                    ],
+                },
+                {
+                    "step_index": 1,
+                    "source": "MODEL",
+                    "type": "GENERIC",
+                    "status": "DONE",
+                    "created_at": iso_now(t_base + 110.5),
+                    "content": json.dumps({"conversationId": rev_flip_cid, "logAbsoluteUri": rev_flip_tp.as_uri()}),
+                },
+                {
+                    "step_index": 2,
+                    "source": "SYSTEM",
+                    "type": "SYSTEM_MESSAGE",
+                    "status": "DONE",
+                    "created_at": iso_now(t_base + 115.5),
+                    "content": f"<SYSTEM_MESSAGE>\n[Message] timestamp={iso_now(t_base + 115.0)} sender={rev_flip_cid} priority=MESSAGE_PRIORITY_HIGH content=VERDICT: REVISE\n</SYSTEM_MESSAGE>",
+                },
+            ]
+            sub_ev_6 = cwg_stop.scan_native_subagents(parent_steps_6, str(self.transcript), t_base)
+            self.assertEqual(len(sub_ev_6["reviews"]), 1)
+            self.assertEqual(sub_ev_6["reviews"][0]["verdict"], "APPROVED")
+            self.assertAlmostEqual(sub_ev_6["reviews"][0]["verdict_ts"], t_base + 160.0, places=2)
+
+            cand_marker_6 = {
+                "session": "sess-r3-bypass",
+                "first_ts": t_base,
+                "last_ts": t_base + 120.0,
+                "last_durable_ts": t_base + 120.0,
+                "cwd": str(self.workspace).replace("\\", "/"),
+                "git_root": str(self.workspace).replace("\\", "/"),
+                "paths": [str(auth_flow).replace("\\", "/")],
+                "content_marks": [
+                    {"ts": t_base, "fp": "fp-v1"},
+                    {"ts": t_base + 40.0, "fp": "fp-v2"},
+                    {"ts": t_base + 80.0, "fp": "fp-v3"},
+                    {"ts": t_base + 120.0, "fp": "fp-v4"},
+                ],
+                "closed": False,
+            }
+            checks_6 = {
+                "checks": [{"kind": "check", "passed": True, "ts": t_base + 125.0}],
+                "passed_count": 1,
+                "failed_count": 0,
+                "latest_pass_ts": t_base + 125.0,
+                "latest_fail_ts": 0.0,
+            }
+            swarm_ev_6 = {
+                "sonnet_lenses": {"reuse": t_base + 130.0, "quality": t_base + 130.0, "efficiency": t_base + 130.0},
+                "sonnet_lenses_end": {"reuse": t_base + 135.0, "quality": t_base + 135.0, "efficiency": t_base + 135.0},
+                "fallback_lenses": {},
+                "fallback_lenses_end": {},
+                "sonnet_combined_ts": 0.0,
+                "fallback_combined_ts": 0.0,
+                "sonnet_combined_end_ts": 0.0,
+                "fallback_combined_end_ts": 0.0,
+                "simplify_launch_steps": set(),
+                "simplify_history": [
+                    {"kind": "lens", "lens": lns, "tier": "sonnet", "launch_ts": t, "end_ts": t + 2.0}
+                    for t in (t_base + 5.0, t_base + 45.0, t_base + 85.0, t_base + 130.0)
+                    for lns in ("reuse", "quality", "efficiency")
+                ],
+                "simplify_failures": 0,
+                "reviews": [],
+                "review_failures": [],
+                "in_flight_workers": [],
+                "opus_issue_verified": True,
+                "opus_issue_ts": t_base + 100.0,
+                "sonnet_issue_verified": False,
+                "codex_cmd_failed": True,
+                "codex_issue_ts": t_base + 100.0,
+                "codex_issue_step": -1,
+                "board_head": 0,
+            }
+            codex_revs_6 = [
+                {
+                    "engine": "codex",
+                    "kind": "ordinary",
+                    "verdict": "REVISE",
+                    "launch_ts": t_base + 20.0,
+                    "verdict_ts": t_base + 30.0,
+                    "xhigh": True,
+                },
+                {
+                    "engine": "codex",
+                    "kind": "ordinary",
+                    "verdict": "REVISE",
+                    "launch_ts": t_base + 60.0,
+                    "verdict_ts": t_base + 70.0,
+                    "xhigh": True,
+                },
+                {
+                    "engine": "codex",
+                    "kind": "ordinary",
+                    "verdict": "APPROVED",
+                    "launch_ts": t_base + 175.0,
+                    "verdict_ts": t_base + 180.0,
+                    "xhigh": True,
+                },
+            ]
+            ok_6, why_6 = cwg_stop.validate_candidate_closure(
+                {"kind": "verified", "risk": "HIGH"},
+                cand_marker_6,
+                checks_6,
+                sub_ev_6,
+                swarm_ev_6,
+                codex_revs_6,
+            )
+            self.assertFalse(ok_6)
+            self.assertIn("MAX_REVIEW_ROUNDS=3", why_6)
+
+    def test_22_aborted_codex_timeout_truncated_marks_and_closure_ready_cycle_reset(self) -> None:
+        sys.path.insert(0, str(HOOKS_DIR))
+        import codex_lane
+        import cwg_common as cwg
+        import cwg_stop
+
+        auth_mod = self.workspace / "auth_anom_fix.py"
+        auth_mod.write_text("def verify_token(tok: str) -> bool:\n    return bool(tok)\n", encoding="utf-8")
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CARBON_STACK_HOME": str(self.stack_home),
+                "CARBON_CODEX_SESSIONS_DIR": str(self.codex_sessions),
+                "ANTIGRAVITY_BRAIN_ROOT": str(self.brain),
+            },
+        ):
+            # 1. `codex_lane.py review --timeout 1` unlinks packet on timeout, kills child tree, and rejects duplicate `--review-id`
+            slow_py = self.root / "slow_codex_22.py"
+            slow_py.write_text(
+                "import sys, time\n"
+                "if sys.argv[1:3] == ['login', 'status']:\n"
+                "    print('Logged in using ChatGPT')\n"
+                "    sys.exit(0)\n"
+                "_ = sys.stdin.read()\n"
+                "time.sleep(8.0)\n"
+                "print('VERDICT: REVISE')\n",
+                encoding="utf-8",
+            )
+            slow_cmd = self.root / ("slow-codex-22.cmd" if os.name == "nt" else "slow-codex-22.sh")
+            if os.name == "nt":
+                slow_cmd.write_text(f'@echo off\r\n"{sys.executable}" -X utf8 "{slow_py}" %*\r\n', encoding="utf-8")
+            else:
+                slow_cmd.write_text(f'#!/bin/sh\nexec "{sys.executable}" -X utf8 "{slow_py}" "$@"\n', encoding="utf-8")
+                slow_cmd.chmod(0o755)
+
+            sub_env = dict(
+                os.environ,
+                CARBON_STACK_HOME=str(self.stack_home),
+                CARBON_CODEX_SESSIONS_DIR=str(self.codex_sessions),
+                CARBON_CODEX_BIN=str(slow_cmd),
+            )
+            codex_lane.reset_breaker()
+            timeout_rid = "cwg-timeout-22a"
+            proc_to = subprocess.run(
+                [
+                    sys.executable,
+                    "-X",
+                    "utf8",
+                    str(HOOKS_DIR / "codex_lane.py"),
+                    "review",
+                    "--cwd",
+                    str(self.workspace),
+                    "--session",
+                    self.conv_id,
+                    "--review-id",
+                    timeout_rid,
+                    "--timeout",
+                    "1",
+                ],
+                capture_output=True,
+                text=True,
+                env=sub_env,
+            )
+            self.assertEqual(proc_to.returncode, 3, msg=proc_to.stderr)
+            to_json = json.loads(proc_to.stdout.strip())
+            self.assertIs(to_json["ok"], False)
+            self.assertEqual(to_json["review_id"], timeout_rid)
+            self.assertFalse((codex_lane.packets_dir() / f"{timeout_rid}.json").exists())
+
+            codex_lane.reset_breaker()
+            existing_rid = "cwg-existing-22b"
+            codex_lane.record_packet(existing_rid, f"REVIEW_ID: {existing_rid}", str(self.workspace), session=self.conv_id)
+            proc_dup = subprocess.run(
+                [
+                    sys.executable,
+                    "-X",
+                    "utf8",
+                    str(HOOKS_DIR / "codex_lane.py"),
+                    "review",
+                    "--cwd",
+                    str(self.workspace),
+                    "--session",
+                    self.conv_id,
+                    "--review-id",
+                    existing_rid,
+                    "--timeout",
+                    "1",
+                ],
+                capture_output=True,
+                text=True,
+                env=sub_env,
+            )
+            self.assertEqual(proc_dup.returncode, 2)
+            dup_json = json.loads(proc_dup.stdout.strip())
+            self.assertIs(dup_json["ok"], False)
+            self.assertNotIn("review_id", dup_json)
+            self.assertTrue((codex_lane.packets_dir() / f"{existing_rid}.json").exists())
+            codex_lane.reset_breaker()
+
+            # 1b. `KeyboardInterrupt` inside `Popen.communicate` reaps child tree, unlinks registered packet, and re-raises
+            import argparse
+            import runtime_io as rio
+
+            kint_rid = "cwg-kint-22c"
+            seen_pkt_during_comm = False
+            reaped_procs: list[object] = []
+
+            class _FakeInterruptPopen:
+                def __init__(self, *a: object, **kw: object) -> None:
+                    self.pid = 999999
+                    self.returncode = None
+
+                def communicate(self, input: bytes | None = None, timeout: float | None = None) -> tuple[bytes, bytes]:
+                    nonlocal seen_pkt_during_comm
+                    seen_pkt_during_comm = (codex_lane.packets_dir() / f"{kint_rid}.json").exists()
+                    raise KeyboardInterrupt()
+
+                def kill(self) -> None:
+                    return None
+
+            kint_ns = argparse.Namespace(
+                cwd=str(self.workspace),
+                summary="test interrupt cleanup",
+                diff_file="",
+                review_id=kint_rid,
+                session=self.conv_id,
+                model="",
+                resume="",
+                new_session=True,
+                xhigh=False,
+                closure=False,
+                timeout=30,
+                pretty=False,
+            )
+            with mock.patch.object(
+                codex_lane, "check_health", return_value={"available": True, "lane": "codex", "binary": "codex"}
+            ), mock.patch.object(
+                codex_lane.subprocess, "Popen", side_effect=_FakeInterruptPopen
+            ), mock.patch.object(
+                codex_lane, "_kill_process_tree", side_effect=lambda p: reaped_procs.append(p)
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    codex_lane.cmd_review(kint_ns)
+            self.assertTrue(seen_pkt_during_comm)
+            self.assertEqual(len(reaped_procs), 1)
+            self.assertFalse((codex_lane.packets_dir() / f"{kint_rid}.json").exists())
+
+            # 2. Boundary compact-transcript decoding vs decoded `transcript_full.jsonl` & PowerShell literal anti-spoofing
+            t0 = 2_000_000.0
+            self.assertFalse(codex_lane.is_direct_codex_invocation('"codex exec quota exceeded"'))
+            self.assertFalse(codex_lane.is_direct_codex_invocation("'codex exec quota exceeded'"))
+            self.assertFalse(codex_lane.is_direct_codex_invocation('"codex" exec "quota exceeded"'))
+            self.assertEqual(
+                codex_lane.inspect_codex_cmd_result('"codex exec quota exceeded"', "DONE", "codex exec quota exceeded"),
+                (False, None),
+            )
+
+            ps_spoof_steps = [
+                {
+                    "step_index": 1,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": iso_now(t0 + 2.0),
+                    "tool_calls": [
+                        {
+                            "name": "run_command",
+                            "args": {
+                                "CommandLine": '"codex exec quota exceeded"',
+                                "WaitMsBeforeAsync": 5000,
+                                "toolSummary": "Print string",
+                            },
+                        }
+                    ],
+                },
+                {
+                    "step_index": 2,
+                    "source": "MODEL",
+                    "type": "GENERIC",
+                    "status": "DONE",
+                    "created_at": iso_now(t0 + 2.5),
+                    "content": "codex exec quota exceeded",
+                },
+            ]
+            spoof_full_dir = self.root / "tx_spoof_full"
+            spoof_full_dir.mkdir(parents=True)
+            (spoof_full_dir / "transcript_full.jsonl").write_text(
+                "\n".join(json.dumps(s) for s in ps_spoof_steps) + "\n", encoding="utf-8"
+            )
+            (spoof_full_dir / "transcript.jsonl").write_text("{}", encoding="utf-8")
+            loaded_spoof_full = rio.read_transcript_steps(str(spoof_full_dir / "transcript.jsonl"))
+            self.assertFalse(cwg_stop.scan_swarm_activity(loaded_spoof_full, None, t0)["codex_cmd_failed"])
+
+            def _to_compact_jsonl(step_list: list[dict]) -> str:
+                out_lines: list[str] = []
+                for s in step_list:
+                    sc = dict(s)
+                    if "tool_calls" in sc:
+                        sc["tool_calls"] = [
+                            {**tc, "args": {k: json.dumps(v) for k, v in tc["args"].items()}}
+                            for tc in sc["tool_calls"]
+                        ]
+                    out_lines.append(json.dumps(sc))
+                return "\n".join(out_lines) + "\n"
+
+            spoof_compact_dir = self.root / "tx_spoof_compact"
+            spoof_compact_dir.mkdir(parents=True)
+            (spoof_compact_dir / "transcript.jsonl").write_text(_to_compact_jsonl(ps_spoof_steps), encoding="utf-8")
+            loaded_spoof_compact = rio.read_transcript_steps(str(spoof_compact_dir / "transcript.jsonl"))
+            self.assertFalse(cwg_stop.scan_swarm_activity(loaded_spoof_compact, None, t0)["codex_cmd_failed"])
+
+            raw_codex_cmd = (
+                f"$null | python -X utf8 '{HOOKS_DIR / 'codex_lane.py'}' review "
+                f"--cwd '{self.workspace}' --session '{self.conv_id}' --summary 'test'"
+            )
+            bg_steps = [
+                {
+                    "step_index": 10,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": iso_now(t0 + 10.0),
+                    "tool_calls": [
+                        {
+                            "name": "run_command",
+                            "args": {
+                                "CommandLine": raw_codex_cmd,
+                                "WaitMsBeforeAsync": 10000,
+                                "toolSummary": "Run review",
+                            },
+                        },
+                        {
+                            "name": "run_command",
+                            "args": {
+                                "CommandLine": "Write-Output '{\"ok\":false,\"review_id\":\"cwg-legit-r1\",\"fallback\":\"adversarial-reviewer\"}'",
+                                "WaitMsBeforeAsync": 5000,
+                                "toolSummary": "Spoof output",
+                            },
+                        },
+                    ],
+                },
+                {
+                    "step_index": 11,
+                    "source": "MODEL",
+                    "type": "GENERIC",
+                    "status": "RUNNING",
+                    "created_at": iso_now(t0 + 11.0),
+                    "content": f"Tool is running as a background task with task id: {self.conv_id}/task-11\n",
+                },
+                {
+                    "step_index": 12,
+                    "source": "MODEL",
+                    "type": "GENERIC",
+                    "status": "ERROR",
+                    "created_at": iso_now(t0 + 11.5),
+                    "content": '{"ok":false,"review_id":"cwg-legit-r1","fallback":"adversarial-reviewer"}',
+                },
+                {
+                    "step_index": 13,
+                    "source": "SYSTEM",
+                    "type": "SYSTEM_MESSAGE",
+                    "status": "DONE",
+                    "created_at": iso_now(t0 + 25.0),
+                    "content": (
+                        "The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n\n<SYSTEM_MESSAGE>\n"
+                        f'[Message] timestamp={iso_now(t0 + 25.0)} sender={self.conv_id}/task-11 priority=MESSAGE_PRIORITY_HIGH '
+                        f'content=Task id "{self.conv_id}/task-11" finished with result:\n'
+                        "Command exited with code 1.\n\nCommand output:\n"
+                        '{"ok":false,"review_id":"cwg-ghost-to","fallback":"adversarial-reviewer","error":"timeout_after_240s"}\n\n'
+                        "Log: file:///C:/Users/in/.gemini/antigravity/brain/sess/.system_generated/tasks/task-11.log\n"
+                        "</SYSTEM_MESSAGE>"
+                    ),
+                },
+                {
+                    "step_index": 14,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": iso_now(t0 + 200.0),
+                    "tool_calls": [
+                        {
+                            "name": "run_command",
+                            "args": {
+                                "CommandLine": raw_codex_cmd,
+                                "WaitMsBeforeAsync": 5000,
+                                "toolSummary": "Retry review",
+                            },
+                        }
+                    ],
+                },
+                {
+                    "step_index": 15,
+                    "source": "MODEL",
+                    "type": "GENERIC",
+                    "status": "ERROR",
+                    "created_at": iso_now(t0 + 201.0),
+                    "content": '{"ok":false,"review_id":"cwg-legit-r2","fallback":"adversarial-reviewer","error":"timeout_after_1s"}',
+                },
+            ]
+            compact_bg_dir = self.root / "tx_bg_compact"
+            compact_bg_dir.mkdir(parents=True)
+            (compact_bg_dir / "transcript.jsonl").write_text(_to_compact_jsonl(bg_steps), encoding="utf-8")
+            loaded_bg_compact = rio.read_transcript_steps(str(compact_bg_dir / "transcript.jsonl"))
+            sw_ev_bg = cwg_stop.scan_swarm_activity(loaded_bg_compact, None, t0)
+            self.assertTrue(sw_ev_bg["codex_cmd_failed"])
+            self.assertIn("cwg-ghost-to", sw_ev_bg["aborted_codex_reviews"])
+            self.assertNotIn("cwg-legit-r1", sw_ev_bg["aborted_codex_reviews"])
+            self.assertIn("cwg-legit-r2", sw_ev_bg["aborted_codex_reviews"])
+            t_perf = time.perf_counter()
+            stripped_tail = codex_lane.strip_task_envelope_tail(
+                "payload" + ("\n" * 10000) + "Log: file:///C:/tmp/task.log\n</SYSTEM_MESSAGE>\n"
+            )
+            self.assertEqual(stripped_tail, "payload")
+            self.assertLess(time.perf_counter() - t_perf, 0.25)
+
+            sw_ev_bg["sonnet_lenses"] = {"reuse": t0 + 135.0, "quality": t0 + 135.0, "efficiency": t0 + 135.0}
+            sw_ev_bg["sonnet_lenses_end"] = {"reuse": t0 + 138.0, "quality": t0 + 138.0, "efficiency": t0 + 138.0}
+            sw_ev_bg["simplify_history"] = [
+                {"kind": "lens", "lens": lns, "tier": "sonnet", "launch_ts": ts_s, "end_ts": ts_s + 2.0}
+                for ts_s in (t0 + 5.0, t0 + 55.0, t0 + 95.0, t0 + 135.0)
+                for lns in ("reuse", "quality", "efficiency")
+            ]
+            marker_ghost = {
+                "session": self.conv_id,
+                "first_ts": t0,
+                "last_ts": t0 + 130.0,
+                "last_durable_ts": t0 + 130.0,
+                "cwd": str(self.workspace).replace("\\", "/"),
+                "git_root": str(self.workspace).replace("\\", "/"),
+                "paths": [str(auth_mod).replace("\\", "/")],
+                "content_marks": [
+                    {"ts": t0, "fp": "fp-1"},
+                    {"ts": t0 + 50.0, "fp": "fp-2"},
+                    {"ts": t0 + 90.0, "fp": "fp-3"},
+                    {"ts": t0 + 130.0, "fp": "fp-4"},
+                ],
+                "closed": False,
+            }
+            checks_ghost = {
+                "checks": [{"kind": "check", "passed": True, "ts": t0 + 132.0}],
+                "passed_count": 1,
+                "failed_count": 0,
+                "latest_pass_ts": t0 + 132.0,
+                "latest_fail_ts": 0.0,
+            }
+            codex_revs_with_ghost = [
+                {"engine": "codex", "review_id": "cwg-ghost-to", "kind": "ordinary", "verdict": "REVISE", "launch_ts": t0 + 11.0, "verdict_ts": t0 + 28.0, "xhigh": False},
+                {"engine": "codex", "review_id": "cwg-legit-r1", "kind": "ordinary", "verdict": "REVISE", "launch_ts": t0 + 60.0, "verdict_ts": t0 + 65.0, "xhigh": False},
+                {"engine": "codex", "review_id": "cwg-legit-r2", "kind": "ordinary", "verdict": "REVISE", "launch_ts": t0 + 100.0, "verdict_ts": t0 + 105.0, "xhigh": False},
+                {"engine": "codex", "review_id": "cwg-legit-r3", "kind": "ordinary", "verdict": "APPROVED", "launch_ts": t0 + 145.0, "verdict_ts": t0 + 150.0, "xhigh": False},
+            ]
+            empty_sub = {
+                "fallback_lenses": {},
+                "fallback_lenses_end": {},
+                "fallback_combined_ts": 0.0,
+                "fallback_combined_end_ts": 0.0,
+                "simplify_launch_steps": set(),
+                "simplify_history": [],
+                "simplify_failures": 0,
+                "reviews": [],
+                "review_failures": [],
+                "in_flight_subagents": [],
+            }
+            self.assertEqual(
+                cwg_stop.validate_candidate_closure(
+                    {"kind": "verified", "risk": "HIGH"},
+                    marker_ghost,
+                    checks_ghost,
+                    empty_sub,
+                    sw_ev_bg,
+                    codex_revs_with_ghost,
+                ),
+                (True, "verified"),
+            )
+            # Adding a 4th non-aborted round proves `cwg-legit-r2` (`launch_ts=t0+100 < abort_call_ts=t0+200`) was NOT retroactively erased
+            codex_revs_retro = codex_revs_with_ghost[:-1] + [
+                {"engine": "codex", "review_id": "cwg-legit-r3b", "kind": "ordinary", "verdict": "REVISE", "launch_ts": t0 + 145.0, "verdict_ts": t0 + 150.0, "xhigh": False},
+                {"engine": "codex", "review_id": "cwg-legit-r4b", "kind": "ordinary", "verdict": "APPROVED", "launch_ts": t0 + 155.0, "verdict_ts": t0 + 160.0, "xhigh": False},
+            ]
+            ok_retro, why_retro = cwg_stop.validate_candidate_closure(
+                {"kind": "verified", "risk": "HIGH"},
+                marker_ghost,
+                checks_ghost,
+                empty_sub,
+                sw_ev_bg,
+                codex_revs_retro,
+            )
+            self.assertFalse(ok_retro)
+            self.assertIn("MAX_REVIEW_ROUNDS=3", why_retro)
+
+            # 3. `MAX_CONTENT_MARKS = 512` + `trim_content_marks` + truncated-marker transcript-backed cycle reset vs mid-review edit / seek gap
+            self.assertEqual(cwg.MAX_CONTENT_MARKS, 512)
+            m_trim: dict = {}
+            marks_600 = [{"ts": float(i), "fp": f"fp-{i}"} for i in range(1, 601)]
+            cwg.trim_content_marks(m_trim, marks_600)
+            self.assertEqual(len(m_trim["content_marks"]), 512)
+            self.assertEqual(m_trim["marks_evicted_through_ts"], 88.0)
+
+            trunc_marker = {
+                "session": self.conv_id,
+                "first_ts": t0,
+                "last_ts": t0 + 300.0,
+                "last_durable_ts": t0 + 300.0,
+                "edits": 80,
+                "marks_evicted_through_ts": t0 + 180.0,
+                "cwd": str(self.workspace).replace("\\", "/"),
+                "git_root": str(self.workspace).replace("\\", "/"),
+                "paths": [str(auth_mod).replace("\\", "/")],
+                "content_marks": [
+                    {"ts": t0 + 200.0, "fp": "fp-tail-1"},
+                    {"ts": t0 + 300.0, "fp": "fp-tail-2"},
+                ],
+                "closed": False,
+            }
+            checks_trunc = {
+                "checks": [{"kind": "check", "passed": True, "ts": t0 + 305.0}],
+                "passed_count": 1,
+                "failed_count": 0,
+                "latest_pass_ts": t0 + 305.0,
+                "latest_fail_ts": 0.0,
+            }
+            sw_trunc = dict(
+                sw_ev_bg,
+                aborted_codex_reviews={},
+                sonnet_lenses={"reuse": t0 + 310.0, "quality": t0 + 310.0, "efficiency": t0 + 310.0},
+                sonnet_lenses_end={"reuse": t0 + 312.0, "quality": t0 + 312.0, "efficiency": t0 + 312.0},
+                simplify_history=[
+                    {"kind": "lens", "lens": lns, "tier": "sonnet", "launch_ts": ts_s, "end_ts": ts_s + 2.0}
+                    for ts_s in (t0 + 15.0, t0 + 55.0, t0 + 95.0, t0 + 310.0)
+                    for lns in ("reuse", "quality", "efficiency")
+                ],
+            )
+            revs_trunc = [
+                {"engine": "codex", "review_id": "cwg-tr-1", "kind": "ordinary", "verdict": "REVISE", "launch_ts": t0 + 20.0, "verdict_ts": t0 + 25.0, "xhigh": False},
+                {"engine": "codex", "review_id": "cwg-tr-2", "kind": "ordinary", "verdict": "REVISE", "launch_ts": t0 + 60.0, "verdict_ts": t0 + 65.0, "xhigh": False},
+                {"engine": "codex", "review_id": "cwg-tr-3", "kind": "ordinary", "verdict": "APPROVED", "launch_ts": t0 + 100.0, "verdict_ts": t0 + 110.0, "xhigh": False},
+                {"engine": "codex", "review_id": "cwg-tr-4", "kind": "ordinary", "verdict": "APPROVED", "launch_ts": t0 + 320.0, "verdict_ts": t0 + 325.0, "xhigh": False},
+            ]
+            clean_tx_steps = [
+                {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE", "created_at": iso_now(t0)},
+                {
+                    "step_index": 1,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": iso_now(t0 + 120.0),
+                    "tool_calls": [
+                        {"name": "edit_file", "args": {"Path": str(auth_mod), "Target": "old", "Replacement": "new"}}
+                    ],
+                },
+                {"step_index": 2, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": iso_now(t0 + 121.0), "content": "Edited"},
+            ]
+            self.assertEqual(
+                cwg_stop.validate_candidate_closure(
+                    {"kind": "verified", "risk": "HIGH"},
+                    trunc_marker,
+                    checks_trunc,
+                    empty_sub,
+                    sw_trunc,
+                    revs_trunc,
+                    steps=clean_tx_steps,
+                ),
+                (True, "verified"),
+            )
+
+            # Mid-review edit (`t0 + 105` inside `[100, 110]`) MUST block cycle reset on truncated marker
+            mid_edit_steps = [
+                {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE", "created_at": iso_now(t0)},
+                {
+                    "step_index": 1,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": iso_now(t0 + 105.0),
+                    "tool_calls": [
+                        {"name": "edit_file", "args": {"Path": str(auth_mod), "Target": "old", "Replacement": "new"}}
+                    ],
+                },
+                {"step_index": 2, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": iso_now(t0 + 105.5), "content": "Edited"},
+            ]
+            ok_mid_tr, why_mid_tr = cwg_stop.validate_candidate_closure(
+                {"kind": "verified", "risk": "HIGH"},
+                trunc_marker,
+                checks_trunc,
+                empty_sub,
+                sw_trunc,
+                revs_trunc,
+                steps=mid_edit_steps,
+            )
+            self.assertFalse(ok_mid_tr)
+            self.assertIn("MAX_REVIEW_ROUNDS=3", why_mid_tr)
+
+            # Seek gap in `steps` (`step_index` jumps `0 -> 500` at `t0 + 150 > launch_ts = t0 + 100`) MUST fail closed
+            gap_steps = [
+                {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE", "created_at": iso_now(t0)},
+                {"step_index": 500, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": iso_now(t0 + 150.0), "content": "tail"},
+            ]
+            ok_gap, why_gap = cwg_stop.validate_candidate_closure(
+                {"kind": "verified", "risk": "HIGH"},
+                trunc_marker,
+                checks_trunc,
+                empty_sub,
+                sw_trunc,
+                revs_trunc,
+                steps=gap_steps,
+            )
+            self.assertFalse(ok_gap)
+            self.assertIn("MAX_REVIEW_ROUNDS=3", why_gap)
+
+            # Evicted edit at `t0 + 98` AFTER simplify (`t0 + 95`) and BEFORE Round 3 (`t0 + 100`) MUST disqualify Round 3 approval reset
+            evicted_post_sim_edit_steps = [
+                {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE", "created_at": iso_now(t0)},
+                {
+                    "step_index": 1,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": iso_now(t0 + 98.0),
+                    "tool_calls": [
+                        {"name": "edit_file", "args": {"Path": str(auth_mod), "Target": "a", "Replacement": "b"}}
+                    ],
+                },
+                {"step_index": 2, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": iso_now(t0 + 98.5), "content": "Edited"},
+            ] + clean_tx_steps[1:]
+            ok_nosim, why_nosim = cwg_stop.validate_candidate_closure(
+                {"kind": "verified", "risk": "HIGH"},
+                trunc_marker,
+                checks_trunc,
+                empty_sub,
+                sw_trunc,
+                revs_trunc,
+                steps=evicted_post_sim_edit_steps,
+            )
+            self.assertFalse(ok_nosim)
+            self.assertIn("MAX_REVIEW_ROUNDS=3", why_nosim)
+
+            # 4. Post-`CLOSURE_VALIDATION: READY` durable edit resets cycle cleanly, while `CLOSURE_VALIDATION: BLOCKED` does NOT
+            cls_marker = {
+                "session": self.conv_id,
+                "first_ts": t0,
+                "last_ts": t0 + 200.0,
+                "last_durable_ts": t0 + 200.0,
+                "cwd": str(self.workspace).replace("\\", "/"),
+                "git_root": str(self.workspace).replace("\\", "/"),
+                "paths": [str(auth_mod).replace("\\", "/")],
+                "content_marks": [
+                    {"ts": t0, "fp": "fp-c1"},
+                    {"ts": t0 + 40.0, "fp": "fp-c2"},
+                    {"ts": t0 + 80.0, "fp": "fp-c3"},
+                    {"ts": t0 + 200.0, "fp": "fp-c4"},
+                ],
+                "closed": False,
+            }
+            cls_checks = {
+                "checks": [{"kind": "check", "passed": True, "ts": t0 + 205.0}],
+                "passed_count": 1,
+                "failed_count": 0,
+                "latest_pass_ts": t0 + 205.0,
+                "latest_fail_ts": 0.0,
+            }
+            cls_swarm = dict(
+                sw_ev_bg,
+                aborted_codex_reviews={},
+                sonnet_lenses={"reuse": t0 + 210.0, "quality": t0 + 210.0, "efficiency": t0 + 210.0},
+                sonnet_lenses_end={"reuse": t0 + 212.0, "quality": t0 + 212.0, "efficiency": t0 + 212.0},
+                simplify_history=[
+                    {"kind": "lens", "lens": lns, "tier": "sonnet", "launch_ts": ts_s, "end_ts": ts_s + 2.0}
+                    for ts_s in (t0 + 5.0, t0 + 45.0, t0 + 85.0, t0 + 210.0)
+                    for lns in ("reuse", "quality", "efficiency")
+                ],
+            )
+            base_3_rounds = [
+                {"engine": "codex", "review_id": "cwg-cr1", "kind": "ordinary", "verdict": "REVISE", "launch_ts": t0 + 15.0, "verdict_ts": t0 + 20.0, "xhigh": False},
+                {"engine": "codex", "review_id": "cwg-cr2", "kind": "ordinary", "verdict": "REVISE", "launch_ts": t0 + 55.0, "verdict_ts": t0 + 60.0, "xhigh": False},
+                {"engine": "codex", "review_id": "cwg-cr3", "kind": "ordinary", "verdict": "ESCALATE", "launch_ts": t0 + 95.0, "verdict_ts": t0 + 100.0, "xhigh": False},
+                {"engine": "codex", "review_id": "cwg-cls-b1", "kind": "closure", "verdict": "BLOCKED", "launch_ts": t0 + 110.0, "verdict_ts": t0 + 115.0, "xhigh": False},
+                {"engine": "codex", "review_id": "cwg-cls-b2", "kind": "closure", "verdict": "BLOCKED", "launch_ts": t0 + 120.0, "verdict_ts": t0 + 125.0, "xhigh": False},
+                {"engine": "codex", "review_id": "cwg-cls-ok", "kind": "closure", "verdict": "READY", "launch_ts": t0 + 130.0, "verdict_ts": t0 + 135.0, "xhigh": False},
+            ]
+            # Without a post-edit review on `fp-c4`, reports stale `CLOSURE_VALIDATION: READY` (not `MAX_CLOSURE_PASSES=2`)
+            ok_stale_rdy, why_stale_rdy = cwg_stop.validate_candidate_closure(
+                {"kind": "verified", "risk": "HIGH"},
+                cls_marker,
+                cls_checks,
+                empty_sub,
+                cls_swarm,
+                base_3_rounds,
+            )
+            self.assertFalse(ok_stale_rdy)
+            self.assertIn("`CLOSURE_VALIDATION: READY` verdict is stale", why_stale_rdy)
+
+            # With post-edit Round 1 `APPROVED` on `fp-c4`, cycle resets cleanly and closes `verified`
+            revs_after_rdy = base_3_rounds + [
+                {"engine": "codex", "review_id": "cwg-c2-r1", "kind": "ordinary", "verdict": "APPROVED", "launch_ts": t0 + 220.0, "verdict_ts": t0 + 225.0, "xhigh": False},
+            ]
+            self.assertEqual(
+                cwg_stop.validate_candidate_closure(
+                    {"kind": "verified", "risk": "HIGH"},
+                    cls_marker,
+                    cls_checks,
+                    empty_sub,
+                    cls_swarm,
+                    revs_after_rdy,
+                ),
+                (True, "verified"),
+            )
+
+            # If Cycle 1 ended in `CLOSURE_VALIDATION: BLOCKED`, post-edit ordinary round MUST NOT reset `MAX_REVIEW_ROUNDS=3`
+            revs_after_blk = base_3_rounds[:-1] + [
+                {"engine": "codex", "review_id": "cwg-c2-over", "kind": "ordinary", "verdict": "APPROVED", "launch_ts": t0 + 220.0, "verdict_ts": t0 + 225.0, "xhigh": False},
+            ]
+            ok_blk_noreset, why_blk_noreset = cwg_stop.validate_candidate_closure(
+                {"kind": "verified", "risk": "HIGH"},
+                cls_marker,
+                cls_checks,
+                empty_sub,
+                cls_swarm,
+                revs_after_blk,
+            )
+            self.assertFalse(ok_blk_noreset)
+            self.assertIn("MAX_REVIEW_ROUNDS=3", why_blk_noreset)
+
+            # 5. Simplify fallback enforces `gemini-4-hydrogen-xhigh` (never `gemini-4-carbon-high` or direct Carbon subagents)
+            sys.path.insert(0, str(REPO_ROOT / "plugin" / "tools"))
+            import safety_guards
+            import stack_doctor
+            import swarm_cache
+
+            self.assertEqual(cwg.SIMPLIFY_FALLBACK_MODEL, "gemini-4-hydrogen-xhigh")
+            self.assertEqual(cwg.SIMPLIFY_FALLBACK_MODELS, frozenset({"gemini-4-hydrogen-xhigh"}))
+
+            # PreToolUse `guard_swarm_invocation`: blocks Carbon / omitted model / lower Hydrogen on simplify workers; allows Sonnet & Hydrogen XHigh
+            self.assertEqual(
+                safety_guards.guard_swarm_invocation({"action": "add", "name": "simplify-reuse", "model": "gemini-4-carbon-high"})[0],
+                "deny",
+            )
+            self.assertEqual(
+                safety_guards.guard_swarm_invocation({"action": "add", "name": "simplify-reuse"})[0],
+                "deny",
+            )
+            self.assertEqual(
+                safety_guards.guard_swarm_invocation({"action": "add", "name": "simplify-reuse", "model": "gemini-4-hydrogen-high"})[0],
+                "deny",
+            )
+            self.assertEqual(
+                safety_guards.guard_swarm_invocation({"action": "add", "name": "simplify-reuse", "model": "claude-sonnet-5-5-high"})[0],
+                "allow",
+            )
+            self.assertEqual(
+                safety_guards.guard_swarm_invocation({"action": "add", "name": "simplify-reuse", "model": "gemini-4-hydrogen-xhigh"})[0],
+                "allow",
+            )
+
+            # PreToolUse `guard_subagent_invocation`: denies both `simplify-reuse-reviewer` and `research` with simplify Role from main Carbon chat,
+            # allows normal `research` from Carbon, and allows simplify delegation inside a `gemini-4-hydrogen-xhigh` swarm worker
+            dec_main_sub, reason_main_sub, _ = safety_guards.guard_subagent_invocation(
+                {"transcriptPath": str(self.transcript), "conversationId": self.conv_id},
+                {"TypeName": "simplify-reuse-reviewer", "Prompt": "Inspect diff for reuse improvements."},
+            )
+            self.assertEqual(dec_main_sub, "deny")
+            self.assertIn("gemini-4-hydrogen-xhigh", reason_main_sub or "")
+
+            dec_research_bypass, reason_research_bypass, _ = safety_guards.guard_subagent_invocation(
+                {"transcriptPath": str(self.transcript), "conversationId": self.conv_id},
+                {
+                    "TypeName": "research",
+                    "Role": "simplify reuse",
+                    "Model": "inherit",
+                    "Prompt": "Inspect diff for reuse improvements and output SIMPLIFY_VERDICT.",
+                },
+            )
+            self.assertEqual(dec_research_bypass, "deny")
+            self.assertIn("gemini-4-hydrogen-xhigh", reason_research_bypass or "")
+
+            dec_normal_research, _, _ = safety_guards.guard_subagent_invocation(
+                {"transcriptPath": str(self.transcript), "conversationId": self.conv_id},
+                {
+                    "TypeName": "research",
+                    "Role": "Codebase Researcher",
+                    "Model": "inherit",
+                    "Prompt": "Survey existing hook modules in plugin/hooks and summarize entrypoints.",
+                },
+            )
+            self.assertEqual(dec_normal_research, "allow")
+
+            hyd_worker_cid = self.add_swarm_worker(
+                name="simplify-reuse-hx",
+                model="gemini-4-hydrogen-xhigh",
+                brief="Reuse lens on Hydrogen XHigh.",
+                worker_post="@coordinator\nSIMPLIFY_LENS: REUSE\nSIMPLIFY_VERDICT: CLEAN",
+            )
+            hyd_wlogs = self.brain / hyd_worker_cid / ".system_generated" / "logs"
+            hyd_wake_steps = [
+                {
+                    "step_index": 0,
+                    "source": "SYSTEM",
+                    "type": "SYSTEM_MESSAGE",
+                    "status": "DONE",
+                    "created_at": iso_now(t0 + 210.0),
+                    "content": f"[Message] timestamp={iso_now(t0 + 210.0)} sender={self.conv_id} priority=MESSAGE_PRIORITY_HIGH content=[swarm] new board message #1",
+                }
+            ]
+            (hyd_wlogs / "transcript_full.jsonl").write_text(
+                "\n".join(json.dumps(s) for s in hyd_wake_steps) + "\n", encoding="utf-8"
+            )
+            dec_hyd_sub, _, _ = safety_guards.guard_subagent_invocation(
+                {"transcriptPath": str(hyd_wlogs / "transcript_full.jsonl"), "conversationId": hyd_worker_cid},
+                {"TypeName": "simplify-reuse-reviewer", "Model": "inherit", "Prompt": "Inspect diff for reuse improvements."},
+            )
+            self.assertEqual(dec_hyd_sub, "allow")
+            dec_hyd_research_sub, _, _ = safety_guards.guard_subagent_invocation(
+                {"transcriptPath": str(hyd_wlogs / "transcript_full.jsonl"), "conversationId": hyd_worker_cid},
+                {"TypeName": "research", "Role": "simplify reuse", "Model": "inherit", "Prompt": "Inspect diff for reuse improvements."},
+            )
+            self.assertEqual(dec_hyd_research_sub, "allow")
+
+            # Stop defense-in-depth: even if `invoke_subagent(TypeName="research", Role="simplify <lens>", Model="inherit")`
+            # appeared in the main Carbon coordinator transcript for all 3 lenses (plus Sonnet outage + passing check + Codex APPROVED),
+            # `scan_native_subagents` + `validate_candidate_closure` MUST refuse to credit Carbon runs as fallback.
+            carbon_bypass_steps: list[dict[str, object]] = []
+            for idx_l, (lens_l, tag_l) in enumerate((("reuse", "REUSE"), ("quality", "QUALITY"), ("efficiency", "EFFICIENCY"))):
+                b_cid = f"carbon-research-bypass-{lens_l}"
+                b_tp = self.brain / b_cid / ".system_generated" / "logs" / "transcript.jsonl"
+                b_tp.parent.mkdir(parents=True, exist_ok=True)
+                b_tp.write_text(
+                    json.dumps(
+                        {
+                            "step_index": 0,
+                            "source": "MODEL",
+                            "type": "PLANNER_RESPONSE",
+                            "status": "DONE",
+                            "created_at": iso_now(t0 + 215.0 + idx_l),
+                            "content": f"SIMPLIFY_LENS: {tag_l}\nSIMPLIFY_VERDICT: CLEAN",
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                carbon_bypass_steps.append(
+                    {
+                        "step_index": idx_l * 2,
+                        "source": "MODEL",
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "created_at": iso_now(t0 + 212.0 + idx_l),
+                        "tool_calls": [
+                            {
+                                "name": "invoke_subagent",
+                                "args": {"TypeName": "research", "Role": f"simplify {lens_l}", "Model": "inherit", "Prompt": "check"},
+                            }
+                        ],
+                    }
+                )
+                carbon_bypass_steps.append(
+                    {
+                        "step_index": idx_l * 2 + 1,
+                        "source": "MODEL",
+                        "type": "GENERIC",
+                        "status": "DONE",
+                        "created_at": iso_now(t0 + 212.5 + idx_l),
+                        "content": json.dumps({"conversationId": b_cid, "logAbsoluteUri": b_tp.as_uri()}),
+                    }
+                )
+            sub_ev_bypass = cwg_stop.scan_native_subagents(carbon_bypass_steps, str(self.transcript), t0)
+            self.assertEqual(sub_ev_bypass["fallback_lenses"], {})
+            self.assertEqual(sub_ev_bypass["simplify_history"], [])
+            bypass_marker = {
+                "session": self.conv_id,
+                "first_ts": t0,
+                "last_ts": t0 + 205.0,
+                "last_durable_ts": t0 + 205.0,
+                "cwd": str(self.workspace).replace("\\", "/"),
+                "git_root": str(self.workspace).replace("\\", "/"),
+                "paths": [str(auth_mod).replace("\\", "/")],
+                "content_marks": [{"ts": t0 + 205.0, "fp": "fp-bypass-check"}],
+                "closed": False,
+            }
+            bypass_checks = {
+                "checks": [{"kind": "check", "passed": True, "ts": t0 + 210.0}],
+                "passed_count": 1,
+                "failed_count": 0,
+                "latest_pass_ts": t0 + 210.0,
+                "latest_fail_ts": 0.0,
+            }
+            bypass_swarm_ev = {
+                "sonnet_lenses": {},
+                "sonnet_lenses_end": {},
+                "fallback_lenses": {},
+                "fallback_lenses_end": {},
+                "sonnet_combined_ts": 0.0,
+                "fallback_combined_ts": 0.0,
+                "sonnet_combined_end_ts": 0.0,
+                "fallback_combined_end_ts": 0.0,
+                "simplify_launch_steps": set(),
+                "simplify_history": [],
+                "simplify_failures": 0,
+                "reviews": [],
+                "review_failures": [],
+                "in_flight_workers": [],
+                "opus_issue_verified": False,
+                "opus_issue_ts": 0.0,
+                "sonnet_issue_verified": True,
+                "codex_cmd_failed": False,
+                "codex_issue_ts": 0.0,
+                "codex_issue_step": -1,
+                "board_head": 0,
+            }
+            bypass_codex_revs = [
+                {
+                    "engine": "codex",
+                    "kind": "ordinary",
+                    "verdict": "APPROVED",
+                    "launch_ts": t0 + 230.0,
+                    "verdict_ts": t0 + 235.0,
+                    "xhigh": True,
+                }
+            ]
+            ok_bypass, why_bypass = cwg_stop.validate_candidate_closure(
+                {"kind": "verified", "risk": "HIGH"},
+                bypass_marker,
+                bypass_checks,
+                sub_ev_bypass,
+                bypass_swarm_ev,
+                bypass_codex_revs,
+            )
+            self.assertFalse(ok_bypass)
+            self.assertIn("missing: efficiency, quality, reuse", why_bypass)
+
+            # Once all 3 lenses come from `gemini-4-hydrogen-xhigh` swarm workers before Codex APPROVED, closure succeeds
+            valid_hx_swarm_ev = dict(
+                bypass_swarm_ev,
+                fallback_lenses={"reuse": t0 + 220.0, "quality": t0 + 220.0, "efficiency": t0 + 220.0},
+                fallback_lenses_end={"reuse": t0 + 225.0, "quality": t0 + 225.0, "efficiency": t0 + 225.0},
+            )
+            self.assertEqual(
+                cwg_stop.validate_candidate_closure(
+                    {"kind": "verified", "risk": "HIGH"},
+                    bypass_marker,
+                    bypass_checks,
+                    sub_ev_bypass,
+                    valid_hx_swarm_ev,
+                    bypass_codex_revs,
+                ),
+                (True, "verified"),
+            )
+
+            # `swarm_cache` tracks `gemini-4-hydrogen-xhigh` simplify workers and ignores `gemini-4-carbon-high`
+            self.add_swarm_worker(
+                name="simplify-quality-carbon-bad",
+                model="gemini-4-carbon-high",
+                brief="Should be ignored.",
+                worker_post="@coordinator\nSIMPLIFY_LENS: QUALITY\nSIMPLIFY_VERDICT: CLEAN",
+            )
+            sim_inspect = swarm_cache.inspect_swarm_workers(session=self.conv_id, brain_root=self.brain, label="simplify")
+            sim_names = {w["name"] for w in sim_inspect["workers"]}
+            self.assertIn("simplify-reuse-hx", sim_names)
+            self.assertNotIn("simplify-quality-carbon-bad", sim_names)
+
+            doc_rep = stack_doctor.run_diagnostics(cwd=str(self.workspace), compact=False)
+            self.assertEqual(doc_rep["model_routing"]["simplify_lenses"]["fallback_model"], "gemini-4-hydrogen-xhigh")
+
+            # 6. `diff_git_snapshots`: staging & committing unchanged working-tree bytes yields `changed == []` (OPERATIONAL),
+            #    while edit+commit, sneaky commit+revert, and `git restore` working-tree changes are detected as durable edits.
+            import cwg_mark
+
+            git_mod = self.workspace / "commit_check.py"
+            git_mod.write_text("x = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "commit_check.py"], cwd=self.workspace, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=self.workspace, check=True, capture_output=True)
+
+            git_mod.write_text("x = 2\n", encoding="utf-8")
+            snap_dirty = cwg_mark.take_git_snapshot(str(self.workspace))
+            subprocess.run(["git", "add", "commit_check.py"], cwd=self.workspace, check=True, capture_output=True)
+            snap_staged = cwg_mark.take_git_snapshot(str(self.workspace))
+            self.assertEqual(cwg_mark.diff_git_snapshots(snap_dirty, snap_staged), ([], False))
+
+            subprocess.run(["git", "commit", "-m", "commit v2"], cwd=self.workspace, check=True, capture_output=True)
+            snap_committed = cwg_mark.take_git_snapshot(str(self.workspace))
+            self.assertEqual(cwg_mark.diff_git_snapshots(snap_dirty, snap_committed), ([], False))
+            self.assertEqual(cwg_mark.diff_git_snapshots(snap_staged, snap_committed), ([], False))
+
+            # Clean -> edited & committed in one shell call MUST be caught
+            git_mod.write_text("x = 3\n", encoding="utf-8")
+            subprocess.run(["git", "commit", "-am", "one-shot v3"], cwd=self.workspace, check=True, capture_output=True)
+            snap_oneshot = cwg_mark.take_git_snapshot(str(self.workspace))
+            chg_oneshot, unm_oneshot = cwg_mark.diff_git_snapshots(snap_committed, snap_oneshot)
+            self.assertFalse(unm_oneshot)
+            self.assertEqual(len(chg_oneshot), 1)
+            self.assertTrue(chg_oneshot[0].endswith("/commit_check.py"))
+
+            # Dirty v4 -> edited to v5 & committed & reverted on disk back to v4 MUST STILL be caught
+            git_mod.write_text("x = 4\n", encoding="utf-8")
+            snap_v4 = cwg_mark.take_git_snapshot(str(self.workspace))
+            git_mod.write_text("x = 5\n", encoding="utf-8")
+            subprocess.run(["git", "commit", "-am", "sneaky v5"], cwd=self.workspace, check=True, capture_output=True)
+            git_mod.write_text("x = 4\n", encoding="utf-8")
+            snap_sneaky = cwg_mark.take_git_snapshot(str(self.workspace))
+            chg_sneaky, _ = cwg_mark.diff_git_snapshots(snap_v4, snap_sneaky)
+            self.assertEqual(len(chg_sneaky), 1)
+
+            # Working-tree `git checkout -- commit_check.py` (v4 -> v5 on disk) MUST be caught
+            subprocess.run(["git", "checkout", "--", "commit_check.py"], cwd=self.workspace, check=True, capture_output=True)
+            snap_restored = cwg_mark.take_git_snapshot(str(self.workspace))
+            chg_restored, _ = cwg_mark.diff_git_snapshots(snap_sneaky, snap_restored)
+            self.assertEqual(len(chg_restored), 1)
+
+            # >2MB dirty file modified preserving exact size & `st_mtime_ns` then committed MUST NOT be exempted (`large:` token)
+            large_mod = self.workspace / "large_blob.bin"
+            large_mod.write_bytes(b"A" * 2_000_001)
+            subprocess.run(["git", "add", "large_blob.bin"], cwd=self.workspace, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "base large"], cwd=self.workspace, check=True, capture_output=True)
+            large_mod.write_bytes(b"B" * 2_000_001)
+            st_large_b = os.lstat(large_mod)
+            snap_large_dirty = cwg_mark.take_git_snapshot(str(self.workspace))
+            large_mod.write_bytes(b"C" * 2_000_001)
+            os.utime(large_mod, ns=(st_large_b.st_atime_ns, st_large_b.st_mtime_ns))
+            subprocess.run(["git", "commit", "-am", "spoofed mtime large"], cwd=self.workspace, check=True, capture_output=True)
+            snap_large_committed = cwg_mark.take_git_snapshot(str(self.workspace))
+            chg_large, unm_large = cwg_mark.diff_git_snapshots(snap_large_dirty, snap_large_committed)
+            self.assertFalse(unm_large)
+            self.assertEqual(len(chg_large), 1)
+            self.assertTrue(chg_large[0].endswith("/large_blob.bin"))
+
+            # Dirty symlink/reparse entry replaced by a regular file with identical target bytes & committed MUST NOT be exempted (`link:` token)
+            link_target = self.workspace / "link_target.txt"
+            link_target.write_text("same-payload\n", encoding="utf-8")
+            subprocess.run(["git", "add", "link_target.txt"], cwd=self.workspace, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "add target"], cwd=self.workspace, check=True, capture_output=True)
+            link_path = self.workspace / "entry_link.txt"
+            norm_link = cwg.rio.normalize_path(str(link_path))
+            symlink_created = False
+            try:
+                os.symlink(link_target, link_path)
+                symlink_created = True
+            except OSError:
+                symlink_created = False
+            if symlink_created:
+                snap_link_before = cwg_mark.take_git_snapshot(str(self.workspace))
+                self.assertIn(":link:", snap_link_before["entries"][norm_link])
+                link_path.unlink()
+                link_path.write_text("same-payload\n", encoding="utf-8")
+                subprocess.run(["git", "add", "entry_link.txt"], cwd=self.workspace, check=True, capture_output=True)
+                subprocess.run(["git", "commit", "-m", "replace link with regular file"], cwd=self.workspace, check=True, capture_output=True)
+                snap_link_after = cwg_mark.take_git_snapshot(str(self.workspace))
+            else:
+                fake_lnk_stat = mock.Mock(st_mode=0o120777, st_size=13, st_mtime_ns=123456789, st_reparse_tag=0)
+                lnk_tok = cwg_mark._file_entry_token(str(link_path), prefix="??:", stat_result=fake_lnk_stat)
+                self.assertTrue(lnk_tok.startswith("??:link:"))
+                snap_link_before = dict(
+                    cwg_mark.take_git_snapshot(str(self.workspace)),
+                    entries={norm_link: lnk_tok},
+                )
+                link_path.write_text("same-payload\n", encoding="utf-8")
+                subprocess.run(["git", "add", "entry_link.txt"], cwd=self.workspace, check=True, capture_output=True)
+                subprocess.run(["git", "commit", "-m", "replace link with regular file"], cwd=self.workspace, check=True, capture_output=True)
+                snap_link_after = cwg_mark.take_git_snapshot(str(self.workspace))
+            chg_link, unm_link = cwg_mark.diff_git_snapshots(snap_link_before, snap_link_after)
+            self.assertFalse(unm_link)
+            self.assertIn(norm_link, chg_link)
 
 
 if __name__ == "__main__":

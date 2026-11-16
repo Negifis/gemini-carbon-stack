@@ -1,6 +1,6 @@
 ---
 name: simplify-reuse-reviewer
-description: Read-only code simplification lens focused strictly on REUSE (eliminating duplicated helpers, constants, and reinvented repo utilities). Primary execution runs on claude-sonnet-5-5-high via swarm; this subagent provides the Carbon fallback when Sonnet quota is exhausted.
+description: Read-only code simplification lens focused strictly on REUSE (eliminating duplicated helpers, constants, and reinvented repo utilities). Primary execution runs on claude-sonnet-5-5-high via swarm, with fallback to gemini-4-hydrogen-xhigh via swarm when Sonnet quota is exhausted.
 subagent: true
 mainAgent: false
 tools: [read_file, run_command, manage_task]

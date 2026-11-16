@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import json
 import os
 import pathlib
 import re
@@ -21,6 +22,7 @@ RISK_LEVELS = ("LOW", "STANDARD", "HIGH", "XHIGH")
 RISK_ORDER = {name: idx for idx, name in enumerate(RISK_LEVELS)}
 
 SHELL_MUTATION_SENTINEL = "<shell-mutation>"
+MAX_CONTENT_MARKS = 512
 
 DOC_EXTENSIONS = frozenset(
     {".md", ".mdx", ".txt", ".rst", ".adoc", ".csv", ".tsv"}
@@ -106,6 +108,186 @@ CLOSURE_LINE_RE = re.compile(
     r"^\s*(?:\*{0,2})CLOSURE_VALIDATION(?:\*{0,2})\s*:\s*(?:\*{0,2})(READY|BLOCKED)(?:\*{0,2})\b",
     re.MULTILINE,
 )
+_PLAIN_ORD_VERDICTS = frozenset({"APPROVED", "REVISE", "ESCALATE"})
+_PLAIN_CLS_VERDICTS = frozenset({"READY", "BLOCKED"})
+CODEX_REVIEW_OUTPUT_BANNER = "--- CODEX REVIEW OUTPUT ---"
+CODEX_CLI_WRAPPER_RE = re.compile(
+    r"\AREVIEW_ID:\s*[A-Za-z0-9_-]+[ \t]*\r?\n"
+    r"(?:(?:SESSION_ID|SESSION_MODE|ENGINE):[^\r\n]*\r?\n){0,3}"
+    + re.escape(CODEX_REVIEW_OUTPUT_BANNER)
+    + r"[ \t]*\r?\n"
+)
+_SWARM_MENTION_LINE_RE = re.compile(r"\A@[A-Za-z0-9_-]+(?:[ \t]+@[A-Za-z0-9_-]+)*[ \t]*\r?\n")
+_JSON_NUM_TOKEN = r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?"
+_JSON_ARRAY_START_RE = re.compile(
+    r"\A\[[ \t]*(?:"
+    r"[\{\[\"]"
+    r"|\][ \t]*(?:\r?\n|$)"
+    r"|(?:true|false|null)[ \t]*(?:,|\][ \t]*(?:\r?\n|$)|\r?\n|$)"
+    r"|" + _JSON_NUM_TOKEN + r"[ \t]*(?:,|\][ \t]*(?:\r?\n|$)|\r?\n|$)"
+    r"|\r?\n|$)"
+)
+
+
+def _decision_from_json_dict(obj: dict[str, Any]) -> tuple[str | None, str | None]:
+    # INVARIANT: Inspect ONLY top-level decision keys (`closure_validation`/`verdict`), never nested finding text.
+    for key in ("closure_validation", "CLOSURE_VALIDATION"):
+        raw_cls = obj.get(key)
+        if isinstance(raw_cls, str) and raw_cls.strip():
+            s = raw_cls.strip()
+            cm = CLOSURE_LINE_RE.search(s)
+            if cm:
+                return ("closure", cm.group(1).upper())
+            up = s.strip("*` \t\r\n").upper()
+            if up in _PLAIN_CLS_VERDICTS:
+                return ("closure", up)
+    for key in ("verdict", "VERDICT"):
+        raw_ord = obj.get(key)
+        if isinstance(raw_ord, str) and raw_ord.strip():
+            s = raw_ord.strip()
+            cm2 = CLOSURE_LINE_RE.search(s)
+            if cm2:
+                return ("closure", cm2.group(1).upper())
+            vm = VERDICT_LINE_RE.search(s)
+            if vm:
+                return ("ordinary", vm.group(1).upper())
+            up = s.strip("*` \t\r\n").upper()
+            if up in _PLAIN_ORD_VERDICTS:
+                return ("ordinary", up)
+            if up in _PLAIN_CLS_VERDICTS:
+                return ("closure", up)
+    return (None, None)
+
+
+def _advance_json_depth(line: str, depth: int, in_str: bool, esc: bool) -> tuple[int, bool, bool]:
+    for ch in line:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth = max(0, depth - 1)
+    return (depth, in_str, esc)
+
+
+def _strip_unfenced_json_blocks(lines: list[str]) -> str:
+    # SAFETY: Exclude unfenced line-anchored `{...}` / `[...]` blocks from plain-text fallback
+    # so malformed JSON payloads after prose cannot leak embedded `VERDICT:` lines.
+    kept: list[str] = []
+    depth = 0
+    in_str = False
+    esc = False
+    for ln in lines:
+        if depth == 0 and not in_str:
+            lstripped = ln.lstrip(" \t")
+            if lstripped.startswith("{") or _JSON_ARRAY_START_RE.match(lstripped):
+                depth, in_str, esc = _advance_json_depth(lstripped, 0, False, False)
+                continue
+            kept.append(ln)
+            continue
+        depth, in_str, esc = _advance_json_depth(ln, depth, in_str, esc)
+    return "\n".join(kept).strip()
+
+
+def _extract_terminal_json_dict(text: str) -> tuple[dict[str, Any] | None, str]:
+    # SAFETY: Accept ONLY a syntactically complete RFC 8259 JSON object occupying the entire review payload
+    # (after optional byte-0 CLI wrapper / `@mention`) or a complete terminal markdown JSON fence; strip all
+    # fenced blocks and unfenced JSON blocks from `prose_fallback` so embedded lines never spoof plain-text regexes.
+    body = (text or "").strip()
+    if not body:
+        return (None, "")
+    wrapper_m = CODEX_CLI_WRAPPER_RE.match(body)
+    if wrapper_m:
+        body = body[wrapper_m.end() :].strip()
+    mention_m = _SWARM_MENTION_LINE_RE.match(body)
+    if mention_m:
+        body = body[mention_m.end() :].strip()
+    if not body:
+        return (None, "")
+
+    if body.startswith("{"):
+        if not body.endswith("}"):
+            return (None, "")
+        try:
+            obj = json.loads(body)
+        except Exception:
+            return (None, "")
+        return (obj if isinstance(obj, dict) else None, "")
+    if _JSON_ARRAY_START_RE.match(body):
+        return (None, "")
+
+    if "```" in body:
+        lines = body.splitlines()
+        fence_indices = [i for i, ln in enumerate(lines) if ln.strip().startswith("```")]
+        n_fences = len(fence_indices)
+        has_terminal_fence = (
+            n_fences >= 2
+            and n_fences % 2 == 0
+            and fence_indices[-1] == len(lines) - 1
+            and lines[-1].strip() == "```"
+        )
+        excluded_ranges: list[tuple[int, int]] = [
+            (fence_indices[k], fence_indices[k + 1]) for k in range(0, n_fences - 1, 2)
+        ]
+        if n_fences % 2 == 1:
+            excluded_ranges.append((fence_indices[-1], len(lines) - 1))
+
+        json_candidate: dict[str, Any] | None = None
+        if has_terminal_fence:
+            open_idx = fence_indices[-2]
+            fence_hdr = lines[open_idx].strip().lower()
+            fenced = "\n".join(lines[open_idx + 1 : -1]).strip()
+            if fence_hdr in ("```", "```json") and fenced.startswith("{") and fenced.endswith("}"):
+                try:
+                    parsed = json.loads(fenced)
+                except Exception:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    json_candidate = parsed
+
+        kept_lines: list[str] = []
+        r_idx = 0
+        n_ranges = len(excluded_ranges)
+        for idx, ln in enumerate(lines):
+            while r_idx < n_ranges and idx > excluded_ranges[r_idx][1]:
+                r_idx += 1
+            if r_idx < n_ranges and excluded_ranges[r_idx][0] <= idx <= excluded_ranges[r_idx][1]:
+                continue
+            kept_lines.append(ln)
+        return (json_candidate, _strip_unfenced_json_blocks(kept_lines))
+    return (None, _strip_unfenced_json_blocks(body.splitlines()))
+
+
+def extract_review_decision(text: str) -> tuple[str | None, str | None]:
+    """Extract `(kind, verdict)` from plain-text control lines or a complete top-level JSON review payload."""
+    stripped = (text or "").strip()
+    if not stripped:
+        return (None, None)
+
+    json_obj, prose_fallback = _extract_terminal_json_dict(stripped)
+    if json_obj is not None:
+        dec = _decision_from_json_dict(json_obj)
+        if dec != (None, None) or not prose_fallback:
+            return dec
+    if not prose_fallback:
+        return (None, None)
+
+    cls_matches = CLOSURE_LINE_RE.findall(prose_fallback)
+    if cls_matches:
+        return ("closure", cls_matches[-1].upper())
+    ord_matches = VERDICT_LINE_RE.findall(prose_fallback)
+    if ord_matches:
+        return ("ordinary", ord_matches[-1].upper())
+    return (None, None)
+
+
 SIMPLIFY_LINE_RE = re.compile(
     r"^\s*(?:\*{0,2})SIMPLIFY_VERDICT(?:\*{0,2})\s*:\s*(?:\*{0,2})(CLEAN|FINDINGS_REPORTED|ACTIONABLE_FIXES)(?:\*{0,2})\b",
     re.IGNORECASE | re.MULTILINE,
@@ -139,6 +321,9 @@ HYDROGEN_MODEL_BY_LEVEL = {
 FLASH_MODEL_RE = re.compile(r"\bflash(?:[-_]lite)?\b", re.IGNORECASE)
 
 SIMPLIFY_LENSES = ("reuse", "quality", "efficiency")
+SIMPLIFY_FALLBACK_MODEL = HYDROGEN_XHIGH_MODEL
+SIMPLIFY_FALLBACK_MODELS = frozenset({HYDROGEN_XHIGH_MODEL})
+SIMPLIFY_ALLOWED_MODELS = frozenset({SONNET_HIGH_MODEL}) | SIMPLIFY_FALLBACK_MODELS
 SIMPLIFY_LENS_AGENTS = frozenset(
     {
         "simplify-reuse-reviewer",
@@ -149,8 +334,16 @@ SIMPLIFY_LENS_AGENTS = frozenset(
 NATIVE_REVIEWERS = frozenset({"adversarial-reviewer", "adversarial-reviewer-xhigh"})
 XHIGH_NATIVE_REVIEWER = "adversarial-reviewer-xhigh"
 SIMPLIFY_REVIEWER = "simplify-reviewer"
+SIMPLIFY_AGENT_TYPES = SIMPLIFY_LENS_AGENTS | frozenset({SIMPLIFY_REVIEWER})
 ANTHROPIC_EPHEMERAL_TTL_SECONDS = 300
 SWARM_CACHE_SAFE_TTL_SECONDS = 270
+
+
+def is_simplify_subagent_call(sub_type: str, role: str = "") -> bool:
+    base = (sub_type or "").strip().lower().rsplit(":", 1)[-1]
+    if base in SIMPLIFY_AGENT_TYPES:
+        return True
+    return base in ("research", "self") and "simplify" in (role or "").strip().lower()
 
 
 def gate_dir(*parts: str) -> pathlib.Path:
@@ -606,6 +799,18 @@ def content_fingerprint(paths: list[str], max_file_bytes: int = 4_000_000) -> st
     return hasher.hexdigest()
 
 
+def trim_content_marks(marker: dict[str, Any], marks: list[dict[str, Any]]) -> None:
+    if len(marks) > MAX_CONTENT_MARKS:
+        evicted_last = marks[-MAX_CONTENT_MARKS - 1]
+        ev_ts = float(evicted_last.get("ts") or 0.0) if isinstance(evicted_last, dict) else 0.0
+        prev_ev = float(marker.get("marks_evicted_through_ts") or 0.0)
+        if ev_ts > prev_ev:
+            marker["marks_evicted_through_ts"] = ev_ts
+        marker["content_marks"] = marks[-MAX_CONTENT_MARKS:]
+    else:
+        marker["content_marks"] = marks
+
+
 def parse_terminal_receipt(message: str | None) -> dict[str, Any] | None:
     """Parse `[gate] <kind>: ...` strictly from the last non-empty line of the assistant message."""
     if not message or not message.strip():
@@ -935,16 +1140,16 @@ def receipt_requirements_summary(
     if floor == "STANDARD":
         parts = ["local verification/test execution" if has_tests else "self-check (run any applicable check)"]
         if pol.get("require_simplify_on_standard"):
-            parts.append(f"simplify on `{SONNET_HIGH_MODEL}`")
+            parts.append(f"simplify on `{SONNET_HIGH_MODEL}` (fallback `{SIMPLIFY_FALLBACK_MODEL}`)")
         if pol.get("require_review_on_standard"):
             parts.append("independent APPROVED review")
         return " + ".join(parts)
     if floor == "HIGH":
         return (
-            f"decisive test/check execution + 3 separate simplify lenses (`{SONNET_HIGH_MODEL}`) + "
-            f"1 independent APPROVED review (Codex lane or internal `{OPUS_HIGH_MODEL}` -> fallback `{CARBON_HIGH_MODEL}`)"
+            f"decisive test/check execution -> 3 separate simplify lenses (`{SONNET_HIGH_MODEL}`, fallback `{SIMPLIFY_FALLBACK_MODEL}` on Sonnet outage, completed BEFORE review) -> "
+            f"1 independent APPROVED review (priority: Codex lane `codex_lane.py` -> fallback `{OPUS_HIGH_MODEL}` -> `{CARBON_HIGH_MODEL}` only on verified outage)"
         )
     return (
-        f"decisive test/check execution + 3 separate simplify lenses (`{SONNET_HIGH_MODEL}`) + "
-        f"1 XHIGH APPROVED review (Codex --xhigh or internal `{OPUS_HIGH_MODEL}` [XHIGH] -> fallback `{CARBON_HIGH_MODEL}`)"
+        f"decisive test/check execution -> 3 separate simplify lenses (`{SONNET_HIGH_MODEL}`, fallback `{SIMPLIFY_FALLBACK_MODEL}` on Sonnet outage, completed BEFORE review) -> "
+        f"1 XHIGH APPROVED review (priority: Codex `--xhigh` -> fallback `{OPUS_HIGH_MODEL}` [XHIGH] -> `{CARBON_HIGH_MODEL}` only on verified outage)"
     )

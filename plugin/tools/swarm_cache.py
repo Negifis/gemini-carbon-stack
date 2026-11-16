@@ -37,12 +37,7 @@ def _rotated_worker_name(base_name: str, round_num: int) -> str:
 
 
 def resolve_brain_root(brain_root_arg: str = "") -> pathlib.Path:
-    if brain_root_arg and brain_root_arg.strip():
-        return pathlib.Path(brain_root_arg.strip()).expanduser().resolve()
-    env_dir = os.environ.get("ANTIGRAVITY_BRAIN_ROOT", "").strip()
-    if env_dir:
-        return pathlib.Path(env_dir).expanduser().resolve()
-    return (pathlib.Path.home() / ".gemini" / "antigravity" / "brain").resolve()
+    return rio.resolve_brain_root(brain_root_arg)
 
 
 def _matches_label(worker_name: str, label: str, model: str = "") -> bool:
@@ -52,11 +47,13 @@ def _matches_label(worker_name: str, label: str, model: str = "") -> bool:
     low = (worker_name or "").strip().lower()
     model_low = (model or "").strip().lower()
     is_simplify = "simplify" in low or any(k in low for k in cwg.SIMPLIFY_LENSES)
-    if clean in ("simplify", "review"):
+    if clean == "simplify":
+        if not is_simplify:
+            return False
+        return not model_low or model_low in cwg.SIMPLIFY_ALLOWED_MODELS
+    if clean == "review":
         if model_low and (model_low in cwg.HYDROGEN_MODEL_BY_LEVEL.values() or cwg.FLASH_MODEL_RE.search(model_low)):
             return False
-        if clean == "simplify":
-            return is_simplify
         return not is_simplify and (
             model_low == cwg.OPUS_HIGH_MODEL
             or "review" in low

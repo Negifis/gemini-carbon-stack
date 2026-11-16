@@ -66,11 +66,30 @@ def guard_shell_command(cmd: str, cwd: str) -> tuple[str, str | None]:
     return "allow", None
 
 
+def _is_simplify_swarm_target(name: str, brief: str) -> bool:
+    if "simplify" in (name or "").strip().lower():
+        return True
+    low_brief = (brief or "").lower()
+    return "simplify_lens:" in low_brief or "simplify_verdict:" in low_brief
+
+
 def guard_swarm_invocation(args: dict[str, Any]) -> tuple[str, str | None]:
     action = str(args.get("action") or "").strip().lower()
+    if action not in ("add", "model"):
+        return "allow", None
     model = str(args.get("model") or "").strip()
-    if action in ("add", "model") and model and cwg.FLASH_MODEL_RE.search(model):
+    if model and cwg.FLASH_MODEL_RE.search(model):
         return "deny", HYDROGEN_POLICY_MSG
+    if _is_simplify_swarm_target(str(args.get("name") or ""), str(args.get("brief") or "")):
+        if not model or model.lower() not in cwg.SIMPLIFY_ALLOWED_MODELS:
+            # SAFETY: Never allow simplify workers to default to or target Carbon, preserving main-agent quota.
+            return (
+                "deny",
+                f"[Simplify Model Policy] Линзы simplify запрещено запускать на `{model or 'inherit (Carbon)'}`, "
+                f"чтобы не сжигать лимиты `{cwg.CARBON_HIGH_MODEL}`. Используйте `{cwg.SONNET_HIGH_MODEL}`, "
+                f"а при исчерпании квоты/сбое Sonnet — `{cwg.SIMPLIFY_FALLBACK_MODEL}` через "
+                f"`swarm(action='add', ..., model='{cwg.SIMPLIFY_FALLBACK_MODEL}')`.",
+            )
     return "allow", None
 
 
@@ -79,28 +98,44 @@ def guard_subagent_invocation(
 ) -> tuple[str, str | None, dict[str, Any] | None]:
     transcript_path = payload.get("transcriptPath")
     prompt = str(args.get("Prompt") or "").strip()
+    role = str(args.get("Role") or "").strip()
     req_model = str(args.get("Model") or "").strip().lower()
     sub_type = str(args.get("TypeName") or "").strip().lower()
+    base_sub_type = sub_type.rsplit(":", 1)[-1]
+    is_simplify_sub = cwg.is_simplify_subagent_call(base_sub_type, role)
 
-    # 1. Block deprecated Gemini Flash tiers (`flash` / `flash_lite`)
     if req_model and cwg.FLASH_MODEL_RE.search(req_model):
         suffix = (
             "Для `browser` запустите swarm-воркера на `gemini-4-hydrogen-<low|medium|high|xhigh>`, который вызовет `invoke_subagent(TypeName='browser', Model='inherit')` (либо передайте `Model='inherit'` внутри Hydrogen-сессии)."
-            if sub_type == "browser"
+            if base_sub_type == "browser"
             else "Запустите задачу через `swarm(action='add', model='gemini-4-hydrogen-<low|medium|high|xhigh>')` или передайте `Model='inherit'` внутри Hydrogen-сессии."
         )
         return "deny", f"{HYDROGEN_POLICY_MSG} {suffix}", None
 
-    # 2. Prevent recursive subagent nesting unless top-level swarm worker delegates `browser` with `inherit`
     steps_head = rio.read_transcript_steps(transcript_path, max_lines=5)
     is_delegated = rio.is_subagent_session(transcript_path, steps=steps_head)
-    is_swarm_worker = rio.is_swarm_worker_session(
+    worker_model = rio.swarm_worker_model(
         transcript_path,
         steps=steps_head,
         conversation_id=payload.get("conversationId") or payload.get("session_id"),
     )
-    allow_swarm_browser = bool(is_swarm_worker and sub_type == "browser" and req_model in ("", "inherit"))
-    if is_delegated and not allow_swarm_browser and "[allow-nested-subagent]" not in prompt:
+    is_swarm_worker = bool(worker_model)
+
+    if is_simplify_sub and not (worker_model in cwg.SIMPLIFY_FALLBACK_MODELS and req_model in ("", "inherit")):
+        # SAFETY: Direct `invoke_subagent` from a Carbon session inherits Carbon and burns primary quota; enforce swarm Hydrogen fallback.
+        return (
+            "deny",
+            f"[Simplify Model Policy] Прямой вызов субагента `{base_sub_type}` из не-Hydrogen сессии наследует "
+            f"`{cwg.CARBON_HIGH_MODEL}` и сжигает квоту основной модели. Запускайте simplify через "
+            f"`swarm(action='add', ..., model='{cwg.SONNET_HIGH_MODEL}')`, а при исчерпании квоты/сбое Sonnet — "
+            f"через `swarm(action='add', ..., model='{cwg.SIMPLIFY_FALLBACK_MODEL}')`.",
+            None,
+        )
+
+    allow_swarm_delegation = bool(
+        is_swarm_worker and req_model in ("", "inherit") and (base_sub_type == "browser" or is_simplify_sub)
+    )
+    if is_delegated and not allow_swarm_delegation and "[allow-nested-subagent]" not in prompt:
         return (
             "deny",
             "[Subagent Nesting Guard] Вложенный запуск субагента изнутри субагента заблокирован во избежание каскадного размножения контекстов. "

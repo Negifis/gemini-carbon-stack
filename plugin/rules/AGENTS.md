@@ -26,7 +26,7 @@
 - `PERSISTENT` (правка файлов; квитанция — последняя строка):
   - `LOW` (доки/заметки/статика): проверка содержимого -> `[gate] verified: LOW; <итог>`.
   - `STANDARD` (обычный код, скрипты, UI, аддоны): локальные проверки/тесты после правки (если применимы), без авто-`swarm`/ревью -> `[gate] verified: STANDARD; <кандидат и проверки>`.
-  - `HIGH`/`XHIGH` (auth/crypto/секреты/права, миграции, CI/CD, хуки/манифесты плагина/`install.py`, `.agents/carbon-gate.json`): тесты + 3 раздельные линзы `simplify` (`claude-sonnet-5-5-high`) + свежее независимое `VERDICT: APPROVED` (`codex_lane.py` или `claude-opus-5-5-high` -> `gemini-4-carbon-high` при сбое Opus) -> `[gate] verified: HIGH|XHIGH; <кандидат, тесты и ревью>`.
+  - `HIGH`/`XHIGH` (auth/crypto/секреты/права, миграции, CI/CD, хуки/манифесты плагина/`install.py`, `.agents/carbon-gate.json`): строго последовательно: 1) тесты -> 2) 3 раздельные линзы `simplify` (`claude-sonnet-5-5-high`, fallback при исчерпании квоты Sonnet строго на `gemini-4-hydrogen-xhigh` через `swarm`, никогда не на Carbon; дождаться их полного завершения до старта ревью, никогда параллельно с ревью) -> 3) свежее независимое `VERDICT: APPROVED` (приоритет всегда `codex_lane.py review`; только при подтверждённой недоступности Codex — эскалация на внутренний `claude-opus-5-5-high` -> `gemini-4-carbon-high` при сбое Opus) -> `[gate] verified: HIGH|XHIGH; <кандидат, тесты и ревью>`.
 
 ## 5. Общение и код
 

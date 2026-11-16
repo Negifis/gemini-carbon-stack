@@ -436,11 +436,54 @@ def resolve_transcript_path(transcript_path: str | None) -> pathlib.Path | None:
     return p if p.is_file() else None
 
 
+_COMPACT_JSON_SCALAR_RE = re.compile(r"^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)$")
+
+
+def _decode_compact_arg_map(raw_args: dict[str, Any]) -> dict[str, Any] | None:
+    decoded_map: dict[str, Any] = {}
+    for k, v in raw_args.items():
+        if not isinstance(v, str) or not v:
+            return None
+        if v[0] not in ('"', "[", "{") and not _COMPACT_JSON_SCALAR_RE.match(v):
+            return None
+        try:
+            decoded_map[k] = json.loads(v)
+        except json.JSONDecodeError:
+            return None
+    return decoded_map
+
+
+def _decode_compact_step_args(steps: list[dict[str, Any]]) -> None:
+    # INVARIANT: Antigravity's compact `transcript.jsonl` encodes every `tool_calls[*].args` value as a JSON string
+    # (`map<string, string>`), whereas `transcript_full.jsonl` stores decoded JSON values. Decode compact args strictly
+    # once at the `transcript.jsonl` reader boundary so downstream PowerShell/CLI parsers never strip user quotes.
+    pending: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for st in steps:
+        tcs = st.get("tool_calls")
+        if not isinstance(tcs, list):
+            continue
+        for tc in tcs:
+            if not isinstance(tc, dict):
+                continue
+            raw_args = tc.get("args")
+            if not isinstance(raw_args, dict) or not raw_args:
+                continue
+            decoded_map = _decode_compact_arg_map(raw_args)
+            if decoded_map is None:
+                return
+            pending.append((tc, decoded_map))
+    for tc, decoded_map in pending:
+        tc["args"] = decoded_map
+
+
 def read_transcript_steps(transcript_path: str | None, max_lines: int = 4000) -> list[dict[str, Any]]:
     tp = resolve_transcript_path(transcript_path)
     if tp is None:
         return []
-    return read_jsonl(tp, max_lines=max_lines)
+    steps = read_jsonl(tp, max_lines=max_lines)
+    if tp.name == "transcript.jsonl" and steps:
+        _decode_compact_step_args(steps)
+    return steps
 
 
 def _is_system_message(step: dict[str, Any] | None) -> bool:
@@ -470,6 +513,13 @@ def subagent_parent_id(transcript_path: str | None, steps: list[dict[str, Any]] 
 
 def swarm_dir(brain_root: pathlib.Path, session: str) -> pathlib.Path:
     return brain_root / session / ".system_generated" / "swarm"
+
+
+def resolve_brain_root(override: str = "") -> pathlib.Path:
+    raw = (override or os.environ.get("ANTIGRAVITY_BRAIN_ROOT") or "").strip()
+    if raw:
+        return pathlib.Path(raw).expanduser().resolve()
+    return (pathlib.Path.home() / ".gemini" / "antigravity" / "brain").resolve()
 
 
 def member_transcript_path(brain_root: pathlib.Path, cid: str) -> pathlib.Path:
@@ -523,65 +573,64 @@ def _swarm_brain_and_cid(
         return None, ""
     if derived_brain is None:
         env_dir = os.environ.get("ANTIGRAVITY_BRAIN_ROOT", "").strip()
-        if env_dir:
-            derived_brain = pathlib.Path(env_dir).expanduser().resolve()
-        else:
-            default_brain = (pathlib.Path.home() / ".gemini" / "antigravity" / "brain").resolve()
-            if default_brain.is_dir():
-                derived_brain = default_brain
+        cand_brain = resolve_brain_root(env_dir)
+        if env_dir or cand_brain.is_dir():
+            derived_brain = cand_brain
     return derived_brain, worker_cid
 
 
-def _has_active_worker_entry(members: dict[str, Any], worker_cid: str) -> bool:
+def _find_active_worker_model(members: dict[str, Any], worker_cid: str) -> str | None:
     for name, meta in members.items():
         if not isinstance(meta, dict) or is_swarm_member_killed(meta) or is_swarm_role_member(name, meta):
             continue
         cid = str(meta.get("conversation_id") or meta.get("conversationId") or "").strip()
         if cid == worker_cid:
-            return True
-    return False
+            return str(meta.get("model") or "registered").strip().lower() or "registered"
+    return None
 
 
-def _is_registered_swarm_worker(
+def _registered_swarm_worker_model(
     brain_root: pathlib.Path | None,
     worker_cid: str,
     candidate_sessions: list[str] | tuple[str, ...],
-) -> bool:
+) -> str:
     if brain_root is None or not worker_cid:
-        return False
+        return ""
     seen: set[str] = set()
     for sid in candidate_sessions:
         clean_sid = (sid or "").strip()
         if not clean_sid or clean_sid in seen:
             continue
         seen.add(clean_sid)
-        if _has_active_worker_entry(load_swarm_members(brain_root, clean_sid), worker_cid):
-            return True
-    # Peer-sender step-0 on >128KB transcripts may omit step-1 coordinator sender; scan swarm registries on disk.
+        found = _find_active_worker_model(load_swarm_members(brain_root, clean_sid), worker_cid)
+        if found is not None:
+            return found
+    # INVARIANT: Peer-sender step-0 on >128KB transcripts may omit step-1 coordinator sender; scan swarm registries on disk.
     try:
         for mf in brain_root.glob("*/.system_generated/swarm/members.json"):
             sid = mf.parents[2].name
             if sid in seen:
                 continue
             seen.add(sid)
-            if _has_active_worker_entry(load_swarm_members(brain_root, sid), worker_cid):
-                return True
+            found = _find_active_worker_model(load_swarm_members(brain_root, sid), worker_cid)
+            if found is not None:
+                return found
     except OSError:
-        return False
-    return False
+        return ""
+    return ""
 
 
-def is_swarm_worker_session(
+def swarm_worker_model(
     transcript_path: str | None,
     steps: list[dict[str, Any]] | None = None,
     conversation_id: str | None = None,
-) -> bool:
+) -> str:
     items = steps if steps is not None else read_transcript_steps(transcript_path, max_lines=5)
     if not items or not _is_system_message(items[0]):
-        return False
+        return ""
     m0 = SUBAGENT_MSG_RE.search(str(items[0].get("content") or ""))
     if not m0 or not SWARM_BOARD_WAKE_BODY_RE.match(m0.group("body") or ""):
-        return False
+        return ""
 
     candidate_sids = [m0.group("sender")]
     if len(items) > 1 and _is_system_message(items[1]):
@@ -590,7 +639,21 @@ def is_swarm_worker_session(
             candidate_sids.append(m1.group("sender"))
 
     brain_root, worker_cid = _swarm_brain_and_cid(transcript_path, conversation_id=conversation_id)
-    return _is_registered_swarm_worker(brain_root, worker_cid, candidate_sids)
+    return _registered_swarm_worker_model(brain_root, worker_cid, candidate_sids)
+
+
+def is_swarm_worker_session(
+    transcript_path: str | None,
+    steps: list[dict[str, Any]] | None = None,
+    conversation_id: str | None = None,
+) -> bool:
+    return bool(
+        swarm_worker_model(
+            transcript_path,
+            steps=steps,
+            conversation_id=conversation_id,
+        )
+    )
 
 
 def is_subagent_session(transcript_path: str | None, steps: list[dict[str, Any]] | None = None) -> bool:
