@@ -438,11 +438,16 @@ def scan_swarm_activity(
     host_worker_errors: dict[tuple[str, str], float] = {}
     worker_add_step: dict[str, int] = {}
     pending_codex_tasks: dict[str, tuple[str, float]] = {}
+    pending_bg_tasks: set[str] = set()
+    idle_unkilled_workers: list[str] = []
 
     for idx, st in enumerate(steps):
         if st.get("source") == "SYSTEM":
             sys_ts = rio.parse_iso_ts(st.get("created_at"))
             sys_txt = str(st.get("content") or "")
+            for tid in list(pending_bg_tasks):
+                if f'Task id "{tid}" finished' in sys_txt or f'Task id "{tid}" was canceled' in sys_txt:
+                    pending_bg_tasks.discard(tid)
             if not sys_ts or sys_ts >= first_ts - 2.0:
                 for sm in SYSTEM_SWARM_ERR_RE.finditer(sys_txt):
                     if MODEL_FAILURE_RE.search(sm.group("err")):
@@ -489,13 +494,8 @@ def scan_swarm_activity(
                         hint = f"@{w_full}".lower() if w_full else ""
                         coord_call_events.append((call_ts, hint, idx))
         has_swarm_tc = any(isinstance(tc, dict) and tc.get("name") == "swarm" for tc in all_tcs)
-        has_codex_tc = any(
-            isinstance(tc, dict)
-            and tc.get("name") == "run_command"
-            and "codex" in str((tc.get("args") or {}).get("CommandLine") or "").lower()
-            for tc in all_tcs
-        )
-        if not has_swarm_tc and not has_codex_tc:
+        has_run_cmd_tc = any(isinstance(tc, dict) and tc.get("name") == "run_command" for tc in all_tcs)
+        if not has_swarm_tc and not has_run_cmd_tc:
             continue
 
         generic_steps = _collect_generic_results(steps, idx)
@@ -505,6 +505,9 @@ def scan_swarm_activity(
                 continue
             g_status, blob, g_ts = generic_steps[pos] if pos < len(generic_steps) else ("", "", 0.0)
             if tc.get("name") == "run_command":
+                bgm_any = BG_TASK_ID_RE.search(blob)
+                if bgm_any:
+                    pending_bg_tasks.add(bgm_any.group(1))
                 cmd_str = str((tc.get("args") or {}).get("CommandLine") or "")
                 if "codex" in cmd_str.lower():
                     res_ts = max(call_ts, g_ts) if g_ts > 0.0 else call_ts
@@ -514,9 +517,8 @@ def scan_swarm_activity(
                         _mark_codex_issue(res_ts, idx + 1 + pos)
                     if aborted_rid and aborted_rid not in aborted_codex_reviews:
                         aborted_codex_reviews[aborted_rid] = call_ts
-                    bgm = BG_TASK_ID_RE.search(blob)
-                    if bgm and not aborted_rid:
-                        pending_codex_tasks[bgm.group(1)] = (cmd_str, call_ts)
+                    if bgm_any and not aborted_rid:
+                        pending_codex_tasks[bgm_any.group(1)] = (cmd_str, call_ts)
                 continue
             if tc.get("name") != "swarm":
                 continue
@@ -571,6 +573,8 @@ def scan_swarm_activity(
             "reviews": reviews,
             "review_failures": review_failures,
             "in_flight_workers": in_flight_workers,
+            "idle_unkilled_workers": idle_unkilled_workers,
+            "pending_bg_tasks": sorted(pending_bg_tasks),
             "opus_issue_verified": opus_issue_verified,
             "opus_issue_ts": opus_issue_ts,
             "sonnet_issue_verified": sonnet_issue_verified,
@@ -682,11 +686,12 @@ def scan_swarm_activity(
         t_cursor = 0
         matched_t: set[int] = set()
         combined_outputs: list[tuple[float, str]] = []
-        for bts, btxt in worker_board_posts:
+        for b_idx, (bts, btxt) in enumerate(worker_board_posts):
             eff_ots = bts
+            next_bts = worker_board_posts[b_idx + 1][0] if b_idx + 1 < len(worker_board_posts) else float("inf")
             for tidx in range(t_cursor, len(tsum_outs)):
                 ots, otxt = tsum_outs[tidx]
-                if otxt == btxt and abs(ots - bts) < 5.0:
+                if otxt == btxt and abs(ots - bts) < 5.0 and ots < next_bts:
                     eff_ots = max(eff_ots, ots)
                     matched_t.add(tidx)
                     t_cursor = tidx + 1
@@ -711,6 +716,8 @@ def scan_swarm_activity(
         if not killed and latest_assign_ts >= first_ts - 2.0 and not has_reply_since_assign and not parked_after_assign:
             in_flight_workers.append(f"swarm:{mname}")
             continue
+        if not killed:
+            idle_unkilled_workers.append(mname)
 
         if not combined_outputs:
             continue
@@ -2137,9 +2144,13 @@ def main() -> int:
                 return 0
 
             fully_idle = payload.get("fullyIdle", True)
-            in_flight = list(sub_ev.get("in_flight_subagents") or []) + list(
-                swarm_ev.get("in_flight_workers") or []
+            in_flight = (
+                list(sub_ev.get("in_flight_subagents") or [])
+                + list(swarm_ev.get("in_flight_workers") or [])
+                + [f"bg:{t}" for t in (swarm_ev.get("pending_bg_tasks") or [])]
             )
+            # SAFETY: Unkilled `waiting` swarm workers keep host `fullyIdle=False` even after replying; require real `in_flight` work.
+            effective_not_idle = (fully_idle is False) and not bool(swarm_ev.get("idle_unkilled_workers"))
             # Only worker/subagent output advances `progress_sig` (never coordinator turn count), plus a hard per-candidate cap.
             progress_sig = (
                 f"{swarm_ev.get('worker_activity_count', 0)}:"
@@ -2150,7 +2161,7 @@ def main() -> int:
             waits = 0 if state.get("last_wait_progress") != progress_sig else int(state.get("waits") or 0)
             total_waits = int(state.get("total_waits") or 0)
             if (
-                (fully_idle is False or in_flight)
+                (effective_not_idle or in_flight)
                 and waits < MAX_BACKGROUND_WAITS
                 and total_waits < MAX_TOTAL_BACKGROUND_WAITS
             ):

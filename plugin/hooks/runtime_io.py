@@ -785,9 +785,41 @@ def read_mutation_stamp(session: str) -> int:
         return 0
 
 
+TOKENADE_WRAP_SEG_RE = re.compile(
+    r"(?:^|(?<=[;\r\n|&]))\s*(?:\$null\s*\|\s*)?(?:&\s*)?"
+    r"(?:'(?:''|[^'\r\n])*tokenade(?:\.cmd|\.exe)?'|\"[^\"`$\r\n]*tokenade(?:\.cmd|\.exe)?\"|[^\s|;&\"'`$()\r\n]*tokenade(?:\.cmd|\.exe)?)"
+    r"\s+(?:wrap|exec-compact|raw|bypass|noproxy|shellwrap)\b(?:\s+--shell\s+[A-Za-z0-9_.-]+)?\s+"
+    r"(?P<inner>'(?:''|[^'])*'|\"(?:`[\s\S]|\"\"|[^\"`])*\"|[^|;&\"'\r\n]+?)(?=\s*(?:$|[;\r\n|&]))",
+    re.IGNORECASE,
+)
+
+
+def _unquote_wrapped_inner(m: re.Match[str]) -> str:
+    inner = m.group("inner").strip()
+    if len(inner) >= 2 and inner[0] == "'" and inner[-1] == "'":
+        inner = inner[1:-1].replace("''", "'").strip()
+    elif len(inner) >= 2 and inner[0] == '"' and inner[-1] == '"':
+        inner = re.sub(r"`([\s\S])", r"\1", inner[1:-1].replace('""', '"')).strip()
+    return inner
+
+
+def unwrap_tokenade_command(cmd: str) -> str:
+    # SAFETY: Unwrap Tokenade CLI wrappers so gate classification and destructive-command guards inspect the real payload.
+    s = re.sub(r"^\s*\$null\s*\|\s*", "", (cmd or "").strip(), flags=re.IGNORECASE)
+    if "tokenade" not in s.lower():
+        return s
+    for _ in range(3):
+        nxt = TOKENADE_WRAP_SEG_RE.sub(_unquote_wrapped_inner, s)
+        if nxt == s:
+            break
+        s = re.sub(r"^\s*\$null\s*\|\s*", "", nxt.strip(), flags=re.IGNORECASE)
+    return s
+
+
 def resolve_command_cwd(cmd: str, default_cwd: str, fallback_dir: str = "") -> str:
+    unwrapped = unwrap_tokenade_command(cmd or "")
     for pat in (CD_LEADING_RE, GIT_DASH_C_RE):
-        m = pat.search(cmd or "") if pat is GIT_DASH_C_RE else pat.match(cmd or "")
+        m = pat.search(unwrapped) if pat is GIT_DASH_C_RE else pat.match(unwrapped)
         if m:
             raw_dir = m.group("dir").strip()
             if os.path.isabs(raw_dir):

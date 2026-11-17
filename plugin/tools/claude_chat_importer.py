@@ -326,15 +326,7 @@ def infer_default_cwd(project_folder: str) -> str:
     if m:
         drive = m.group(1).upper()
         rest = m.group(2).replace("-", "\\")
-        candidate = f"{drive}:\\{rest}"
-        if os.path.isdir(candidate):
-            return candidate
-    if project_folder == "C--Users-negif":
-        return r"C:\Users\negif"
-    if project_folder == "D--FNVEE":
-        return r"D:\FNVEE"
-    if project_folder == "D--SkyrimAI":
-        return r"D:\SkyrimAI"
+        return f"{drive}:\\{rest}"
     return os.path.expanduser("~")
 
 
@@ -506,7 +498,8 @@ def parse_claude_session(project_folder: str, filepath: str) -> ParsedSession | 
     if raw_title and raw_title != "New session":
         resolved_title = raw_title
     elif raw_title == "New session":
-        proj_tag = project_folder.replace("D--", "").replace("C--Users-negif", "Home")
+        proj_tag = re.sub(r"^[A-Za-z]--Users-[^-]+$", "Home", project_folder)
+        proj_tag = re.sub(r"^[A-Za-z]--", "", proj_tag)
         if "/init" in first_prompt_stripped:
             resolved_title = f"Инициализация {proj_tag} (/init)"
         else:

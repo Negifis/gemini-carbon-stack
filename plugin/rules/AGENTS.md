@@ -11,12 +11,13 @@
 ## 2. Безопасность дерева и Windows PowerShell 5.1
 
 - Не трогайте чужие правки. Запрещены `git reset --hard`, `checkout -- .`, `restore .`, `clean -fd` в грязном дереве и голый `git worktree remove` (используйте `worktree_guard.py`). Параллельную разработку изолируйте (`workspace: "share"|"branch"` или `chip_handoff.py`).
-- Оболочка `run_command` — PowerShell 5.1: без `&&`/`||`, `<<`, `/dev/null` (`$null`) и GNU-утилит (`sed`/`awk`/`head`/`tail`). Запускайте `python -X utf8`, закрывайте `stdin` у CLI (`$null | ...`), не пайпьте `unittest` в `Select-Object`. Проверки запускайте компактно, сохраняя полный вывод ошибок.
-- Ищите точечно (`code_search.py`/`git grep -n`), читайте диапазоны (`StartLine`/`EndLine`), не перечитывайте неизменённые файлы. Модели `Gemini Flash` запрещены — используйте `Gemini 4 Hydrogen` (`low..xhigh`).
+- Оболочка `run_command` — PowerShell 5.1: без `&&`/`||`, `<<`, `/dev/null` (`$null`) и GNU-утилит (`sed`/`awk`/`head`/`tail`). Запускайте `python -X utf8`, закрывайте `stdin` у CLI (`$null | ...`), не пайпьте `unittest` в `Select-Object`. Проверки запускайте компактно (`python -X utf8 -m unittest`, `npx tsc --noEmit`, `tokenade wrap`), сохраняя полный вывод ошибок.
+- Запрещено читать целиком lock-файлы (`package-lock.json`, `uv.lock`, `yarn.lock`, `pnpm-lock.yaml`, `Cargo.lock`), артефакты сборки (`dist/`, `build/`, `.next/`, `node_modules/`, `.venv/`, `target/`), бинарники и дампы БД.
+- Ищите символьно (`serena`: `get_symbols_overview`, `find_symbol`, `find_referencing_symbols`) и точечно (`tokenade skeleton`/`query`, `code_search.py`, `git grep -n`), читайте диапазоны (`StartLine`/`EndLine`), не перечитывайте неизменённые файлы. Модели `Gemini Flash` запрещены — используйте `Gemini 4 Hydrogen` (`low..xhigh`).
 
 ## 3. Оркестрация и контекст
 
-- Работайте в штатном Orchestrator (`Plan <-> Execute`). Для понятных follow-up задач сразу передавайте краткий план в `exit_plan_mode`, чтобы чтение и правку сделал исполнитель. Для сложных задач исследуйте зависимости полностью.
+- Работайте в штатном Orchestrator (`Plan <-> Execute`). Для понятных follow-up задач сразу передавайте краткий план в `exit_plan_mode`, чтобы чтение и правку сделал исполнитель. Объёмный ресерч репозитория (`code-explorer`/`research`) и проверку живого UI (`browser` на `Gemini 4 Hydrogen`) делегируйте через `invoke_subagent`.
 - Для многосессионного handoff используйте компактный `continuity.py handoff` (без копирования исходников и логов).
 
 ## 4. Code Work Gate (по риску компонентов и операции, не по числу строк)

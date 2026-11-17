@@ -65,6 +65,7 @@ _GIT_TOK = _exe_pat("git")
 _RG_TOK = _exe_pat("rg")
 _CODEX_TOK = _exe_pat("codex", _EXT_CMD_EXE)
 _AGY_TOK = _exe_pat("agy", _EXT_CMD_EXE)
+_TOKENADE_TOK = _exe_pat("tokenade", _EXT_CMD_EXE)
 _RO_SCRIPTS_TOK = _exe_pat("code_search|stack_doctor", _EXT_PY)
 _WT_GUARD_TOK = _exe_pat("worktree_guard", _EXT_PY)
 _WT_GUARD_MUT_TOK = _exe_pat("worktree_guard", _EXT_PY, allow_dq_vars=True)
@@ -103,7 +104,8 @@ READ_ONLY_CMD_RE = re.compile(
     r"|Get-ItemProperty\b|gp\b|Get-ItemPropertyValue\b|gpv\b|Get-CimInstance\b|gcim\b|Get-WmiObject\b|gwmi\b"
     r"|Get-WinEvent\b|Get-EventLog\b|Get-Process\b|gps\b|Get-Service\b|gsv\b|Get-Location\b|gl\b|Write-Output\b"
     rf"|(?:&\s*)?{_CODEX_TOK}\s+(?:--version|login\s+status|exec\b[^|;&\r\n]*-s\s+read-only\b)"
-    rf"|(?:&\s*)?{_AGY_TOK}\s+(?:--help|--version|plugin\s+(?:list|help))"
+    rf"|(?:&\s*)?{_AGY_TOK}\s+(?:--help|--version|plugin\s+(?:list|help)|mcp\s+(?:list|help)|models\b)"
+    rf"|(?:&\s*)?{_TOKENADE_TOK}\s+(?:--version|--help|help|map|query|skeleton|semantic|ask|sem|impact|expand-ref|gain|dashboard|healthcheck|detect|measure|statusline)\b"
     rf"|(?:&\s*)?{_PY_INTERP_PAT}\s+{_PY_SAFE_FLAGS_PAT}(?:{_RO_SCRIPTS_TOK}|{_WT_GUARD_TOK}\s+(?:audit|status)\b)"
     r")(?:\s+[^|;&\r\n]*)?"
     rf"|(?:&\s*)?{_GIT_TOK}\s+(?:--no-pager\s+)?(?:-C\s+[\"']?[^\"'|;&\r\n]+[\"']?\s+)?branch(?:\s+(?:--list|-l|-a|--all|-r|--remotes|-v|-vv|--show-current|--no-color))*"
@@ -211,7 +213,7 @@ INLINE_PY_WRITE_RE = re.compile(
 
 
 def _strip_null_pipe(cmd: str) -> str:
-    return re.sub(r"^\s*\$null\s*\|\s*", "", (cmd or "").strip(), flags=re.IGNORECASE)
+    return rio.unwrap_tokenade_command(cmd)
 
 
 _PS_DQ_PAT = r'"(?:`[\s\S]|""|[^"`])*"'

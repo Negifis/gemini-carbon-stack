@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import pathlib
+import shutil
 import ssl
 import subprocess
 import sys
@@ -129,6 +130,24 @@ def run_diagnostics(cwd: str = "", compact: bool = False) -> dict[str, Any]:
     err_log = rio.state_dir("logs") / "hook-errors.jsonl"
     recent_errors = len(rio.read_jsonl(err_log))
 
+    mcp_cfg_path = pathlib.Path.home() / ".gemini" / "config" / "mcp_config.json"
+    mcp_cfg = rio.read_json(mcp_cfg_path, default={})
+    raw_servers = mcp_cfg.get("mcpServers") if isinstance(mcp_cfg, dict) else None
+    mcp_servers = raw_servers if isinstance(raw_servers, dict) else {}
+    serena_cfg = mcp_servers.get("serena")
+    cli_settings = rio.read_json(pathlib.Path.home() / ".gemini" / "antigravity-cli" / "settings.json", default={})
+    token_opt_info = {
+        "tokenade_cli": shutil.which("tokenade") or shutil.which("tokenade.cmd"),
+        "uvx_cli": shutil.which("uvx") or shutil.which("uvx.exe"),
+        "mcp_servers": sorted(mcp_servers.keys()),
+        "serena_lazy_filtered": bool(
+            isinstance(serena_cfg, dict)
+            and serena_cfg.get("eager") is False
+            and serena_cfg.get("enabledTools")
+        ),
+        "cli_use_g1_credits_safe": bool(isinstance(cli_settings, dict) and cli_settings.get("useG1Credits") is False),
+    }
+
     mem = carbon_memory.memory_stats(cwd=cwd or os.getcwd())
     codex_info = {
         "binary": codex_lane.find_codex_binary(),
@@ -165,6 +184,7 @@ def run_diagnostics(cwd: str = "", compact: bool = False) -> dict[str, Any]:
         },
         "rules": rules,
         "codex_lane": codex_info,
+        "token_optimization": token_opt_info,
         "memory": mem,
         "active_chips": chips_info.get("active_count", 0),
         "gate_anomaly_handler": handler_sess or None,

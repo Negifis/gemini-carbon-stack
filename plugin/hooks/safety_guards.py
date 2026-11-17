@@ -34,13 +34,24 @@ DESTRUCTIVE_GIT_RE = re.compile(
     re.IGNORECASE,
 )
 
+_CMD_BACKTICK_RE = re.compile(r"`([A-Za-z0-9_-])")
+
+
+def _strip_cmd_backticks(text: str) -> str:
+    # SAFETY: Normalize PowerShell backtick-escaped command tokens in `norm_cmd` while `stripped` preserves literal paths for `resolve_command_cwd`.
+    if "`" not in text:
+        return text
+    return _CMD_BACKTICK_RE.sub(r"\1", text)
+
+
 def guard_shell_command(cmd: str, cwd: str) -> tuple[str, str | None]:
-    stripped = (cmd or "").strip()
+    stripped = rio.unwrap_tokenade_command(cmd or "")
     if not stripped:
         return "allow", None
+    norm_cmd = _strip_cmd_backticks(stripped)
 
     # 1. Block unsafe bare `git worktree remove` (unless invoked inside worktree_guard.py itself)
-    if BARE_WORKTREE_REMOVE_RE.search(stripped) and "worktree_guard.py" not in stripped:
+    if BARE_WORKTREE_REMOVE_RE.search(norm_cmd) and "worktree_guard.py" not in norm_cmd:
         guard_script = rio.normalize_path(TOOLS_DIR / "worktree_guard.py")
         return (
             "deny",
@@ -49,7 +60,7 @@ def guard_shell_command(cmd: str, cwd: str) -> tuple[str, str | None]:
         )
 
     # 2. Protect uncommitted dirty worktree from destructive git wipe commands
-    if DESTRUCTIVE_GIT_RE.search(stripped):
+    if DESTRUCTIVE_GIT_RE.search(norm_cmd):
         eff_cwd = rio.resolve_command_cwd(stripped, cwd)
         git_root = rio.git_toplevel(eff_cwd)
         if git_root:
@@ -170,6 +181,67 @@ def guard_subagent_invocation(
     return "allow", None, None
 
 
+def guard_swarm_wait(payload: dict[str, Any]) -> tuple[str, str | None]:
+    # SAFETY: Prevent coordinator deadlock when calling `swarm_wait` after all active workers have already posted to the board.
+    tp = payload.get("transcriptPath")
+    if rio.is_subagent_session(tp):
+        return "allow", None
+    session = rio.session_key(payload)
+    if not session or session == "unknown":
+        return "allow", None
+    brain_root: pathlib.Path | None = None
+    if tp:
+        try:
+            p = pathlib.Path(str(tp)).resolve()
+            if len(p.parents) >= 4 and p.parents[1].name == ".system_generated":
+                brain_root = p.parents[3]
+        except OSError:
+            pass
+    if brain_root is None:
+        brain_root = rio.resolve_brain_root()
+    members = rio.load_swarm_members(brain_root, session)
+    if not members:
+        return "allow", None
+    raw_board = rio.read_jsonl(rio.swarm_dir(brain_root, session) / "board.jsonl")
+    if not raw_board:
+        return "allow", None
+
+    active_workers: list[str] = []
+    in_flight: list[str] = []
+    for mname, minfo in members.items():
+        if not isinstance(minfo, dict) or rio.is_swarm_role_member(mname, minfo) or rio.is_swarm_member_killed(minfo):
+            continue
+        active_workers.append(mname)
+        group_prefix = mname.rsplit("-", 1)[0] if re.search(r"-\d+$", mname) else ""
+        mention_pats = [re.compile(rf"(?<![A-Za-z0-9_-])@{re.escape(mname)}(?![A-Za-z0-9_-])", re.IGNORECASE)]
+        if group_prefix:
+            mention_pats.append(
+                re.compile(rf"(?<![A-Za-z0-9_-])@{re.escape(group_prefix)}(?![A-Za-z0-9_-])", re.IGNORECASE)
+            )
+        last_assign_seq = 0
+        last_reply_seq = 0
+        for idx, bp in enumerate(raw_board, start=1):
+            seq = int(bp.get("seq") or idx)
+            poster = str(bp.get("agent") or "")
+            btext = str(bp.get("text") or "")
+            if poster == "coordinator" and (any(mp.search(btext) for mp in mention_pats) or "@all" in btext.lower()):
+                last_assign_seq = seq
+            elif poster == mname:
+                last_reply_seq = seq
+        if last_assign_seq == 0 or last_reply_seq < last_assign_seq:
+            in_flight.append(mname)
+
+    if active_workers and not in_flight:
+        head_seq = int(raw_board[-1].get("seq") or len(raw_board))
+        return (
+            "deny",
+            f"[Swarm Wait Guard] Все активные воркеры роя ({', '.join(active_workers)}) уже опубликовали ответы на доске "
+            f"(head=#{head_seq}). Вызов `swarm_wait` сейчас приведёт к вечному ожиданию. "
+            "Не вызывайте `read_board` и `swarm_wait` в одном ходе: обработайте полученные сообщения и завершите воркеров через `swarm(action='kill', ...)`.",
+        )
+    return "allow", None
+
+
 def main() -> int:
     payload, err = rio.read_hook_stdin()
     if err or payload is None:
@@ -196,6 +268,13 @@ def main() -> int:
             decision, reason = guard_swarm_invocation(args)
             if decision != "allow":
                 rio.log_hook_event("hygiene-events", "model_guard_deny", session=session, reason=reason or "")
+                rio.emit_pre_tool(decision, reason=reason)
+                return 0
+
+        elif tool_name == "swarm_wait":
+            decision, reason = guard_swarm_wait(payload)
+            if decision != "allow":
+                rio.log_hook_event("hygiene-events", "swarm_wait_guard_deny", session=session, reason=reason or "")
                 rio.emit_pre_tool(decision, reason=reason)
                 return 0
 

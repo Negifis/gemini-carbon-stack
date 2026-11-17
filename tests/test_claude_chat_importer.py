@@ -39,7 +39,7 @@ class ClaudeChatImporterTestCase(unittest.TestCase):
         self.tmp.cleanup()
 
     def _populate_fixture_sessions(self) -> None:
-        proj_main = self.claude_dir / "C--Users-negif"
+        proj_main = self.claude_dir / "C--Users-developer"
         proj_bench = self.claude_dir / "D--SkyrimAI-bench"
 
         # INVARIANT: Continuation chains sharing custom-title merge chronologically into the latest UUID.
@@ -50,7 +50,7 @@ class ClaudeChatImporterTestCase(unittest.TestCase):
                 {
                     "type": "user",
                     "uuid": "u-1",
-                    "cwd": r"C:\Users\negif",
+                    "cwd": r"C:\Users\developer",
                     "timestamp": "2026-03-01T10:00:00.100Z",
                     "message": {"content": "Настрой Mikrotik WireGuard туннель"},
                 },
@@ -94,7 +94,7 @@ class ClaudeChatImporterTestCase(unittest.TestCase):
                 {
                     "type": "user",
                     "uuid": "u-bridge",
-                    "cwd": r"C:\Users\negif",
+                    "cwd": r"C:\Users\developer",
                     "timestamp": "2026-03-02T10:00:00.000Z",
                     "message": {
                         "content": "This session is being continued from a previous conversation that ran out of context."
@@ -103,7 +103,7 @@ class ClaudeChatImporterTestCase(unittest.TestCase):
                 {
                     "type": "user",
                     "uuid": "u-2",
-                    "cwd": r"C:\Users\negif",
+                    "cwd": r"C:\Users\developer",
                     "timestamp": "2026-03-02T10:01:00.000Z",
                     "message": {"content": "Добавь маршрут для подсети 10.10.0.0/24"},
                 },

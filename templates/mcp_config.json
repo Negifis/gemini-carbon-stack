@@ -1,0 +1,42 @@
+{
+  "mcpServers": {
+    "serena": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/oraios/serena",
+        "serena",
+        "start-mcp-server",
+        "--context=antigravity",
+        "--agent-interface=tools",
+        "--project-from-cwd",
+        "--enable-web-dashboard=False",
+        "--open-web-dashboard=False",
+        "--enable-gui-log-window=False"
+      ],
+      "eager": false,
+      "enabledTools": [
+        "activate_project",
+        "get_symbols_overview",
+        "find_symbol",
+        "find_referencing_symbols",
+        "find_implementations",
+        "find_declaration",
+        "search_for_pattern",
+        "get_diagnostics_for_file"
+      ]
+    },
+    "context7": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@upstash/context7-mcp"
+      ],
+      "eager": false,
+      "enabledTools": [
+        "resolve-library-id",
+        "query-docs"
+      ]
+    }
+  }
+}

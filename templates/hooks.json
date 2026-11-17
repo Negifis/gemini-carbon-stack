@@ -1,0 +1,16 @@
+{
+  "tokenade": {
+    "PreToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -X utf8 ~/.gemini/config/plugins/gemini-carbon-stack/hooks/tokenade_hook.py --event PreToolUse",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

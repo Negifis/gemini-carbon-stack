@@ -24,7 +24,7 @@ python -X utf8 "<PLUGIN_ROOT>/tools/claude_chat_importer.py" --json
 python -X utf8 "<PLUGIN_ROOT>/tools/claude_chat_importer.py" --verify --json
 ```
 
-Для выборочного импорта конкретных папок проектов передайте `--projects "C--Users-negif,D--FNVEE,D--SkyrimAI"`.
+Для выборочного импорта конкретных папок проектов передайте `--projects "<PROJECT_FOLDER_1>,<PROJECT_FOLDER_2>"`.
 
 ## 3. Синхронизация `agyhub_summaries_proto.pb` после закрытия Antigravity
 

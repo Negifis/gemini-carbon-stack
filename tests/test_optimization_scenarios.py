@@ -22,6 +22,7 @@ sys.path.insert(0, str(TESTS_DIR))
 import continuity as cont  # noqa: E402
 import cwg_common as cwg  # noqa: E402
 import cwg_mark  # noqa: E402
+import safety_guards as guards  # noqa: E402
 import test_runtime_and_gate as trg  # noqa: E402
 
 
@@ -895,6 +896,109 @@ class OptimizationScenariosTestCase(unittest.TestCase):
         )
         _, after_edit_out = self._h.run_hook("continuity.py", "PreToolUse", read_call)
         self.assertEqual(after_edit_out["decision"], "allow")
+
+        # INVARIANT: Tokenade CLI wrappers are unwrapped before classification and safety guards.
+        self.assertEqual(
+            cwg_mark.classify_shell_command(
+                '"C:\\tools\\tokenade.exe" wrap --shell powershell \'git status --short\''
+            ),
+            "READ_ONLY",
+        )
+        self.assertEqual(
+            cwg_mark.classify_shell_command(
+                '"C:\\tools\\tokenade.exe" wrap --shell powershell \'python -X utf8 -m unittest discover -s tests -v\''
+            ),
+            "VALIDATION",
+        )
+        self.assertEqual(
+            cwg_mark.classify_shell_command(
+                "tokenade wrap 'Remove-Item C:\\outside.txt -Force'; git status"
+            ),
+            "MUTATING",
+        )
+        for ro_tk in ("tokenade map", "tokenade skeleton app.py", "tokenade query main", "tokenade healthcheck"):
+            self.assertEqual(cwg_mark.classify_shell_command(ro_tk), "READ_ONLY", msg=ro_tk)
+        tk_dec, _ = guards.guard_shell_command("tokenade wrap 'git worktree remove C:\\wt'", str(self._h.workspace))
+        self.assertEqual(tk_dec, "deny")
+        bt_dec, _ = guards.guard_shell_command('tokenade wrap "git worktree re`move C:\\wt"', str(self._h.workspace))
+        self.assertEqual(bt_dec, "deny")
+        apo_dec, _ = guards.guard_shell_command('Write-Output "\'$(git worktree re`move C:\\wt)\'"', str(self._h.workspace))
+        self.assertEqual(apo_dec, "deny")
+        bt_repo = self._h.root / "repo`a"
+        self._h._init_git_repo(bt_repo, {"f.py": "x = 1\n"}, "init bt")
+        (bt_repo / "f.py").write_text("x = 2\n", encoding="utf-8")
+        clean_cwd = self._h.root / "clean_repo"
+        self._h._init_git_repo(clean_cwd, {"c.py": "c = 1\n"}, "init clean")
+        lit_bt_dec, _ = guards.guard_shell_command(f"git -C '{bt_repo}' reset --hard", str(clean_cwd))
+        self.assertEqual(lit_bt_dec, "deny")
+        smuggled_tk = '& "C:\\tools\\$(git reset --hard | Out-Null)tokenade.cmd" wrap \'git status --short\''
+        self.assertEqual(cwg_mark.classify_shell_command(smuggled_tk), "MUTATING")
+        (self._h.workspace / "app.py").write_text("dirty = 1\n", encoding="utf-8")
+        smug_dec, _ = guards.guard_shell_command(smuggled_tk, str(self._h.workspace))
+        self.assertEqual(smug_dec, "deny")
+
+        # INVARIANT: `swarm_wait` is blocked when all active swarm workers have already posted replies to the board,
+        # while `cwg_stop.py` still honors pending non-Codex background `run_command` tasks alongside idle unkilled workers.
+        self._h.add_swarm_worker(
+            name="simp-reuse-done",
+            model="claude-sonnet-5-5-high",
+            brief="Check reuse",
+            worker_post="@coordinator\nSIMPLIFY_LENS: REUSE\nSIMPLIFY_VERDICT: CLEAN",
+        )
+        _, sw_wait_out = self._h.run_hook(
+            "safety_guards.py",
+            "PreToolUse",
+            {"toolCall": {"id": "sw1", "name": "swarm_wait", "args": {"since": 1}}},
+        )
+        self.assertEqual(sw_wait_out["decision"], "deny")
+        self.assertIn("[Swarm Wait Guard]", sw_wait_out["reason"])
+
+        self._h.run_hook(
+            "cwg_mark.py",
+            "PostToolUse",
+            {"toolCall": {"id": "w_bg", "name": "write_file", "args": {"Path": str(app_py), "Content": "dirty = 1\n"}}, "error": ""},
+        )
+        now_iso = trg.iso_now()
+        self._h.steps.extend(
+            [
+                {
+                    "step_index": len(self._h.steps),
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": now_iso,
+                    "tool_calls": [{"name": "run_command", "args": {"CommandLine": "python -X utf8 -m unittest -v"}}],
+                },
+                {
+                    "step_index": len(self._h.steps) + 1,
+                    "source": "MODEL",
+                    "type": "GENERIC",
+                    "status": "DONE",
+                    "created_at": now_iso,
+                    "content": "Tool is running as a background task with task id: bg-unittest-01\n",
+                },
+            ]
+        )
+        self._h._flush_transcript()
+        self._h.add_final_response("Waiting for background test task...")
+        _, bg_allow = self._h.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": False})
+        self.assertEqual(bg_allow, {"decision": "allow"})
+
+        self._h.steps.append(
+            {
+                "step_index": len(self._h.steps),
+                "source": "SYSTEM",
+                "type": "SYSTEM_MESSAGE",
+                "status": "DONE",
+                "created_at": trg.iso_now(),
+                "content": 'Task id "bg-unittest-01" finished with result:\nCommand exited with code 0.\n',
+            }
+        )
+        self._h._flush_transcript()
+        _, idle_worker_blk = self._h.run_hook(
+            "cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": False}
+        )
+        self.assertEqual(idle_worker_blk["decision"], "continue")
 
 
 if __name__ == "__main__":

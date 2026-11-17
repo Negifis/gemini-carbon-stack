@@ -1,0 +1,18 @@
+{
+  "allowNonWorkspaceAccess": true,
+  "artifactReviewPolicy": "always-proceed",
+  "model": "Orchestrator (Argon)",
+  "useG1Credits": false,
+  "permissions": {
+    "allow": [
+      "command(node -v; npm -v; pnpm -v; git --version)",
+      "command(npx tsc --noEmit)",
+      "command(npm run build)",
+      "command(npm test)"
+    ]
+  },
+  "toolPermission": "always-proceed",
+  "trustedWorkspaces": [
+    "<YOUR_WORKSPACE_PATH>"
+  ]
+}

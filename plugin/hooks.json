@@ -39,7 +39,7 @@
     "enabled": true,
     "PreToolUse": [
       {
-        "matcher": "run_command|invoke_subagent|swarm",
+        "matcher": "run_command|invoke_subagent|swarm|swarm_wait",
         "hooks": [
           {
             "type": "command",

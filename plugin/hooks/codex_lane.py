@@ -53,8 +53,9 @@ OUTAGE_PATTERNS = tuple(
     )
 )
 
-REVIEW_ID_RE = re.compile(r"REVIEW_ID\s*:\s*([A-Za-z0-9_-]{8,64})")
-_ABORTED_RID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+_RID_TOKEN_PAT = r"[A-Za-z0-9_-]{6,64}"
+REVIEW_ID_RE = re.compile(rf"REVIEW_ID\s*:\s*({_RID_TOKEN_PAT})")
+_ABORTED_RID_RE = re.compile(rf"^{_RID_TOKEN_PAT}$")
 
 
 def strip_task_envelope_tail(blob: str) -> str:
