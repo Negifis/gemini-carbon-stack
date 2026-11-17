@@ -21,10 +21,12 @@ sys.path.insert(0, str(TOOLS_DIR))
 
 import carbon_memory
 import chip_handoff
+import code_search
 import codex_lane
 import cwg_common as cwg
 import gate_inbox
 import runtime_io as rio
+import tokenade_hook
 
 
 def find_agy_cli() -> str | None:
@@ -137,7 +139,9 @@ def run_diagnostics(cwd: str = "", compact: bool = False) -> dict[str, Any]:
     serena_cfg = mcp_servers.get("serena")
     cli_settings = rio.read_json(pathlib.Path.home() / ".gemini" / "antigravity-cli" / "settings.json", default={})
     token_opt_info = {
-        "tokenade_cli": shutil.which("tokenade") or shutil.which("tokenade.cmd"),
+        "tokenade_cli": tokenade_hook.find_tokenade_bin(),
+        "tokenade_auto_wrap": tokenade_hook.is_auto_wrap_enabled(),
+        "ripgrep_cli": code_search.find_rg(),
         "uvx_cli": shutil.which("uvx") or shutil.which("uvx.exe"),
         "mcp_servers": sorted(mcp_servers.keys()),
         "serena_lazy_filtered": bool(

@@ -212,13 +212,17 @@ def extract_subagent_final_texts(subagent_transcript_path: str | None) -> tuple[
     return "\n\n".join(txt for _, txt, _, _ in chunks), last_ts, finished
 
 
-SIMPLIFY_COMBINED_NAME_RE = re.compile(r"^simplify(?:-reviewer)?(?:-r\d+)?$", re.IGNORECASE)
+SIMPLIFY_COMBINED_NAME_RE = re.compile(
+    r"^(?:simplify(?:-reviewer)?|simp-all(?:-[0-9a-f]{2,4})?)(?:-r\d+)?$",
+    re.IGNORECASE,
+)
 SYSTEM_SWARM_ERR_RE = re.compile(
     r'\[Message\]\s+timestamp=\S+\s+sender=system\b[^\n]*Swarm Worker \((?P<name>[A-Za-z0-9._-]+)\)[^\n]*with id "(?P<cid>[A-Za-z0-9._-]+)" encountered an error[^\n]*?:\s*(?P<err>.+)',
     re.IGNORECASE,
 )
 MODEL_FAILURE_RE = re.compile(
-    r"(?:RESOURCE_EXHAUSTED|quota[^\n]{0,30}(?:exceeded|exhausted|reached|0%)|"
+    r"(?:RESOURCE_EXHAUSTED|(?:out\s+of|insufficient|no)\s+quota|"
+    r"quota[^\n]{0,30}(?:exceeded|exhausted|reached|depleted|0%)|"
     r"rate[ _-]limit|429\b|503\b|502\b|"
     r"model[^\n]{0,40}(?:unavailable|at\s+capacity|not\s+found|not\s+supported|invalid|unknown)|"
     r"(?:unknown|invalid|unsupported)\s+model|"
@@ -247,15 +251,14 @@ def _classify_simplify_worker(name: str, brief_or_role: str, output_text: str) -
     if len(explicit) > 1:
         return ("combined", None) if has_verdict else ("other", None)
 
-    low_name = (name or "").lower()
-    for lens in cwg.SIMPLIFY_LENSES:
-        if lens in low_name:
-            return ("lens", lens)
+    name_lens = cwg.simplify_lens_from_worker_name(name)
+    if name_lens:
+        return ("lens", name_lens)
 
     if SIMPLIFY_COMBINED_NAME_RE.match((name or "").strip()):
         return ("combined", None) if has_verdict else ("other", None)
 
-    if "simplify" in low_name or "simplify" in (brief_or_role or "").lower():
+    if cwg.is_simplify_worker_name(name) or "simplify" in (brief_or_role or "").lower():
         low_brief = (brief_or_role or "").lower()
         matched = [lens for lens in cwg.SIMPLIFY_LENSES if re.search(rf"\b{lens}\b", low_brief)]
         if len(matched) == 1:
@@ -370,9 +373,11 @@ def _collect_generic_results(steps: list[dict[str, Any]], planner_idx: int) -> l
     out: list[tuple[str, str, float]] = []
     while g_cur < len(steps) and steps[g_cur].get("type") == "GENERIC":
         g_st = steps[g_cur]
-        out.append(
-            (str(g_st.get("status") or ""), str(g_st.get("content") or ""), rio.parse_iso_ts(g_st.get("created_at")))
-        )
+        g_txt = str(g_st.get("content") or "")
+        g_err = str(g_st.get("error") or "").strip()
+        if g_err and g_err not in g_txt:
+            g_txt = f"{g_txt}\n{g_err}".strip()
+        out.append((str(g_st.get("status") or ""), g_txt, rio.parse_iso_ts(g_st.get("created_at"))))
         g_cur += 1
     return out
 
@@ -443,7 +448,7 @@ def scan_swarm_activity(
         if any(cwg.SONNET_HIGH_MODEL in m for m in models):
             sonnet_issue_verified = True
             simplify_failures += 1
-        elif not models.isdisjoint(cwg.SIMPLIFY_FALLBACK_MODELS) and "simplify" in worker_name.lower():
+        elif not models.isdisjoint(cwg.SIMPLIFY_FALLBACK_MODELS) and cwg.is_simplify_worker_name(worker_name):
             simplify_failures += 1
 
     requested_models: dict[str, set[str]] = {}
@@ -454,6 +459,97 @@ def scan_swarm_activity(
     pending_codex_tasks: dict[str, tuple[str, float]] = {}
     pending_bg_tasks: set[str] = set()
     idle_unkilled_workers: list[str] = []
+
+    def _inspect_swarm_tool_result(
+        tc: dict[str, Any],
+        g_status: str,
+        blob: str,
+        call_ts: float,
+        step_pos: int | None,
+        allow_missing_avail: bool = True,
+    ) -> None:
+        nonlocal sonnet_issue_verified
+        args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+        action = str(args.get("action") or "").strip().lower()
+        wname = str(args.get("name") or "").strip()
+        req_model = str(args.get("model") or "").strip().lower()
+        mdata = _extract_json_dict(blob)
+
+        if wname and req_model:
+            requested_models.setdefault(wname, set()).add(req_model)
+        if action == "model" and wname and call_ts:
+            model_switches.setdefault(wname, []).append((call_ts, f"[model-switch:{req_model}]", step_pos))
+
+        if action == "models" and mdata is not None:
+            avail = set(mdata.get("models") or [])
+            quotas = mdata.get("quotas") or {}
+            if avail and allow_missing_avail:
+                if cwg.OPUS_HIGH_MODEL not in avail:
+                    _mark_opus_issue(call_ts)
+                if cwg.SONNET_HIGH_MODEL not in avail:
+                    sonnet_issue_verified = True
+            opus_q = str((quotas.get(cwg.OPUS_HIGH_MODEL) or {}).get("quota_remaining") or "")
+            if opus_q in ("0%", "0"):
+                _mark_opus_issue(call_ts)
+            sonnet_q = str((quotas.get(cwg.SONNET_HIGH_MODEL) or {}).get("quota_remaining") or "")
+            if sonnet_q in ("0%", "0"):
+                sonnet_issue_verified = True
+
+        err_detail = (str((mdata or {}).get("error") or "") + "\n" + blob).strip()
+        json_err = bool(mdata and mdata.get("error"))
+        is_err = (g_status == "ERROR") or json_err or (
+            mdata is None and ("error" in blob.lower() or "failed" in blob.lower())
+        )
+        # INVARIANT: Only model/quota/availability failures count (never duplicate worker names or bad args).
+        if is_err and req_model and MODEL_FAILURE_RE.search(err_detail):
+            _record_model_failure({req_model}, wname, call_ts)
+
+    if transcript_path and rio.has_prefix_slice_gap(steps):
+        tail_first = (
+            steps[1]
+            if (len(steps) > 1 and steps[0].get("step_index") == 0)
+            else (steps[0] if steps else None)
+        )
+        tail_idx = tail_first.get("step_index") if isinstance(tail_first, dict) else None
+        tail_ts = rio.parse_iso_ts(tail_first.get("created_at")) if isinstance(tail_first, dict) else 0.0
+        if isinstance(tail_idx, int) and tail_idx > 1 and (not tail_ts or tail_ts > first_ts - 2.0):
+            # SAFETY: Recover early candidate swarm model/quota signals evicted from `transcript_full.jsonl` tail window via compact `transcript.jsonl` without shifting `steps` indices.
+            compact_steps = rio.read_compact_transcript_steps(transcript_path, max_lines=16000)
+            for p_idx, p_st in enumerate(compact_steps):
+                s_idx = p_st.get("step_index")
+                if not isinstance(s_idx, int) or s_idx <= 0 or s_idx >= tail_idx:
+                    continue
+                if p_st.get("source") == "SYSTEM":
+                    p_sys_ts = rio.parse_iso_ts(p_st.get("created_at"))
+                    if not p_sys_ts or p_sys_ts >= first_ts - 2.0:
+                        for sm in SYSTEM_SWARM_ERR_RE.finditer(str(p_st.get("content") or "")):
+                            if MODEL_FAILURE_RE.search(sm.group("err")):
+                                key = (sm.group("name"), sm.group("cid"))
+                                host_worker_errors[key] = max(host_worker_errors.get(key, 0.0), p_sys_ts or time.time())
+                    continue
+                if p_st.get("source") != "MODEL" or p_st.get("type") != "PLANNER_RESPONSE":
+                    continue
+                p_call_ts = rio.parse_iso_ts(p_st.get("created_at"))
+                if p_call_ts and p_call_ts < first_ts - 2.0:
+                    continue
+                p_tcs = p_st.get("tool_calls") or []
+                if not any(isinstance(tc, dict) and tc.get("name") == "swarm" for tc in p_tcs):
+                    continue
+                p_gen = _collect_generic_results(compact_steps, p_idx)
+                for p_pos, p_tc in enumerate(p_tcs):
+                    if not isinstance(p_tc, dict) or p_tc.get("name") != "swarm":
+                        continue
+                    g_status, blob, _ = p_gen[p_pos] if p_pos < len(p_gen) else ("", "", 0.0)
+                    g_step = compact_steps[p_idx + 1 + p_pos] if (p_idx + 1 + p_pos) < len(compact_steps) else {}
+                    trunc = g_step.get("truncated_fields") or []
+                    _inspect_swarm_tool_result(
+                        p_tc,
+                        g_status,
+                        blob,
+                        p_call_ts,
+                        None,
+                        allow_missing_avail=("content" not in trunc),
+                    )
 
     for idx, st in enumerate(steps):
         if st.get("source") == "SYSTEM":
@@ -540,40 +636,7 @@ def scan_swarm_activity(
                 continue
             if tc.get("name") != "swarm":
                 continue
-            args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
-            action = str(args.get("action") or "").strip().lower()
-            wname = str(args.get("name") or "").strip()
-            req_model = str(args.get("model") or "").strip().lower()
-            mdata = _extract_json_dict(blob)
-
-            if wname and req_model:
-                requested_models.setdefault(wname, set()).add(req_model)
-            if action == "model" and wname and call_ts:
-                model_switches.setdefault(wname, []).append((call_ts, f"[model-switch:{req_model}]", idx))
-
-            if action == "models" and mdata is not None:
-                avail = set(mdata.get("models") or [])
-                quotas = mdata.get("quotas") or {}
-                if avail:
-                    if cwg.OPUS_HIGH_MODEL not in avail:
-                        _mark_opus_issue(call_ts)
-                    if cwg.SONNET_HIGH_MODEL not in avail:
-                        sonnet_issue_verified = True
-                opus_q = str((quotas.get(cwg.OPUS_HIGH_MODEL) or {}).get("quota_remaining") or "")
-                if opus_q in ("0%", "0"):
-                    _mark_opus_issue(call_ts)
-                sonnet_q = str((quotas.get(cwg.SONNET_HIGH_MODEL) or {}).get("quota_remaining") or "")
-                if sonnet_q in ("0%", "0"):
-                    sonnet_issue_verified = True
-
-            err_detail = (str((mdata or {}).get("error") or "") + "\n" + blob).strip()
-            json_err = bool(mdata and mdata.get("error"))
-            is_err = (g_status == "ERROR") or json_err or (
-                mdata is None and ("error" in blob.lower() or "failed" in blob.lower())
-            )
-            # SECURITY INVARIANT: Only model/quota/availability failures count (never duplicate worker names or bad args).
-            if is_err and req_model and MODEL_FAILURE_RE.search(err_detail):
-                _record_model_failure({req_model}, wname, call_ts)
+            _inspect_swarm_tool_result(tc, g_status, blob, call_ts, idx)
 
     def _build_swarm_result(worker_activity_count: int | None = None) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -1379,12 +1442,13 @@ def validate_candidate_closure(
 
     sonnet_lenses = {k for k, lts in raw_sonnet_map.items() if is_review_fresh({"launch_ts": lts}, marker)}
     fallback_lenses = {k for k, lts in raw_fallback_map.items() if is_review_fresh({"launch_ts": lts}, marker)}
-    stale_sonnet_lenses = sorted((set(raw_sonnet_map) & required_lenses) - sonnet_lenses)
 
     sonnet_issue = bool(swarm_ev.get("sonnet_issue_verified"))
     simplify_failures = int(swarm_ev.get("simplify_failures") or 0) + int(sub_ev.get("simplify_failures") or 0)
     simplify_exhausted = simplify_failures >= 2
     effective_lenses = (sonnet_lenses | fallback_lenses) if sonnet_issue else sonnet_lenses
+    raw_effective_lenses = (set(raw_sonnet_map) | set(raw_fallback_map)) if sonnet_issue else set(raw_sonnet_map)
+    stale_simplify_lenses = sorted((raw_effective_lenses & required_lenses) - effective_lenses)
     missing_lenses = sorted(required_lenses - effective_lenses)
 
     raw_sonnet_combined = float(swarm_ev.get("sonnet_combined_ts") or 0.0)
@@ -1441,16 +1505,17 @@ def validate_candidate_closure(
                     f"simplify ran on fallback model without verified `{cwg.SONNET_HIGH_MODEL}` error/quota issue; "
                     f"run {target} on `{cwg.SONNET_HIGH_MODEL}` via `swarm`",
                 )
-            if stale_sonnet_lenses or (allow_combined and combined_stale):
+            if stale_simplify_lenses or (allow_combined and combined_stale):
                 stale_label = (
                     "combined simplify"
-                    if (allow_combined and combined_stale and not stale_sonnet_lenses)
-                    else f"simplify lenses ({', '.join(stale_sonnet_lenses)})"
+                    if (allow_combined and combined_stale and not stale_simplify_lenses)
+                    else f"simplify lenses ({', '.join(stale_simplify_lenses)})"
                 )
+                reverify_model = cwg.SIMPLIFY_FALLBACK_MODEL if sonnet_issue else cwg.SONNET_HIGH_MODEL
                 return (
                     False,
                     f"{stale_label} stale because durable files changed after simplify; "
-                    f"re-verify on `{cwg.SONNET_HIGH_MODEL}`",
+                    f"re-verify on `{reverify_model}`",
                 )
             if effective_risk == "STANDARD":
                 unstarted_simplify_reason = (
@@ -2128,6 +2193,26 @@ def validate_candidate_closure(
     return False, f"unsupported receipt kind `{rkind}`"
 
 
+def _merge_sticky_outage_state(state: dict[str, Any], swarm_ev: dict[str, Any]) -> None:
+    # INVARIANT: Propagate the earliest confirmed candidate outage timestamp bidirectionally between `state` and `swarm_ev`
+    # so a later in-window Opus failure never overwrites an earlier evicted Opus outage that authorized a Carbon fallback review.
+    if swarm_ev.get("sonnet_issue_verified") or state.get("sonnet_issue_verified"):
+        state["sonnet_issue_verified"] = True
+        swarm_ev["sonnet_issue_verified"] = True
+    if swarm_ev.get("opus_issue_verified") or state.get("opus_issue_verified"):
+        state["opus_issue_verified"] = True
+        swarm_ev["opus_issue_verified"] = True
+        obs_opus_ts = float(swarm_ev.get("opus_issue_ts") or 0.0)
+        prev_opus_ts = float(state.get("opus_issue_ts") or 0.0)
+        eff_opus_ts = (
+            min(obs_opus_ts, prev_opus_ts)
+            if (obs_opus_ts > 0.0 and prev_opus_ts > 0.0)
+            else (obs_opus_ts or prev_opus_ts)
+        )
+        state["opus_issue_ts"] = eff_opus_ts
+        swarm_ev["opus_issue_ts"] = eff_opus_ts
+
+
 def retire_candidate(
     session: str,
     marker_file: pathlib.Path,
@@ -2152,6 +2237,10 @@ def retire_candidate(
             "closed_ts": time.time(),
             "last_receipt": receipt_summary,
             "block_nonce": "",
+            "candidate_first_ts": 0.0,
+            "sonnet_issue_verified": False,
+            "opus_issue_verified": False,
+            "opus_issue_ts": 0.0,
         }
     )
     rio.write_json(state_file, state)
@@ -2458,6 +2547,11 @@ def main() -> int:
             state["block_nonce"] = ""
 
         first_ts = float(marker.get("first_ts") or 0.0)
+        if float(state.get("candidate_first_ts") or 0.0) != first_ts:
+            state["candidate_first_ts"] = first_ts
+            state["sonnet_issue_verified"] = False
+            state["opus_issue_verified"] = False
+            state["opus_issue_ts"] = 0.0
         assistant_msg = str(payload.get("lastAssistantMessage") or "") or rio.last_assistant_message(steps)
         receipt = cwg.parse_terminal_receipt(assistant_msg)
         cctx: dict[str, Any] | None = None
@@ -2513,6 +2607,7 @@ def main() -> int:
                 current_diff_hash=str(marker.get("current_diff_hash") or ""),
                 cwd=eff_cwd,
             )
+            _merge_sticky_outage_state(state, swarm_ev)
             codex_revs = codex_lane.scan_verified_codex_reviews(
                 since_ts=first_ts,
                 session=session,

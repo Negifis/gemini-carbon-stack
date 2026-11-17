@@ -45,10 +45,50 @@ def find_jev() -> str | None:
     return shutil.which("jev") or shutil.which("jev.exe") or shutil.which("jev.cmd")
 
 
+DEFAULT_WINDOWS_RG_PATH = (
+    "C:/tools/ripgrep-15.1.0-x86_64-pc-windows-msvc/ripgrep-15.1.0-x86_64-pc-windows-msvc/rg.exe"
+)
+_RG_CACHE: str | None | bool = False
+
+
 def find_rg() -> str | None:
-    on_path = shutil.which("rg") or shutil.which("rg.exe")
+    env_rg = os.environ.get("CARBON_RG_BIN", "").strip()
+    if env_rg and os.path.isfile(env_rg):
+        return env_rg
+    global _RG_CACHE
+    if _RG_CACHE is not False:
+        return _RG_CACHE  # type: ignore[return-value]
+    on_path = shutil.which("rg")
     if on_path:
+        _RG_CACHE = on_path
         return on_path
+    if os.name == "nt":
+        # INVARIANT: Probe fixed off-PATH Windows paths first before bounded `C:/tools/ripgrep*` fallback globs.
+        home = pathlib.Path.home()
+        local_app = os.environ.get("LOCALAPPDATA", "").strip()
+        fixed_candidates: list[pathlib.Path] = [
+            pathlib.Path(DEFAULT_WINDOWS_RG_PATH),
+            home / "scoop" / "shims" / "rg.exe",
+            home / ".cargo" / "bin" / "rg.exe",
+            pathlib.Path("C:/Program Files/ripgrep/rg.exe"),
+        ]
+        if local_app:
+            fixed_candidates.append(pathlib.Path(local_app) / "Microsoft" / "WinGet" / "Links" / "rg.exe")
+        for cand in fixed_candidates:
+            if cand.is_file():
+                _RG_CACHE = str(cand)
+                return _RG_CACHE
+        tools_root = pathlib.Path("C:/tools")
+        if tools_root.is_dir():
+            try:
+                for pat in ("ripgrep*/rg.exe", "ripgrep*/*/rg.exe"):
+                    for cand in sorted(tools_root.glob(pat), reverse=True):
+                        if cand.is_file():
+                            _RG_CACHE = str(cand)
+                            return _RG_CACHE
+            except OSError:
+                pass
+    _RG_CACHE = None
     return None
 
 

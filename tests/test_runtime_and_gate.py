@@ -6007,6 +6007,699 @@ class GateSubprocessTestCase(unittest.TestCase):
             self.assertIs(emitted[-1].get("network_outage"), True)
             self.assertEqual(emitted[-1].get("fallback"), "adversarial-reviewer")
 
+    def test_26_anom_9798766e_worker_rotation_stale_fallback_and_home_git_tree_guard(self) -> None:
+        sys.path.insert(0, str(REPO_ROOT / "plugin" / "hooks"))
+        sys.path.insert(0, str(REPO_ROOT / "plugin" / "tools"))
+        import cwg_common as cwg
+        import cwg_stop
+        import gate_inbox
+        import runtime_io as rio
+        import swarm_cache
+
+        with mock.patch.dict(os.environ, {"CARBON_STACK_HOME": str(self.stack_home)}):
+            # 1. `anom-9798766e`: `swarm_cache._rotated_worker_name` obeys Antigravity's 24-char native swarm limit
+            #    while keeping full `<lens>` intact (`simp-efficiency-fdd6-r2` / `-r3`, never `efficie`), and heals legacy `-efficie-`
+            self.assertEqual(swarm_cache.MAX_SWARM_WORKER_NAME_LEN, 24)
+            r2_p2 = swarm_cache._rotated_worker_name("simplify-efficiency-p2", 2)
+            self.assertEqual(r2_p2, "simp-efficiency-fdd6-r2")
+            self.assertLessEqual(len(r2_p2), 24)
+            r3_p2 = swarm_cache._rotated_worker_name(swarm_cache._base_worker_name(r2_p2), 3)
+            self.assertEqual(r3_p2, "simp-efficiency-fdd6-r3")
+            self.assertLessEqual(len(r3_p2), 24)
+            self.assertEqual(
+                swarm_cache._rotated_worker_name(swarm_cache._base_worker_name("simplify-efficie-fdd6-r2"), 3),
+                "simp-efficiency-fdd6-r3",
+            )
+            long_eff_rot = swarm_cache._rotated_worker_name(
+                "simplify-efficiency-very-long-phase-subsystem-suffix", 12
+            )
+            self.assertLessEqual(len(long_eff_rot), 24)
+            self.assertIn("efficiency", long_eff_rot)
+            self.assertTrue(long_eff_rot.endswith("-r12"))
+            self.assertTrue(swarm_cache._matches_label(r2_p2, "simplify", cwg.SIMPLIFY_FALLBACK_MODEL))
+            self.assertEqual(
+                cwg_stop._classify_simplify_worker(r2_p2, "", "SIMPLIFY_VERDICT: CLEAN"),
+                ("lens", "efficiency"),
+            )
+            self.assertEqual(
+                cwg_stop._classify_simplify_worker("simplify-efficie-fdd6-r3", "", "no explicit tag"),
+                ("lens", "efficiency"),
+            )
+
+            # 1b. `simp-*` worker names enforce Simplify Model Policy (`action="add"` without tags and `action="model"`)
+            #     and increment `simplify_failures` on fallback `RESOURCE_EXHAUSTED` inside `scan_swarm_activity`
+            import safety_guards
+
+            dec_add_carbon, why_add_carbon = safety_guards.guard_swarm_invocation(
+                {
+                    "action": "add",
+                    "name": r2_p2,
+                    "model": cwg.CARBON_HIGH_MODEL,
+                    "brief": "Review the incremental diff for redundant I/O.",
+                }
+            )
+            self.assertEqual(dec_add_carbon, "deny")
+            self.assertIn("Simplify Model Policy", why_add_carbon or "")
+            dec_mod_carbon, why_mod_carbon = safety_guards.guard_swarm_invocation(
+                {
+                    "action": "model",
+                    "name": r2_p2,
+                    "model": cwg.CARBON_HIGH_MODEL,
+                }
+            )
+            self.assertEqual(dec_mod_carbon, "deny")
+            self.assertIn("Simplify Model Policy", why_mod_carbon or "")
+            dec_mod_hyd, _ = safety_guards.guard_swarm_invocation(
+                {
+                    "action": "model",
+                    "name": r2_p2,
+                    "model": cwg.SIMPLIFY_FALLBACK_MODEL,
+                }
+            )
+            self.assertEqual(dec_mod_hyd, "allow")
+
+            exh_steps = [
+                {
+                    "step_index": 1,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": "2026-11-17T12:00:10Z",
+                    "tool_calls": [
+                        {
+                            "name": "swarm",
+                            "args": {
+                                "action": "add",
+                                "name": "simplify-efficiency-p2",
+                                "model": cwg.SONNET_HIGH_MODEL,
+                                "brief": "Efficiency lens.",
+                            },
+                        }
+                    ],
+                },
+                {
+                    "step_index": 2,
+                    "source": "MODEL",
+                    "type": "GENERIC",
+                    "status": "ERROR",
+                    "created_at": "2026-11-17T12:00:11Z",
+                    "content": '{"error": "RESOURCE_EXHAUSTED: quota exceeded"}',
+                },
+                {
+                    "step_index": 3,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": "2026-11-17T12:00:15Z",
+                    "tool_calls": [
+                        {
+                            "name": "swarm",
+                            "args": {
+                                "action": "add",
+                                "name": r2_p2,
+                                "model": cwg.SIMPLIFY_FALLBACK_MODEL,
+                                "brief": "Efficiency lens fallback.",
+                            },
+                        }
+                    ],
+                },
+                {
+                    "step_index": 4,
+                    "source": "MODEL",
+                    "type": "GENERIC",
+                    "status": "ERROR",
+                    "created_at": "2026-11-17T12:00:16Z",
+                    "content": '{"error": "RESOURCE_EXHAUSTED: capacity exhausted"}',
+                },
+            ]
+            exh_tp = self.root / "exh_session" / ".system_generated" / "logs" / "transcript.jsonl"
+            exh_tp.parent.mkdir(parents=True, exist_ok=True)
+            exh_tp.write_text("\n".join(json.dumps(s) for s in exh_steps) + "\n", encoding="utf-8")
+            exh_first_ts = rio.parse_iso_ts("2026-11-17T12:00:05Z")
+            sw_exh = cwg_stop.scan_swarm_activity(
+                exh_steps,
+                str(exh_tp),
+                exh_first_ts,
+                cwd=str(self.workspace),
+            )
+            self.assertTrue(sw_exh["sonnet_issue_verified"])
+            self.assertEqual(sw_exh["simplify_failures"], 2)
+
+            # 2. `anom-9798766e`: When Sonnet failed (`sonnet_issue_verified=True`), Round 3 ran all 3 lenses on Hydrogen fallback,
+            #    and a subsequent durable edit (`npm run installer-assets:sync`) invalidated all 3, `cwg_stop` reports ALL 3 stale
+            #    lenses (`efficiency, quality, reuse`) and instructs re-verifying on `gemini-4-hydrogen-xhigh` (not misleadingly
+            #    claiming only `efficiency` on `claude-sonnet-5-5-high`)!
+            t0 = 10_000.0
+            auth_p = str(self.workspace / "auth.py").replace("\\", "/")
+            marker_stale = {
+                "session": self.conv_id,
+                "first_ts": t0,
+                "last_ts": t0 + 900.0,
+                "last_durable_ts": t0 + 900.0,
+                "cwd": str(self.workspace).replace("\\", "/"),
+                "git_root": str(self.workspace).replace("\\", "/"),
+                "paths": [auth_p],
+                "content_marks": [
+                    {"ts": t0 + 10.0, "fp": "fp-r1"},
+                    {"ts": t0 + 400.0, "fp": "fp-r3"},
+                    {"ts": t0 + 900.0, "fp": "fp-post-sync"},
+                ],
+                "closed": False,
+            }
+            checks_ok = {
+                "checks": [{"kind": "check", "passed": True, "ts": t0 + 910.0}],
+                "passed_count": 1,
+                "failed_count": 0,
+                "latest_pass_ts": t0 + 910.0,
+                "latest_fail_ts": 0.0,
+            }
+            empty_sub = {
+                "fallback_lenses": {},
+                "fallback_lenses_end": {},
+                "fallback_combined_ts": 0.0,
+                "fallback_combined_end_ts": 0.0,
+                "simplify_launch_steps": set(),
+                "simplify_history": [],
+                "simplify_failures": 0,
+                "reviews": [],
+                "review_failures": [],
+                "in_flight_subagents": [],
+            }
+            sw_stale_fb = {
+                "sonnet_lenses": {"efficiency": t0 + 20.0},
+                "sonnet_lenses_end": {"efficiency": t0 + 30.0},
+                "fallback_lenses": {
+                    "efficiency": t0 + 500.0,
+                    "quality": t0 + 501.0,
+                    "reuse": t0 + 502.0,
+                },
+                "fallback_lenses_end": {
+                    "efficiency": t0 + 530.0,
+                    "quality": t0 + 535.0,
+                    "reuse": t0 + 525.0,
+                },
+                "sonnet_combined_ts": 0.0,
+                "fallback_combined_ts": 0.0,
+                "sonnet_combined_end_ts": 0.0,
+                "fallback_combined_end_ts": 0.0,
+                "simplify_launch_steps": set(),
+                "simplify_history": [],
+                "simplify_failures": 2,
+                "reviews": [],
+                "review_failures": [],
+                "in_flight_workers": [],
+                "idle_unkilled_workers": [],
+                "pending_bg_tasks": [],
+                "opus_issue_verified": False,
+                "opus_issue_ts": 0.0,
+                "sonnet_issue_verified": True,
+                "codex_cmd_failed": False,
+                "codex_issue_ts": 0.0,
+                "codex_issue_step": -1,
+                "codex_timeout_seen": False,
+                "aborted_codex_reviews": {},
+                "multi_lens_spoof": False,
+            }
+            ok_st, why_st = cwg_stop.validate_candidate_closure(
+                {"kind": "verified", "risk": "HIGH"},
+                marker_stale,
+                checks_ok,
+                empty_sub,
+                sw_stale_fb,
+                [],
+            )
+            self.assertFalse(ok_st)
+            self.assertIn("efficiency, quality, reuse", why_st)
+            self.assertIn(cwg.SIMPLIFY_FALLBACK_MODEL, why_st)
+
+            # 3. `msg-731aba10a071`: `rio.git_toplevel` refuses to climb from a non-git subdirectory into a stray `$HOME/.git`,
+            #    so `swarm_cache.prepare_round` returns `not_in_git_repo` immediately instead of running `git add -A` on `$HOME`!
+            fake_home = self.root / "fake_user_home"
+            self._init_git_repo(fake_home, {".gitconfig": "[user]\nname = Home\n"})
+            non_git_scratch = fake_home / ".gemini" / "antigravity" / "scratch" / "chat-bus"
+            non_git_scratch.mkdir(parents=True, exist_ok=True)
+            (non_git_scratch / "notes.txt").write_text("hello\n", encoding="utf-8")
+
+            with mock.patch.object(rio.pathlib.Path, "home", return_value=fake_home):
+                self.assertIsNone(rio.git_toplevel(str(non_git_scratch)))
+                self.assertIsNone(rio.git_toplevel(str(fake_home)))
+                self.assertEqual(
+                    rio.fold_path(rio.git_toplevel(str(non_git_scratch), include_home_root=True) or ""),
+                    rio.fold_path(str(fake_home)),
+                )
+                # Destructive git commands still get blocked (`deny`) both when climbing from a non-git child into `$HOME/.git`
+                # and when invoked directly in a dirty `$HOME` repo!
+                dec_climb_reset, why_climb_reset = safety_guards.guard_shell_command(
+                    "git reset --hard", str(non_git_scratch)
+                )
+                self.assertEqual(dec_climb_reset, "deny")
+                self.assertIn("Dirty Worktree Protection", why_climb_reset or "")
+                dec_home_reset, why_home_reset = safety_guards.guard_shell_command(
+                    "git reset --hard", str(fake_home)
+                )
+                self.assertEqual(dec_home_reset, "deny")
+                self.assertIn("Dirty Worktree Protection", why_home_reset or "")
+                prep_res = swarm_cache.prepare_round(
+                    session=self.conv_id,
+                    cwd=str(non_git_scratch),
+                    brain_root=self.brain,
+                    label="simplify",
+                )
+                self.assertFalse(prep_res["ok"])
+                self.assertIn("not_in_git_repo", str(prep_res.get("error") or ""))
+                # Inside a real child git repo under `$HOME`, `git_toplevel` returns the child repo normally
+                real_child_repo = fake_home / "projects" / "my-service"
+                self._init_git_repo(real_child_repo, {"main.py": "print(1)\n"})
+                self.assertEqual(
+                    rio.fold_path(rio.git_toplevel(str(real_child_repo)) or ""),
+                    rio.fold_path(str(real_child_repo)),
+                )
+
+            # 4. `msg-731aba10a071`: `rio.run_git` reaps the full process tree on `TimeoutExpired` and returns `124` cleanly
+            reaped: list[object] = []
+
+            class _HangingGitPopen:
+                pid = 999111
+
+                def communicate(self, input: bytes | None = None, timeout: float | None = None) -> tuple[bytes, bytes]:
+                    raise subprocess.TimeoutExpired(cmd=["git", "add", "-A"], timeout=timeout or 0.25)
+
+                def kill(self) -> None:
+                    return None
+
+            with (
+                mock.patch.object(rio, "_git_popen", return_value=_HangingGitPopen()),
+                mock.patch.object(rio, "reap_process_tree", side_effect=lambda p: (reaped.append(p) or (b"", b""))),
+            ):
+                rc_git_to, out_git_to, err_git_to = rio.run_git(str(self.workspace), ["add", "-A"], timeout=0.5)
+            self.assertEqual(rc_git_to, 124)
+            self.assertEqual(out_git_to, "")
+            self.assertIn("git_timeout_after_", err_git_to)
+            self.assertEqual(len(reaped), 1)
+
+            # 4b. Real OS process-tree reaping (BOTH forced post-spawn race order AND `spawn_with_kill_job` `CREATE_SUSPENDED`):
+            #     verify BOTH parent AND grandchild PIDs are terminated within bounded wall-clock time without hanging!
+            def _assert_pid_terminated(pid_val: int) -> None:
+                if os.name == "nt":
+                    import ctypes
+
+                    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                    k32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+                    k32.OpenProcess.restype = ctypes.c_void_p
+                    k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+                    k32.WaitForSingleObject.restype = ctypes.c_uint32
+                    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+                    k32.CloseHandle.restype = ctypes.c_int
+                    # SYNCHRONIZE = 0x00100000; WAIT_OBJECT_0 = 0
+                    hp = k32.OpenProcess(0x00100000, 0, pid_val)
+                    if hp:
+                        try:
+                            wait_rc = k32.WaitForSingleObject(ctypes.c_void_p(int(hp)), 1500)
+                            self.assertEqual(wait_rc, 0, f"grandchild PID {pid_val} survived reap_process_tree!")
+                        finally:
+                            k32.CloseHandle(ctypes.c_void_p(int(hp)))
+                else:
+                    deadline_p = time.time() + 1.5
+                    while time.time() < deadline_p:
+                        try:
+                            os.kill(pid_val, 0)
+                            time.sleep(0.05)
+                        except OSError:
+                            return
+                    self.fail(f"grandchild PID {pid_val} survived reap_process_tree!")
+
+            gc_pid_file = self.root / "grandchild.pid"
+            parent_code = (
+                "import subprocess, sys, time; "
+                "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+                f"open({str(gc_pid_file)!r}, 'w').write(str(p.pid)); "
+                "sys.stdout.write('spawned\\n'); sys.stdout.flush(); time.sleep(30)"
+            )
+            tree_kw = rio.subprocess_kwargs()
+            tree_kw.pop("capture_output", None)
+            tree_kw["stdout"] = subprocess.PIPE
+            tree_kw["stderr"] = subprocess.PIPE
+            if os.name != "nt":
+                tree_kw["start_new_session"] = True
+            # Scenario A: Forced worst-case race — wait until grandchild is ALREADY alive BEFORE `attach_kill_job(real_proc)`!
+            real_proc = subprocess.Popen([sys.executable, "-c", parent_code], **tree_kw)
+            deadline_gc = time.time() + 5.0
+            while not gc_pid_file.is_file() and time.time() < deadline_gc:
+                time.sleep(0.05)
+            gc_pid_a = int(gc_pid_file.read_text(encoding="utf-8").strip())
+            rio.attach_kill_job(real_proc)
+            t_reap0 = time.time()
+            rio.reap_process_tree(real_proc)
+            self.assertLess(time.time() - t_reap0, 4.0)
+            self.assertIsNotNone(real_proc.poll())
+            _assert_pid_terminated(gc_pid_a)
+
+            # Scenario B: Production `spawn_with_kill_job` (`CREATE_SUSPENDED` -> `AssignProcessToJobObject` -> `NtResumeProcess`)
+            gc_pid_file2 = self.root / "grandchild2.pid"
+            parent_code2 = parent_code.replace(repr(str(gc_pid_file)), repr(str(gc_pid_file2)))
+            susp_proc = rio.spawn_with_kill_job(subprocess.Popen, [sys.executable, "-c", parent_code2], **tree_kw)
+            deadline_gc2 = time.time() + 5.0
+            while not gc_pid_file2.is_file() and time.time() < deadline_gc2:
+                time.sleep(0.05)
+            gc_pid_b = int(gc_pid_file2.read_text(encoding="utf-8").strip())
+            t_reap1 = time.time()
+            rio.reap_process_tree(susp_proc)
+            self.assertLess(time.time() - t_reap1, 4.0)
+            self.assertIsNotNone(susp_proc.poll())
+            _assert_pid_terminated(gc_pid_b)
+
+            # Scenario C & D: `KeyboardInterrupt` (`BaseException`) inside `spawn_with_kill_job` after real `Popen` + Job attach
+            # (both on the `CREATE_SUSPENDED` branch before `NtResumeProcess` and on the regular fallback branch) reaps the
+            # unreturned process, closes its Job handle, and re-raises `KeyboardInterrupt` without leaking suspended/live children!
+            captured_spawned: list[subprocess.Popen[bytes]] = []
+            real_attach = rio.attach_kill_job
+
+            def _interrupt_after_attach(p_arg: object, *, walk_existing: bool = True) -> None:
+                real_attach(p_arg, walk_existing=walk_existing)
+                captured_spawned.append(p_arg)  # type: ignore[arg-type]
+                raise KeyboardInterrupt()
+
+            with mock.patch.object(rio, "attach_kill_job", side_effect=_interrupt_after_attach):
+                with self.assertRaises(KeyboardInterrupt):
+                    rio.run_git(str(self.workspace), ["--version"], timeout=5.0)
+            self.assertEqual(len(captured_spawned), 1)
+            self.assertIsNotNone(captured_spawned[0].poll())
+            self.assertIsNone(getattr(captured_spawned[0], "_carbon_job_handle", None))
+            _assert_pid_terminated(captured_spawned[0].pid)
+
+            captured_fallback: list[subprocess.Popen[bytes]] = []
+
+            def _interrupt_on_fallback(p_arg: object, *, walk_existing: bool = True) -> None:
+                real_attach(p_arg, walk_existing=walk_existing)
+                captured_fallback.append(p_arg)  # type: ignore[arg-type]
+                raise KeyboardInterrupt()
+
+            with (
+                mock.patch.object(rio, "_REAL_POPEN", object()),
+                mock.patch.object(rio, "attach_kill_job", side_effect=_interrupt_on_fallback),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    rio.spawn_with_kill_job(subprocess.Popen, [sys.executable, "-c", "import time; time.sleep(30)"], **tree_kw)
+            self.assertEqual(len(captured_fallback), 1)
+            self.assertIsNotNone(captured_fallback[0].poll())
+            self.assertIsNone(getattr(captured_fallback[0], "_carbon_job_handle", None))
+            _assert_pid_terminated(captured_fallback[0].pid)
+
+            # 5. `gate_inbox.unhandled_bus_reports` ignores `[TASK_DONE]` / `[LOCK_RELEASED]` / `[COORDINATION]` status updates
+            import sqlite3
+
+            handler_id = "a508fe71-2b38-458a-b726-7529ddc212ac"
+            gate_inbox.set_handler_config(session=handler_id, stack_repo=str(REPO_ROOT))
+            bus_dir = self.stack_home / "state" / "chat-bus"
+            bus_dir.mkdir(parents=True, exist_ok=True)
+            con = sqlite3.connect(str(bus_dir / "bus.db"))
+            try:
+                con.execute(
+                    "CREATE TABLE IF NOT EXISTS messages (msg_id TEXT PRIMARY KEY, thread_id TEXT, from_id TEXT, "
+                    "from_title TEXT, to_id TEXT, body TEXT, status TEXT, acked_ts REAL, created_ts REAL)"
+                )
+                con.executemany(
+                    "INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            "msg-done-1",
+                            "thr-done",
+                            "cd1bac13",
+                            "Swarm 2.0",
+                            handler_id,
+                            "[TASK_DONE] Swarm 2.0 + anom-94b1b435 fixes committed and pushed.",
+                            "delivered",
+                            0.0,
+                            t0 + 10.0,
+                        ),
+                        (
+                            "msg-coord-1",
+                            "thr-coord",
+                            "cd1bac13",
+                            "Swarm 2.0",
+                            handler_id,
+                            "[COORDINATION] Checking codex_lane.py lock.",
+                            "delivered",
+                            0.0,
+                            t0 + 11.0,
+                        ),
+                        (
+                            "msg-real-anom-1",
+                            "thr-anom",
+                            "ff6935a2",
+                            "Cross-Chat",
+                            handler_id,
+                            "[ANOMALY REPORT] swarm_cache.py prepare hung on $HOME/.git",
+                            "delivered",
+                            0.0,
+                            t0 + 12.0,
+                        ),
+                    ],
+                )
+                con.commit()
+            finally:
+                con.close()
+            unhandled = gate_inbox.unhandled_bus_reports(handler_session=handler_id)
+            self.assertEqual([m["msg_id"] for m in unhandled], ["msg-real-anom-1"])
+
+    def test_27_anom_fef0bde4_out_of_quota_and_evicted_prefix_recovery(self) -> None:
+        sys.path.insert(0, str(REPO_ROOT / "plugin" / "hooks"))
+        import cwg_common as cwg
+        import cwg_stop
+        import runtime_io as rio
+
+        with mock.patch.dict(
+            os.environ,
+            {"CARBON_STACK_HOME": str(self.stack_home), "ANTIGRAVITY_BRAIN_ROOT": str(self.brain)},
+        ):
+            first_ts = rio.parse_iso_ts("2026-11-17T13:00:00Z")
+            # 1. Non-quota argument/duplicate-name error MUST NOT set `sonnet_issue_verified`
+            dup_steps = [
+                {"step_index": 0, "source": "SYSTEM", "type": "SYSTEM_MESSAGE", "created_at": "2026-11-17T12:59:00Z", "content": "init"},
+                {
+                    "step_index": 1,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": "2026-11-17T13:01:00Z",
+                    "tool_calls": [
+                        {
+                            "name": "swarm",
+                            "args": {"action": "add", "name": "simplify-reuse-r1", "model": cwg.SONNET_HIGH_MODEL, "brief": "Reuse"},
+                        }
+                    ],
+                },
+                {
+                    "step_index": 2,
+                    "source": "MODEL",
+                    "type": "GENERIC",
+                    "status": "ERROR",
+                    "created_at": "2026-11-17T13:01:01Z",
+                    "content": "Encountered error in step execution: worker simplify-reuse-r1 already exists",
+                },
+            ]
+            dup_sw = cwg_stop.scan_swarm_activity(dup_steps, None, first_ts, cwd=str(self.workspace))
+            self.assertFalse(dup_sw["sonnet_issue_verified"])
+
+            # 2. Native Antigravity `"is out of quota until ..."` error (both in `content` and in `error` field,
+            #    and across a `transcript_full.jsonl` tail-slice boundary recovered from compact `transcript.jsonl`)
+            sess_cid = "sess-anom-fef0bde4"
+            logs_dir = self.brain / sess_cid / ".system_generated" / "logs"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            compact_tp = logs_dir / "transcript.jsonl"
+            full_tp = logs_dir / "transcript_full.jsonl"
+
+            compact_records = [
+                {"step_index": 0, "source": "SYSTEM", "type": "SYSTEM_MESSAGE", "created_at": "2026-11-17T12:59:00Z", "content": "init"},
+                {
+                    "step_index": 119,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": "2026-11-17T13:30:13Z",
+                    "tool_calls": [
+                        {
+                            "name": "swarm",
+                            "args": {
+                                "action": json.dumps("add"),
+                                "name": json.dumps("simplify-reuse-r11"),
+                                "model": json.dumps(cwg.SONNET_HIGH_MODEL),
+                                "brief": json.dumps("Read-only REUSE lens"),
+                            },
+                        }
+                    ],
+                },
+                {
+                    "step_index": 120,
+                    "source": "MODEL",
+                    "type": "GENERIC",
+                    "status": "ERROR",
+                    "error": 'model claude-sonnet-5-5-high is out of quota until 2026-11-23T05:24:46Z; pick another from swarm{action:"models"}',
+                    "created_at": "2026-11-17T13:30:43Z",
+                    "content": "",
+                },
+                {
+                    "step_index": 121,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": "2026-11-17T14:00:00Z",
+                    "content": "Continuing after compaction.",
+                },
+            ]
+            compact_tp.write_text("\n".join(json.dumps(r) for r in compact_records) + "\n", encoding="utf-8")
+
+            # Simulate `transcript_full.jsonl` tail slice starting right at `step_index=120` (splitting step 119 & 120 across `tail_idx`!)
+            evicted_tail_steps = [
+                compact_records[0],
+                {
+                    "step_index": 120,
+                    "source": "MODEL",
+                    "type": "GENERIC",
+                    "status": "ERROR",
+                    "error": compact_records[2]["error"],
+                    "created_at": "2026-11-17T13:30:43Z",
+                    "content": 'Encountered error in step execution: model claude-sonnet-5-5-high is out of quota until 2026-11-23T05:24:46Z; pick another from swarm{action:"models"}',
+                },
+                compact_records[3],
+            ]
+            full_tp.write_text("\n".join(json.dumps(r) for r in evicted_tail_steps) + "\n", encoding="utf-8")
+
+            sw_rec = cwg_stop.scan_swarm_activity(evicted_tail_steps, str(full_tp), first_ts, cwd=str(self.workspace))
+            self.assertTrue(sw_rec["sonnet_issue_verified"])
+            self.assertEqual(sw_rec["simplify_failures"], 1)
+
+            # 3. End-to-end `cwg_stop.py` sticky candidate state: once `sonnet_issue_verified` is observed for `first_ts`,
+            #    it survives subsequent durable edits (`candidate_key` changes) within the same `first_ts` candidate, and resets on a new `first_ts`.
+            auth_mod = self.workspace / "auth_service.py"
+            auth_mod.write_text("SECRET_V = 1\n", encoding="utf-8")
+            self.run_hook(
+                "cwg_mark.py",
+                "PostToolUse",
+                {"toolCall": {"id": "w_a1", "name": "write_file", "args": {"Path": str(auth_mod), "Content": "SECRET_V = 1\n"}}, "error": ""},
+            )
+            self.steps.append(
+                {
+                    "step_index": len(self.steps),
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": iso_now(),
+                    "tool_calls": [
+                        {
+                            "name": "swarm",
+                            "args": {"action": "add", "name": "simplify-reuse-s1", "model": cwg.SONNET_HIGH_MODEL, "brief": "Reuse"},
+                        }
+                    ],
+                }
+            )
+            self.steps.append(
+                {
+                    "step_index": len(self.steps),
+                    "source": "MODEL",
+                    "type": "GENERIC",
+                    "status": "ERROR",
+                    "created_at": iso_now(),
+                    "error": 'model claude-sonnet-5-5-high is out of quota until 2026-11-23T05:24:46Z; pick another from swarm{action:"models"}',
+                    "content": "",
+                }
+            )
+            self._flush_transcript()
+            self.add_final_response("Checking gate.")
+            _, first_stop = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
+            self.assertEqual(first_stop.get("decision"), "continue")
+            sfile = cwg.enforcement_state_path(self.conv_id)
+            saved_state = rio.read_json(sfile, default={})
+            self.assertTrue(saved_state.get("sonnet_issue_verified"))
+
+            # Subsequent durable edit changes `candidate_key` (`latest_fp`) while keeping `first_ts` — sticky flag MUST remain True!
+            time.sleep(0.02)
+            auth_mod.write_text("SECRET_V = 2\n", encoding="utf-8")
+            self.run_hook(
+                "cwg_mark.py",
+                "PostToolUse",
+                {"toolCall": {"id": "w_a2", "name": "write_file", "args": {"Path": str(auth_mod), "Content": "SECRET_V = 2\n"}}, "error": ""},
+            )
+            # Even if transcript loses the earlier Sonnet failure line completely, sticky state for `first_ts` preserves `sonnet_issue_verified`!
+            self.steps = [self.steps[0]]
+            self._flush_transcript()
+            _, second_stop = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True, "lastAssistantMessage": "Check 2."})
+            self.assertEqual(second_stop.get("decision"), "continue")
+            saved_state2 = rio.read_json(sfile, default={})
+            self.assertTrue(saved_state2.get("sonnet_issue_verified"))
+            # Block message must NOT falsely claim Sonnet wasn't attempted when `sonnet_issue_verified` is sticky True
+            mfile = cwg.marker_path(self.conv_id)
+            mdata = rio.read_json(mfile, default={})
+            mdata["first_ts"] = float(mdata.get("first_ts") or 0.0) + 500.0
+            rio.write_json(mfile, mdata)
+            _, third_stop = self.run_hook("cwg_stop.py", "Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True, "lastAssistantMessage": "New candidate."})
+            self.assertEqual(third_stop.get("decision"), "continue")
+            saved_state3 = rio.read_json(sfile, default={})
+            self.assertFalse(saved_state3.get("sonnet_issue_verified"))
+
+            # 4. Sticky earliest `opus_issue_ts` propagates back into `swarm_ev` even when a later Opus failure (`t=180`)
+            #    is also observed in the current slice, keeping a Carbon fallback review at `t=150` valid!
+            st_opus: dict[str, object] = {"opus_issue_verified": True, "opus_issue_ts": 120.0, "sonnet_issue_verified": True}
+            sw_later: dict[str, object] = {
+                "sonnet_lenses": {},
+                "sonnet_lenses_end": {},
+                "fallback_lenses": {"reuse": 130.0, "quality": 131.0, "efficiency": 132.0},
+                "fallback_lenses_end": {"reuse": 140.0, "quality": 141.0, "efficiency": 142.0},
+                "sonnet_combined_ts": 0.0,
+                "fallback_combined_ts": 0.0,
+                "sonnet_combined_end_ts": 0.0,
+                "fallback_combined_end_ts": 0.0,
+                "simplify_launch_steps": set(),
+                "simplify_history": [],
+                "simplify_failures": 1,
+                "reviews": [
+                    {
+                        "engine": "internal-carbon",
+                        "model": cwg.CARBON_HIGH_MODEL,
+                        "verdict": "APPROVED",
+                        "launch_ts": 150.0,
+                        "verdict_ts": 160.0,
+                        "kind": "ordinary",
+                        "xhigh": False,
+                    }
+                ],
+                "review_failures": [180.0],
+                "in_flight_workers": [],
+                "idle_unkilled_workers": [],
+                "pending_bg_tasks": [],
+                "opus_issue_verified": True,
+                "opus_issue_ts": 180.0,
+                "sonnet_issue_verified": False,
+                "codex_cmd_failed": True,
+                "codex_issue_ts": 110.0,
+                "codex_issue_step": 1,
+                "codex_timeout_seen": False,
+                "aborted_codex_reviews": {},
+                "multi_lens_spoof": False,
+            }
+            marker_opus = {
+                "session": self.conv_id,
+                "first_ts": 100.0,
+                "last_ts": 105.0,
+                "last_durable_ts": 105.0,
+                "cwd": str(self.workspace).replace("\\", "/"),
+                "git_root": str(self.workspace).replace("\\", "/"),
+                "paths": [str(auth_mod).replace("\\", "/")],
+                "content_marks": [{"ts": 105.0, "fp": "fp-opus"}],
+                "closed": False,
+            }
+            checks_opus = {"checks": [{"kind": "check", "passed": True, "ts": 108.0}], "passed_count": 1, "failed_count": 0, "latest_pass_ts": 108.0, "latest_fail_ts": 0.0}
+            sub_opus = {"fallback_lenses": {}, "fallback_lenses_end": {}, "fallback_combined_ts": 0.0, "fallback_combined_end_ts": 0.0, "simplify_launch_steps": set(), "simplify_history": [], "simplify_failures": 0, "reviews": [], "review_failures": [], "in_flight_subagents": []}
+            # Without merging sticky `120.0`, `opus_issue_ts=180.0` rejects the `t=150.0` Carbon fallback review
+            sw_pre_merge = dict(sw_later)
+            sw_pre_merge["sonnet_issue_verified"] = True
+            ok_pre, _ = cwg_stop.validate_candidate_closure({"kind": "verified", "risk": "HIGH"}, marker_opus, checks_opus, sub_opus, sw_pre_merge, [])
+            self.assertFalse(ok_pre)
+            # After `_merge_sticky_outage_state`, `opus_issue_ts=120.0` propagates back into `swarm_ev` and validates cleanly!
+            cwg_stop._merge_sticky_outage_state(st_opus, sw_later)
+            self.assertEqual(st_opus["opus_issue_ts"], 120.0)
+            self.assertEqual(sw_later["opus_issue_ts"], 120.0)
+            self.assertTrue(sw_later["sonnet_issue_verified"])
+            ok_opus, why_opus = cwg_stop.validate_candidate_closure({"kind": "verified", "risk": "HIGH"}, marker_opus, checks_opus, sub_opus, sw_later, [])
+            self.assertTrue(ok_opus, why_opus)
+
 
 if __name__ == "__main__":
     unittest.main()

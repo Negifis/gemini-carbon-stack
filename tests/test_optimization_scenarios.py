@@ -1000,6 +1000,153 @@ class OptimizationScenariosTestCase(unittest.TestCase):
         )
         self.assertEqual(idle_worker_blk["decision"], "continue")
 
+    def test_09_tokenade_hook_antigravity_bridge_and_code_search_off_path_rg(self) -> None:
+        sys.path.insert(0, str(TOOLS_DIR))
+        import code_search
+        import runtime_io as rio
+        import tokenade_hook
+
+        fake_tk = self._h.root / "fake_tokenade.py"
+        fake_tk.write_text("# stub\n", encoding="utf-8")
+
+        captured_bridge_inputs: list[dict] = []
+
+        def _fake_tk_run(cmd, **kw):
+            req = json.loads((kw.get("input") or b"{}").decode("utf-8"))
+            captured_bridge_inputs.append(req)
+            inner_c = req["tool_input"]["command"]
+            if "\n" in inner_c:
+                return subprocess.CompletedProcess(cmd, 0, b"", b"")
+            esc = inner_c.replace("'", "''")
+            out_obj = {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "updatedInput": {
+                        "command": f"& 'C:/tools/tokenade.exe' wrap --shell powershell '{esc}'"
+                    },
+                }
+            }
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(out_obj).encode("utf-8"), b"")
+
+        with (
+            mock.patch.dict(os.environ, {"CARBON_TOKENADE_BIN": str(fake_tk)}, clear=False),
+            mock.patch.object(tokenade_hook.subprocess, "run", side_effect=_fake_tk_run),
+        ):
+            # 1. Enabled by default even when TOKENADE_AUTO_WRAP is unset; translates Antigravity `toolCall.args.CommandLine`
+            os.environ.pop("TOKENADE_AUTO_WRAP", None)
+            rw_cd = tokenade_hook.transform_pretool_payload(
+                {
+                    "event": "PreToolUse",
+                    "toolCall": {
+                        "name": "run_command",
+                        "args": {"CommandLine": 'Set-Location "C:\\repo"\n$null | npm test'},
+                    },
+                }
+            )
+            self.assertIsNotNone(rw_cd)
+            assert rw_cd is not None
+            self.assertTrue(rw_cd.startswith('Set-Location "C:\\repo"\n'))
+            self.assertIn("wrap --shell powershell '$null | npm test'", rw_cd)
+            # Round-trip unwrap preserves exact original command and gate `VALIDATION` recognition!
+            self.assertEqual(rio.unwrap_tokenade_command(rw_cd), 'Set-Location "C:\\repo"\n$null | npm test')
+            self.assertEqual(cwg_mark.classify_shell_command(rw_cd), "VALIDATION")
+
+            # 2. Protocol CLIs (`codex_lane.py`, `install.py`, `chat-bus`, etc.) and multiline scripts are never wrapped
+            self.assertIsNone(
+                tokenade_hook.transform_pretool_payload(
+                    {
+                        "toolCall": {
+                            "name": "run_command",
+                            "args": {"CommandLine": "$null | python -X utf8 codex_lane.py review --cwd C:/repo"},
+                        }
+                    }
+                )
+            )
+            self.assertIsNone(
+                tokenade_hook.transform_pretool_payload(
+                    {
+                        "toolCall": {
+                            "name": "run_command",
+                            "args": {"CommandLine": "$a = 1\n$b = 2\nWrite-Output $a"},
+                        }
+                    }
+                )
+            )
+
+            # 3. Explicit `TOKENADE_AUTO_WRAP=0` disables wrapping cleanly
+            with mock.patch.dict(os.environ, {"TOKENADE_AUTO_WRAP": "0"}):
+                self.assertIsNone(
+                    tokenade_hook.transform_pretool_payload(
+                        {"toolCall": {"name": "run_command", "args": {"CommandLine": "npm test"}}}
+                    )
+                )
+
+            # 3b. Commands with `"` or trailing `\` in `stripped_core` on Windows bypass wrapping (preventing PS 5.1 quote stripping)
+            unsafe_double_quote_cases = (
+                'Write-Output "a b"',
+                'Write-Output "SAFE; Write-Output EXECUTED"',
+                'Write-Output ""; $x=42; Write-Output $x',
+            )
+            if os.name == "nt":
+                for unsafe_ps51 in (*unsafe_double_quote_cases, "git status C:\\repo\\"):
+                    self.assertIsNone(
+                        tokenade_hook.transform_pretool_payload(
+                            {"toolCall": {"name": "run_command", "args": {"CommandLine": unsafe_ps51}}}
+                        ),
+                        msg=f"expected PS 5.1 unsafe command to stay unwrapped: {unsafe_ps51}",
+                    )
+            self.assertEqual(len(captured_bridge_inputs), 1)
+            self.assertEqual(captured_bridge_inputs[0]["tool_input"]["command"], "$null | npm test")
+
+        # 3c. End-to-end execution parity in real Windows PowerShell 5.1 (`powershell.exe`) + real Tokenade CLI (if installed)
+        import shutil
+
+        ps51_bin = shutil.which("powershell.exe") if os.name == "nt" else None
+        real_tk_bin = tokenade_hook.find_tokenade_bin() if os.name == "nt" else None
+        if ps51_bin and real_tk_bin:
+            parity_cases = [
+                *unsafe_double_quote_cases,
+                "Write-Output 'a b'",
+                "Write-Output 'SAFE; Write-Output EXECUTED'",
+                "Write-Output ''; $x=42; Write-Output $x",
+                "Write-Output C:\\repo\\",
+                f'Set-Location "{self._h.root}"\nWrite-Output \'cd-ok; still literal\'',
+            ]
+            with mock.patch.dict(os.environ, {"TOKENADE_AUTO_WRAP": "1"}, clear=False):
+                for raw_ps_cmd in parity_cases:
+                    rewritten = tokenade_hook.transform_pretool_payload(
+                        {"toolCall": {"name": "run_command", "args": {"CommandLine": raw_ps_cmd}}}
+                    )
+                    eff_ps_cmd = rewritten or raw_ps_cmd
+                    base_res = subprocess.run(
+                        [ps51_bin, "-NoProfile", "-NonInteractive", "-Command", raw_ps_cmd],
+                        capture_output=True,
+                        text=True,
+                        timeout=15.0,
+                    )
+                    wrap_res = subprocess.run(
+                        [ps51_bin, "-NoProfile", "-NonInteractive", "-Command", eff_ps_cmd],
+                        capture_output=True,
+                        text=True,
+                        timeout=15.0,
+                    )
+                    self.assertEqual(wrap_res.returncode, base_res.returncode, msg=raw_ps_cmd)
+                    self.assertEqual(wrap_res.stdout, base_res.stdout, msg=raw_ps_cmd)
+
+        # 4. `code_search.find_rg()` honors `CARBON_RG_BIN` and off-PATH Windows fallback without leaking `_RG_CACHE`
+        fake_rg = self._h.root / "custom_rg.exe"
+        fake_rg.write_text("MZ", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"CARBON_RG_BIN": str(fake_rg)}):
+            self.assertEqual(code_search.find_rg(), str(fake_rg))
+        with (
+            mock.patch.object(code_search, "_RG_CACHE", False),
+            mock.patch.dict(os.environ, {"CARBON_RG_BIN": ""}),
+            mock.patch.object(code_search.shutil, "which", return_value=None),
+        ):
+            if os.name == "nt" and pathlib.Path(code_search.DEFAULT_WINDOWS_RG_PATH).is_file():
+                self.assertIsNotNone(code_search.find_rg())
+
 
 if __name__ == "__main__":
     unittest.main()

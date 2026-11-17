@@ -59,12 +59,7 @@ def validate_warm_worker_verdicts(
             stale_rejected += 1
             continue
 
-        default_lens = ""
-        low_agent = agent.lower()
-        for candidate_lens in cwg.SIMPLIFY_LENSES:
-            if candidate_lens in low_agent:
-                default_lens = candidate_lens
-                break
+        default_lens = cwg.simplify_lens_from_worker_name(agent)
         parsed = parse_simplify_verdict(text, default_lens=default_lens)
         if not parsed.get("verdict"):
             continue
@@ -193,8 +188,13 @@ def unresolved_summary(limit: int = 5, handler_session: str | None = None) -> st
 
 
 _BUS_SNAPSHOT_RE = re.compile(r"^snapshot-[0-9a-f]{12}-\d{12}-[0-9a-f]{8}\.db$")
+_BUS_NON_ANOMALY_PREFIX_RE = re.compile(
+    r"^\s*\[(?:TASK_DONE|LOCK_ACQUIRED|LOCK_RELEASED|COORDINATION|RESOLVED|ACK)\b",
+    re.IGNORECASE,
+)
 _BUS_REPORT_RE = re.compile(
-    r"\[[A-Z0-9_-]{4,}(?:\s+[^\]]*)?\]|GATE_ANOMALY|\banom-[0-9a-f]{6,}\b|"
+    r"\[(?:[A-Z0-9_]*ANOMALY[A-Z0-9_]*|[A-Z0-9_]*DEADLOCK[A-Z0-9_]*|[A-Z0-9_]*REPORT[A-Z0-9_]*|[A-Z0-9_]*BUG[A-Z0-9_]*)(?:\s+[^\]]*)?\]|"
+    r"GATE_ANOMALY|\banom-[0-9a-f]{6,}\b|"
     r"\bdeadlock\b|\bcwg_stop\b|\bcodex_lane\b|\bsafety_guards\b|аномал",
     re.IGNORECASE,
 )
@@ -258,7 +258,7 @@ def unhandled_bus_reports(handler_session: str | None = None, limit: int = 10) -
                     break
                 for msg_id, thread_id, from_id, from_title, body, status, created_ts in batch:
                     body_s = str(body or "").strip()
-                    if not body_s or not _BUS_REPORT_RE.search(body_s):
+                    if not body_s or _BUS_NON_ANOMALY_PREFIX_RE.match(body_s) or not _BUS_REPORT_RE.search(body_s):
                         continue
                     anom_ids = [m.lower() for m in _ANOM_ID_RE.findall(body_s)]
                     if anom_ids:

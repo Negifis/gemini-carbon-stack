@@ -23,15 +23,30 @@ MAX_ROUND_HISTORY = 16
 _ROUND_SUFFIX_RE = re.compile(r"-r\d+$", re.IGNORECASE)
 
 
+def _base_worker_name(worker_name: str) -> str:
+    return _ROUND_SUFFIX_RE.sub("", (worker_name or "").strip())
+
+
 def _rotated_worker_name(base_name: str, round_num: int) -> str:
+    # INVARIANT: Native Antigravity `swarm(action="add")` rejects worker names > 24 chars; keep full `<lens>` intact via `simp-<lens>-<hash>-r<N>`.
     suffix = f"-r{round_num}"
     limit = max(1, MAX_SWARM_WORKER_NAME_LEN - len(suffix))
-    stem = (base_name or "worker").rstrip("-") or "w"
+    stem = _base_worker_name(base_name or "worker").rstrip("-") or "w"
+    low_stem = stem.lower()
+    if low_stem.startswith("simplify-efficie-") and len(stem) == 21:
+        stem = f"simp-efficiency-{stem[-4:]}"
+        low_stem = stem.lower()
     if len(stem) <= limit:
         return f"{stem}{suffix}"
     if limit <= 5:
         return f"{stem[:limit]}{suffix}"
     digest = hashlib.sha256(stem.encode("utf-8")).hexdigest()[:4]
+    if cwg.is_simplify_worker_name(low_stem):
+        tag = cwg.simplify_lens_from_worker_name(low_stem) or "all"
+        for dlen in (4, 3, 2):
+            compact = f"simp-{tag}-{digest[:dlen]}"
+            if len(compact) <= limit:
+                return f"{compact}{suffix}"
     prefix = stem[: limit - 5].rstrip("-") or "w"
     return f"{prefix}-{digest}{suffix}"
 
@@ -46,7 +61,7 @@ def _matches_label(worker_name: str, label: str, model: str = "") -> bool:
         return True
     low = (worker_name or "").strip().lower()
     model_low = (model or "").strip().lower()
-    is_simplify = "simplify" in low or any(k in low for k in cwg.SIMPLIFY_LENSES)
+    is_simplify = cwg.is_simplify_worker_name(low) or bool(cwg.simplify_lens_from_worker_name(low))
     if clean == "simplify":
         if not is_simplify:
             return False
@@ -62,10 +77,6 @@ def _matches_label(worker_name: str, label: str, model: str = "") -> bool:
             or "verifier" in low
         )
     return clean in low
-
-
-def _base_worker_name(worker_name: str) -> str:
-    return _ROUND_SUFFIX_RE.sub("", (worker_name or "").strip())
 
 
 def _summarize_diff_stat(diff_text: str) -> str:

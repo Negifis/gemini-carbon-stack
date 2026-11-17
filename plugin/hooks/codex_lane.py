@@ -10,7 +10,6 @@ import os
 import pathlib
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import time
@@ -1357,48 +1356,11 @@ def build_adversarial_prompt(
     )
 
 
-def _coerce_pipe_bytes(val: bytes | str | None) -> bytes:
-    if val is None:
-        return b""
-    if isinstance(val, bytes):
-        return val
-    return val.encode("utf-8", errors="replace")
+_coerce_pipe_bytes = rio.coerce_pipe_bytes
 
 
 def _kill_process_tree(proc: subprocess.Popen[bytes]) -> tuple[bytes, bytes]:
-    # SAFETY: Reap the full Codex child tree on timeout or cancellation and drain buffered pipe output without swallowing BaseException.
-    rem_out = b""
-    rem_err = b""
-    try:
-        if os.name == "nt":
-            try:
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                    timeout=5.0,
-                    **rio.subprocess_kwargs(),
-                )
-            except Exception:
-                pass
-        else:
-            killpg_fn = getattr(os, "killpg", None)
-            if callable(killpg_fn):
-                try:
-                    killpg_fn(proc.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
-                except OSError:
-                    pass
-    finally:
-        try:
-            proc.kill()
-        except OSError:
-            pass
-        try:
-            comm_res = proc.communicate(timeout=2.0)
-            if isinstance(comm_res, tuple) and len(comm_res) == 2:
-                rem_out = _coerce_pipe_bytes(comm_res[0])
-                rem_err = _coerce_pipe_bytes(comm_res[1])
-        except Exception:
-            pass
-    return rem_out, rem_err
+    return rio.reap_process_tree(proc)
 
 
 def _exec_codex_once(
@@ -1409,17 +1371,11 @@ def _exec_codex_once(
     review_id: str,
     xhigh: bool,
 ) -> _CodexExecResult | None:
-    kw = rio.subprocess_kwargs()
-    kw.pop("capture_output", None)
-    kw["stdin"] = subprocess.PIPE
-    kw["stdout"] = subprocess.PIPE
-    kw["stderr"] = subprocess.PIPE
-    if os.name != "nt":
-        kw["start_new_session"] = True
+    kw = rio.popen_kwargs(stdin_pipe=True)
     proc: subprocess.Popen[bytes] | None = None
     t_start = time.time()
     try:
-        proc = subprocess.Popen(cmd, cwd=cwd, **kw)
+        proc = rio.spawn_with_kill_job(subprocess.Popen, cmd, cwd=cwd, **kw)
         out_b, err_b = proc.communicate(input=prompt.encode("utf-8"), timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         kill_res = _kill_process_tree(proc) if proc is not None else None
@@ -1519,6 +1475,9 @@ def _exec_codex_once(
         if proc is not None:
             _kill_process_tree(proc)
         raise
+    finally:
+        if proc is not None:
+            rio.close_kill_job(proc, terminate=False)
 
     raw_stdout_text = (out_b or b"").decode("utf-8", errors="replace")
     stderr_text = (err_b or b"").decode("utf-8", errors="replace")

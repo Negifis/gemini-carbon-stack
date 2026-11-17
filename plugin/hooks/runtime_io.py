@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from contextlib import contextmanager
 from datetime import datetime
 import hashlib
@@ -12,6 +13,7 @@ import os
 import pathlib
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -925,6 +927,414 @@ def subprocess_kwargs() -> dict[str, Any]:
     return kw
 
 
+def popen_kwargs(*, stdin_pipe: bool = False) -> dict[str, Any]:
+    kw = subprocess_kwargs()
+    kw.pop("capture_output", None)
+    if stdin_pipe:
+        kw["stdin"] = subprocess.PIPE
+    kw["stdout"] = subprocess.PIPE
+    kw["stderr"] = subprocess.PIPE
+    if os.name != "nt":
+        kw["start_new_session"] = True
+    return kw
+
+
+def coerce_pipe_bytes(val: bytes | str | None) -> bytes:
+    if val is None:
+        return b""
+    if isinstance(val, bytes):
+        return val
+    return val.encode("utf-8", errors="replace")
+
+
+_WIN_JOB_API: Any = False
+_REAL_POPEN = subprocess.Popen
+_CREATE_SUSPENDED = 0x00000004
+_TH32CS_SNAPPROCESS = 0x00000002
+_PROCESS_TERMINATE = 0x0001
+_PROCESS_SET_QUOTA = 0x0100
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+
+def _is_real_int_handle(val: Any) -> bool:
+    return isinstance(val, int) and not isinstance(val, bool) and val > 0
+
+
+def _win_job_api() -> Any:
+    global _WIN_JOB_API
+    if _WIN_JOB_API is not False:
+        return _WIN_JOB_API
+    if os.name != "nt":
+        _WIN_JOB_API = None
+        return None
+    try:
+        import ctypes
+
+        class _FILETIME(ctypes.Structure):
+            _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+
+        class _PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", ctypes.c_uint32),
+                ("cntUsage", ctypes.c_uint32),
+                ("th32ProcessID", ctypes.c_uint32),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", ctypes.c_uint32),
+                ("cntThreads", ctypes.c_uint32),
+                ("th32ParentProcessID", ctypes.c_uint32),
+                ("pcPriClassBase", ctypes.c_int32),
+                ("dwFlags", ctypes.c_uint32),
+                ("szExeFile", ctypes.c_wchar * 260),
+            ]
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+        k32.CreateJobObjectW.restype = ctypes.c_void_p
+        k32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        k32.AssignProcessToJobObject.restype = ctypes.c_int
+        k32.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        k32.TerminateJobObject.restype = ctypes.c_int
+        k32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        k32.OpenProcess.restype = ctypes.c_void_p
+        k32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        k32.TerminateProcess.restype = ctypes.c_int
+        k32.GetProcessTimes.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_FILETIME),
+            ctypes.POINTER(_FILETIME),
+            ctypes.POINTER(_FILETIME),
+            ctypes.POINTER(_FILETIME),
+        ]
+        k32.GetProcessTimes.restype = ctypes.c_int
+        k32.CreateToolhelp32Snapshot.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+        k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+        k32.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_PROCESSENTRY32W)]
+        k32.Process32FirstW.restype = ctypes.c_int
+        k32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_PROCESSENTRY32W)]
+        k32.Process32NextW.restype = ctypes.c_int
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        k32.CloseHandle.restype = ctypes.c_int
+
+        ntdll = ctypes.WinDLL("ntdll")
+        ntdll.NtResumeProcess.argtypes = [ctypes.c_void_p]
+        ntdll.NtResumeProcess.restype = ctypes.c_int32
+
+        invalid_handle = (1 << (ctypes.sizeof(ctypes.c_void_p) * 8)) - 1
+        _WIN_JOB_API = (ctypes, k32, ntdll, _FILETIME, _PROCESSENTRY32W, invalid_handle)
+    except Exception:
+        _WIN_JOB_API = None
+    return _WIN_JOB_API
+
+
+def _win_proc_creation_time(api: Any, handle_int: int) -> int:
+    ctypes, k32, _, ft_cls, _, _ = api
+    c_ft = ft_cls()
+    e_ft = ft_cls()
+    k_ft = ft_cls()
+    u_ft = ft_cls()
+    if k32.GetProcessTimes(
+        ctypes.c_void_p(handle_int),
+        ctypes.byref(c_ft),
+        ctypes.byref(e_ft),
+        ctypes.byref(k_ft),
+        ctypes.byref(u_ft),
+    ):
+        return (int(c_ft.high) << 32) | int(c_ft.low)
+    return 0
+
+
+def _open_descendant_handles_windows(
+    api: Any,
+    root_pids: set[int],
+    min_ctime: int,
+    want_set_quota: bool = False,
+) -> list[tuple[int, int]]:
+    ctypes, k32, _, _, pe_cls, invalid_handle = api
+    snap = k32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+    if not snap or int(snap) == invalid_handle:
+        return []
+    children_map: dict[int, list[int]] = {}
+    try:
+        pe = pe_cls()
+        pe.dwSize = ctypes.sizeof(pe_cls)
+        ok = k32.Process32FirstW(ctypes.c_void_p(int(snap)), ctypes.byref(pe))
+        while ok:
+            pid = int(pe.th32ProcessID)
+            ppid = int(pe.th32ParentProcessID)
+            if pid > 4:
+                children_map.setdefault(ppid, []).append(pid)
+            ok = k32.Process32NextW(ctypes.c_void_p(int(snap)), ctypes.byref(pe))
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(int(snap)))
+
+    self_pid = os.getpid()
+    visited = set(root_pids)
+    queue: deque[int] = deque(root_pids)
+    opened: list[tuple[int, int]] = []
+    primary_rights = _PROCESS_TERMINATE | _PROCESS_QUERY_LIMITED_INFORMATION | (
+        _PROCESS_SET_QUOTA if want_set_quota else 0
+    )
+    fallback_rights = _PROCESS_TERMINATE | _PROCESS_QUERY_LIMITED_INFORMATION
+    try:
+        while queue:
+            cur = queue.popleft()
+            for cpid in children_map.get(cur, ()):
+                if cpid in visited or cpid == self_pid or cpid <= 4:
+                    continue
+                visited.add(cpid)
+                h_child = k32.OpenProcess(primary_rights, 0, cpid)
+                if not h_child and want_set_quota:
+                    h_child = k32.OpenProcess(fallback_rights, 0, cpid)
+                if not h_child:
+                    continue
+                h_int = int(h_child)
+                if min_ctime > 0:
+                    c_ctime = _win_proc_creation_time(api, h_int)
+                    if c_ctime > 0 and c_ctime + 10_000_000 < min_ctime:
+                        k32.CloseHandle(ctypes.c_void_p(h_int))
+                        continue
+                opened.append((cpid, h_int))
+                queue.append(cpid)
+    except BaseException:
+        for _, h_leak in opened:
+            k32.CloseHandle(ctypes.c_void_p(h_leak))
+        raise
+    return opened
+
+
+def attach_kill_job(proc: Any, *, walk_existing: bool = True) -> None:
+    api = _win_job_api()
+    if not api or proc is None:
+        return
+    raw_handle = getattr(proc, "_handle", None)
+    raw_pid = getattr(proc, "pid", None)
+    if not _is_real_int_handle(raw_handle) or not _is_real_int_handle(raw_pid):
+        return
+    ctypes, k32, _, _, _, _ = api
+    unowned_job = 0
+    try:
+        root_ctime = _win_proc_creation_time(api, int(raw_handle))
+        setattr(proc, "_carbon_root_ctime", root_ctime)
+        job = k32.CreateJobObjectW(None, None)
+        if not job:
+            return
+        unowned_job = int(job)
+        if not k32.AssignProcessToJobObject(ctypes.c_void_p(unowned_job), ctypes.c_void_p(int(raw_handle))):
+            k32.CloseHandle(ctypes.c_void_p(unowned_job))
+            unowned_job = 0
+            return
+        job_int = unowned_job
+        setattr(proc, "_carbon_job_handle", job_int)
+        setattr(proc, "_carbon_race_free_job", not walk_existing)
+        unowned_job = 0
+        seed_pids: set[int] = {int(raw_pid)}
+        if walk_existing:
+            # SAFETY: Retroactively attach any descendants spawned before `AssignProcessToJobObject(parent)` so they cannot escape job termination.
+            for _ in range(3):
+                desc = _open_descendant_handles_windows(api, seed_pids, root_ctime, want_set_quota=True)
+                new_found = False
+                closed_idx = -1
+                try:
+                    for idx_d, (dpid, dhandle) in enumerate(desc):
+                        try:
+                            k32.AssignProcessToJobObject(ctypes.c_void_p(job_int), ctypes.c_void_p(dhandle))
+                        finally:
+                            k32.CloseHandle(ctypes.c_void_p(dhandle))
+                            closed_idx = idx_d
+                        if dpid not in seed_pids:
+                            seed_pids.add(dpid)
+                            new_found = True
+                finally:
+                    for _, rem_h in desc[closed_idx + 1 :]:
+                        k32.CloseHandle(ctypes.c_void_p(rem_h))
+                if not new_found:
+                    break
+        setattr(proc, "_carbon_seed_pids", seed_pids)
+    except Exception:
+        if unowned_job:
+            k32.CloseHandle(ctypes.c_void_p(unowned_job))
+        return
+    except BaseException:
+        if unowned_job:
+            k32.CloseHandle(ctypes.c_void_p(unowned_job))
+        raise
+
+
+def _close_proc_streams(proc: Any) -> None:
+    for stream in (
+        getattr(proc, "stdout", None),
+        getattr(proc, "stderr", None),
+        getattr(proc, "stdin", None),
+    ):
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+
+def _abort_unreturned_spawn(proc: Any) -> None:
+    try:
+        reap_process_tree(proc)
+    finally:
+        close_kill_job(proc, terminate=True)
+        if getattr(proc, "returncode", None) is not None:
+            _close_proc_streams(proc)
+
+
+def spawn_with_kill_job(popen_fn: Any, cmd: list[str], **kw: Any) -> subprocess.Popen[bytes]:
+    api = _win_job_api()
+    orig_flags = int(kw.get("creationflags") or 0)
+    if os.name == "nt" and api is not None and popen_fn is _REAL_POPEN and not (orig_flags & _CREATE_SUSPENDED):
+        # SAFETY: Spawn real Windows child processes with `CREATE_SUSPENDED`, assign the Win32 Job Object before the initial thread
+        # executes a single instruction, and resume via `NtResumeProcess` so zero descendants can race ahead of job assignment.
+        ctypes, _, ntdll, _, _, _ = api
+        susp_kw = dict(kw)
+        susp_kw["creationflags"] = orig_flags | _CREATE_SUSPENDED
+        proc = popen_fn(cmd, **susp_kw)
+        try:
+            attach_kill_job(proc, walk_existing=False)
+            raw_h = getattr(proc, "_handle", None)
+            if _is_real_int_handle(raw_h) and ntdll.NtResumeProcess(ctypes.c_void_p(int(raw_h))) >= 0:
+                return proc
+        except Exception:
+            pass
+        except BaseException:
+            # SAFETY: Reap any unreturned child and close its Job Object on `KeyboardInterrupt`/`SystemExit` before caller binds `proc`.
+            _abort_unreturned_spawn(proc)
+            raise
+        _abort_unreturned_spawn(proc)
+    proc = popen_fn(cmd, **kw)
+    try:
+        attach_kill_job(proc, walk_existing=True)
+    except BaseException:
+        _abort_unreturned_spawn(proc)
+        raise
+    return proc
+
+
+def close_kill_job(proc: Any, *, terminate: bool = False) -> bool:
+    api = _win_job_api()
+    if not api or proc is None:
+        return False
+    job = getattr(proc, "_carbon_job_handle", None)
+    if not _is_real_int_handle(job):
+        return False
+    setattr(proc, "_carbon_job_handle", None)
+    ctypes, k32, _, _, _, _ = api
+    killed = False
+    try:
+        if terminate:
+            killed = bool(k32.TerminateJobObject(ctypes.c_void_p(int(job)), 1))
+        k32.CloseHandle(ctypes.c_void_p(int(job)))
+    except Exception:
+        pass
+    return killed
+
+
+def _taskkill_tree_windows(pid: int) -> None:
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            timeout=12.0,
+            **subprocess_kwargs(),
+        )
+    except Exception:
+        pass
+
+
+def _terminate_descendant_handles(
+    api: Any,
+    desc: list[tuple[int, int]],
+    seeds: set[int] | None = None,
+) -> None:
+    ctypes, k32, _, _, _, _ = api
+    for dpid, dhandle in desc:
+        if seeds is not None:
+            seeds.add(dpid)
+        try:
+            k32.TerminateProcess(ctypes.c_void_p(dhandle), 1)
+        finally:
+            k32.CloseHandle(ctypes.c_void_p(dhandle))
+
+
+def _drain_communicate(proc: subprocess.Popen[bytes], timeout: float) -> tuple[bytes, bytes]:
+    comm_res = proc.communicate(timeout=timeout)
+    if isinstance(comm_res, tuple) and len(comm_res) == 2:
+        return coerce_pipe_bytes(comm_res[0]), coerce_pipe_bytes(comm_res[1])
+    return b"", b""
+
+
+def reap_process_tree(proc: subprocess.Popen[bytes]) -> tuple[bytes, bytes]:
+    # SAFETY: Reap the full child process tree (Win32 Job Object + Toolhelp32 descendant sweep with 12s `taskkill /T` fallback on Windows,
+    # `os.killpg` on POSIX) and drain buffered output with a bounded timeout so callers never hang after TimeoutExpired.
+    rem_out = b""
+    rem_err = b""
+    job_killed = False
+    try:
+        if os.name == "nt":
+            api = _win_job_api()
+            raw_pid = getattr(proc, "pid", None)
+            raw_handle = getattr(proc, "_handle", None)
+            race_free_job = bool(
+                getattr(proc, "_carbon_race_free_job", False)
+                and _is_real_int_handle(getattr(proc, "_carbon_job_handle", None))
+            )
+            if race_free_job:
+                job_killed = close_kill_job(proc, terminate=True)
+            if not job_killed:
+                root_ctime = 0
+                seeds: set[int] = set()
+                pre_desc: list[tuple[int, int]] = []
+                if api and _is_real_int_handle(raw_pid) and _is_real_int_handle(raw_handle):
+                    root_ctime = int(getattr(proc, "_carbon_root_ctime", 0) or _win_proc_creation_time(api, int(raw_handle)))
+                    seeds = set(getattr(proc, "_carbon_seed_pids", None) or {int(raw_pid)})
+                    seeds.add(int(raw_pid))
+                    pre_desc = _open_descendant_handles_windows(api, seeds, root_ctime, want_set_quota=False)
+                job_killed = close_kill_job(proc, terminate=True)
+                if not job_killed:
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                if api and (pre_desc or (not job_killed and seeds)):
+                    _terminate_descendant_handles(api, pre_desc, seeds)
+                    if not job_killed:
+                        post_desc = _open_descendant_handles_windows(api, seeds, root_ctime, want_set_quota=False)
+                        _terminate_descendant_handles(api, post_desc)
+                elif not job_killed and not api and _is_real_int_handle(raw_pid):
+                    _taskkill_tree_windows(int(raw_pid))
+        else:
+            killpg_fn = getattr(os, "killpg", None)
+            if callable(killpg_fn):
+                try:
+                    killpg_fn(proc.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+                except OSError:
+                    pass
+    finally:
+        if not job_killed:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            rem_out, rem_err = _drain_communicate(proc, 0.5 if job_killed else 1.5)
+        except subprocess.TimeoutExpired:
+            raw_pid2 = getattr(proc, "pid", None)
+            if os.name == "nt" and _is_real_int_handle(raw_pid2):
+                _taskkill_tree_windows(int(raw_pid2))
+                try:
+                    rem_out, rem_err = _drain_communicate(proc, 1.5)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    return rem_out, rem_err
+
+
+_git_popen = subprocess.Popen
+
+
 def run_git(
     cwd: str,
     args: list[str],
@@ -932,29 +1342,73 @@ def run_git(
     text: bool = True,
     env: dict[str, str] | None = None,
 ) -> tuple[int, str | bytes, str]:
+    kw = popen_kwargs(stdin_pipe=False)
+    proc: subprocess.Popen[bytes] | None = None
+    comm_done = False
+    eff_to = max(0.25, timeout)
     try:
-        proc = subprocess.run(
+        proc = spawn_with_kill_job(
+            _git_popen,
             ["git", "--no-optional-locks"] + args,
             cwd=cwd,
             env=env,
-            timeout=max(0.25, timeout),
-            **subprocess_kwargs(),
+            **kw,
         )
+        out_b, err_b = proc.communicate(timeout=eff_to)
+        comm_done = True
+    except subprocess.TimeoutExpired:
+        if proc is not None:
+            reap_process_tree(proc)
+        return 124, "" if text else b"", f"git_timeout_after_{eff_to}s"
     except Exception as exc:
+        if proc is not None:
+            reap_process_tree(proc)
         return 127, "" if text else b"", str(exc)
-    err = proc.stderr.decode("utf-8", errors="replace") if proc.stderr else ""
+    except BaseException:
+        if proc is not None:
+            reap_process_tree(proc)
+        raise
+    finally:
+        if proc is not None:
+            close_kill_job(proc, terminate=False)
+            if comm_done:
+                _close_proc_streams(proc)
+    err = err_b.decode("utf-8", errors="replace") if err_b else ""
     if text:
-        out = proc.stdout.decode("utf-8", errors="replace") if proc.stdout else ""
+        out = out_b.decode("utf-8", errors="replace") if out_b else ""
         return proc.returncode, out, err
-    return proc.returncode, proc.stdout or b"", err
+    return proc.returncode, out_b or b"", err
 
 
-def git_toplevel(cwd: str | None) -> str | None:
+def _home_fold_path() -> str:
+    try:
+        return fold_path(os.path.abspath(str(pathlib.Path.home())))
+    except Exception:
+        return ""
+
+
+def is_unapproved_home_git_root(cwd: str | None, git_root: str | None) -> bool:
+    if not git_root:
+        return False
+    home_fold = _home_fold_path()
+    if not home_fold or fold_path(os.path.abspath(git_root)) != home_fold:
+        return False
+    if os.environ.get("CARBON_ALLOW_HOME_GIT_ROOT") == "1" and cwd and fold_path(os.path.abspath(cwd)) == home_fold:
+        return False
+    return True
+
+
+def git_toplevel(cwd: str | None, *, include_home_root: bool = False) -> str | None:
     if not cwd or not os.path.isdir(cwd):
         return None
     rc, out, _ = run_git(cwd, ["rev-parse", "--show-toplevel"], timeout=3.0)
     if rc == 0 and isinstance(out, str) and out.strip():
-        return os.path.abspath(out.strip())
+        top = os.path.abspath(out.strip())
+        # SAFETY: Never climb from a non-git subdirectory (`~/.gemini/antigravity/scratch/...`, `%TEMP%`, etc.)
+        # into a stray `$HOME/.git`, which would trigger `git add -A` / `git diff` across the entire user profile.
+        if not include_home_root and is_unapproved_home_git_root(cwd, top):
+            return None
+        return top
     return None
 
 
@@ -979,7 +1433,13 @@ def capture_worktree_tree_oid(git_root: str, timeout: float = 15.0) -> tuple[str
         if real_idx and os.path.isfile(real_idx):
             shutil.copy2(real_idx, tmp_index)
         env = dict(os.environ, GIT_INDEX_FILE=tmp_index)
-        rc1, _, err1 = run_git(git_root, ["add", "-A"], timeout=timeout, text=True, env=env)
+        rc1, _, err1 = run_git(
+            git_root,
+            ["-c", "core.fsmonitor=false", "add", "-A"],
+            timeout=timeout,
+            text=True,
+            env=env,
+        )
         if rc1 != 0:
             return "", f"git_add_failed:{err1.strip()[:160]}"
         rc2, tree_sha, err2 = run_git(git_root, ["write-tree"], timeout=timeout, text=True, env=env)

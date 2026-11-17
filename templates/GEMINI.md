@@ -5,12 +5,12 @@
 ## 1. Гигиена контекста и чтения файлов
 
 - Запрещено читать целиком lock-файлы (`package-lock.json`, `uv.lock`, `yarn.lock`, `pnpm-lock.yaml`, `Cargo.lock`), директории сборки и зависимостей (`dist/`, `build/`, `.next/`, `node_modules/`, `.venv/`, `target/`), бинарники и дампы БД.
-- Вместо чтения длинных файлов целиком используйте символьную LSP-навигацию (`serena`: `get_symbols_overview`, `find_symbol`, `find_referencing_symbols`), `tokenade skeleton` / `tokenade query`, `code_search.py` или `git grep -n`, затем читайте узкие диапазоны (`StartLine`/`EndLine`).
-- Не перечитывайте неизменённые файлы в рамках одной сессии.
+- Вместо чтения длинных файлов целиком или залпов по `4–8` файлов `[1-800]` используйте символьную LSP-навигацию (`serena`: `get_symbols_overview`, `find_symbol`, `find_referencing_symbols`), `tokenade skeleton` / `tokenade query`, `code_search.py` или `git grep -n`, затем читайте узкие диапазоны (`StartLine`/`EndLine`).
+- Не читайте превентивно посторонние `SKILL.md` и вложенные `AGENTS.md` пакетов, в которых вы не правите код; не нарезайте `steps/*/output.txt` через `read_file` (фильтруйте вывод на месте через `tokenade wrap` / `<cmd> | tokenade exec`) и не перечитывайте неизменённые файлы.
 
 ## 2. Делегирование и маршрутизация моделей
 
-- Объёмный ресерч по репозиторию делегируйте в `invoke_subagent` (`code-explorer` / `research`), а проверку живого веб-интерфейса — в субагент `browser` на `Gemini 4 Hydrogen`.
+- При поиске шире `2–3` файлов или в незнакомой подсистеме делегируйте разведку в `invoke_subagent` (`code-explorer` / `research`, возвращая только краткую выжимку `path:line-range`), а проверку живого веб-интерфейса — в субагент `browser` на `Gemini 4 Hydrogen`.
 - Модели `Gemini Flash` запрещены — используйте `Gemini 4 Hydrogen` (`low..xhigh`). Овердрафт кредитов (`useG1Credits`) отключён (`false`).
 - Для **Swarm 2.0** (разведка `3+` подсистем, параллельные билдеры, гейт) подключайте скилл `swarm-orchestration`: `swarm_ctl.py` для непересекающихся `owned_paths`/`worktree`, `.swarm/artifacts/*.md` (`<= 12` строк на доске) и `read_board(since=<id>)`.
 - Верификация `HIGH`/`XHIGH` идёт по порядку `unittest -> codex_lane.py review -> simplify (ALL при <=2 ф. и <=30 ст.) -> batch kill -> --closure`, с переиспользованием `waiting` воркеров через `@mention`.

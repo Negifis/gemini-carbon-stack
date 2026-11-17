@@ -373,8 +373,31 @@ NATIVE_REVIEWERS = frozenset({"adversarial-reviewer", "adversarial-reviewer-xhig
 XHIGH_NATIVE_REVIEWER = "adversarial-reviewer-xhigh"
 SIMPLIFY_REVIEWER = "simplify-reviewer"
 SIMPLIFY_AGENT_TYPES = SIMPLIFY_LENS_AGENTS | frozenset({SIMPLIFY_REVIEWER})
+COMPACT_SIMPLIFY_WORKER_RE = re.compile(
+    r"^simp-(?:reuse|quality|efficiency|efficie|all)(?:$|[-_][a-z0-9._-]*$)",
+    re.IGNORECASE,
+)
 ANTHROPIC_EPHEMERAL_TTL_SECONDS = 300
 SWARM_CACHE_SAFE_TTL_SECONDS = 270
+
+
+def is_simplify_worker_name(name: str | None) -> bool:
+    low = (name or "").strip().lower()
+    if not low:
+        return False
+    return "simplify" in low or bool(COMPACT_SIMPLIFY_WORKER_RE.match(low))
+
+
+def simplify_lens_from_worker_name(name: str | None) -> str:
+    low = (name or "").strip().lower()
+    if not low:
+        return ""
+    for lens in SIMPLIFY_LENSES:
+        if lens in low:
+            return lens
+    if "efficie" in low and is_simplify_worker_name(low):
+        return "efficiency"
+    return ""
 
 
 def swarm_stall_timeout_sec() -> float:
@@ -999,7 +1022,7 @@ def is_simplify_subagent_call(sub_type: str, role: str = "") -> bool:
     base = (sub_type or "").strip().lower().rsplit(":", 1)[-1]
     if base in SIMPLIFY_AGENT_TYPES:
         return True
-    return base in ("research", "self") and "simplify" in (role or "").strip().lower()
+    return base in ("research", "self") and is_simplify_worker_name(role)
 
 
 def gate_dir(*parts: str) -> pathlib.Path:

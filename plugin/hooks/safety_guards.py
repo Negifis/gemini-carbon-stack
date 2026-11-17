@@ -168,10 +168,18 @@ def guard_shell_command(cmd: str, cwd: str, session: str = "") -> tuple[str, str
     # 2. Protect uncommitted dirty worktree from destructive git wipe commands
     if DESTRUCTIVE_GIT_RE.search(norm_cmd):
         eff_cwd = rio.resolve_command_cwd(stripped, cwd)
-        git_root = rio.git_toplevel(eff_cwd)
+        git_root = rio.git_toplevel(eff_cwd, include_home_root=True)
         if git_root:
+            if rio.is_unapproved_home_git_root(eff_cwd, git_root) and (
+                rio.fold_path(os.path.abspath(eff_cwd)) != rio.fold_path(git_root)
+            ):
+                return (
+                    "deny",
+                    "[Dirty Worktree Protection] Разрушающая Git-команда запущена во вложенном каталоге без собственного `.git` и поднимется в корневой `$HOME/.git`, "
+                    "что грозит безвозвратной потерей файлов домашнего каталога.",
+                )
             rc, st_out, _ = rio.run_git(git_root, ["status", "--porcelain=v1"], timeout=4.0)
-            if rc == 0 and str(st_out or "").strip():
+            if (rc == 0 and str(st_out or "").strip()) or rc == 124:
                 guard_script = rio.normalize_path(TOOLS_DIR / "worktree_guard.py")
                 return (
                     "deny",
@@ -184,7 +192,7 @@ def guard_shell_command(cmd: str, cwd: str, session: str = "") -> tuple[str, str
 
 
 def _is_simplify_swarm_target(name: str, brief: str) -> bool:
-    if "simplify" in (name or "").strip().lower():
+    if cwg.is_simplify_worker_name(name):
         return True
     low_brief = (brief or "").lower()
     return "simplify_lens:" in low_brief or "simplify_verdict:" in low_brief
