@@ -189,4 +189,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    import pathlib as _pathlib
+
+    sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parent))
+    import runtime_io as _rio
+
+    _rio.maybe_exec_rust_cli("tokenade-hook")
     raise SystemExit(main())

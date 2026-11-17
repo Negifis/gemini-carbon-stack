@@ -1542,3 +1542,51 @@ def find_agy_cli() -> str | None:
         return on_path
     default_win = pathlib.Path.home() / "AppData" / "Local" / "agy" / "bin" / "agy.exe"
     return str(default_win) if default_win.is_file() else None
+
+
+def find_rust_binary() -> str | None:
+    if str(os.environ.get("CARBON_PURE_PYTHON") or "").strip().lower() in ("1", "true", "yes"):
+        return None
+    override = str(os.environ.get("CARBON_STACK_BIN") or "").strip()
+    if override and pathlib.Path(override).is_file():
+        return override
+    exe_name = "carbon-stack.exe" if os.name == "nt" else "carbon-stack"
+    local_bin = pathlib.Path(__file__).resolve().parent.parent / "bin" / exe_name
+    if local_bin.is_file():
+        return str(local_bin)
+    plug_bin = plugin_root() / "bin" / exe_name
+    return str(plug_bin) if plug_bin.is_file() else None
+
+
+_RUST_HOOK_SUBCOMMANDS = frozenset(
+    {"hook", "safety-guards", "tokenade-hook", "chip-hooks", "cwg-pre-invocation", "cwg-mark", "cwg-stop"}
+)
+
+
+def maybe_exec_rust_cli(subcommand: str, argv: list[str] | None = None) -> None:
+    # INVARIANT: Delegate CLI/hook subprocess invocations to native `bin/carbon-stack.exe` with explicit pipe I/O (`CREATE_NO_WINDOW` disables implicit Win32 handle inheritance when `stdin` is omitted).
+    rust_bin = find_rust_binary()
+    if not rust_bin:
+        return
+    args = sys.argv[1:] if argv is None else list(argv)
+    needs_stdin = subcommand in _RUST_HOOK_SUBCOMMANDS or any(
+        a == "--event" or a.startswith("--event=") for a in args
+    )
+    kw: dict[str, Any] = {"capture_output": True}
+    if os.name == "nt":
+        kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    if needs_stdin:
+        try:
+            raw_in = b"" if sys.stdin.isatty() else sys.stdin.buffer.read()
+        except Exception:
+            raw_in = b""
+        proc = subprocess.run([rust_bin, subcommand, *args], input=raw_in, **kw)
+    else:
+        proc = subprocess.run([rust_bin, subcommand, *args], stdin=subprocess.DEVNULL, **kw)
+    if proc.stdout:
+        sys.stdout.buffer.write(proc.stdout)
+        sys.stdout.buffer.flush()
+    if proc.stderr:
+        sys.stderr.buffer.write(proc.stderr)
+        sys.stderr.buffer.flush()
+    sys.exit(proc.returncode)

@@ -878,9 +878,9 @@ class OptimizationScenariosTestCase(unittest.TestCase):
 
         # 3. Hook budget & Loop Guard generation sync via monotonic mutation stamp (including scratch edits & subagents)
         hooks_cfg = json.loads((plugin_dir / "hooks.json").read_text(encoding="utf-8"))
-        self.assertNotIn("PostToolUse", hooks_cfg["continuity"])
-        self.assertEqual(hooks_cfg["code-work-gate"]["PreToolUse"][0]["matcher"], "run_command")
-        self.assertEqual(hooks_cfg["code-work-gate"]["PostToolUse"][0]["matcher"], "edit_file|write_file|run_command")
+        self.assertEqual(list(hooks_cfg.keys()), ["carbon-stack"])
+        self.assertIn("run_command", hooks_cfg["carbon-stack"]["PreToolUse"][0]["matcher"])
+        self.assertEqual(hooks_cfg["carbon-stack"]["PostToolUse"][0]["matcher"], "edit_file|write_file|run_command")
 
         app_py = self._h.workspace / "app.py"
         scratch_probe = self._h.brain / self._h.conv_id / "scratch" / "probe.py"

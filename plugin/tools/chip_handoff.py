@@ -174,11 +174,12 @@ def finish_chip(chip_id: str = "", message: str = "", cwd: str = "") -> dict[str
                 tip_sha = str(tip_out or "").strip() if rc_tip == 0 else ""
                 card["head_sha"] = tip_sha
 
-                # Create portable git bundle backup if commits were added beyond base_sha
+                # INVARIANT: Create portable git bundle backup via branch ref or HEAD (git bundle rejects raw SHA tips).
                 base_sha = str(card.get("base_sha") or "")
                 if tip_sha and base_sha and tip_sha != base_sha:
                     bundle_file = str(chip_bundles_dir() / f"{cid}.bundle")
-                    rio.run_git(wt, ["bundle", "create", bundle_file, f"{base_sha}..{tip_sha}"], timeout=10.0)
+                    pos_ref = str(card.get("chip_branch") or "") or "HEAD"
+                    rio.run_git(wt, ["bundle", "create", bundle_file, f"{base_sha}..{pos_ref}"], timeout=10.0)
                     if os.path.isfile(bundle_file):
                         card["bundle_path"] = rio.normalize_path(bundle_file)
 
@@ -353,4 +354,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    rio.maybe_exec_rust_cli("chip-handoff")
     sys.exit(main())

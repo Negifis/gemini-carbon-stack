@@ -164,9 +164,11 @@ def run_diagnostics(cwd: str = "", compact: bool = False) -> dict[str, Any]:
 
     safety_matcher = ""
     if isinstance(hooks_json, dict):
+        cs_pre = (hooks_json.get("carbon-stack") or {}).get("PreToolUse") or []
         sg_pre = (hooks_json.get("safety-and-quality-guards") or {}).get("PreToolUse") or []
-        if sg_pre and isinstance(sg_pre[0], dict):
-            safety_matcher = str(sg_pre[0].get("matcher") or "")
+        pre_entries = cs_pre or sg_pre
+        if pre_entries and isinstance(pre_entries[0], dict):
+            safety_matcher = str(pre_entries[0].get("matcher") or "")
     required_guard_tools = ("read_board", "edit_file", "write_file", "swarm_wait")
     swarm_guards_ok = all(t in safety_matcher for t in required_guard_tools)
     swarm_ctl_ok = (bundle_dir / "tools" / "swarm_ctl.py").is_file()
@@ -269,4 +271,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    rio.maybe_exec_rust_cli("stack-doctor")
     sys.exit(main())

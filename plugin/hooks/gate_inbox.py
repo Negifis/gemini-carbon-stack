@@ -588,4 +588,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    rio.maybe_exec_rust_cli("gate-inbox")
     sys.exit(main())

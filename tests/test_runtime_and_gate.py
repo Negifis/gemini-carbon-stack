@@ -6700,6 +6700,187 @@ class GateSubprocessTestCase(unittest.TestCase):
             ok_opus, why_opus = cwg_stop.validate_candidate_closure({"kind": "verified", "risk": "HIGH"}, marker_opus, checks_opus, sub_opus, sw_later, [])
             self.assertTrue(ok_opus, why_opus)
 
+    def test_28_rust_carbon_stack_binary_and_consolidated_hooks_parity(self) -> None:
+        exe_name = "carbon-stack.exe" if os.name == "nt" else "carbon-stack"
+        bin_path = REPO_ROOT / "plugin" / "bin" / exe_name
+        self.assertTrue(bin_path.is_file(), f"Expected compiled Rust binary at {bin_path}")
+
+        base_env = dict(
+            os.environ,
+            CARBON_STACK_HOME=str(self.stack_home),
+            CARBON_CODEX_SESSIONS_DIR=str(self.codex_sessions),
+            CARBON_CODEX_BIN=getattr(self, "codex_bin", str(self.root / "no-codex-bin")),
+            PLUGIN_ROOT=str(REPO_ROOT / "plugin"),
+        )
+        kw: dict[str, object] = {"capture_output": True, "timeout": 15.0}
+        if os.name == "nt":
+            kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+        ver = subprocess.run([str(bin_path), "--version"], stdin=subprocess.DEVNULL, env=base_env, **kw)
+        self.assertEqual(ver.returncode, 0)
+        self.assertIn("carbon-stack", ver.stdout.decode("utf-8", errors="replace"))
+
+        def call_unified_hook(event: str, payload: dict[str, object]) -> dict[str, object]:
+            body: dict[str, object] = {
+                "conversationId": self.conv_id,
+                "workspacePaths": [str(self.workspace)],
+                "transcriptPath": str(self.transcript),
+                "artifactDirectoryPath": str(self.brain / self.conv_id),
+                "hookEventName": event,
+                "cwd": str(self.workspace),
+            }
+            body.update(payload)
+            raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            proc = subprocess.run(
+                [str(bin_path), "hook", "--event", event],
+                input=raw,
+                env=base_env,
+                **kw,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", errors="replace"))
+            txt = proc.stdout.decode("utf-8", errors="replace").strip()
+            return json.loads(txt) if txt else {}
+
+        deny_flash = call_unified_hook(
+            "PreToolUse",
+            {"toolCall": {"id": "tc-flash", "name": "swarm", "args": {"action": "add", "name": "scout-1", "model": "gemini-2.5-flash", "brief": "Scan"}}},
+        )
+        self.assertEqual(deny_flash.get("decision"), "deny", deny_flash)
+
+        sample_file = self.workspace / "rust_parity_target.py"
+        sample_code = "def compute_total(items: list[int]) -> int:\n    return sum(items)\n"
+        sample_file.write_text(sample_code, encoding="utf-8")
+        call_unified_hook(
+            "PostToolUse",
+            {"toolCall": {"id": "w-rp", "name": "write_file", "args": {"Path": str(sample_file), "Content": sample_code}}, "error": ""},
+        )
+        self.add_final_response("Готово без квитанции.")
+        blocked = call_unified_hook("Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
+        self.assertEqual(blocked.get("decision"), "continue")
+
+        time.sleep(0.01)
+        call_unified_hook(
+            "PostToolUse",
+            {"toolCall": {"id": "t-rp", "name": "run_command", "args": {"CommandLine": "python -m unittest -q"}}, "error": ""},
+        )
+        self.add_final_response("Готово.\n[gate] verified: STANDARD; rust_parity_target.py, unittest")
+        allowed = call_unified_hook("Stop", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})
+        self.assertEqual(allowed, {"decision": "allow"})
+
+        # INVARIANT: Differential parity across Stage 3 CLI tools (Rust vs CARBON_PURE_PYTHON=1).
+        search_tool = REPO_ROOT / "plugin" / "tools" / "code_search.py"
+        rust_sym = subprocess.run(
+            [sys.executable, "-X", "utf8", str(search_tool), "symbols", "compute_total", "--cwd", str(self.workspace)],
+            stdin=subprocess.DEVNULL,
+            env={**base_env, "CARBON_PURE_PYTHON": "0"},
+            **kw,
+        )
+        py_sym = subprocess.run(
+            [sys.executable, "-X", "utf8", str(search_tool), "symbols", "compute_total", "--cwd", str(self.workspace)],
+            stdin=subprocess.DEVNULL,
+            env={**base_env, "CARBON_PURE_PYTHON": "1"},
+            **kw,
+        )
+        self.assertEqual(rust_sym.returncode, 0)
+        self.assertEqual(py_sym.returncode, 0)
+        r_sym_json = json.loads(rust_sym.stdout.decode("utf-8"))
+        p_sym_json = json.loads(py_sym.stdout.decode("utf-8"))
+        self.assertEqual(r_sym_json["count"], p_sym_json["count"])
+        self.assertEqual(r_sym_json["symbols"][0]["name"], "compute_total")
+
+        mem_tool = REPO_ROOT / "plugin" / "tools" / "carbon_memory.py"
+        rem = subprocess.run(
+            [
+                sys.executable,
+                "-X",
+                "utf8",
+                str(mem_tool),
+                "remember",
+                "--category",
+                "GOTCHA",
+                "--text",
+                "Always call sqlite3_initialize before sqlite3_open_v2 in FFI",
+                "--cwd",
+                str(self.workspace),
+            ],
+            stdin=subprocess.DEVNULL,
+            env={**base_env, "CARBON_PURE_PYTHON": "0"},
+            **kw,
+        )
+        self.assertEqual(rem.returncode, 0, rem.stderr.decode("utf-8", errors="replace"))
+        rec_py = subprocess.run(
+            [sys.executable, "-X", "utf8", str(mem_tool), "recall", "--query", "sqlite3_initialize", "--cwd", str(self.workspace)],
+            stdin=subprocess.DEVNULL,
+            env={**base_env, "CARBON_PURE_PYTHON": "1"},
+            **kw,
+        )
+        self.assertEqual(rec_py.returncode, 0)
+        self.assertEqual(json.loads(rec_py.stdout.decode("utf-8"))["count"], 1)
+
+        mock_claude = self.root / "mock_claude_projects" / "proj-alpha"
+        mock_claude.mkdir(parents=True)
+        (mock_claude / "11111111-2222-3333-4444-555555555555.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps({"type": "user", "sessionId": "11111111-2222-3333-4444-555555555555", "cwd": str(self.workspace), "timestamp": "2026-11-17T12:00:00Z", "message": {"role": "user", "content": "Hello importer"}}),
+                    json.dumps({"type": "assistant", "sessionId": "11111111-2222-3333-4444-555555555555", "cwd": str(self.workspace), "timestamp": "2026-11-17T12:00:05Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "Ready!"}]}}),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        imp_tool = REPO_ROOT / "plugin" / "tools" / "claude_chat_importer.py"
+        agy_out_r = self.root / "agy_r"
+        agy_out_p = self.root / "agy_p"
+        imp_r = subprocess.run(
+            [sys.executable, "-X", "utf8", str(imp_tool), "--claude-projects-dir", str(mock_claude.parent), "--antigravity-dir", str(agy_out_r), "--include-all-projects", "--dry-run", "--json"],
+            stdin=subprocess.DEVNULL,
+            env={**base_env, "CARBON_PURE_PYTHON": "0"},
+            **kw,
+        )
+        imp_p = subprocess.run(
+            [sys.executable, "-X", "utf8", str(imp_tool), "--claude-projects-dir", str(mock_claude.parent), "--antigravity-dir", str(agy_out_p), "--include-all-projects", "--dry-run", "--json"],
+            stdin=subprocess.DEVNULL,
+            env={**base_env, "CARBON_PURE_PYTHON": "1"},
+            **kw,
+        )
+        self.assertEqual(imp_r.returncode, 0, imp_r.stderr.decode("utf-8", errors="replace"))
+        self.assertEqual(imp_p.returncode, 0, imp_p.stderr.decode("utf-8", errors="replace"))
+        self.assertEqual(json.loads(imp_r.stdout.decode("utf-8"))["sessions_count"], json.loads(imp_p.stdout.decode("utf-8"))["sessions_count"])
+
+        ctl_tool = REPO_ROOT / "plugin" / "tools" / "swarm_ctl.py"
+        for pure_mode in ("0", "1"):
+            mode_env = {**base_env, "CARBON_PURE_PYTHON": pure_mode}
+            for wname, wpath in (("w1", "a.py"), ("w2", "b.py")):
+                sres = subprocess.run(
+                    [sys.executable, "-X", "utf8", str(ctl_tool), "ownership", "set", "--cwd", str(self.workspace), "--worker", wname, "--paths", wpath],
+                    stdin=subprocess.DEVNULL,
+                    env=mode_env,
+                    **kw,
+                )
+                self.assertEqual(sres.returncode, 0, sres.stderr.decode("utf-8", errors="replace"))
+            cres = subprocess.run(
+                [sys.executable, "-X", "utf8", str(ctl_tool), "ownership", "clear", "--cwd", str(self.workspace), "--worker", "w1"],
+                stdin=subprocess.DEVNULL,
+                env=mode_env,
+                **kw,
+            )
+            self.assertEqual(cres.returncode, 0, cres.stderr.decode("utf-8", errors="replace"))
+            cdoc = json.loads(cres.stdout.decode("utf-8"))
+            self.assertEqual(cdoc["ok"], True)
+            self.assertEqual(cdoc["removed"], True)
+            self.assertEqual(cdoc["remaining"], ["w2"])
+            mfile = self.workspace / ".swarm" / "ownership.json"
+            self.assertTrue(mfile.is_file())
+            self.assertIn("w2", json.loads(mfile.read_text(encoding="utf-8")).get("workers", {}))
+            subprocess.run(
+                [sys.executable, "-X", "utf8", str(ctl_tool), "ownership", "clear", "--cwd", str(self.workspace)],
+                stdin=subprocess.DEVNULL,
+                env=mode_env,
+                **kw,
+            )
+            self.assertFalse(mfile.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

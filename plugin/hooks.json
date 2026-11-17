@@ -1,88 +1,27 @@
 {
-  "continuity": {
+  "carbon-stack": {
     "enabled": true,
     "SessionStart": [
       {
         "type": "command",
-        "command": "python -X utf8 hooks/continuity.py --event SessionStart",
+        "command": "bin\\carbon-stack.exe hook --event SessionStart",
         "timeout": 12
       }
     ],
     "PreInvocation": [
       {
         "type": "command",
-        "command": "python -X utf8 hooks/continuity.py --event PreInvocation",
+        "command": "bin\\carbon-stack.exe hook --event PreInvocation",
         "timeout": 10
       }
     ],
     "PreToolUse": [
       {
-        "matcher": "read_file|run_command",
+        "matcher": "read_file|run_command|invoke_subagent|swarm|swarm_wait|read_board|edit_file|write_file",
         "hooks": [
           {
             "type": "command",
-            "command": "python -X utf8 hooks/continuity.py --event PreToolUse",
-            "timeout": 8
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "type": "command",
-        "command": "python -X utf8 hooks/continuity.py --event Stop",
-        "timeout": 10
-      }
-    ]
-  },
-  "safety-and-quality-guards": {
-    "enabled": true,
-    "PreToolUse": [
-      {
-        "matcher": "run_command|invoke_subagent|swarm|swarm_wait|read_board|edit_file|write_file",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python -X utf8 hooks/safety_guards.py --event PreToolUse",
-            "timeout": 10
-          }
-        ]
-      }
-    ]
-  },
-  "chip-handoff": {
-    "enabled": true,
-    "PreInvocation": [
-      {
-        "type": "command",
-        "command": "python -X utf8 hooks/chip_hooks.py --event PreInvocation",
-        "timeout": 8
-      }
-    ],
-    "Stop": [
-      {
-        "type": "command",
-        "command": "python -X utf8 hooks/chip_hooks.py --event Stop",
-        "timeout": 10
-      }
-    ]
-  },
-  "code-work-gate": {
-    "enabled": true,
-    "PreInvocation": [
-      {
-        "type": "command",
-        "command": "python -X utf8 hooks/cwg_pre_invocation.py --event PreInvocation",
-        "timeout": 8
-      }
-    ],
-    "PreToolUse": [
-      {
-        "matcher": "run_command",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python -X utf8 hooks/cwg_mark.py --event PreToolUse",
+            "command": "bin\\carbon-stack.exe hook --event PreToolUse",
             "timeout": 12
           }
         ]
@@ -94,7 +33,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python -X utf8 hooks/cwg_mark.py --event PostToolUse",
+            "command": "bin\\carbon-stack.exe hook --event PostToolUse",
             "timeout": 12
           }
         ]
@@ -103,7 +42,7 @@
     "Stop": [
       {
         "type": "command",
-        "command": "python -X utf8 hooks/cwg_stop.py --event Stop",
+        "command": "bin\\carbon-stack.exe hook --event Stop",
         "timeout": 15
       }
     ]

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pathlib
 import sys
@@ -119,15 +120,62 @@ def cmd_ownership_clear(args: argparse.Namespace) -> int:
     root = _repo_root(args.cwd)
     mpath = cwg.ownership_manifest_path(root)
     worker = (args.worker or "").strip()
-    if not mpath.exists():
+    try:
+        os.lstat(mpath)
+    except FileNotFoundError:
         rio.print_cli_json({"ok": True, "cleared": True, "manifest": rio.normalize_path(mpath)}, pretty=False)
         return 0
+    except OSError as exc:
+        rio.print_cli_json(
+            {"ok": False, "error": "manifest_stat_failed", "detail": str(exc), "manifest": rio.normalize_path(mpath)},
+            pretty=False,
+        )
+        return 1
     if not worker:
-        mpath.unlink(missing_ok=True)
+        try:
+            mpath.unlink(missing_ok=True)
+        except OSError as exc:
+            rio.print_cli_json(
+                {"ok": False, "error": "manifest_remove_failed", "detail": str(exc), "manifest": rio.normalize_path(mpath)},
+                pretty=False,
+            )
+            return 1
         rio.print_cli_json({"ok": True, "cleared": "all", "manifest": rio.normalize_path(mpath)}, pretty=False)
         return 0
-    manifest = cwg.load_ownership_manifest(root)
-    workers = dict(manifest.get("workers") or {})
+    try:
+        raw_txt = mpath.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        rio.print_cli_json({"ok": True, "cleared": True, "manifest": rio.normalize_path(mpath)}, pretty=False)
+        return 0
+    except UnicodeDecodeError as exc:
+        rio.print_cli_json(
+            {"ok": False, "error": "manifest_invalid_json", "detail": str(exc), "manifest": rio.normalize_path(mpath)},
+            pretty=False,
+        )
+        return 1
+    except OSError as exc:
+        rio.print_cli_json(
+            {"ok": False, "error": "manifest_read_failed", "detail": str(exc), "manifest": rio.normalize_path(mpath)},
+            pretty=False,
+        )
+        return 1
+    try:
+        loaded = json.loads(raw_txt)
+    except (json.JSONDecodeError, ValueError) as exc:
+        rio.print_cli_json(
+            {"ok": False, "error": "manifest_invalid_json", "detail": str(exc), "manifest": rio.normalize_path(mpath)},
+            pretty=False,
+        )
+        return 1
+    if not isinstance(loaded, dict):
+        rio.print_cli_json(
+            {"ok": False, "error": "manifest_invalid_json", "detail": "root is not an object", "manifest": rio.normalize_path(mpath)},
+            pretty=False,
+        )
+        return 1
+    manifest = loaded
+    raw_workers = manifest.get("workers")
+    workers = dict(raw_workers) if isinstance(raw_workers, dict) else {}
     removed = workers.pop(worker, None) is not None
     if workers:
         manifest["workers"] = workers
@@ -139,7 +187,14 @@ def cmd_ownership_clear(args: argparse.Namespace) -> int:
             )
             return 1
     else:
-        mpath.unlink(missing_ok=True)
+        try:
+            mpath.unlink(missing_ok=True)
+        except OSError as exc:
+            rio.print_cli_json(
+                {"ok": False, "error": "manifest_remove_failed", "detail": str(exc), "manifest": rio.normalize_path(mpath)},
+                pretty=False,
+            )
+            return 1
     rio.print_cli_json(
         {"ok": True, "worker": worker, "removed": removed, "remaining": sorted(workers.keys())},
         pretty=False,
@@ -453,4 +508,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    rio.maybe_exec_rust_cli("swarm-ctl")
     sys.exit(main())
