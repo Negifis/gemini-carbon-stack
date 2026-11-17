@@ -158,12 +158,46 @@ def run_diagnostics(cwd: str = "", compact: bool = False) -> dict[str, Any]:
     inbox_note = gate_inbox.unresolved_summary(handler_session=handler_sess)
     ls_info = query_live_ls_plugin("gemini-carbon-stack")
 
+    safety_matcher = ""
+    if isinstance(hooks_json, dict):
+        sg_pre = (hooks_json.get("safety-and-quality-guards") or {}).get("PreToolUse") or []
+        if sg_pre and isinstance(sg_pre[0], dict):
+            safety_matcher = str(sg_pre[0].get("matcher") or "")
+    required_guard_tools = ("read_board", "edit_file", "write_file", "swarm_wait")
+    swarm_guards_ok = all(t in safety_matcher for t in required_guard_tools)
+    swarm_ctl_ok = (bundle_dir / "tools" / "swarm_ctl.py").is_file()
+    swarm_skill_ok = "swarm-orchestration" in skills
+
+    git_check_dir = pathlib.Path(cwd or os.getcwd())
+    gitignore_file = git_check_dir / ".gitignore"
+    if not gitignore_file.is_file() and (bundle_dir.parent / ".gitignore").is_file():
+        gitignore_file = bundle_dir.parent / ".gitignore"
+    gitignore_has_swarm = False
+    if gitignore_file.is_file():
+        try:
+            gitignore_has_swarm = ".swarm/" in gitignore_file.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            pass
+
+    swarm_v2_info = {
+        "swarm_ctl": swarm_ctl_ok,
+        "swarm_orchestration_skill": swarm_skill_ok,
+        "guards_matcher_ok": swarm_guards_ok,
+        "fast_path_limits": {"max_files": cwg.FAST_PATH_MAX_FILES, "max_lines": cwg.FAST_PATH_MAX_LINES},
+        "cursor_threshold": cwg.BOARD_CURSOR_THRESHOLD,
+        "stall_timeout_sec": cwg.swarm_stall_timeout_sec(),
+        "gitignore_has_swarm": gitignore_has_swarm,
+    }
+
     ok = bool(
         isinstance(plugin_json, dict)
         and isinstance(hooks_json, dict)
         and len(skills) >= 10
         and len(agents) >= 4
         and len(rules) >= 1
+        and swarm_ctl_ok
+        and swarm_skill_ok
+        and swarm_guards_ok
         and (agy_validate_ok in (True, None))
     )
 
@@ -183,6 +217,7 @@ def run_diagnostics(cwd: str = "", compact: bool = False) -> dict[str, Any]:
             "rules": len(rules),
         },
         "rules": rules,
+        "swarm_v2": swarm_v2_info,
         "codex_lane": codex_info,
         "token_optimization": token_opt_info,
         "memory": mem,
@@ -195,15 +230,16 @@ def run_diagnostics(cwd: str = "", compact: bool = False) -> dict[str, Any]:
         report["skills"] = skills
         report["agents"] = agents
         report["model_routing"] = {
+            "pipeline_order": "unittest -> primary review -> simplify once -> batch kill -> --closure",
             "simplify_lenses": {
                 "lenses": list(cwg.SIMPLIFY_LENSES),
                 "standard_mode": "opt_in single_combined (simplify-reviewer) via .agents/carbon-gate.json",
-                "high_xhigh_mode": "three_parallel_lenses (reuse, quality, efficiency)",
+                "high_xhigh_mode": "fast_path ALL (<=2 files & <=30 lines) else three_parallel_lenses (reuse, quality, efficiency)",
                 "primary_model": cwg.SONNET_HIGH_MODEL,
                 "fallback_model": cwg.SIMPLIFY_FALLBACK_MODEL,
                 "prompt_cache_ttl_seconds": cwg.SWARM_CACHE_SAFE_TTL_SECONDS,
             },
-            "external_review": "codex-cli (unchanged)",
+            "external_review": "codex-cli (primary logic review + final --closure)",
             "internal_review": {
                 "primary_model": cwg.OPUS_HIGH_MODEL,
                 "escalation_model": cwg.CARBON_HIGH_MODEL,
@@ -211,7 +247,7 @@ def run_diagnostics(cwd: str = "", compact: bool = False) -> dict[str, Any]:
             "auxiliary_hydrogen": {
                 "replaces": "gemini-flash (disabled)",
                 "models_by_complexity": dict(cwg.HYDROGEN_MODEL_BY_LEVEL),
-                "roles": ["browser", "translator", "auxiliary_exploration", "simplify_fallback"],
+                "roles": ["browser", "translator", "scout_swarm", "disjoint_builder", "simplify_fallback"],
             },
         }
     return report

@@ -26,6 +26,17 @@
 - `ARCHITECTURE.md` — описание архитектуры, межмодельной маршрутизации и реальных границ гарантий.
 - `MIGRATION_MATRIX.md` — полная техническая матрица решений (`NATIVE`, `ADAPT`, `KEEP`, `MERGE`, `REMOVE`, `UNAVAILABLE`).
 
+## **Swarm 2.0 Architecture**
+
+- **Трёхфазный конвейер (`swarm-orchestration`):**
+  1. **Scout Swarm (Разведка):** параллельные read-only скауты на `Gemini 4 Hydrogen` с `serena` LSP пишут отчёты в `.swarm/artifacts/<worker>-<round>.md` (`Pointer-on-Board`: `<= 12` строк на доске).
+  2. **Disjoint Builder Swarm (Реализация):** координатор `Orchestrator (Argon)` задаёт непересекающиеся `owned_paths` в `.swarm/ownership.json` или изолированные `git worktree` (`.swarm/worktrees/<worker>`) через CLI `plugin/tools/swarm_ctl.py`; `File Ownership Guard` в `safety_guards.py` блокирует запись за пределами зоны воркера.
+  3. **Verification Gate (`UNITTEST -> REVIEW -> SIMPLIFY -> KILL -> --CLOSURE`):** сначала локальные тесты и первичный `codex_lane.py review`; после закрытия функциональных замечаний — однократный `simplify` (`SIMPLIFY_LENS: ALL` Fast-Path при `<= 2` файлов и `<= 30` изменённых строк, иначе 3 параллельные линзы), затем пакетный `kill` воркеров и финальный `codex_lane.py review --closure`.
+- **Гигиена и устойчивость роя:**
+  - **Warm Pool (`gate_inbox.py` + `cwg_stop.py`):** переиспользование `waiting` воркеров через `@mention` со строгой проверкой `round_start_msg_id` и `current_diff_hash`.
+  - **Cursor Guard:** при `> 15` сообщениях в `board.jsonl` повторный `read_board` без `since=<last_seen_id>` блокируется хуком `PreToolUse`.
+  - **Stall Watchdog:** `in_flight` воркеры без активности дольше `SWARM_STALL_TIMEOUT_SEC` (по умолчанию `240` с) диагностируются явно вместо вечного ожидания.
+
 ## Быстрый старт и эксплуатация
 
 ```powershell

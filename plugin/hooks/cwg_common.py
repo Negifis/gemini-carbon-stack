@@ -67,6 +67,7 @@ ALWAYS_EPHEMERAL_PATTERNS = USER_SCRATCH_PATTERNS + tuple(
     for pat in (
         r"/\.gemini/antigravity/brain/[^/]+/\.system_generated(?:/|$)",
         r"/\.gemini/carbon-stack/state(?:/|$)",
+        r"(?:^|/)\.swarm(?:/|$)",
     )
 )
 
@@ -288,22 +289,59 @@ def extract_review_decision(text: str) -> tuple[str | None, str | None]:
     return (None, None)
 
 
-SIMPLIFY_LINE_RE = re.compile(
-    r"^\s*(?:\*{0,2})SIMPLIFY_VERDICT(?:\*{0,2})\s*:\s*(?:\*{0,2})(CLEAN|FINDINGS_REPORTED|ACTIONABLE_FIXES)(?:\*{0,2})\b",
-    re.IGNORECASE | re.MULTILINE,
+FAST_PATH_MAX_FILES = 2
+FAST_PATH_MAX_LINES = 30
+BOARD_CURSOR_THRESHOLD = 15
+DEFAULT_SWARM_STALL_TIMEOUT_SEC = 240
+
+_MD_EDGE = r"(?:\*{1,2}|__|`)?"
+_MD_WRAP = r"(?:(?:\*{1,2}|__|`)\s*){0,2}"
+_ALL_SIMPLIFY_TOKENS = r"(?:CLEAN|FINDINGS_REPORTED|ACTIONABLE_FIXES|REUSE|QUALITY|EFFICIENCY|ALL|COMBINED)"
+_SIMPLIFY_ALT_TAIL = (
+    rf"(?!\s*{_MD_WRAP}"
+    rf"(?:\||/(?!/)"
+    rf"|\(?\s*\b(?:or|или)\b\s+(?:{_MD_WRAP}SIMPLIFY_(?:VERDICT|LENS){_MD_WRAP}\s*:\s*{_MD_WRAP})?{_ALL_SIMPLIFY_TOKENS}\b"
+    rf"|,\s*{_MD_WRAP}(?:(?:or|или)\b\s+)?{_ALL_SIMPLIFY_TOKENS}\b))"
 )
-SIMPLIFY_LENS_LINE_RE = re.compile(
-    r"^\s*(?:\*{0,2})SIMPLIFY_LENS(?:\*{0,2})\s*:\s*(?:\*{0,2})(REUSE|QUALITY|EFFICIENCY)(?:\*{0,2})\b",
-    re.IGNORECASE | re.MULTILINE,
+_SIMPLIFY_TEMPLATE_PAIR_RE = re.compile(
+    rf"{_MD_WRAP}SIMPLIFY_(?:VERDICT|LENS){_MD_WRAP}\s*:\s*{_MD_WRAP}{_ALL_SIMPLIFY_TOKENS}{_MD_WRAP}"
+    rf"\s*(?:\(|,|\||/)?\s*(?:\bor\b|\bили\b|\|)\s*"
+    rf"{_MD_WRAP}SIMPLIFY_(?:VERDICT|LENS){_MD_WRAP}\s*:\s*{_MD_WRAP}{_ALL_SIMPLIFY_TOKENS}{_MD_WRAP}\)?",
+    re.IGNORECASE,
 )
-SIMPLIFY_COMBINED_LENS_RE = re.compile(
-    r"^\s*(?:\*{0,2})SIMPLIFY_LENS(?:\*{0,2})\s*:\s*(?:\*{0,2})(ALL|COMBINED)(?:\*{0,2})\b",
-    re.IGNORECASE | re.MULTILINE,
+
+
+def _compile_simplify_tag_re(key: str, choices: str) -> re.Pattern[str]:
+    return re.compile(
+        rf"(?<![A-Za-z0-9_])(?<!\(or )(?<!\(or `)(?<!\bor )(?<!\bor `)(?<!\bили )"
+        rf"{_MD_WRAP}{key}{_MD_WRAP}\s*:\s*{_MD_WRAP}"
+        rf"({choices})(?:(?![A-Za-z0-9_])|(?=__(?![A-Za-z0-9_]))){_SIMPLIFY_ALT_TAIL}",
+        re.IGNORECASE,
+    )
+
+
+SIMPLIFY_LINE_RE = _compile_simplify_tag_re(
+    "SIMPLIFY_VERDICT",
+    "CLEAN|FINDINGS_REPORTED|ACTIONABLE_FIXES",
+)
+SIMPLIFY_LENS_LINE_RE = _compile_simplify_tag_re(
+    "SIMPLIFY_LENS",
+    "REUSE|QUALITY|EFFICIENCY",
+)
+SIMPLIFY_COMBINED_LENS_RE = _compile_simplify_tag_re(
+    "SIMPLIFY_LENS",
+    "ALL|COMBINED",
 )
 REVIEW_TIER_XHIGH_RE = re.compile(
     r"\bREVIEW_TIER\s*:\s*XHIGH\b",
     re.IGNORECASE,
 )
+DIFF_HASH_RE = re.compile(r"\bDIFF_HASH\s*:\s*([A-Za-z0-9_.:-]+)", re.IGNORECASE)
+
+
+def extract_diff_hash(text: str) -> str:
+    m = DIFF_HASH_RE.search(text or "")
+    return m.group(1).strip() if m else ""
 
 SONNET_HIGH_MODEL = "claude-sonnet-5-5-high"
 OPUS_HIGH_MODEL = "claude-opus-5-5-high"
@@ -337,6 +375,624 @@ SIMPLIFY_REVIEWER = "simplify-reviewer"
 SIMPLIFY_AGENT_TYPES = SIMPLIFY_LENS_AGENTS | frozenset({SIMPLIFY_REVIEWER})
 ANTHROPIC_EPHEMERAL_TTL_SECONDS = 300
 SWARM_CACHE_SAFE_TTL_SECONDS = 270
+
+
+def swarm_stall_timeout_sec() -> float:
+    raw = str(os.environ.get("SWARM_STALL_TIMEOUT_SEC") or "").strip()
+    if not raw:
+        return float(DEFAULT_SWARM_STALL_TIMEOUT_SEC)
+    try:
+        parsed = float(raw)
+    except ValueError:
+        return float(DEFAULT_SWARM_STALL_TIMEOUT_SEC)
+    return parsed if parsed > 0.0 else float(DEFAULT_SWARM_STALL_TIMEOUT_SEC)
+
+
+def parse_simplify_verdict(text: str, default_lens: str = "") -> dict[str, Any]:
+    cleaned = _SIMPLIFY_TEMPLATE_PAIR_RE.sub(" ", text or "")
+    has_combined = bool(SIMPLIFY_COMBINED_LENS_RE.search(cleaned))
+    explicit_lenses = [m.lower() for m in SIMPLIFY_LENS_LINE_RE.findall(cleaned)]
+    unique_lenses = list(dict.fromkeys(explicit_lenses))
+    verdict_matches = SIMPLIFY_LINE_RE.findall(cleaned)
+    verdict = verdict_matches[-1].upper() if verdict_matches else ""
+    multi_lens_spoof = (not has_combined) and len(unique_lenses) > 1
+    if has_combined:
+        lens = "all"
+    elif len(unique_lenses) == 1:
+        lens = unique_lenses[0]
+    elif multi_lens_spoof:
+        lens = "combined"
+    else:
+        lens = (default_lens or "").strip().lower()
+    return {
+        "lens": lens,
+        "verdict": verdict,
+        "clean": verdict == "CLEAN",
+        "combined": has_combined or multi_lens_spoof or lens in ("all", "combined"),
+        "has_explicit_all": has_combined,
+        "multi_lens_spoof": multi_lens_spoof,
+        "explicit_lenses": unique_lenses,
+    }
+
+
+extract_simplify_verdict = parse_simplify_verdict
+
+
+def _normalize_diff_metrics(raw: dict[str, Any], default_source: str) -> dict[str, Any]:
+    files_count = int(raw.get("files_count", raw.get("files", 0)) or 0)
+    additions = max(0, int(raw.get("additions") or 0))
+    deletions = max(0, int(raw.get("deletions") or 0))
+    total_lines = raw.get("total_lines")
+    total = max(0, int(total_lines)) if total_lines is not None else (additions + deletions)
+    return {
+        "files_count": files_count,
+        "additions": additions,
+        "deletions": deletions,
+        "total_lines": total,
+        "source": str(raw.get("source") or default_source),
+    }
+
+
+def _probe_untracked_file_lines(fp: pathlib.Path) -> tuple[bool, int]:
+    """Check binary header first (4 KiB) then count lines in chunks without loading whole file."""
+    with fp.open("rb") as fh:
+        head = fh.read(4096)
+        if not head:
+            return False, 0
+        if b"\x00" in head:
+            return True, 0
+        newlines = head.count(b"\n")
+        last_byte = head[-1:]
+        while True:
+            chunk = fh.read(65536)
+            if not chunk:
+                break
+            newlines += chunk.count(b"\n")
+            last_byte = chunk[-1:]
+        return False, newlines + (0 if last_byte in (b"\n", b"\r") else 1)
+
+
+def compute_diff_metrics(
+    marker: dict[str, Any] | None = None,
+    repo_root: str | pathlib.Path | None = None,
+    diff_stats: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if isinstance(diff_stats, dict) and diff_stats:
+        return _normalize_diff_metrics(diff_stats, "explicit")
+
+    m = marker if isinstance(marker, dict) else {}
+    saved = m.get("diff_metrics")
+    if isinstance(saved, dict) and saved and (not repo_root or saved.get("source") == "explicit"):
+        return _normalize_diff_metrics(saved, "marker")
+
+    if repo_root:
+        root_str = str(repo_root)
+        rc, out, _ = rio.run_git(root_str, ["rev-parse", "--verify", "HEAD"])
+        diff_args = ["diff", "--numstat", "HEAD"] if rc == 0 and out.strip() else ["diff", "--numstat"]
+        rc_d, out_d, _ = rio.run_git(root_str, diff_args)
+        rc_u, out_u, _ = rio.run_git(root_str, ["ls-files", "--others", "--exclude-standard"])
+        git_files: set[str] = set()
+        adds = 0
+        dels = 0
+        has_binary = False
+        if rc_d == 0 and out_d:
+            for line in out_d.splitlines():
+                parts = line.split("\t", 2)
+                if len(parts) != 3:
+                    continue
+                a_raw, d_raw, rel = parts
+                if is_ephemeral_path(rel, cwd=root_str):
+                    continue
+                git_files.add(rio.normalize_path(rel))
+                if a_raw == "-" or d_raw == "-":
+                    has_binary = True
+                else:
+                    adds += int(a_raw or 0)
+                    dels += int(d_raw or 0)
+        if rc_u == 0 and out_u:
+            root_path = pathlib.Path(root_str)
+            for rel in out_u.splitlines():
+                rel = rel.strip()
+                if not rel or is_ephemeral_path(rel, cwd=root_str):
+                    continue
+                git_files.add(rio.normalize_path(rel))
+                fp = root_path / rel
+                try:
+                    if fp.is_file():
+                        f_bin, f_lines = _probe_untracked_file_lines(fp)
+                        if f_bin:
+                            has_binary = True
+                        else:
+                            adds += f_lines
+                except OSError:
+                    continue
+        if git_files:
+            candidate_dpaths = durable_paths(list(m.get("paths") or []))
+            all_files = set(git_files)
+            for cp in candidate_dpaths:
+                rel_cp = resolve_repo_rel_path(cp, root_str)
+                if rel_cp:
+                    all_files.add(rel_cp)
+            total = (adds + dels) if not has_binary else max(adds + dels, FAST_PATH_MAX_LINES + 1)
+            return {
+                "files_count": max(len(all_files), len(candidate_dpaths)),
+                "additions": adds,
+                "deletions": dels,
+                "total_lines": total,
+                "source": "git",
+            }
+
+    if isinstance(saved, dict) and saved:
+        return _normalize_diff_metrics(saved, "marker")
+
+    dpaths = durable_paths(list(m.get("paths") or []))
+    changed_lines = max(0, int(m.get("changed_lines") or 0))
+    return {
+        "files_count": len(dpaths),
+        "additions": changed_lines,
+        "deletions": 0,
+        "total_lines": changed_lines,
+        "source": "marker-fallback",
+    }
+
+
+def is_simplify_fast_path_eligible(
+    marker: dict[str, Any] | None = None,
+    swarm_ev: dict[str, Any] | None = None,
+    diff_stats: dict[str, Any] | None = None,
+    repo_root: str | pathlib.Path | None = None,
+) -> bool:
+    if isinstance(swarm_ev, dict) and swarm_ev.get("multi_lens_spoof"):
+        return False
+    m = marker if isinstance(marker, dict) else {}
+    effective_root = repo_root or m.get("repo_root") or m.get("cwd")
+    metrics = compute_diff_metrics(marker=m, repo_root=effective_root, diff_stats=diff_stats)
+    files_count = int(metrics.get("files_count") or 0)
+    total_lines = int(metrics.get("total_lines") or 0)
+    if files_count <= 0:
+        files_count = len(durable_paths(list(m.get("paths") or [])))
+    return 0 < files_count <= FAST_PATH_MAX_FILES and total_lines <= FAST_PATH_MAX_LINES
+
+
+def _swarm_board_candidates(
+    session: str = "",
+    cwd: str = "",
+    transcript_path: str = "",
+) -> list[pathlib.Path]:
+    candidates: list[pathlib.Path] = []
+    seen: set[str] = set()
+
+    def _add(p: pathlib.Path | None) -> None:
+        if p is None:
+            return
+        k = rio.fold_path(p)
+        if k not in seen:
+            seen.add(k)
+            candidates.append(p)
+
+    tp_brain, tp_cid = rio._swarm_brain_and_cid(transcript_path or None, session or None)
+    eff_session = tp_cid or (session or "").strip()
+    if tp_brain is not None and eff_session:
+        _add(rio.swarm_dir(tp_brain, eff_session) / "board.jsonl")
+    if eff_session:
+        _add(rio.swarm_dir(rio.resolve_brain_root(""), eff_session) / "board.jsonl")
+    if cwd:
+        cwd_path = pathlib.Path(cwd)
+        _add(cwd_path / ".swarm" / "board.jsonl")
+        if not (cwd_path / ".git").exists() and not (cwd_path / ".swarm" / "board.jsonl").is_file():
+            top = rio.git_toplevel(cwd)
+            if top:
+                _add(pathlib.Path(top) / ".swarm" / "board.jsonl")
+    return candidates
+
+
+def _extract_msg_seq(row: dict[str, Any], fallback: int) -> int:
+    raw = row.get("seq")
+    if raw is None:
+        raw = row.get("msg_id", row.get("id"))
+    if raw is None:
+        return fallback
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _resolve_board_path_and_rows(
+    session: str = "",
+    cwd: str = "",
+    transcript_path: str = "",
+) -> tuple[pathlib.Path | None, list[dict[str, Any]]]:
+    candidates = _swarm_board_candidates(session=session, cwd=cwd, transcript_path=transcript_path)
+    best_existing: pathlib.Path | None = None
+    best_rows: list[dict[str, Any]] = []
+    best_head = -1
+    for cand in candidates:
+        if cand.is_file():
+            rows = rio.read_jsonl(cand)
+            head = max(
+                (_extract_msg_seq(r, idx) for idx, r in enumerate(rows, start=1) if isinstance(r, dict)),
+                default=0,
+            )
+            if rows and head > best_head:
+                best_existing = cand
+                best_rows = rows
+                best_head = head
+            elif best_existing is None:
+                best_existing = cand
+                best_rows = rows
+    if best_existing is not None:
+        return best_existing, best_rows
+    return (candidates[0] if candidates else None), []
+
+
+def resolve_swarm_board_path(
+    session: str = "",
+    cwd: str = "",
+    transcript_path: str = "",
+) -> pathlib.Path | None:
+    bp, _ = _resolve_board_path_and_rows(session=session, cwd=cwd, transcript_path=transcript_path)
+    return bp
+
+
+def load_swarm_board_messages(
+    session: str = "",
+    cwd: str = "",
+    transcript_path: str = "",
+    board_path: str | pathlib.Path | None = None,
+) -> tuple[pathlib.Path | None, list[dict[str, Any]]]:
+    if board_path:
+        bp: pathlib.Path | None = pathlib.Path(board_path)
+        if not bp.is_file():
+            return bp, []
+        rows = rio.read_jsonl(bp)
+    else:
+        bp, rows = _resolve_board_path_and_rows(session=session, cwd=cwd, transcript_path=transcript_path)
+        if bp is None or not rows:
+            return bp, []
+    normalized: list[dict[str, Any]] = []
+    for idx, row in enumerate(rows, start=1):
+        if not isinstance(row, dict):
+            continue
+        item = dict(row)
+        item["_seq"] = _extract_msg_seq(item, idx)
+        normalized.append(item)
+    return bp, normalized
+
+
+def swarm_board_head_seq(
+    session: str = "",
+    cwd: str = "",
+    transcript_path: str = "",
+    board_path: str | pathlib.Path | None = None,
+) -> int:
+    _, msgs = load_swarm_board_messages(
+        session=session,
+        cwd=cwd,
+        transcript_path=transcript_path,
+        board_path=board_path,
+    )
+    return max((int(m.get("_seq") or 0) for m in msgs), default=0)
+
+
+def ownership_manifest_path(cwd: str | pathlib.Path) -> pathlib.Path:
+    p = pathlib.Path(str(cwd))
+    if (p / ".swarm" / "ownership.json").is_file() or (p / ".git").exists():
+        return p / ".swarm" / "ownership.json"
+    root = rio.git_toplevel(str(cwd)) or str(cwd)
+    return pathlib.Path(root) / ".swarm" / "ownership.json"
+
+
+def load_ownership_manifest(cwd: str | pathlib.Path) -> dict[str, Any]:
+    path = ownership_manifest_path(cwd)
+    doc = rio.read_json(path, default=None)
+    if not isinstance(doc, dict):
+        return {"workers": {}}
+    workers = doc.get("workers")
+    if not isinstance(workers, dict):
+        return {"workers": {}}
+    return doc
+
+
+def save_ownership_manifest(cwd: str | pathlib.Path, manifest: dict[str, Any]) -> tuple[bool, pathlib.Path]:
+    path = ownership_manifest_path(cwd)
+    return bool(rio.write_json(path, manifest)), path
+
+
+def normalize_glob_pattern(pattern: str) -> str:
+    p = str(pattern or "").strip().replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    p = p.lstrip("/")
+    while "//" in p:
+        p = p.replace("//", "/")
+    if p.endswith("/") and len(p) > 1:
+        p = f"{p}**"
+    return p
+
+
+def _split_glob_segments(pattern: str) -> list[str]:
+    norm = normalize_glob_pattern(pattern)
+    if not norm:
+        return []
+    return [seg for seg in norm.split("/") if seg]
+
+
+def _seg_patterns_intersect(p1: str, p2: str) -> bool:
+    a, b = p1.lower(), p2.lower()
+    if "[" in a or "[" in b:
+        return True
+    memo: dict[tuple[int, int], bool] = {}
+
+    def _dp(i: int, j: int) -> bool:
+        key = (i, j)
+        if key in memo:
+            return memo[key]
+        res = False
+        if i == len(a) and j == len(b):
+            res = True
+        elif i < len(a) and a[i] == "*":
+            res = _dp(i + 1, j) or (j < len(b) and _dp(i, j + 1))
+        elif j < len(b) and b[j] == "*":
+            res = _dp(i, j + 1) or (i < len(a) and _dp(i + 1, j))
+        elif i < len(a) and j < len(b):
+            ca, cb = a[i], b[j]
+            if ca == "?" or cb == "?" or ca == cb:
+                res = _dp(i + 1, j + 1)
+        memo[key] = res
+        return res
+
+    return _dp(0, 0)
+
+
+def glob_matches_path(pattern: str, rel_path: str) -> bool:
+    pat_segs = _split_glob_segments(pattern)
+    rel_norm = normalize_glob_pattern(rel_path)
+    if rel_norm.endswith("**"):
+        rel_norm = rel_norm[:-2].rstrip("/")
+    path_segs = [seg for seg in rel_norm.split("/") if seg]
+    if not pat_segs or not path_segs:
+        return False
+    memo: dict[tuple[int, int], bool] = {}
+
+    def _match(pi: int, si: int) -> bool:
+        key = (pi, si)
+        if key in memo:
+            return memo[key]
+        res = False
+        if pi == len(pat_segs) and si == len(path_segs):
+            res = True
+        elif pi < len(pat_segs) and pat_segs[pi] == "**":
+            res = _match(pi + 1, si) or (si < len(path_segs) and _match(pi, si + 1))
+        elif pi < len(pat_segs) and si < len(path_segs):
+            if fnmatch.fnmatchcase(path_segs[si].lower(), pat_segs[pi].lower()):
+                res = _match(pi + 1, si + 1)
+        memo[key] = res
+        return res
+
+    return _match(0, 0)
+
+
+def globs_may_overlap(g1: str, g2: str, existing_files: list[str] | None = None) -> bool:
+    s1 = _split_glob_segments(g1)
+    s2 = _split_glob_segments(g2)
+    if not s1 or not s2:
+        return False
+    memo: dict[tuple[int, int], bool] = {}
+
+    def _dp(i: int, j: int) -> bool:
+        key = (i, j)
+        if key in memo:
+            return memo[key]
+        res = False
+        if i == len(s1) and j == len(s2):
+            res = True
+        elif i < len(s1) and s1[i] == "**":
+            res = _dp(i + 1, j) or (j < len(s2) and _dp(i, j + 1))
+        elif j < len(s2) and s2[j] == "**":
+            res = _dp(i, j + 1) or (i < len(s1) and _dp(i + 1, j))
+        elif i < len(s1) and j < len(s2):
+            if _seg_patterns_intersect(s1[i], s2[j]):
+                res = _dp(i + 1, j + 1)
+        memo[key] = res
+        return res
+
+    if _dp(0, 0):
+        return True
+    for rel in existing_files or ():
+        if glob_matches_path(g1, rel) and glob_matches_path(g2, rel):
+            return True
+    return False
+
+
+def _list_repo_rel_files(repo_root: str) -> list[str]:
+    if not repo_root:
+        return []
+    out_files: set[str] = set()
+    rc, tracked, _ = rio.run_git(repo_root, ["ls-files"])
+    if rc == 0 and tracked:
+        for ln in tracked.splitlines():
+            norm = normalize_glob_pattern(ln)
+            if norm and not norm.startswith(".swarm/"):
+                out_files.add(norm)
+    rc_u, untracked, _ = rio.run_git(repo_root, ["ls-files", "--others", "--exclude-standard"])
+    if rc_u == 0 and untracked:
+        for ln in untracked.splitlines():
+            norm = normalize_glob_pattern(ln)
+            if norm and not norm.startswith(".swarm/"):
+                out_files.add(norm)
+    return sorted(out_files)
+
+
+def detect_ownership_overlaps(
+    manifest: dict[str, Any],
+    repo_root: str = "",
+) -> list[dict[str, str]]:
+    workers = manifest.get("workers") if isinstance(manifest, dict) else {}
+    if not isinstance(workers, dict) or len(workers) < 2:
+        return []
+    existing_files = _list_repo_rel_files(repo_root) if repo_root else []
+    names = sorted(workers.keys())
+    conflicts: list[dict[str, str]] = []
+    for idx, w1 in enumerate(names):
+        p1_list = workers[w1].get("paths") if isinstance(workers[w1], dict) else []
+        for w2 in names[idx + 1 :]:
+            p2_list = workers[w2].get("paths") if isinstance(workers[w2], dict) else []
+            for g1 in p1_list or []:
+                for g2 in p2_list or []:
+                    if globs_may_overlap(str(g1), str(g2), existing_files=existing_files):
+                        conflicts.append(
+                            {
+                                "worker_a": w1,
+                                "glob_a": str(g1),
+                                "worker_b": w2,
+                                "glob_b": str(g2),
+                            }
+                        )
+    return conflicts
+
+
+def resolve_repo_rel_info(file_path: str | pathlib.Path, repo_root: str | pathlib.Path) -> tuple[bool, str, str]:
+    root_abs = pathlib.Path(repo_root).resolve()
+    raw = str(file_path or "").strip()
+    if not raw:
+        return False, "", ""
+    p = pathlib.Path(raw)
+    if not p.is_absolute():
+        p = root_abs / p
+    try:
+        resolved = p.resolve()
+        rel = normalize_glob_pattern(resolved.relative_to(root_abs).as_posix())
+        return True, rel, str(resolved)
+    except ValueError:
+        return False, normalize_glob_pattern(raw), raw
+
+
+def resolve_repo_rel_path(file_path: str | pathlib.Path, repo_root: str | pathlib.Path) -> str:
+    _, rel, _ = resolve_repo_rel_info(file_path, repo_root)
+    return rel
+
+
+def path_matches_any_glob(rel_path: str, globs: list[str]) -> bool:
+    return any(glob_matches_path(g, rel_path) for g in globs if str(g).strip())
+
+
+def detect_stalled_workers(
+    members: dict[str, Any],
+    board_messages: list[dict[str, Any]],
+    cwd: str = "",
+    brain_root: pathlib.Path | None = None,
+    worker_last_activity: dict[str, float] | None = None,
+    in_flight_names: list[str] | None = None,
+    now_ts: float | None = None,
+    timeout_sec: float | None = None,
+) -> list[dict[str, Any]]:
+    active_set = {
+        str(x).split(":", 1)[-1]
+        for x in (in_flight_names or [])
+        if str(x).strip()
+    }
+    if in_flight_names is not None and not active_set:
+        return []
+    threshold = float(timeout_sec) if timeout_sec is not None else swarm_stall_timeout_sec()
+    now = float(now_ts) if now_ts is not None else time.time()
+    repo_root = ""
+    if cwd:
+        cwd_p = pathlib.Path(cwd)
+        if (cwd_p / ".swarm").is_dir() or (cwd_p / ".git").exists():
+            repo_root = cwd
+        else:
+            repo_root = rio.git_toplevel(cwd) or cwd
+    artifacts_dir = (pathlib.Path(repo_root) / ".swarm" / "artifacts") if repo_root else None
+    artifact_files = list(artifacts_dir.glob("*")) if (artifacts_dir and artifacts_dir.is_dir()) else []
+
+    mention_pats_by_worker = {
+        mname: rio.swarm_mention_patterns(mname, include_group=False)[0]
+        for mname in (members or {})
+    }
+    board_ts_by_worker: dict[str, float] = {}
+    coord_mention_by_worker: dict[str, float] = {}
+    for msg in board_messages or []:
+        if not isinstance(msg, dict):
+            continue
+        ts = rio.parse_iso_ts(msg.get("time") or msg.get("ts") or msg.get("created_at"))
+        if ts <= 0.0:
+            continue
+        agent = str(msg.get("agent") or msg.get("worker") or "").strip()
+        text = str(msg.get("text") or "")
+        if agent == "coordinator":
+            for mname, mp in mention_pats_by_worker.items():
+                if mp.search(text):
+                    coord_mention_by_worker[mname] = max(coord_mention_by_worker.get(mname, 0.0), ts)
+        elif agent:
+            board_ts_by_worker[agent] = max(board_ts_by_worker.get(agent, 0.0), ts)
+
+    stalled: list[dict[str, Any]] = []
+    for name, meta in sorted((members or {}).items()):
+        if not isinstance(meta, dict):
+            continue
+        if rio.is_swarm_role_member(name, meta) or rio.is_swarm_member_killed(meta):
+            continue
+        already_replied = (
+            coord_mention_by_worker.get(name, 0.0) > 0.0
+            and board_ts_by_worker.get(name, 0.0) >= coord_mention_by_worker.get(name, 0.0)
+        )
+        if already_replied and name not in active_set:
+            continue
+        if in_flight_names is not None and name not in active_set:
+            continue
+        is_working_state = (
+            name in active_set
+            or str(meta.get("wake_mode") or "").lower() == "working"
+            or str(meta.get("desired_state") or "").lower() == "working"
+        )
+        if not is_working_state:
+            continue
+
+        candidates_ts: list[float] = []
+        if worker_last_activity and worker_last_activity.get(name, 0.0) > 0.0:
+            candidates_ts.append(float(worker_last_activity[name]))
+        if board_ts_by_worker.get(name, 0.0) > 0.0:
+            candidates_ts.append(board_ts_by_worker[name])
+        if coord_mention_by_worker.get(name, 0.0) > 0.0:
+            candidates_ts.append(coord_mention_by_worker[name])
+        for k in ("last_activity_ts", "assigned_ts", "updated_at", "started_at"):
+            val = rio.parse_iso_ts(meta.get(k)) if not isinstance(meta.get(k), (int, float)) else float(meta.get(k) or 0.0)
+            if val > 0.0:
+                candidates_ts.append(val)
+
+        cid = str(meta.get("conversation_id") or "").strip()
+        if cid and brain_root is not None:
+            tp = rio.member_transcript_path(brain_root, cid)
+            if tp.exists():
+                try:
+                    candidates_ts.append(tp.stat().st_mtime)
+                except OSError:
+                    pass
+        safe_name = rio.safe_key(name, name)
+        for af in artifact_files:
+            low_af = af.name.lower()
+            if name.lower() in low_af or safe_name.lower() in low_af:
+                try:
+                    candidates_ts.append(af.stat().st_mtime)
+                except OSError:
+                    pass
+
+        if not candidates_ts:
+            continue
+        last_act = max(candidates_ts)
+        idle_sec = max(0.0, now - last_act)
+        if idle_sec >= threshold:
+            stalled.append(
+                {
+                    "worker": name,
+                    "idle_sec": round(idle_sec, 1),
+                    "timeout_sec": round(threshold, 1),
+                    "last_activity_ts": last_act,
+                    "cid": cid,
+                }
+            )
+    return stalled
 
 
 def is_simplify_subagent_call(sub_type: str, role: str = "") -> bool:
@@ -448,6 +1104,9 @@ def is_scratch_or_ephemeral(
         if pat.search(norm):
             return True
     return False
+
+
+is_ephemeral_path = is_scratch_or_ephemeral
 
 
 DEFAULT_GATE_POLICY: dict[str, Any] = {
@@ -1146,10 +1805,12 @@ def receipt_requirements_summary(
         return " + ".join(parts)
     if floor == "HIGH":
         return (
-            f"decisive test/check execution -> 3 separate simplify lenses (`{SONNET_HIGH_MODEL}`, fallback `{SIMPLIFY_FALLBACK_MODEL}` on Sonnet outage, completed BEFORE review) -> "
-            f"1 independent APPROVED review (priority: Codex lane `codex_lane.py` -> fallback `{OPUS_HIGH_MODEL}` -> `{CARBON_HIGH_MODEL}` only on verified outage)"
+            f"decisive test/check execution -> primary independent APPROVED review (`codex_lane.py` -> `{OPUS_HIGH_MODEL}` -> `{CARBON_HIGH_MODEL}`) -> "
+            f"simplify once (`SIMPLIFY_LENS: ALL` fast-path if <=2 files & <=30 lines, else 3 separate lenses on `{SONNET_HIGH_MODEL}`, fallback `{SIMPLIFY_FALLBACK_MODEL}`) -> "
+            f"batch kill workers -> final `--closure` check"
         )
     return (
-        f"decisive test/check execution -> 3 separate simplify lenses (`{SONNET_HIGH_MODEL}`, fallback `{SIMPLIFY_FALLBACK_MODEL}` on Sonnet outage, completed BEFORE review) -> "
-        f"1 XHIGH APPROVED review (priority: Codex `--xhigh` -> fallback `{OPUS_HIGH_MODEL}` [XHIGH] -> `{CARBON_HIGH_MODEL}` only on verified outage)"
+        f"decisive test/check execution -> primary XHIGH APPROVED review (`codex_lane.py --xhigh` -> `{OPUS_HIGH_MODEL}` -> `{CARBON_HIGH_MODEL}`) -> "
+        f"simplify once (`SIMPLIFY_LENS: ALL` fast-path if <=2 files & <=30 lines, else 3 separate lenses on `{SONNET_HIGH_MODEL}`, fallback `{SIMPLIFY_FALLBACK_MODEL}`) -> "
+        f"batch kill workers -> final `--closure` check"
     )

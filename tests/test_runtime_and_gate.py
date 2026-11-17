@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -53,7 +54,10 @@ class GateSubprocessTestCase(unittest.TestCase):
         self._flush_transcript()
 
     def tearDown(self) -> None:
-        self.tmp.cleanup()
+        try:
+            self.tmp.cleanup()
+        except PermissionError:
+            shutil.rmtree(self.tmp.name, ignore_errors=True)
 
     def _init_git_repo(self, repo_dir: pathlib.Path, files: dict[str, str], commit_msg: str = "init") -> None:
         repo_dir.mkdir(parents=True, exist_ok=True)
@@ -1811,11 +1815,18 @@ class GateSubprocessTestCase(unittest.TestCase):
                 '{"available": false, "lane": "native-fallback", "reason": "codex_outage"}',
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             cwg_stop._is_verified_codex_cmd_outage(
                 "$null | python -X utf8 'C:\\plugin\\hooks\\codex_lane.py' review --session s1",
                 "ERROR",
                 '{"ok": false, "review_id": "cwg-1", "fallback": "adversarial-reviewer", "error": "timeout_after_240s"}',
+            )
+        )
+        self.assertTrue(
+            cwg_stop._is_verified_codex_cmd_outage(
+                "$null | python -X utf8 'C:\\plugin\\hooks\\codex_lane.py' review --session s1",
+                "ERROR",
+                '{"ok": false, "review_id": "cwg-1", "network_outage": true, "fallback": "adversarial-reviewer", "error": "timeout_after_600s"}',
             )
         )
 
@@ -3833,7 +3844,9 @@ class GateSubprocessTestCase(unittest.TestCase):
                 timeout=30,
                 pretty=False,
             )
-            with mock.patch.object(
+            with mock.patch.dict(
+                os.environ, {"CARBON_CODEX_BIN": "codex"}
+            ), mock.patch.object(
                 codex_lane, "check_health", return_value={"available": True, "lane": "codex", "binary": "codex"}
             ), mock.patch.object(
                 codex_lane.subprocess, "Popen", side_effect=_FakeInterruptPopen
@@ -4003,7 +4016,8 @@ class GateSubprocessTestCase(unittest.TestCase):
             (compact_bg_dir / "transcript.jsonl").write_text(_to_compact_jsonl(bg_steps), encoding="utf-8")
             loaded_bg_compact = rio.read_transcript_steps(str(compact_bg_dir / "transcript.jsonl"))
             sw_ev_bg = cwg_stop.scan_swarm_activity(loaded_bg_compact, None, t0)
-            self.assertTrue(sw_ev_bg["codex_cmd_failed"])
+            self.assertFalse(sw_ev_bg["codex_cmd_failed"])
+            self.assertTrue(sw_ev_bg["codex_timeout_seen"])
             self.assertIn("cwg-ghost-to", sw_ev_bg["aborted_codex_reviews"])
             self.assertNotIn("cwg-legit-r1", sw_ev_bg["aborted_codex_reviews"])
             self.assertIn("cwg-legit-r2", sw_ev_bg["aborted_codex_reviews"])
@@ -4658,6 +4672,1340 @@ class GateSubprocessTestCase(unittest.TestCase):
             chg_link, unm_link = cwg_mark.diff_git_snapshots(snap_link_before, snap_link_after)
             self.assertFalse(unm_link)
             self.assertIn(norm_link, chg_link)
+
+    def test_23_anom_158c11a4_closure_deadlock_inbox_write_check_and_ps_block_hint(self) -> None:
+        sys.path.insert(0, str(HOOKS_DIR))
+        import argparse
+        import io
+        import cwg_common as cwg
+        import cwg_stop
+        import gate_inbox
+
+        t0 = 1_800_000_000.0
+        bus_mod = self.workspace / "hooks" / "chat_bus_hook.py"
+        bus_mod.parent.mkdir(parents=True, exist_ok=True)
+        bus_mod.write_text("def send():\n    return True\n", encoding="utf-8")
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CARBON_STACK_HOME": str(self.stack_home),
+                "CARBON_CODEX_SESSIONS_DIR": str(self.codex_sessions),
+                "ANTIGRAVITY_BRAIN_ROOT": str(self.brain),
+            },
+        ):
+            # 1. Exact `anom-158c11a4` forensics: `marks_truncated` (`edits=146`, marks start at `t0 + 100`), `shell_durable_edit=False`,
+            #    `transcript_full.jsonl` tail-seek gap (`0 -> 500`) recovered via compact `transcript.jsonl`, plus a premature
+            #    pre-simplify `REVISE` round `r0` that must NOT deadlock the 3 valid post-simplify rounds (`cwg-b09c3faa7da8`,
+            #    `internal-opus-33`, `cwg-4c9a95ddf006`) + fresh post-simplify `CLOSURE_VALIDATION: READY` (`cwg-f5b261c075c2`).
+            compact_tp = self.transcript.with_name("transcript.jsonl")
+            full_tp = self.transcript.with_name("transcript_full.jsonl")
+            compact_steps = [
+                {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE", "created_at": iso_now(t0)},
+                {
+                    "step_index": 1,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": iso_now(t0 + 2.0),
+                    "tool_calls": [
+                        {
+                            "name": "edit_file",
+                            "args": {
+                                "Path": json.dumps(str(bus_mod)),
+                                "Target": json.dumps("a"),
+                                "Replacement": json.dumps("b"),
+                            },
+                        }
+                    ],
+                },
+                {"step_index": 2, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": iso_now(t0 + 2.5), "content": "Edited"},
+                {
+                    "step_index": 3,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": iso_now(t0 + 18.0),
+                    "tool_calls": [
+                        {
+                            "name": "run_command",
+                            "args": {"CommandLine": json.dumps("python -X utf8 tools/chat_bus_cli.py status")},
+                        }
+                    ],
+                },
+                {"step_index": 4, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": iso_now(t0 + 18.5), "content": "ok"},
+                {
+                    "step_index": 5,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": iso_now(t0 + 50.0),
+                    "tool_calls": [
+                        {
+                            "name": "edit_file",
+                            "args": {
+                                "Path": json.dumps(str(bus_mod)),
+                                "Target": json.dumps("b"),
+                                "Replacement": json.dumps("c"),
+                            },
+                        }
+                    ],
+                },
+                {"step_index": 6, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": iso_now(t0 + 50.5), "content": "Edited"},
+            ]
+            compact_tp.write_text("\n".join(json.dumps(s) for s in compact_steps) + "\n", encoding="utf-8")
+            full_tp.write_text("", encoding="utf-8")
+            seek_gap_full_steps = [
+                {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE", "created_at": iso_now(t0)},
+                {"step_index": 500, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": iso_now(t0 + 140.0), "content": "tail"},
+            ]
+
+            anom_marker = {
+                "session": self.conv_id,
+                "first_ts": t0,
+                "last_ts": t0 + 150.0,
+                "last_durable_ts": t0 + 150.0,
+                "cwd": str(self.workspace).replace("\\", "/"),
+                "git_root": str(self.workspace).replace("\\", "/"),
+                "paths": [str(bus_mod).replace("\\", "/")],
+                "edits": 146,
+                "shell_durable_edit": False,
+                "marks_evicted_through_ts": t0 + 90.0,
+                "content_marks": [
+                    {"ts": t0 + 100.0, "fp": "fp-v3"},
+                    {"ts": t0 + 150.0, "fp": "fp-v4"},
+                ],
+                "closed": False,
+            }
+            anom_checks = {
+                "checks": [{"kind": "check", "passed": True, "ts": t0 + 155.0}],
+                "passed_count": 1,
+                "failed_count": 0,
+                "latest_pass_ts": t0 + 155.0,
+                "latest_fail_ts": 0.0,
+            }
+            empty_sub = {
+                "fallback_lenses": {},
+                "fallback_lenses_end": {},
+                "fallback_combined_ts": 0.0,
+                "fallback_combined_end_ts": 0.0,
+                "simplify_launch_steps": set(),
+                "simplify_history": [],
+                "simplify_failures": 0,
+                "reviews": [],
+                "review_failures": [],
+                "in_flight_subagents": [],
+            }
+            anom_swarm = {
+                "sonnet_lenses": {"reuse": t0 + 160.0, "quality": t0 + 160.0, "efficiency": t0 + 160.0},
+                "sonnet_lenses_end": {"reuse": t0 + 165.0, "quality": t0 + 165.0, "efficiency": t0 + 165.0},
+                "fallback_lenses": {},
+                "fallback_lenses_end": {},
+                "sonnet_combined_ts": 0.0,
+                "fallback_combined_ts": 0.0,
+                "sonnet_combined_end_ts": 0.0,
+                "fallback_combined_end_ts": 0.0,
+                "simplify_launch_steps": set(),
+                "simplify_history": [
+                    {"kind": "lens", "lens": lns, "tier": "sonnet", "launch_ts": ts_s, "end_ts": ts_s + 5.0}
+                    for ts_s in (t0 + 10.0, t0 + 60.0, t0 + 110.0, t0 + 160.0)
+                    for lns in ("reuse", "quality", "efficiency")
+                ],
+                "simplify_failures": 0,
+                "reviews": [
+                    {
+                        "engine": "internal-opus",
+                        "reviewer": "internal-opus-33",
+                        "kind": "ordinary",
+                        "verdict": "REVISE",
+                        "launch_ts": t0 + 70.0,
+                        "verdict_ts": t0 + 75.0,
+                        "xhigh": False,
+                        "model": cwg.OPUS_HIGH_MODEL,
+                    }
+                ],
+                "review_failures": [],
+                "in_flight_workers": [],
+                "opus_issue_verified": False,
+                "opus_issue_ts": 0.0,
+                "sonnet_issue_verified": False,
+                "codex_cmd_failed": True,
+                "codex_issue_ts": t0 + 68.0,
+                "codex_issue_step": -1,
+                "board_head": 0,
+            }
+            ord_3_rounds = [
+                {"engine": "codex", "review_id": "cwg-r0-premature", "kind": "ordinary", "verdict": "REVISE", "launch_ts": t0 + 4.0, "verdict_ts": t0 + 6.0, "xhigh": False},
+                {"engine": "codex", "review_id": "cwg-b09c3faa7da8", "kind": "ordinary", "verdict": "REVISE", "launch_ts": t0 + 25.0, "verdict_ts": t0 + 30.0, "xhigh": False},
+                {"engine": "codex", "review_id": "cwg-4c9a95ddf006", "kind": "ordinary", "verdict": "REVISE", "launch_ts": t0 + 120.0, "verdict_ts": t0 + 125.0, "xhigh": False},
+            ]
+
+            # Before `--phase closure` runs on `fp-v4`, Stop directs the agent to `--phase closure` (not a forbidden 4th round)
+            # and sanitizes PowerShell backticks/quotes/`$` out of `--block "..."` and `Message="[GATE_ANOMALY ...]"`.
+            ok_pre_cls, why_pre_cls = cwg_stop.validate_candidate_closure(
+                {"kind": "verified", "risk": "HIGH"},
+                anom_marker,
+                anom_checks,
+                empty_sub,
+                anom_swarm,
+                ord_3_rounds,
+                steps=seek_gap_full_steps,
+                transcript_path=str(full_tp),
+            )
+            self.assertFalse(ok_pre_cls)
+            self.assertIn("--phase closure", why_pre_cls)
+
+            gate_inbox.set_handler_config(session="a508fe71-2b38-458a-b726-7529ddc212ac", stack_repo=str(REPO_ROOT))
+            blk_msg = cwg_stop.format_block_message(
+                session=self.conv_id,
+                marker=anom_marker,
+                reason=why_pre_cls,
+                block_num=1,
+                nonce="bc079fc23940",
+            )
+            self.assertIn("--phase closure --summary", blk_msg)
+            block_flag_idx = blk_msg.index("--block ")
+            block_snippet = blk_msg[block_flag_idx : block_flag_idx + 160]
+            self.assertNotIn("`", block_snippet)
+
+            # Pre-simplify `CLOSURE_VALIDATION: READY` on `fp-v4` (`launch_ts = t0 + 158 < simplify_end = t0 + 165`) is STILL rejected!
+            revs_early_cls = ord_3_rounds + [
+                {"engine": "codex", "review_id": "cwg-early-f4", "kind": "closure", "verdict": "READY", "launch_ts": t0 + 158.0, "verdict_ts": t0 + 162.0, "xhigh": False},
+            ]
+            ok_early_v, why_early_v = cwg_stop.validate_candidate_closure(
+                {"kind": "verified", "risk": "HIGH"},
+                anom_marker,
+                anom_checks,
+                empty_sub,
+                anom_swarm,
+                revs_early_cls,
+                steps=seek_gap_full_steps,
+                transcript_path=str(full_tp),
+            )
+            self.assertFalse(ok_early_v)
+            self.assertIn("adversarial review ran simultaneously with or before simplify lenses", why_early_v)
+            ok_early_pr, why_early_pr = cwg_stop.validate_candidate_closure(
+                {"kind": "pr-ready", "risk": "HIGH"},
+                anom_marker,
+                anom_checks,
+                empty_sub,
+                anom_swarm,
+                revs_early_cls,
+                steps=seek_gap_full_steps,
+                transcript_path=str(full_tp),
+            )
+            self.assertFalse(ok_early_pr)
+            self.assertIn("adversarial review ran simultaneously with or before simplify lenses", why_early_pr)
+
+            # Post-simplify `CLOSURE_VALIDATION: READY` (`cwg-f5b261c075c2`, `launch_ts = t0 + 170 > simplify_end = t0 + 165`)
+            # succeeds cleanly for BOTH `verified` and `pr-ready`!
+            revs_ready = ord_3_rounds + [
+                {"engine": "codex", "review_id": "cwg-f5b261c075c2", "kind": "closure", "verdict": "READY", "launch_ts": t0 + 170.0, "verdict_ts": t0 + 175.0, "xhigh": False},
+            ]
+            self.assertEqual(
+                cwg_stop.validate_candidate_closure(
+                    {"kind": "verified", "risk": "HIGH"},
+                    anom_marker,
+                    anom_checks,
+                    empty_sub,
+                    anom_swarm,
+                    revs_ready,
+                    steps=seek_gap_full_steps,
+                    transcript_path=str(full_tp),
+                ),
+                (True, "verified"),
+            )
+            self.assertEqual(
+                cwg_stop.validate_candidate_closure(
+                    {"kind": "pr-ready", "risk": "HIGH"},
+                    anom_marker,
+                    anom_checks,
+                    empty_sub,
+                    anom_swarm,
+                    revs_ready,
+                    steps=seek_gap_full_steps,
+                    transcript_path=str(full_tp),
+                ),
+                (True, "pr-ready"),
+            )
+
+            # Subsequent durable edit (`fp-v5` at `t0 + 200`) resets the cycle cleanly after `cwg-f5b261c075c2`
+            marker_v5 = dict(
+                anom_marker,
+                last_ts=t0 + 200.0,
+                last_durable_ts=t0 + 200.0,
+                content_marks=list(anom_marker["content_marks"]) + [{"ts": t0 + 200.0, "fp": "fp-v5"}],
+            )
+            checks_v5 = dict(anom_checks, latest_pass_ts=t0 + 205.0)
+            swarm_v5 = dict(
+                anom_swarm,
+                sonnet_lenses={"reuse": t0 + 210.0, "quality": t0 + 210.0, "efficiency": t0 + 210.0},
+                sonnet_lenses_end={"reuse": t0 + 215.0, "quality": t0 + 215.0, "efficiency": t0 + 215.0},
+                simplify_history=list(anom_swarm["simplify_history"])
+                + [
+                    {"kind": "lens", "lens": lns, "tier": "sonnet", "launch_ts": t0 + 210.0, "end_ts": t0 + 215.0}
+                    for lns in ("reuse", "quality", "efficiency")
+                ],
+            )
+            revs_v5 = revs_ready + [
+                {"engine": "codex", "review_id": "cwg-v5-app", "kind": "ordinary", "verdict": "APPROVED", "launch_ts": t0 + 220.0, "verdict_ts": t0 + 225.0, "xhigh": False},
+            ]
+            self.assertEqual(
+                cwg_stop.validate_candidate_closure(
+                    {"kind": "verified", "risk": "HIGH"},
+                    marker_v5,
+                    checks_v5,
+                    empty_sub,
+                    swarm_v5,
+                    revs_v5,
+                    steps=seek_gap_full_steps,
+                    transcript_path=str(full_tp),
+                ),
+                (True, "verified"),
+            )
+
+            # Over-limit cycles MUST NOT launder `MAX_REVIEW_ROUNDS` / `MAX_RAW_ORDINARY_ROUNDS` across post-verdict edits:
+            def _ord(rid: str, verdict: str, lts: float, vts: float) -> dict[str, object]:
+                return {"engine": "codex", "review_id": rid, "kind": "ordinary", "verdict": verdict, "launch_ts": lts, "verdict_ts": vts, "xhigh": False}
+
+            over_limit_cases = [
+                (
+                    "raw_cls",
+                    [_ord(f"cwg-pre-raw-{i}", "REVISE", t0 + 1.5 + i * 0.5, t0 + 1.7 + i * 0.5) for i in range(4)]
+                    + revs_ready[1:]
+                    + [_ord("cwg-v5-launder-raw-cls", "APPROVED", t0 + 220.0, t0 + 225.0)],
+                ),
+                (
+                    "cnt_cls",
+                    [_ord("cwg-pre-app-1", "APPROVED", t0 + 2.0, t0 + 4.0)]
+                    + revs_ready[1:]
+                    + [_ord("cwg-v5-launder-cnt-cls", "APPROVED", t0 + 220.0, t0 + 225.0)],
+                ),
+                (
+                    "raw_ord",
+                    [_ord(f"cwg-pre-ord-{i}", "REVISE", t0 + 1.0 + i * 0.4, t0 + 1.2 + i * 0.4) for i in range(6)]
+                    + [
+                        _ord("cwg-post-ord-app", "APPROVED", t0 + 140.0, t0 + 145.0),
+                        _ord("cwg-v5-launder-raw-ord", "APPROVED", t0 + 220.0, t0 + 225.0),
+                    ],
+                ),
+            ]
+            for case_name, case_revs in over_limit_cases:
+                with self.subTest(case=case_name):
+                    ok_over, why_over = cwg_stop.validate_candidate_closure(
+                        {"kind": "verified", "risk": "HIGH"},
+                        marker_v5,
+                        checks_v5,
+                        empty_sub,
+                        swarm_v5,
+                        case_revs,
+                        steps=seek_gap_full_steps,
+                        transcript_path=str(full_tp),
+                    )
+                    self.assertFalse(ok_over)
+                    self.assertIn("MAX_REVIEW_ROUNDS=3", why_over)
+
+            # 2. `gate_inbox.py`: `cmd_report` and `set_handler_config` fail closed when `rio.write_json` returns `False`
+            cwg.rio.write_json(cwg.enforcement_state_path(self.conv_id), {"block_nonce": "bc079fc23940"})
+            rep_args = argparse.Namespace(
+                session=self.conv_id,
+                nonce="bc079fc23940",
+                block="invoked adversarial review ended in REVISE, not APPROVED",
+                facts="cycle_raw_ordinary==3 deadlock",
+                did="unittest + simplify + closure",
+                transcript="",
+            )
+            err_buf = io.StringIO()
+            out_buf = io.StringIO()
+            with (
+                mock.patch.object(gate_inbox.rio, "write_json", return_value=False),
+                mock.patch("sys.stderr", err_buf),
+                mock.patch("sys.stdout", out_buf),
+            ):
+                rc_ro = gate_inbox.cmd_report(rep_args)
+                res_cfg_ro = gate_inbox.set_handler_config(session=self.conv_id, stack_repo=str(REPO_ROOT))
+            self.assertEqual(rc_ro, 1)
+            self.assertEqual(out_buf.getvalue(), "")
+            self.assertIn("Failed to persist anomaly report", err_buf.getvalue())
+            self.assertFalse(res_cfg_ro["ok"])
+
+    def test_24_swarm_unposted_worker_deadlock_codex_xhigh_sandbox_and_bus_digest(self) -> None:
+        import argparse
+        import sqlite3
+        from unittest import mock
+
+        sys.path.insert(0, str(HOOKS_DIR))
+        import codex_lane
+        import cwg_common as cwg
+        import cwg_stop
+        import gate_inbox
+        import runtime_io as rio
+        import safety_guards
+
+        env_vars = {
+            "CARBON_STACK_HOME": str(self.stack_home),
+            "PLUGIN_ROOT": str(REPO_ROOT / "plugin"),
+            "ANTIGRAVITY_BRAIN_ROOT": str(self.brain),
+        }
+        with mock.patch.dict(os.environ, env_vars):
+            # 1. Swarm worker with leading `SYSTEM_SDK` preamble + plain-text verdict without `post_message` (`msg-42dad31c77e7`)
+            sdir = self.brain / self.conv_id / ".system_generated" / "swarm"
+            sdir.mkdir(parents=True, exist_ok=True)
+            w_reuse_cid = "sw-r5-reuse"
+            w_eff_cid = "a19e7165-fd16-43d6-9500-4c7fa02157f0"
+            (sdir / "members.json").write_text(
+                json.dumps(
+                    {
+                        "members": {
+                            "coordinator": {"conversation_id": self.conv_id, "role": "coordinator", "killed": False},
+                            "simplify-reuse-r5": {
+                                "conversation_id": w_reuse_cid,
+                                "role": "worker",
+                                "model": "claude-sonnet-5-5-high",
+                                "wake_mode": "mentions",
+                                "wait_since": 38,
+                                "killed": False,
+                            },
+                            "simplify-efficiency-r5": {
+                                "conversation_id": w_eff_cid,
+                                "role": "worker",
+                                "model": "claude-sonnet-5-5-high",
+                                "wake_mode": "working",
+                                "killed": False,
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            board_file = sdir / "board.jsonl"
+            board_rows = [
+                {"seq": 36, "agent": "coordinator", "text": "@simplify-reuse-r5 Check REUSE"},
+                {"seq": 37, "agent": "coordinator", "text": "@simplify-efficiency-r5 Check EFFICIENCY"},
+                {"seq": 38, "agent": "simplify-reuse-r5", "text": "@coordinator\nSIMPLIFY_LENS: REUSE\nSIMPLIFY_VERDICT: CLEAN"},
+            ]
+            board_file.write_text("\n".join(json.dumps(r) for r in board_rows) + "\n", encoding="utf-8")
+
+            t0 = 1_794_890_000.0
+            w_tp = self.brain / w_eff_cid / ".system_generated" / "logs" / "transcript.jsonl"
+            w_tp.parent.mkdir(parents=True, exist_ok=True)
+            worker_steps = [
+                {
+                    "step_index": 0,
+                    "source": "SYSTEM_SDK",
+                    "type": "EPHEMERAL_MESSAGE",
+                    "status": "DONE",
+                    "created_at": iso_now(t0),
+                    "content": "[memory] NotebookLM durable memory preamble",
+                },
+                {
+                    "step_index": 1,
+                    "source": "SYSTEM",
+                    "type": "SYSTEM_MESSAGE",
+                    "status": "DONE",
+                    "created_at": iso_now(t0 + 0.1),
+                    "content": f"[Message] timestamp={iso_now(t0 + 0.1)} sender={w_reuse_cid} priority=MESSAGE_PRIORITY_HIGH content=[swarm] new board message #37",
+                },
+                {
+                    "step_index": 2,
+                    "source": "SYSTEM",
+                    "type": "SYSTEM_MESSAGE",
+                    "status": "DONE",
+                    "created_at": iso_now(t0 + 0.2),
+                    "content": f"[Message] timestamp={iso_now(t0 + 0.2)} sender={self.conv_id} priority=MESSAGE_PRIORITY_HIGH content=You have just started. Your assignment (recorded on the board as #37 for @simplify-efficiency-r5): check EFFICIENCY.",
+                },
+                *[
+                    {
+                        "step_index": 3 + k * 2,
+                        "source": "MODEL",
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "created_at": iso_now(t0 + 1.0 + k),
+                        "tool_calls": [{"name": "read_file", "args": {"Path": "diff.patch"}}],
+                    }
+                    if sub_k == 0
+                    else {
+                        "step_index": 4 + k * 2,
+                        "source": "MODEL",
+                        "type": "GENERIC",
+                        "status": "DONE",
+                        "created_at": iso_now(t0 + 1.4 + k),
+                        "content": "Showing lines 1-20 of 20",
+                    }
+                    for k in range(5)
+                    for sub_k in (0, 1)
+                ],
+                {
+                    "step_index": 13,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": iso_now(t0 + 9.0),
+                    "content": "Nothing costs extra.\nSIMPLIFY_LENS: EFFICIENCY\nSIMPLIFY_VERDICT: CLEAN",
+                },
+            ]
+            w_tp.write_text("\n".join(json.dumps(s) for s in worker_steps) + "\n", encoding="utf-8")
+
+            # 14-step worker transcript (>8 lines) with `SYSTEM_SDK` at step 0 stays recognized even under `read_transcript_steps(max_lines=8)`
+            sliced_8 = rio.read_transcript_steps(str(w_tp), max_lines=8)
+            self.assertEqual(len(sliced_8), 8)
+            self.assertGreater(int(sliced_8[1]["step_index"]), 2)
+            self.assertTrue(rio.is_subagent_session(str(w_tp), steps=sliced_8))
+            self.assertEqual(rio.swarm_worker_model(str(w_tp), steps=sliced_8, conversation_id=w_eff_cid), "claude-sonnet-5-5-high")
+
+            # Conversely, a >4000-step MAIN chat (`step 0 = SYSTEM_SDK`, `step 1 = USER_EXPLICIT`, `step 7 = late SYSTEM_MESSAGE`
+            # where `read_transcript_steps()` yields `[0, 7, 8, ...]`) MUST NEVER be misclassified as a subagent or bypass Stop gate!
+            long_main_cid = "long-main-4006"
+            long_main_tp = self.brain / long_main_cid / ".system_generated" / "logs" / "transcript.jsonl"
+            long_main_tp.parent.mkdir(parents=True, exist_ok=True)
+            long_main_steps = [
+                {"step_index": 0, "source": "SYSTEM_SDK", "type": "EPHEMERAL_MESSAGE", "status": "DONE", "created_at": iso_now(t0), "content": "[memory] preamble"},
+                {"step_index": 1, "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE", "created_at": iso_now(t0 + 0.1), "content": "Fix auth bug"},
+                *[
+                    {"step_index": si, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": iso_now(t0 + 0.2), "content": "working"}
+                    for si in range(2, 7)
+                ],
+                {
+                    "step_index": 7,
+                    "source": "SYSTEM",
+                    "type": "SYSTEM_MESSAGE",
+                    "status": "DONE",
+                    "created_at": iso_now(t0 + 1.0),
+                    "content": f"[Message] timestamp={iso_now(t0 + 1.0)} sender=sub-helper-1 priority=MESSAGE_PRIORITY_HIGH content=Done researching.",
+                },
+                *[
+                    {"step_index": si, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": iso_now(t0 + 2.0), "content": "Closing without receipt"}
+                    for si in range(8, 4006)
+                ],
+            ]
+            long_main_tp.write_text("\n".join(json.dumps(s) for s in long_main_steps) + "\n", encoding="utf-8")
+            sliced_main_4000 = rio.read_transcript_steps(str(long_main_tp))
+            self.assertEqual((sliced_main_4000[0]["step_index"], sliced_main_4000[1]["step_index"]), (0, 7))
+            self.assertFalse(rio.is_subagent_session(str(long_main_tp), steps=sliced_main_4000))
+            self.assertFalse(rio.is_subagent_session(None, steps=sliced_main_4000))
+            rio.write_json(
+                cwg.marker_path(long_main_cid),
+                {
+                    "session": long_main_cid,
+                    "first_ts": t0,
+                    "last_ts": t0 + 1.5,
+                    "last_durable_ts": t0 + 1.5,
+                    "cwd": str(self.workspace),
+                    "git_root": str(self.workspace),
+                    "paths": [rio.normalize_path(self.workspace / "NOTES.md")],
+                    "closed": False,
+                },
+            )
+            _, long_main_stop = self.run_hook(
+                "cwg_stop.py",
+                "Stop",
+                {
+                    "conversationId": long_main_cid,
+                    "transcriptPath": str(long_main_tp),
+                    "terminationReason": "NO_TOOL_CALL",
+                    "fullyIdle": True,
+                },
+            )
+            self.assertEqual(long_main_stop["decision"], "continue")
+
+            # Worker Stop hook blocks up to MAX_WORKER_POST_REMINDERS=2, then fails finite (`allow`)
+            worker_stop_payload = {
+                "conversationId": w_eff_cid,
+                "transcriptPath": str(w_tp),
+                "terminationReason": "NO_TOOL_CALL",
+                "fullyIdle": True,
+            }
+            for expected_dec in ("continue", "continue", "allow"):
+                _, w_res = self.run_hook("cwg_stop.py", "Stop", worker_stop_payload)
+                self.assertEqual(w_res["decision"], expected_dec)
+                if expected_dec == "continue":
+                    self.assertIn("Swarm Worker Stop Guard", w_res["reason"])
+
+            # Coordinator PreToolUse `guard_swarm_wait` detects `simplify-efficiency-r5` parked without `post_message`
+            coord_payload = {
+                "conversationId": self.conv_id,
+                "cwd": str(self.workspace),
+                "transcriptPath": str(self.transcript),
+            }
+            dec_wait, why_wait = safety_guards.guard_swarm_wait(coord_payload, {"since": 38})
+            self.assertEqual(dec_wait, "deny")
+            self.assertIn("simplify-efficiency-r5", why_wait or "")
+            self.assertIn("без вызова `post_message`", why_wait or "")
+
+            # Re-waking worker at #39 (`last_assign_seq=39 > max_wake_seq=37`) allows `swarm_wait` without race
+            board_rows.append({"seq": 39, "agent": "coordinator", "text": "@simplify-efficiency-r5 Call post_message now"})
+            board_file.write_text("\n".join(json.dumps(r) for r in board_rows) + "\n", encoding="utf-8")
+            self.assertEqual(safety_guards.guard_swarm_wait(coord_payload, {"since": 39}), ("allow", None))
+
+            # Once worker posts #40, Worker Stop hook allows immediately
+            board_rows.append(
+                {"seq": 40, "agent": "simplify-efficiency-r5", "text": "@coordinator\nSIMPLIFY_LENS: EFFICIENCY\nSIMPLIFY_VERDICT: CLEAN"}
+            )
+            board_file.write_text("\n".join(json.dumps(r) for r in board_rows) + "\n", encoding="utf-8")
+            _, w_res_ok = self.run_hook("cwg_stop.py", "Stop", worker_stop_payload)
+            self.assertEqual(w_res_ok["decision"], "allow")
+
+            # 2. `codex_lane.py`: `--xhigh` defaults to 600s, local timeout & sandbox block do NOT trip global breaker (`msg-2e82564cef37`)
+            codex_lane.reset_breaker()
+            seen_timeouts: list[float] = []
+            emitted_cli: list[dict[str, object]] = []
+
+            def _fake_timeout_exec(
+                cmd: list[str], prompt: str, cwd: str, timeout: float, review_id: str, xhigh: bool
+            ) -> None:
+                seen_timeouts.append(timeout)
+                return None
+
+            base_rev_kw = dict(
+                cwd=str(self.workspace),
+                summary="xhigh timeout check",
+                diff_file="",
+                review_id="cwg-xhigh-to-24",
+                session=self.conv_id,
+                model="",
+                resume="",
+                new_session=True,
+                closure=False,
+                timeout=None,
+                pretty=False,
+            )
+            with (
+                mock.patch.object(codex_lane, "check_health", return_value={"available": True, "lane": "codex", "binary": "codex"}),
+                mock.patch.object(codex_lane, "_exec_codex_once", side_effect=_fake_timeout_exec),
+            ):
+                rc_xh = codex_lane.cmd_review(argparse.Namespace(**base_rev_kw, xhigh=True))
+                rc_std = codex_lane.cmd_review(argparse.Namespace(**{**base_rev_kw, "review_id": "cwg-std-to-24"}, xhigh=False))
+            self.assertEqual((rc_xh, rc_std), (3, 3))
+            self.assertEqual(seen_timeouts, [900.0, 600.0])
+            self.assertFalse(codex_lane.breaker_status().get("tripped"))
+            self.assertTrue(
+                codex_lane.is_direct_codex_invocation("python -X utf8 codex_lane.py review --phase closure --summary ok")
+            )
+
+            # Real `subprocess.TimeoutExpired` inside `_exec_codex_once` does NOT trip global breaker
+            class _TimeoutPopen:
+                pid = 888888
+
+                def communicate(self, input: bytes | None = None, timeout: float | None = None) -> tuple[bytes, bytes]:
+                    raise subprocess.TimeoutExpired(cmd=["codex"], timeout=timeout or 1.0)
+
+                def kill(self) -> None:
+                    return None
+
+            with (
+                mock.patch.object(codex_lane.subprocess, "Popen", return_value=_TimeoutPopen()),
+                mock.patch.object(codex_lane, "_kill_process_tree"),
+                mock.patch.object(codex_lane.rio, "print_cli_json", side_effect=lambda obj, **_: emitted_cli.append(obj)),
+            ):
+                res_to = codex_lane._exec_codex_once(["codex"], "prompt", str(self.workspace), 5.0, "cwg-real-to", True)
+            self.assertIsNone(res_to)
+            self.assertEqual(emitted_cli[-1].get("error"), "timeout_after_5s")
+            self.assertFalse(codex_lane.breaker_status().get("tripped"))
+            # PostToolUse `record_from_command` on a local timeout JSON MUST NOT trip global breaker either, whereas 429 quota DOES
+            codex_lane.record_from_command(
+                "python -X utf8 plugin/hooks/codex_lane.py review --xhigh",
+                json.dumps(emitted_cli[-1]),
+                exit_code=3,
+            )
+            self.assertFalse(codex_lane.breaker_status().get("tripped"))
+            codex_lane.record_from_command(
+                "codex exec -s read-only -",
+                "Error: usage limit exceeded (429 Too Many Requests)",
+                exit_code=1,
+            )
+            self.assertTrue(codex_lane.breaker_status().get("tripped"))
+            codex_lane.reset_breaker()
+
+            # Read-only sandbox (`record_packet` fails to write packet) fails fast with `sandbox_blocked: true` and NO `fallback` / NO breaker
+            emitted_cli.clear()
+            with (
+                mock.patch.object(codex_lane, "check_health", return_value={"available": True, "lane": "codex", "binary": "codex"}),
+                mock.patch.object(codex_lane.rio, "write_json", return_value=False),
+                mock.patch.object(codex_lane.rio, "print_cli_json", side_effect=lambda obj, **_: emitted_cli.append(obj)),
+            ):
+                rc_sb = codex_lane.cmd_review(argparse.Namespace(**{**base_rev_kw, "review_id": "cwg-sb-24"}, xhigh=True))
+            self.assertEqual(rc_sb, 2)
+            sb_json = emitted_cli[-1]
+            self.assertTrue(sb_json.get("sandbox_blocked"))
+            self.assertNotIn("fallback", sb_json)
+            self.assertFalse(codex_lane.breaker_status().get("tripped"))
+
+            # 3. `gate_inbox.py` + `cwg_stop.py`: read-only `chat-bus` digest & cross-project notification verification
+            handler_id = "a508fe71-2b38-458a-b726-7529ddc212ac"
+            gate_inbox.set_handler_config(session=handler_id, stack_repo=str(REPO_ROOT))
+            bus_dir = self.stack_home / "state" / "chat-bus"
+            bus_dir.mkdir(parents=True, exist_ok=True)
+            bus_db = bus_dir / "bus.db"
+            con = sqlite3.connect(str(bus_db))
+            try:
+                con.execute(
+                    "CREATE TABLE messages (msg_id TEXT PRIMARY KEY, thread_id TEXT, from_id TEXT, from_title TEXT, "
+                    "to_id TEXT, body TEXT, status TEXT, acked_ts REAL, created_ts REAL)"
+                )
+                con.execute(
+                    "INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "msg-deadlock-1",
+                        "thr-1",
+                        self.conv_id,
+                        "Charon Billing",
+                        handler_id,
+                        "[SWARM_WAIT_DEADLOCK] worker parked without post_message; report anom-deadbeef",
+                        "delivered",
+                        0.0,
+                        t0 + 10.0,
+                    ),
+                )
+                con.executemany(
+                    "INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            f"msg-noise-{idx_n}",
+                            "thr-noise",
+                            self.conv_id,
+                            "Ordinary Chat",
+                            handler_id,
+                            f"Hello ping {idx_n}",
+                            "delivered",
+                            0.0,
+                            t0 + 20.0 + idx_n,
+                        )
+                        for idx_n in range(80)
+                    ],
+                )
+                con.commit()
+            finally:
+                con.close()
+
+            # 80 newer non-report `delivered` messages (`acked_ts=0`) MUST NOT displace `msg-deadlock-1` out of `unhandled_bus_reports`
+            digest_before = gate_inbox.format_handler_digest()
+            self.assertIn("msg-deadlock-1", digest_before)
+            self.assertIn("SWARM_WAIT_DEADLOCK", digest_before)
+            self.assertEqual(gate_inbox.unhandled_bus_reports(limit=0), [])
+            self.assertTrue(
+                cwg_stop._has_notified_anomaly_handler([], handler_id, t0, "anom-deadbeef", session=self.conv_id)
+            )
+
+            con2 = sqlite3.connect(str(bus_db))
+            try:
+                con2.execute("UPDATE messages SET status = 'replied' WHERE msg_id = 'msg-deadlock-1'")
+                con2.commit()
+            finally:
+                con2.close()
+            self.assertEqual(gate_inbox.format_handler_digest(), "")
+
+    def test_25_codex_timeout_policy_continuation_and_escalation_guards(self) -> None:
+        import argparse
+        import io
+
+        sys.path.insert(0, str(REPO_ROOT / "plugin" / "hooks"))
+        import codex_lane
+        import cwg_common as cwg
+        import cwg_stop
+        import safety_guards
+
+        codex_sessions = self.root / "codex_sessions_25"
+        codex_sessions.mkdir(parents=True, exist_ok=True)
+        fake_codex = self.root / ("codex.cmd" if os.name == "nt" else "codex")
+        fake_codex.write_text("echo ok\n", encoding="utf-8")
+
+        env_patch = {
+            "CARBON_STACK_HOME": str(self.stack_home),
+            "CARBON_CODEX_SESSIONS_DIR": str(codex_sessions),
+            "CARBON_CODEX_BIN": str(fake_codex),
+        }
+        with mock.patch.dict(os.environ, env_patch):
+            codex_lane.reset_breaker()
+            t0 = time.time() - 60.0
+            auth_file = self.workspace / "auth_guard.py"
+            auth_file.write_text("def check():\n    return True\n", encoding="utf-8")
+            cwg.rio.write_json(
+                cwg.marker_path(self.conv_id),
+                {
+                    "session": self.conv_id,
+                    "first_ts": t0,
+                    "last_ts": t0 + 1.0,
+                    "last_durable_ts": t0 + 1.0,
+                    "cwd": str(self.workspace).replace("\\", "/"),
+                    "git_root": str(self.workspace).replace("\\", "/"),
+                    "paths": [str(auth_file).replace("\\", "/")],
+                    "content_marks": [{"ts": t0 + 1.0, "fp": "fp-auth-1"}],
+                    "closed": False,
+                },
+            )
+
+            # 1. PreToolUse (`safety_guards.py`) blocks upfront custom `--timeout 180` while allowing standard invocation
+            dec_upfront, rsn_upfront = safety_guards.guard_shell_command(
+                f'$null | python -X utf8 "{REPO_ROOT / "plugin/hooks/codex_lane.py"}" review --cwd "{self.workspace}" --session {self.conv_id} --timeout 180',
+                str(self.workspace),
+                session=self.conv_id,
+            )
+            self.assertEqual(dec_upfront, "deny")
+            self.assertIn("[Codex Timeout Policy]", rsn_upfront or "")
+            self.assertIn("600s", rsn_upfront or "")
+
+            dec_no_to, _ = safety_guards.guard_shell_command(
+                f'$null | python -X utf8 "{REPO_ROOT / "plugin/hooks/codex_lane.py"}" review --cwd "{self.workspace}" --session {self.conv_id} --summary "Fix --timeout 180 policy in PreToolUse"',
+                str(self.workspace),
+                session=self.conv_id,
+            )
+            self.assertEqual(dec_no_to, "allow")
+
+            # Live `cmd_review` (when `CARBON_CODEX_BIN` is unset) also rejects upfront custom `--timeout`
+            emitted: list[dict[str, object]] = []
+            with (
+                mock.patch.dict(os.environ, {"CARBON_CODEX_BIN": ""}),
+                mock.patch.object(codex_lane, "check_health", return_value={"available": True, "lane": "codex", "binary": str(fake_codex)}),
+                mock.patch.object(codex_lane.rio, "print_cli_json", side_effect=lambda obj, **_: emitted.append(obj)),
+            ):
+                rc_bad_to = codex_lane.cmd_review(
+                    argparse.Namespace(
+                        cwd=str(self.workspace),
+                        summary="upfront timeout",
+                        diff_file="",
+                        review_id="cwg-bad-to-25",
+                        session=self.conv_id,
+                        model="",
+                        resume="",
+                        new_session=False,
+                        xhigh=False,
+                        closure=False,
+                        phase="",
+                        timeout=180,
+                        pretty=False,
+                    )
+                )
+            self.assertEqual(rc_bad_to, 2)
+            self.assertTrue(emitted[-1].get("invalid_timeout"))
+            self.assertNotIn("fallback", emitted[-1])
+
+            # 2. Thinking timeout (`TimeoutExpired` WITHOUT network outage):
+            #    - Emits `timed_out: True`, `retry_in_same_lane: True`, `round_consumed: False`, NO `fallback`
+            #    - Saves rollout `session_id` + `pending_timeout_resume: True` + `next_timeout_seconds: 900`
+            #    - `inspect_codex_cmd_result` returns `(False, aborted_rid)`
+            #    - `PreToolUse` blocks switching to internal Opus/subagent AND blocks `--timeout 600` (< 900)
+            #    - Re-running `codex_lane.py review` (without `--timeout`) resumes same `session_id` with `900s` & `timeout_continuation`
+            think_sid = "019a0000-1111-7000-8000-000000000025"
+            think_rid = "cwg-think-to-25"
+            rollout_path = codex_sessions / f"rollout-2026-11-17T14-20-00-{think_sid}.jsonl"
+
+            class _ThinkingTimeoutPopen:
+                pid = 777001
+
+                def __init__(self, cmd: list[str], **_: object) -> None:
+                    self.cmd = cmd
+
+                def communicate(self, input: bytes | None = None, timeout: float | None = None) -> tuple[bytes, bytes]:
+                    prompt_str = (input or b"").decode("utf-8", errors="replace")
+                    rows = [
+                        {"timestamp": iso_now(), "type": "session_meta", "payload": {"id": think_sid, "cwd": str(self.workspace_ref)}},
+                        {"timestamp": iso_now(), "type": "event_msg", "payload": {"type": "user_message", "message": "REVIEW_ID: cwg-prior-turn-err\nOld turn"}},
+                        {"timestamp": iso_now(), "type": "event_msg", "payload": {"type": "error", "message": "ERROR: error sending request for url: ETIMEDOUT"}},
+                        {"timestamp": iso_now(), "type": "event_msg", "payload": {"type": "task_complete", "completed_at": iso_now()}},
+                        {"timestamp": iso_now(), "type": "event_msg", "payload": {"type": "user_message", "message": prompt_str}},
+                        {
+                            "timestamp": iso_now(),
+                            "type": "response_item",
+                            "payload": {
+                                "type": "function_call_output",
+                                "output": "ERROR: ETIMEDOUT\nPermissionError: [Errno 13] operation not permitted",
+                            },
+                        },
+                    ]
+                    rollout_path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+                    raise subprocess.TimeoutExpired(cmd=self.cmd, timeout=timeout or 600.0)
+
+                def kill(self) -> None:
+                    return None
+
+            _ThinkingTimeoutPopen.workspace_ref = self.workspace  # type: ignore[attr-defined]
+            emitted.clear()
+            with (
+                mock.patch.object(codex_lane, "check_health", return_value={"available": True, "lane": "codex", "binary": str(fake_codex)}),
+                mock.patch.object(codex_lane.subprocess, "Popen", side_effect=_ThinkingTimeoutPopen),
+                mock.patch.object(
+                    codex_lane,
+                    "_kill_process_tree",
+                    return_value=(
+                        b"ERROR: ETIMEDOUT\nPermissionError: [Errno 13] operation not permitted\n",
+                        b"Get-Content captured-error.log\nERROR: ETIMEDOUT\nPermissionError: [Errno 13] operation not permitted\n",
+                    ),
+                ),
+                mock.patch.object(codex_lane.rio, "print_cli_json", side_effect=lambda obj, **_: emitted.append(obj)),
+            ):
+                rc_think = codex_lane.cmd_review(
+                    argparse.Namespace(
+                        cwd=str(self.workspace),
+                        summary="deep review",
+                        diff_file="",
+                        review_id=think_rid,
+                        session=self.conv_id,
+                        model="",
+                        resume="",
+                        new_session=False,
+                        xhigh=False,
+                        closure=False,
+                        phase="",
+                        timeout=None,
+                        pretty=False,
+                    )
+                )
+            self.assertEqual(rc_think, 3)
+            think_json = emitted[-1]
+            self.assertIs(think_json.get("ok"), False)
+            self.assertIs(think_json.get("timed_out"), True)
+            self.assertIs(think_json.get("retry_in_same_lane"), True)
+            self.assertIs(think_json.get("round_consumed"), False)
+            self.assertEqual(think_json.get("recommended_timeout"), 900)
+            self.assertEqual(think_json.get("session_id"), think_sid)
+            self.assertNotIn("fallback", think_json)
+            self.assertFalse((codex_lane.packets_dir() / f"{think_rid}.json").exists())
+
+            # `inspect_codex_cmd_result`: NOT an outage (`False`), while `aborted_rid == think_rid` (round NOT consumed)
+            raw_lane_cmd = f'$null | python -X utf8 "{REPO_ROOT / "plugin/hooks/codex_lane.py"}" review --cwd "{self.workspace}" --session {self.conv_id}'
+            is_out_think, ab_rid_think = codex_lane.inspect_codex_cmd_result(
+                raw_lane_cmd, "ERROR", json.dumps(think_json)
+            )
+            self.assertFalse(is_out_think)
+            self.assertEqual(ab_rid_think, think_rid)
+
+            # PreToolUse blocks shrinking `--timeout 600` after thinking timeout, allows `--timeout 900` and omitted `--timeout`
+            dec_shrunk, _ = safety_guards.guard_shell_command(
+                f"{raw_lane_cmd} --timeout 600", str(self.workspace), session=self.conv_id
+            )
+            self.assertEqual(dec_shrunk, "deny")
+            dec_elevated, _ = safety_guards.guard_shell_command(
+                f"{raw_lane_cmd} --timeout 900", str(self.workspace), session=self.conv_id
+            )
+            self.assertEqual(dec_elevated, "allow")
+
+            # PreToolUse blocks premature escalation to `internal-reviewer` (`claude-opus-5-5-high`) and `adversarial-reviewer` subagent
+            coord_hook_payload = {
+                "conversationId": self.conv_id,
+                "cwd": str(self.workspace),
+                "transcriptPath": str(self.transcript),
+            }
+            dec_sw_esc, rsn_sw_esc = safety_guards.guard_swarm_invocation(
+                {
+                    "action": "add",
+                    "name": "internal-reviewer",
+                    "model": cwg.OPUS_HIGH_MODEL,
+                    "brief": "Adversarial code review. Conclude with VERDICT: APPROVED or VERDICT: REVISE.",
+                },
+                payload=coord_hook_payload,
+            )
+            self.assertEqual(dec_sw_esc, "deny")
+            self.assertIn("[Codex Timeout Policy]", rsn_sw_esc or "")
+            self.assertIn(think_sid, rsn_sw_esc or "")
+
+            dec_sub_esc, rsn_sub_esc, _ = safety_guards.guard_subagent_invocation(
+                coord_hook_payload,
+                {
+                    "TypeName": "adversarial-reviewer",
+                    "Role": "Fallback Reviewer",
+                    "Prompt": "Perform read-only adversarial code review of auth_guard.py and return VERDICT.",
+                },
+            )
+            self.assertEqual(dec_sub_esc, "deny")
+            self.assertIn("[Codex Timeout Policy]", rsn_sub_esc or "")
+
+            # `cwg_stop.py` also rejects internal Opus review run after a Codex thinking timeout with explicit diagnosis
+            tx_steps_think = [
+                {
+                    "step_index": 1,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": iso_now(t0 + 5.0),
+                    "tool_calls": [{"name": "run_command", "args": {"CommandLine": raw_lane_cmd}}],
+                },
+                {
+                    "step_index": 2,
+                    "source": "MODEL",
+                    "type": "GENERIC",
+                    "status": "ERROR",
+                    "created_at": iso_now(t0 + 10.0),
+                    "content": json.dumps(think_json),
+                },
+            ]
+            sw_ev_think = cwg_stop.scan_swarm_activity(tx_steps_think, None, t0)
+            self.assertFalse(sw_ev_think["codex_cmd_failed"])
+            self.assertTrue(sw_ev_think["codex_timeout_seen"])
+            self.assertIn(think_rid, sw_ev_think["aborted_codex_reviews"])
+            ok_premature_opus, why_premature_opus = cwg_stop.validate_candidate_closure(
+                {"kind": "verified", "risk": "HIGH"},
+                cwg.rio.read_json(cwg.marker_path(self.conv_id)),
+                {"checks": [{"kind": "check", "passed": True, "ts": t0 + 2.0}], "passed_count": 1, "failed_count": 0, "latest_pass_ts": t0 + 2.0, "latest_fail_ts": 0.0},
+                {"reviews": [], "fallback_lenses": {}, "fallback_lenses_end": {}, "fallback_combined_ts": 0.0, "fallback_combined_end_ts": 0.0, "simplify_launch_steps": set(), "simplify_history": [], "simplify_failures": 0, "review_failures": [], "in_flight_subagents": []},
+                {**sw_ev_think, "reviews": [{"engine": "internal-opus", "model": cwg.OPUS_HIGH_MODEL, "kind": "ordinary", "verdict": "APPROVED", "launch_ts": t0 + 15.0, "verdict_ts": t0 + 20.0, "step_idx": 3, "xhigh": False}]},
+                [],
+            )
+            self.assertFalse(ok_premature_opus)
+            self.assertIn("thinking timeout is NOT an outage", why_premature_opus)
+
+            # Re-running `codex_lane.py review` without `--timeout` automatically resumes `think_sid` with `900.0s` and `timeout_continuation`
+            captured_resume: dict[str, object] = {}
+
+            def _fake_resumed_exec(
+                cmd: list[str], prompt: str, cwd: str, timeout: float, review_id: str, xhigh: bool
+            ) -> object:
+                captured_resume["cmd"] = cmd
+                captured_resume["prompt"] = prompt
+                captured_resume["timeout"] = timeout
+                rows = json.loads("[" + ",".join(rollout_path.read_text(encoding="utf-8").splitlines()) + "]")
+                rows.append({"timestamp": iso_now(), "type": "event_msg", "payload": {"type": "user_message", "message": prompt}})
+                rows.append({"timestamp": iso_now(), "type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Clean.\nVERDICT: APPROVED"}]}})
+                rollout_path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+                return codex_lane._CodexExecResult(0, "Clean.\nVERDICT: APPROVED\n", "", True, None)
+
+            buf_out = io.StringIO()
+            with (
+                mock.patch.object(codex_lane, "check_health", return_value={"available": True, "lane": "codex", "binary": str(fake_codex)}),
+                mock.patch.object(codex_lane, "_exec_codex_once", side_effect=_fake_resumed_exec),
+                mock.patch("sys.stdout", buf_out),
+            ):
+                rc_resumed = codex_lane.cmd_review(
+                    argparse.Namespace(
+                        cwd=str(self.workspace),
+                        summary="continue deep review",
+                        diff_file="",
+                        review_id="cwg-think-cont-25",
+                        session=self.conv_id,
+                        model="",
+                        resume="",
+                        new_session=False,
+                        xhigh=False,
+                        closure=False,
+                        phase="",
+                        timeout=None,
+                        pretty=False,
+                    )
+                )
+            self.assertEqual(rc_resumed, 0)
+            self.assertEqual(captured_resume["timeout"], 900.0)
+            self.assertIn("resume", list(captured_resume["cmd"]))  # type: ignore[arg-type]
+            self.assertIn(think_sid, list(captured_resume["cmd"]))  # type: ignore[arg-type]
+            self.assertIn("ROUND_MODE: timeout_continuation", str(captured_resume["prompt"]))
+            self.assertIn("SESSION_MODE: resumed", buf_out.getvalue())
+            tstate_after = codex_lane.active_thread_state(self.conv_id, str(self.workspace))
+            self.assertIsNotNone(tstate_after)
+            self.assertFalse(bool((tstate_after or {}).get("pending_timeout_resume")))
+
+            # 3. Genuine internet timeout AFTER a thinking timeout (`pending_timeout_resume` active) clears `pending_timeout_resume`
+            #    so PreToolUse immediately unblocks internal Opus fallback, and multiline PowerShell backtick command works in Stop!
+            with (
+                mock.patch.object(codex_lane, "check_health", return_value={"available": True, "lane": "codex", "binary": str(fake_codex)}),
+                mock.patch.object(codex_lane.subprocess, "Popen", side_effect=_ThinkingTimeoutPopen),
+                mock.patch.object(codex_lane, "_kill_process_tree", return_value=(b"", b"Still thinking...")),
+                mock.patch.object(codex_lane.rio, "print_cli_json", side_effect=lambda obj, **_: emitted.append(obj)),
+            ):
+                codex_lane.cmd_review(
+                    argparse.Namespace(
+                        cwd=str(self.workspace),
+                        summary="pre-net thinking timeout",
+                        diff_file="",
+                        review_id="cwg-pre-net-think-25",
+                        session=self.conv_id,
+                        model="",
+                        resume="",
+                        new_session=False,
+                        xhigh=False,
+                        closure=False,
+                        phase="",
+                        timeout=None,
+                        pretty=False,
+                    )
+                )
+            self.assertTrue(bool((codex_lane.active_thread_state(self.conv_id, str(self.workspace)) or {}).get("pending_timeout_resume")))
+
+            class _NetTimeoutPopen:
+                pid = 777002
+
+                def communicate(self, input: bytes | None = None, timeout: float | None = None) -> tuple[bytes, bytes]:
+                    raise subprocess.TimeoutExpired(cmd=["codex"], timeout=timeout or 900.0)
+
+                def kill(self) -> None:
+                    return None
+
+            emitted.clear()
+            net_rid = "cwg-net-to-25"
+            with (
+                mock.patch.object(codex_lane, "check_health", return_value={"available": True, "lane": "codex", "binary": str(fake_codex)}),
+                mock.patch.object(codex_lane.subprocess, "Popen", return_value=_NetTimeoutPopen()),
+                mock.patch.object(
+                    codex_lane,
+                    "_kill_process_tree",
+                    return_value=(b"", b"ERROR: error sending request for url (https://api.openai.com/v1/responses): ETIMEDOUT"),
+                ),
+                mock.patch.object(codex_lane.rio, "print_cli_json", side_effect=lambda obj, **_: emitted.append(obj)),
+            ):
+                rc_net = codex_lane.cmd_review(
+                    argparse.Namespace(
+                        cwd=str(self.workspace),
+                        summary="net timeout after thinking timeout",
+                        diff_file="",
+                        review_id=net_rid,
+                        session=self.conv_id,
+                        model="",
+                        resume="",
+                        new_session=False,
+                        xhigh=False,
+                        closure=False,
+                        phase="",
+                        timeout=None,
+                        pretty=False,
+                    )
+                )
+            self.assertEqual(rc_net, 3)
+            net_json = emitted[-1]
+            self.assertIs(net_json.get("network_outage"), True)
+            self.assertEqual(net_json.get("fallback"), "adversarial-reviewer")
+            self.assertFalse(bool((codex_lane.active_thread_state(self.conv_id, str(self.workspace)) or {}).get("pending_timeout_resume")))
+            dec_sw_after_net, _ = safety_guards.guard_swarm_invocation(
+                {
+                    "action": "add",
+                    "name": "internal-reviewer",
+                    "model": cwg.OPUS_HIGH_MODEL,
+                    "brief": "Adversarial code review. Conclude with VERDICT: APPROVED or VERDICT: REVISE.",
+                },
+                payload=coord_hook_payload,
+            )
+            self.assertEqual(dec_sw_after_net, "allow")
+
+            # Documented multiline PowerShell invocation with backtick line-continuations is accepted by `is_direct_codex_invocation`
+            multiline_lane_cmd = (
+                f'python -X utf8 "{REPO_ROOT / "plugin/hooks/codex_lane.py"}" review `\n'
+                f'  --cwd "{self.workspace}" `\n'
+                f'  --session "{self.conv_id}" `\n'
+                '  --summary "goal"'
+            )
+            self.assertTrue(codex_lane.is_direct_codex_invocation(multiline_lane_cmd))
+            self.assertFalse(codex_lane.is_direct_codex_invocation(f"{raw_lane_cmd}\nWrite-Output spoof"))
+            is_out_net, ab_rid_net = codex_lane.inspect_codex_cmd_result(
+                multiline_lane_cmd, "ERROR", json.dumps(net_json)
+            )
+            self.assertTrue(is_out_net)
+            self.assertEqual(ab_rid_net, net_rid)
+
+            # 4. Ordinary non-zero CLI exit (`rc = 1` before wall-clock timeout) on `ETIMEDOUT` also grants `fallback` and outage proof
+            class _NetExitPopen:
+                pid = 777003
+                returncode = 1
+
+                def communicate(self, input: bytes | None = None, timeout: float | None = None) -> tuple[bytes, bytes]:
+                    return (b"", b"ERROR: error sending request for url (https://api.openai.com/v1/responses): ETIMEDOUT\n")
+
+                def kill(self) -> None:
+                    return None
+
+            emitted.clear()
+            net_exit_rid = "cwg-net-exit-25"
+            with (
+                mock.patch.object(codex_lane, "check_health", return_value={"available": True, "lane": "codex", "binary": str(fake_codex)}),
+                mock.patch.object(codex_lane.subprocess, "Popen", return_value=_NetExitPopen()),
+                mock.patch.object(codex_lane.rio, "print_cli_json", side_effect=lambda obj, **_: emitted.append(obj)),
+            ):
+                rc_net_exit = codex_lane.cmd_review(
+                    argparse.Namespace(
+                        cwd=str(self.workspace),
+                        summary="net rc=1 exit",
+                        diff_file="",
+                        review_id=net_exit_rid,
+                        session=self.conv_id,
+                        model="",
+                        resume="",
+                        new_session=True,
+                        xhigh=False,
+                        closure=False,
+                        phase="",
+                        timeout=None,
+                        pretty=False,
+                    )
+                )
+            self.assertEqual(rc_net_exit, 2)
+            net_exit_json = emitted[-1]
+            self.assertIs(net_exit_json.get("network_outage"), True)
+            self.assertEqual(net_exit_json.get("fallback"), "adversarial-reviewer")
+            self.assertEqual(
+                codex_lane.inspect_codex_cmd_result(multiline_lane_cmd, "ERROR", json.dumps(net_exit_json)),
+                (True, net_exit_rid),
+            )
+
+            # 5. Codex 0.159+ `--json` stream & non-persisted `EventMsg::Error` rollout (`found_rollout=True` without rollout error):
+            #    - `--json` `command_execution` reading `ERROR: ETIMEDOUT` stays thinking timeout (`NO fallback`)
+            #    - `found_rollout=True` + real CLI `ETIMEDOUT` (in `--json` `error` OR `stderr`) still authorizes fallback on both `rc=1` and `TimeoutExpired`
+            jsonl_think_rid = "cwg-jsonl-think-25"
+            jsonl_think_sid = "019a0000-2222-7000-8000-000000000025"
+            jsonl_think_out = "\n".join(
+                json.dumps(ev)
+                for ev in (
+                    {"type": "thread.started", "thread_id": jsonl_think_sid},
+                    {"type": "turn.started"},
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "item_1",
+                            "type": "command_execution",
+                            "command": "Get-Content captured-error.log",
+                            "aggregated_output": "ERROR: ETIMEDOUT\nPermissionError: [Errno 13] operation not permitted\n",
+                        },
+                    },
+                )
+            ).encode("utf-8")
+
+            class _JsonlThinkingTimeoutPopen:
+                pid = 777004
+
+                def communicate(self, input: bytes | None = None, timeout: float | None = None) -> tuple[bytes, bytes]:
+                    raise subprocess.TimeoutExpired(cmd=["codex"], timeout=timeout or 600.0)
+
+                def kill(self) -> None:
+                    return None
+
+            emitted.clear()
+            with (
+                mock.patch.object(codex_lane, "check_health", return_value={"available": True, "lane": "codex", "binary": str(fake_codex)}),
+                mock.patch.object(codex_lane.subprocess, "Popen", return_value=_JsonlThinkingTimeoutPopen()),
+                mock.patch.object(codex_lane, "_kill_process_tree", return_value=(jsonl_think_out, b"")),
+                mock.patch.object(codex_lane.rio, "print_cli_json", side_effect=lambda obj, **_: emitted.append(obj)),
+            ):
+                rc_jt = codex_lane.cmd_review(
+                    argparse.Namespace(
+                        cwd=str(self.workspace),
+                        summary="jsonl tool output thinking timeout",
+                        diff_file="",
+                        review_id=jsonl_think_rid,
+                        session=self.conv_id,
+                        model="",
+                        resume="",
+                        new_session=True,
+                        xhigh=False,
+                        closure=False,
+                        phase="",
+                        timeout=None,
+                        pretty=False,
+                    )
+                )
+            self.assertEqual(rc_jt, 3)
+            jt_json = emitted[-1]
+            self.assertIs(jt_json.get("timed_out"), True)
+            self.assertEqual(jt_json.get("session_id"), jsonl_think_sid)
+            self.assertNotIn("fallback", jt_json)
+            jt_saved = codex_lane.active_thread_state(self.conv_id, str(self.workspace))
+            self.assertIsNotNone(jt_saved)
+            self.assertEqual((jt_saved or {}).get("session_id"), jsonl_think_sid)
+            self.assertTrue(bool((jt_saved or {}).get("pending_timeout_resume")))
+            self.assertEqual(
+                codex_lane._resolve_resume_session(str(self.workspace), self.conv_id, t0),
+                jsonl_think_sid,
+            )
+
+            rollout_no_err_sid = "019a0000-3333-7000-8000-000000000025"
+            rollout_no_err_path = codex_sessions / f"rollout-2026-11-17T15-15-00-{rollout_no_err_sid}.jsonl"
+
+            class _RolloutNoErrNetExitPopen:
+                pid = 777005
+                returncode = 1
+
+                def communicate(self, input: bytes | None = None, timeout: float | None = None) -> tuple[bytes, bytes]:
+                    prompt_s = (input or b"").decode("utf-8", errors="replace")
+                    rollout_no_err_path.write_text(
+                        "\n".join(
+                            json.dumps(r)
+                            for r in (
+                                {"timestamp": iso_now(), "type": "session_meta", "payload": {"id": rollout_no_err_sid, "cwd": str(self.workspace_ref)}},
+                                {"timestamp": iso_now(), "type": "event_msg", "payload": {"type": "user_message", "message": prompt_s}},
+                            )
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                    return (b"", b"ERROR: error sending request for url (https://api.openai.com/v1/responses): ETIMEDOUT\n")
+
+                def kill(self) -> None:
+                    return None
+
+            _RolloutNoErrNetExitPopen.workspace_ref = self.workspace  # type: ignore[attr-defined]
+            emitted.clear()
+            with (
+                mock.patch.object(codex_lane, "check_health", return_value={"available": True, "lane": "codex", "binary": str(fake_codex)}),
+                mock.patch.object(codex_lane.subprocess, "Popen", return_value=_RolloutNoErrNetExitPopen()),
+                mock.patch.object(codex_lane.rio, "print_cli_json", side_effect=lambda obj, **_: emitted.append(obj)),
+            ):
+                rc_rne_exit = codex_lane.cmd_review(
+                    argparse.Namespace(
+                        cwd=str(self.workspace),
+                        summary="rollout without persisted error rc=1",
+                        diff_file="",
+                        review_id="cwg-rne-exit-25",
+                        session=self.conv_id,
+                        model="",
+                        resume="",
+                        new_session=True,
+                        xhigh=False,
+                        closure=False,
+                        phase="",
+                        timeout=None,
+                        pretty=False,
+                    )
+                )
+            self.assertEqual(rc_rne_exit, 2)
+            self.assertIs(emitted[-1].get("network_outage"), True)
+            self.assertEqual(emitted[-1].get("fallback"), "adversarial-reviewer")
+
+            class _RolloutNoErrNetTimeoutPopen:
+                pid = 777006
+
+                def communicate(self, input: bytes | None = None, timeout: float | None = None) -> tuple[bytes, bytes]:
+                    prompt_s = (input or b"").decode("utf-8", errors="replace")
+                    rollout_no_err_path.write_text(
+                        "\n".join(
+                            json.dumps(r)
+                            for r in (
+                                {"timestamp": iso_now(), "type": "session_meta", "payload": {"id": rollout_no_err_sid, "cwd": str(self.workspace_ref)}},
+                                {"timestamp": iso_now(), "type": "event_msg", "payload": {"type": "user_message", "message": prompt_s}},
+                            )
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                    raise subprocess.TimeoutExpired(cmd=["codex"], timeout=timeout or 600.0)
+
+                def kill(self) -> None:
+                    return None
+
+            _RolloutNoErrNetTimeoutPopen.workspace_ref = self.workspace  # type: ignore[attr-defined]
+            emitted.clear()
+            with (
+                mock.patch.object(codex_lane, "check_health", return_value={"available": True, "lane": "codex", "binary": str(fake_codex)}),
+                mock.patch.object(codex_lane.subprocess, "Popen", return_value=_RolloutNoErrNetTimeoutPopen()),
+                mock.patch.object(
+                    codex_lane,
+                    "_kill_process_tree",
+                    return_value=(b"", b"ERROR: error sending request for url (https://api.openai.com/v1/responses): ETIMEDOUT\n"),
+                ),
+                mock.patch.object(codex_lane.rio, "print_cli_json", side_effect=lambda obj, **_: emitted.append(obj)),
+            ):
+                rc_rne_to = codex_lane.cmd_review(
+                    argparse.Namespace(
+                        cwd=str(self.workspace),
+                        summary="rollout without persisted error timeout",
+                        diff_file="",
+                        review_id="cwg-rne-to-25",
+                        session=self.conv_id,
+                        model="",
+                        resume="",
+                        new_session=True,
+                        xhigh=False,
+                        closure=False,
+                        phase="",
+                        timeout=None,
+                        pretty=False,
+                    )
+                )
+            self.assertEqual(rc_rne_to, 3)
+            self.assertIs(emitted[-1].get("network_outage"), True)
+            self.assertEqual(emitted[-1].get("fallback"), "adversarial-reviewer")
 
 
 if __name__ == "__main__":

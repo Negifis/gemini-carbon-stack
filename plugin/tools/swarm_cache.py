@@ -397,6 +397,13 @@ def prepare_round(
         if w["cache_state"] == "EXPIRED"
     }
 
+    marker_doc = rio.read_json(cwg.marker_path(session), default=None)
+    diff_metrics = cwg.compute_diff_metrics(
+        marker=marker_doc if isinstance(marker_doc, dict) else {},
+        repo_root=git_root or cwd,
+    )
+    fast_path_eligible = cwg.is_simplify_fast_path_eligible(diff_stats=diff_metrics)
+
     return {
         "ok": True,
         "session": session,
@@ -409,6 +416,8 @@ def prepare_round(
         "full_diff_path": full_diff_path,
         "incremental_diff_path": incremental_diff_path,
         "incremental_stat": incremental_stat,
+        "diff_metrics": diff_metrics,
+        "fast_path_eligible": fast_path_eligible,
         "overall_action": worker_status["overall_action"],
         "next_worker_names": next_names,
         "worker_status": worker_status,

@@ -22,8 +22,14 @@ import cwg_common as cwg
 import runtime_io as rio
 
 BREAKER_TTL_SECONDS = 1800  # 30 minutes cooldown after quota/auth/capacity outage
+DEFAULT_REVIEW_TIMEOUT_SECONDS = 600
+DEFAULT_XHIGH_REVIEW_TIMEOUT_SECONDS = 900
+TIMEOUT_STEP_SECONDS = 300
+MAX_REVIEW_TIMEOUT_SECONDS = 1800
 PACKET_TTL_SECONDS = 86400
 MAX_DIFF_SNAPSHOT_CHARS = 160_000
+_LAST_TIMEOUT_OUTAGE: dict[str, tuple[str, str]] = {}
+_LAST_ROLLOUT_TURN_SID: dict[str, str] = {}
 
 
 class _CodexExecResult(NamedTuple):
@@ -32,6 +38,9 @@ class _CodexExecResult(NamedTuple):
     stderr: str
     has_verdict: bool
     outage: str | None
+    network_outage: str | None = None
+    sandbox_blocked: str | None = None
+    thread_id: str = ""
 
 OUTAGE_PATTERNS = tuple(
     re.compile(pat, re.IGNORECASE)
@@ -76,6 +85,18 @@ def strip_task_envelope_tail(blob: str) -> str:
 
 def _fallback_reviewer(xhigh: bool) -> str:
     return cwg.XHIGH_NATIVE_REVIEWER if xhigh else "adversarial-reviewer"
+
+
+def next_timeout_after(timeout_sec: float | int) -> int:
+    return min(
+        MAX_REVIEW_TIMEOUT_SECONDS,
+        max(int(timeout_sec) + TIMEOUT_STEP_SECONDS, DEFAULT_XHIGH_REVIEW_TIMEOUT_SECONDS),
+    )
+
+
+def required_review_timeout(xhigh: bool, saved_next_sec: float | int = 0) -> int:
+    base = DEFAULT_XHIGH_REVIEW_TIMEOUT_SECONDS if xhigh else DEFAULT_REVIEW_TIMEOUT_SECONDS
+    return min(MAX_REVIEW_TIMEOUT_SECONDS, max(base, int(saved_next_sec or 0)))
 
 
 def breaker_path() -> pathlib.Path:
@@ -191,6 +212,39 @@ def _thread_state_path(session: str, git_root: str) -> pathlib.Path:
     return threads_dir() / f"{digest}.json"
 
 
+def active_thread_state(
+    session: str,
+    git_root: str,
+    candidate_first_ts: float | None = None,
+) -> dict[str, Any] | None:
+    saved = rio.read_json(_thread_state_path(session, git_root), default=None)
+    if not isinstance(saved, dict):
+        return None
+    cand_ts = _candidate_first_ts(session) if candidate_first_ts is None else float(candidate_first_ts)
+    saved_cand_ts = float(saved.get("candidate_first_ts") or 0.0)
+    # INVARIANT: Bind thread continuity & timeout escalation strictly to the active candidate (`1h` TTL when no marker is open).
+    matched = (
+        abs(saved_cand_ts - cand_ts) < 1.0
+        if cand_ts > 0.0
+        else (saved_cand_ts <= 0.0 and (time.time() - float(saved.get("updated_ts") or 0.0)) < 3600.0)
+    )
+    return saved if matched else None
+
+
+def _clear_pending_timeout_resume(session: str, git_root: str) -> None:
+    tpath = _thread_state_path(session, git_root)
+    saved = rio.read_json(tpath, default=None)
+    if not isinstance(saved, dict) or not saved.get("pending_timeout_resume"):
+        return
+    if saved.get("session_id"):
+        saved["pending_timeout_resume"] = False
+        saved.pop("next_timeout_seconds", None)
+        saved["updated_ts"] = time.time()
+        rio.write_json(tpath, saved)
+    else:
+        cwg.unlink_quiet(tpath)
+
+
 def _packet_path(review_id: str) -> pathlib.Path:
     return packets_dir() / f"{rio.safe_key(review_id)}.json"
 
@@ -249,14 +303,57 @@ CLI_ARG_ERROR_RE = re.compile(
 )
 
 _REVIEW_VAL_FLAGS = frozenset(
-    {"--cwd", "--summary", "--diff-file", "--review-id", "--session", "--model", "--resume", "--timeout"}
+    {"--cwd", "--summary", "--diff-file", "--review-id", "--session", "--model", "--resume", "--timeout", "--phase"}
 )
 _REVIEW_BOOL_FLAGS = frozenset({"--new-session", "--xhigh", "--closure", "--pretty"})
 
 
+def _fold_ps_line_continuations(cmd_str: str) -> str:
+    # INVARIANT: Fold only PowerShell backtick line-continuations (`` ` `` + optional horizontal space + newline) outside quotes;
+    # bare newlines and arbitrary backticks remain untouched and rejected as multi-statement / escape hazards.
+    if "`" not in cmd_str or ("\n" not in cmd_str and "\r" not in cmd_str):
+        return cmd_str
+    out: list[str] = []
+    quote: str | None = None
+    i = 0
+    n = len(cmd_str)
+    while i < n:
+        ch = cmd_str[i]
+        if quote is not None:
+            out.append(ch)
+            if ch == quote:
+                if i + 1 < n and cmd_str[i + 1] == quote:
+                    out.append(quote)
+                    i += 2
+                    continue
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "`":
+            k = i + 1
+            while k < n and cmd_str[k] in (" ", "\t"):
+                k += 1
+            if k < n and cmd_str[k] == "\r" and k + 1 < n and cmd_str[k + 1] == "\n":
+                out.append(" ")
+                i = k + 2
+                continue
+            if k < n and cmd_str[k] == "\n":
+                out.append(" ")
+                i = k + 1
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def is_direct_codex_invocation(cmd_str: str) -> bool:
     """Return True iff `cmd_str` is a single direct PowerShell invocation of `codex_lane.py (check|review)` or `codex exec`."""
-    s = (cmd_str or "").strip()
+    s = _fold_ps_line_continuations((cmd_str or "").strip()).strip()
     if not s or "\r" in s or "\n" in s or "`" in s or "codex" not in s.lower():
         return False
     m_stdin = re.match(r"^\$null\s*\|\s*", s, re.IGNORECASE)
@@ -372,6 +469,189 @@ def is_direct_codex_invocation(cmd_str: str) -> bool:
     return False
 
 
+SANDBOX_BLOCK_PATTERNS = tuple(
+    re.compile(pat, re.IGNORECASE)
+    for pat in (
+        r"operation not permitted",
+        r"permissionerror:\s*\[(?:errno|winerror)",
+        r"winerror\s+10013",
+        r"eacces:\s*permission denied",
+        r"blocked by (?:sandbox|network policy|proxy)",
+        r"carbon_stack_home is (?:read-only|not writable)",
+    )
+)
+
+
+def detect_sandbox_restriction(output_text: str) -> str | None:
+    if not output_text:
+        return None
+    for pat in SANDBOX_BLOCK_PATTERNS:
+        m = pat.search(output_text)
+        if m:
+            return m.group(0)
+    return None
+
+
+NETWORK_TIMEOUT_PATTERNS = tuple(
+    re.compile(pat, re.IGNORECASE)
+    for pat in (
+        r"connection\s+timed\s+out",
+        r"connect\s+timeout",
+        r"\betimedout\b",
+        r"\beconnreset\b",
+        r"\beconnrefused\b",
+        r"\behostunreach\b",
+        r"\benetunreach\b",
+        r"\benotfound\b",
+        r"\beai_again\b",
+        r"getaddrinfo\b",
+        r"temporary\s+failure\s+in\s+name\s+resolution",
+        r"failed\s+to\s+lookup\s+address",
+        r"tls\s+handshake\s+(?:timeout|eof|failed)",
+        r"network\s+is\s+unreachable",
+        r"error\s+sending\s+request\s+for\s+url",
+        r"stream\s+disconnected\s+before\s+completion",
+        r"timed\s+out\s+waiting\s+for\s+model",
+    )
+)
+
+
+_CLI_DIAG_LINE_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:fatal|error|codex(?:\.exe|\.cmd)?|openai|api\s+error|stream\s+error)\s*:"
+    r"|\d{4}-\d{2}-\d{2}T\S+\s+(?:ERROR|FATAL)\b"
+    r"|caused\s+by\s*:"
+    r"|\d+\s*:\s*(?:error|reqwest|hyper|tls|dns|connect|io)"
+    r"|reqwest::error"
+    r"|permissionerror\s*:"
+    r"|oserror\s*:"
+    r"|traceback\b"
+    r"|thread\s+'[^']+'\s+panicked"
+    r")",
+    re.IGNORECASE,
+)
+
+_STDERR_TOOL_OPEN_RE = re.compile(
+    r"^(?:exec\s*$|"
+    r".*\bin\s+\S.*\b(?:succeeded|exited)\b.*:\s*$|"
+    r"\s*(?:powershell(?:\.exe)?\b[^\n]*\b)?(?:Get-Content|Select-String|cat|type|rg(?:\.exe)?|git\s+(?:diff|show|grep|log))\b)",
+    re.IGNORECASE,
+)
+_STDERR_SECTION_RESET_RE = re.compile(
+    r"^(?:thinking|codex|tokens\s+used)\s*$|^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}",
+    re.IGNORECASE,
+)
+_JSONL_EVENT_PREFIXES = ("thread.", "turn.", "item.")
+
+
+def _extract_cli_error_lines(text: str, excluded_blobs: list[str] | None = None) -> str:
+    if not text:
+        return ""
+    excluded_lines = {
+        ln.strip()
+        for blob in (excluded_blobs or [])
+        if blob
+        for ln in blob.splitlines()
+        if ln.strip()
+    }
+    matched: list[str] = []
+    in_tool_block = False
+    for raw_ln in text.splitlines():
+        s_ln = raw_ln.strip()
+        if not s_ln:
+            continue
+        if in_tool_block and _STDERR_SECTION_RESET_RE.match(s_ln):
+            in_tool_block = False
+        if _STDERR_TOOL_OPEN_RE.match(raw_ln):
+            in_tool_block = True
+            continue
+        if in_tool_block or s_ln in excluded_lines:
+            continue
+        if _CLI_DIAG_LINE_RE.match(raw_ln):
+            matched.append(s_ln)
+    return "\n".join(matched)
+
+
+def _parse_codex_json_stream(raw_stdout: str) -> dict[str, Any]:
+    # INVARIANT: Parse `codex exec --json` JSONL stream so CLI/API `error` and `turn.failed` events are structurally
+    # separated from `command_execution` tool outputs (`Get-Content`/`rg` reading repository files).
+    saw_jsonl = False
+    thread_id = ""
+    agent_messages: list[str] = []
+    cli_errors: list[str] = []
+    tool_outputs: list[str] = []
+    if not raw_stdout or "{" not in raw_stdout:
+        return {
+            "saw_jsonl": False,
+            "thread_id": "",
+            "agent_text": "",
+            "cli_errors": cli_errors,
+            "tool_outputs": tool_outputs,
+        }
+    for ln in raw_stdout.splitlines():
+        s = ln.strip()
+        if not (s.startswith("{") and s.endswith("}")):
+            continue
+        try:
+            rec = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        etype = str(rec.get("type") or "")
+        if etype != "error" and not etype.startswith(_JSONL_EVENT_PREFIXES):
+            continue
+        saw_jsonl = True
+        if etype == "thread.started":
+            tid = str(rec.get("thread_id") or "").strip()
+            if tid:
+                thread_id = tid
+        elif etype == "error":
+            emsg = str(rec.get("message") or "").strip()
+            if emsg:
+                cli_errors.append(emsg)
+        elif etype == "turn.failed":
+            eobj = rec.get("error")
+            emsg = str(eobj.get("message") if isinstance(eobj, dict) else (eobj or rec.get("message") or "")).strip()
+            if emsg:
+                cli_errors.append(emsg)
+        elif etype == "item.completed":
+            item = rec.get("item") if isinstance(rec.get("item"), dict) else {}
+            itype = str(item.get("type") or "")
+            if itype == "agent_message":
+                txt = str(item.get("text") or "").strip()
+                if txt:
+                    agent_messages.append(txt)
+            elif itype == "error":
+                emsg = str(item.get("message") or "").strip()
+                if emsg:
+                    cli_errors.append(emsg)
+            elif itype in ("command_execution", "mcp_tool_call", "tool_call"):
+                for k in ("aggregated_output", "output", "result"):
+                    v = item.get(k)
+                    if isinstance(v, str) and v.strip():
+                        tool_outputs.append(v)
+    return {
+        "saw_jsonl": saw_jsonl,
+        "thread_id": thread_id,
+        "agent_text": "\n\n".join(agent_messages),
+        "cli_errors": cli_errors,
+        "tool_outputs": tool_outputs,
+    }
+
+
+def detect_network_timeout_from_output(output_text: str) -> str | None:
+    if not output_text:
+        return None
+    if CLI_ARG_ERROR_RE.search(output_text):
+        return None
+    for pat in NETWORK_TIMEOUT_PATTERNS:
+        m = pat.search(output_text)
+        if m:
+            return m.group(0)
+    return None
+
+
 def detect_outage_from_output(output_text: str, exit_code: int = 0) -> str | None:
     if not output_text and exit_code == 0:
         return None
@@ -434,11 +714,27 @@ def inspect_codex_cmd_result(cmd_str: str, g_status: str, blob: str) -> tuple[bo
                 aborted_rid = cand_rid
         if jobj.get("available") is False and str(jobj.get("lane") or "") == "native-fallback":
             return True, aborted_rid
-        if jobj.get("ok") is False and str(jobj.get("fallback") or "") in cwg.NATIVE_REVIEWERS:
+        err_s = str(jobj.get("error") or "")
+        # INVARIANT: A wall-clock thinking timeout (`timeout_after_*s` without `network_outage`) aborts the round (`round_consumed=False`)
+        # but is NEVER a Codex outage — the caller must resume the same Codex session rather than escalating to internal Opus/Carbon.
+        is_thinking_timeout = bool(
+            jobj.get("retry_in_same_lane")
+            or (jobj.get("timed_out") and not jobj.get("network_outage"))
+            or (err_s.startswith("timeout_after_") and not jobj.get("network_outage"))
+        )
+        if (
+            jobj.get("ok") is False
+            and not is_thinking_timeout
+            and str(jobj.get("fallback") or "") in cwg.NATIVE_REVIEWERS
+        ):
             return True, aborted_rid
     if is_lane:
         return False, aborted_rid
-    outage = detect_outage_from_output(cleaned, exit_code=1 if g_status == "ERROR" else 0) is not None
+    exit_c = 1 if g_status == "ERROR" else 0
+    diag_direct = _extract_cli_error_lines(cleaned) or (cleaned if len(cleaned) <= 2048 else "")
+    outage = detect_outage_from_output(diag_direct, exit_code=exit_c) is not None or (
+        exit_c != 0 and detect_network_timeout_from_output(diag_direct) is not None
+    )
     return outage, None
 
 
@@ -456,7 +752,16 @@ def record_from_command(command_text: str, output_text: str, exit_code: int = 0)
     status = "ERROR" if exit_code != 0 else "DONE"
     if not is_verified_codex_cmd_outage(command_text, status, output_text):
         return
-    reason = detect_outage_from_output(strip_task_envelope_tail(output_text), exit_code=exit_code) or "codex_outage"
+    cleaned = strip_task_envelope_tail(output_text)
+    jobj = _extract_cli_json_payload(cleaned)
+    if isinstance(jobj, dict):
+        err_s = str(jobj.get("error") or "")
+        # SAFETY: Local review timeouts, transient socket errors, and sandbox blocks must never trip the global 30-minute circuit breaker via PostToolUse.
+        if jobj.get("sandbox_blocked") or jobj.get("network_outage") or err_s.startswith("timeout_after_"):
+            return
+    reason = detect_outage_from_output(cleaned, exit_code=exit_code)
+    if not reason:
+        return
     trip_breaker(f"CLI reported: {reason}")
 
 
@@ -547,6 +852,28 @@ def _read_rollout_session_meta(rollout_file: pathlib.Path) -> dict[str, Any]:
     return {}
 
 
+def _rollout_message_text(blocks: Any) -> str:
+    if isinstance(blocks, list):
+        return "\n".join(
+            blk["text"]
+            for blk in blocks
+            if isinstance(blk, dict) and isinstance(blk.get("text"), str)
+        ).strip()
+    if isinstance(blocks, str):
+        return blocks.strip()
+    return ""
+
+
+def _rollout_user_review_ids(rtype: Any, payload: dict[str, Any]) -> list[str]:
+    if rtype == "event_msg" and payload.get("type") == "user_message":
+        umsg = str(payload.get("message") or "").strip()
+        return REVIEW_ID_RE.findall(umsg) if umsg else []
+    if rtype == "response_item" and payload.get("type") == "message" and payload.get("role") == "user":
+        txt = _rollout_message_text(payload.get("content"))
+        return REVIEW_ID_RE.findall(txt) if txt else []
+    return []
+
+
 def _extract_rollout_texts_and_meta(rollout_file: pathlib.Path) -> dict[str, Any] | None:
     records = rio.read_jsonl(rollout_file)
     if not records:
@@ -588,38 +915,36 @@ def _extract_rollout_texts_and_meta(rollout_file: pathlib.Path) -> dict[str, Any
         elif rtype == "event_msg" and payload.get("type") == "task_started":
             if current_turn is not None:
                 current_turn["closed"] = True
-        elif rtype == "response_item" and payload.get("type") == "message":
-            role = payload.get("role")
-            blocks = payload.get("content")
-            chunks: list[str] = []
-            if isinstance(blocks, list):
-                for blk in blocks:
-                    if isinstance(blk, dict) and isinstance(blk.get("text"), str):
-                        chunks.append(blk["text"])
-            elif isinstance(blocks, str):
-                chunks.append(blocks)
-            joined = "\n".join(chunks).strip()
+        elif (
+            (rtype == "event_msg" and payload.get("type") == "user_message")
+            or (rtype == "response_item" and payload.get("type") == "message" and payload.get("role") == "user")
+        ):
+            m_ids = _rollout_user_review_ids(rtype, payload)
+            if m_ids and not (
+                current_turn is not None
+                and not current_turn["closed"]
+                and current_turn["review_ids"] == m_ids
+                and not current_turn["assistant_messages"]
+            ):
+                if current_turn is not None:
+                    current_turn["closed"] = True
+                current_turn = {
+                    "review_ids": m_ids,
+                    "started_ts": rec_ts or started_ts,
+                    "completed_ts": 0.0,
+                    "effort": cur_effort,
+                    "model": cur_model,
+                    "assistant_messages": [],
+                    "closed": False,
+                }
+                turns.append(current_turn)
+        elif rtype == "response_item" and payload.get("type") == "message" and payload.get("role") == "assistant":
+            joined = _rollout_message_text(payload.get("content"))
             if joined:
-                if role == "user":
-                    m_ids = REVIEW_ID_RE.findall(joined)
-                    if m_ids:
-                        if current_turn is not None:
-                            current_turn["closed"] = True
-                        current_turn = {
-                            "review_ids": m_ids,
-                            "started_ts": rec_ts or started_ts,
-                            "completed_ts": 0.0,
-                            "effort": cur_effort,
-                            "model": cur_model,
-                            "assistant_messages": [],
-                            "closed": False,
-                        }
-                        turns.append(current_turn)
-                elif role == "assistant":
-                    msg_ts = rec_ts or file_mtime
-                    last_msg_ts = msg_ts
-                    if current_turn is not None and not current_turn["closed"]:
-                        current_turn["assistant_messages"].append((msg_ts, joined))
+                msg_ts = rec_ts or file_mtime
+                last_msg_ts = msg_ts
+                if current_turn is not None and not current_turn["closed"]:
+                    current_turn["assistant_messages"].append((msg_ts, joined))
         elif rtype == "event_msg" and payload.get("type") == "task_complete":
             ts_done = rec_ts or rio.parse_iso_ts(payload.get("completed_at")) or file_mtime
             completed_ts = ts_done
@@ -815,19 +1140,11 @@ def _resolve_resume_session(
     if explicit_resume.strip():
         return _unwrap_primary_session_id(explicit_resume.strip(), candidate_first_ts)
 
-    saved = rio.read_json(_thread_state_path(session, git_root), default=None)
+    saved = active_thread_state(session, git_root, candidate_first_ts)
     if isinstance(saved, dict) and saved.get("session_id"):
-        saved_cand_ts = float(saved.get("candidate_first_ts") or 0.0)
-        # INVARIANT: When no candidate marker is open (NO_CHANGE / manual review), reuse same-repo thread for 1h.
-        matched_saved = (
-            abs(saved_cand_ts - candidate_first_ts) < 1.0
-            if candidate_first_ts > 0.0
-            else (saved_cand_ts <= 0.0 and (time.time() - float(saved.get("updated_ts") or 0.0)) < 3600.0)
-        )
-        if matched_saved:
-            unwrapped = _unwrap_primary_session_id(str(saved["session_id"]), candidate_first_ts)
-            if unwrapped:
-                return unwrapped
+        unwrapped = _unwrap_primary_session_id(str(saved["session_id"]), candidate_first_ts)
+        if unwrapped:
+            return unwrapped
 
     if session and candidate_first_ts > 0.0:
         prior = scan_verified_codex_reviews(
@@ -859,6 +1176,95 @@ def _find_session_id_for_review(review_id: str, since_ts: float) -> str:
     return ""
 
 
+def _find_rollout_turn_state(review_id: str, since_ts: float) -> tuple[bool, str, list[str]]:
+    if not review_id:
+        return False, "", []
+    for rf in _recent_rollout_files(since_ts, limit=30, newest_first=True):
+        meta = _read_rollout_session_meta(rf)
+        if _is_subagent_rollout_meta(meta):
+            continue
+        records = rio.read_jsonl(rf)
+        if not records:
+            continue
+        has_rid = False
+        in_target_turn = False
+        err_msgs: list[str] = []
+        tool_outputs: list[str] = []
+        for rec in records:
+            rec_ts = rio.parse_iso_ts(rec.get("timestamp"))
+            rtype = rec.get("type")
+            payload = rec.get("payload") if isinstance(rec.get("payload"), dict) else {}
+            m_ids = _rollout_user_review_ids(rtype, payload)
+            if m_ids:
+                if review_id in m_ids:
+                    if not in_target_turn:
+                        err_msgs = []
+                        tool_outputs = []
+                    has_rid = True
+                    in_target_turn = True
+                else:
+                    in_target_turn = False
+            elif rtype == "event_msg" and payload.get("type") == "task_complete":
+                in_target_turn = False
+            elif in_target_turn and (rec_ts <= 0.0 or rec_ts >= since_ts - 2.0):
+                if rtype == "error":
+                    msg = str(payload.get("message") or rec.get("message") or "").strip()
+                    if msg:
+                        err_msgs.append(msg)
+                elif rtype == "event_msg" and payload.get("type") in ("error", "stream_error"):
+                    msg = str(payload.get("message") or payload.get("error") or "").strip()
+                    if msg:
+                        err_msgs.append(msg)
+                elif rtype == "response_item" and payload.get("type") in ("function_call_output", "custom_tool_call_output"):
+                    tout = payload.get("output")
+                    if isinstance(tout, str) and tout.strip():
+                        tool_outputs.append(tout)
+                elif rtype == "event_msg" and payload.get("type") == "exec_command_end":
+                    for k in ("stdout", "stderr", "formatted_output", "aggregated_output"):
+                        tout = payload.get(k)
+                        if isinstance(tout, str) and tout.strip():
+                            tool_outputs.append(tout)
+        if has_rid:
+            sid = str((meta or {}).get("id") or "").strip()
+            if sid:
+                _LAST_ROLLOUT_TURN_SID[review_id] = sid
+            return True, "\n".join(err_msgs), tool_outputs
+    return False, "", []
+
+
+def _extract_cli_diagnostic_text(
+    stdout_text: str,
+    stderr_text: str,
+    review_id: str,
+    since_ts: float,
+    is_timeout: bool,
+    parsed_json: dict[str, Any] | None = None,
+) -> str:
+    # INVARIANT: Combine structured `--json` CLI error events (`error`/`turn.failed`), current-turn rollout error events,
+    # and non-tool CLI stderr lines while strictly excluding `command_execution`/`function_call_output` file contents.
+    jstream = parsed_json if parsed_json is not None else _parse_codex_json_stream(stdout_text)
+    found_rollout, rollout_err, rollout_tools = _find_rollout_turn_state(review_id, since_ts)
+    excluded_tools = list(jstream.get("tool_outputs") or []) + rollout_tools
+    parts: list[str] = []
+    for jerr in jstream.get("cli_errors") or []:
+        if jerr:
+            parts.append(str(jerr))
+    if rollout_err:
+        parts.append(rollout_err)
+    stderr_diag = _extract_cli_error_lines(stderr_text, excluded_blobs=excluded_tools)
+    if stderr_diag:
+        parts.append(stderr_diag)
+    if jstream.get("saw_jsonl") or is_timeout or found_rollout:
+        return "\n".join(parts)
+    stdout_diag = _extract_cli_error_lines(stdout_text, excluded_blobs=excluded_tools)
+    if stdout_diag:
+        parts.append(stdout_diag)
+    combined = f"{stdout_text}\n{stderr_text}".strip()
+    if not parts and len(combined) <= 2048:
+        return combined
+    return "\n".join(parts)
+
+
 def _read_diff_file(path: str) -> str:
     raw = pathlib.Path(path).read_bytes()
     if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
@@ -878,6 +1284,7 @@ def _build_codex_exec_cmd(
     resume_session_id: str = "",
 ) -> list[str]:
     common_opts = [
+        "--json",
         "--skip-git-repo-check",
         "-c",
         "mcp_servers={}",
@@ -902,6 +1309,7 @@ def build_adversarial_prompt(
     diff_text: str,
     phase: str,
     is_resume: bool = False,
+    is_timeout_resume: bool = False,
 ) -> str:
     if phase == "closure":
         verdict_rule = (
@@ -922,12 +1330,19 @@ def build_adversarial_prompt(
             "Approve when no real correctness, security, concurrency, edge-case, or contract defects exist. "
             "Do not invent nitpicks to justify REVISE."
         )
-    round_mode = (
-        "ROUND_MODE: continuation (same review thread — verify whether prior findings are resolved, "
-        "check remediation delta for regressions, and do not invent nitpicks on unchanged code).\n"
-        if is_resume
-        else ""
-    )
+    if is_timeout_resume:
+        round_mode = (
+            "ROUND_MODE: timeout_continuation (same review thread — your previous review turn hit the wall-clock timeout "
+            "before emitting a final verdict; continue from the repository context already inspected in this thread "
+            "without starting over, and conclude with your findings and exact standalone verdict line).\n"
+        )
+    elif is_resume:
+        round_mode = (
+            "ROUND_MODE: continuation (same review thread — verify whether prior findings are resolved, "
+            "check remediation delta for regressions, and do not invent nitpicks on unchanged code).\n"
+        )
+    else:
+        round_mode = ""
     return (
         f"REVIEW_ID: {review_id}\n"
         "ROLE: Independent Adversarial Code Reviewer (Read-Only).\n"
@@ -942,8 +1357,18 @@ def build_adversarial_prompt(
     )
 
 
-def _kill_process_tree(proc: subprocess.Popen[bytes]) -> None:
-    # SAFETY: Reap the full Codex child tree on timeout or cancellation without swallowing KeyboardInterrupt/SystemExit.
+def _coerce_pipe_bytes(val: bytes | str | None) -> bytes:
+    if val is None:
+        return b""
+    if isinstance(val, bytes):
+        return val
+    return val.encode("utf-8", errors="replace")
+
+
+def _kill_process_tree(proc: subprocess.Popen[bytes]) -> tuple[bytes, bytes]:
+    # SAFETY: Reap the full Codex child tree on timeout or cancellation and drain buffered pipe output without swallowing BaseException.
+    rem_out = b""
+    rem_err = b""
     try:
         if os.name == "nt":
             try:
@@ -967,9 +1392,13 @@ def _kill_process_tree(proc: subprocess.Popen[bytes]) -> None:
         except OSError:
             pass
         try:
-            proc.communicate(timeout=2.0)
+            comm_res = proc.communicate(timeout=2.0)
+            if isinstance(comm_res, tuple) and len(comm_res) == 2:
+                rem_out = _coerce_pipe_bytes(comm_res[0])
+                rem_err = _coerce_pipe_bytes(comm_res[1])
         except Exception:
             pass
+    return rem_out, rem_err
 
 
 def _exec_codex_once(
@@ -988,26 +1417,102 @@ def _exec_codex_once(
     if os.name != "nt":
         kw["start_new_session"] = True
     proc: subprocess.Popen[bytes] | None = None
+    t_start = time.time()
     try:
         proc = subprocess.Popen(cmd, cwd=cwd, **kw)
         out_b, err_b = proc.communicate(input=prompt.encode("utf-8"), timeout=timeout)
-    except subprocess.TimeoutExpired:
-        if proc is not None:
-            _kill_process_tree(proc)
-        trip_breaker(f"codex_exec_timeout_{int(timeout)}s")
-        rio.print_cli_json(
-            {
-                "ok": False,
-                "review_id": review_id,
-                "fallback": _fallback_reviewer(xhigh),
-                "error": f"timeout_after_{int(timeout)}s",
-            },
+    except subprocess.TimeoutExpired as exc:
+        kill_res = _kill_process_tree(proc) if proc is not None else None
+        rem_out, rem_err = (
+            (_coerce_pipe_bytes(kill_res[0]), _coerce_pipe_bytes(kill_res[1]))
+            if isinstance(kill_res, tuple) and len(kill_res) == 2
+            else (b"", b"")
         )
+        partial_out = _coerce_pipe_bytes(getattr(exc, "output", None)) + rem_out
+        partial_err = _coerce_pipe_bytes(getattr(exc, "stderr", None)) + rem_err
+        partial_stdout_txt = partial_out.decode("utf-8", errors="replace")
+        partial_stderr_txt = partial_err.decode("utf-8", errors="replace")
+        jstream_to = _parse_codex_json_stream(partial_stdout_txt)
+        diag_timeout = _extract_cli_diagnostic_text(
+            partial_stdout_txt,
+            partial_stderr_txt,
+            review_id,
+            t_start - 1.0,
+            is_timeout=True,
+            parsed_json=jstream_to,
+        )
+        provider_outage = detect_outage_from_output(diag_timeout, exit_code=1)
+        net_outage = provider_outage or detect_network_timeout_from_output(diag_timeout)
+        sb_err = None if net_outage else detect_sandbox_restriction(diag_timeout)
+        if sb_err:
+            _LAST_TIMEOUT_OUTAGE[review_id] = ("sandbox", "")
+            rio.print_cli_json(
+                {
+                    "ok": False,
+                    "review_id": review_id,
+                    "sandbox_blocked": True,
+                    "round_consumed": False,
+                    "error": f"sandbox_restricted ({sb_err}); re-run codex_lane.py review with BypassSandbox=true",
+                },
+            )
+            return None
+        if net_outage:
+            # SAFETY: Only genuine internet/API/quota failures during a timeout authorize fallback; local thinking timeouts never do.
+            _LAST_TIMEOUT_OUTAGE[review_id] = ("network", "")
+            if provider_outage:
+                trip_breaker(provider_outage)
+            rio.log_hook_event(
+                "gate-events",
+                "codex_review_network_timeout",
+                review_id=review_id,
+                timeout=int(timeout),
+                reason=net_outage,
+            )
+            rio.print_cli_json(
+                {
+                    "ok": False,
+                    "review_id": review_id,
+                    "network_outage": True,
+                    "outage_reason": net_outage,
+                    "round_consumed": False,
+                    "fallback": _fallback_reviewer(xhigh),
+                    "error": f"timeout_after_{int(timeout)}s",
+                },
+            )
+            return None
+        rio.log_hook_event("gate-events", "codex_review_timeout", review_id=review_id, timeout=int(timeout))
+        recommended_timeout = next_timeout_after(timeout)
+        cached_rollout_sid = _LAST_ROLLOUT_TURN_SID.pop(review_id, "")
+        timeout_sid = (
+            _unwrap_primary_session_id(str(jstream_to.get("thread_id") or ""), t_start - 1.0)
+            or (_unwrap_primary_session_id(cached_rollout_sid, t_start - 1.0) if cached_rollout_sid else "")
+            or _find_session_id_for_review(review_id, t_start - 1.0)
+        )
+        _LAST_TIMEOUT_OUTAGE[review_id] = ("thinking", timeout_sid)
+        payload_to: dict[str, Any] = {
+            "ok": False,
+            "review_id": review_id,
+            "timed_out": True,
+            "retry_in_same_lane": True,
+            "round_consumed": False,
+            "recommended_timeout": recommended_timeout,
+            "error": f"timeout_after_{int(timeout)}s",
+            "hint": (
+                f"Codex did not finish within {int(timeout)}s (thinking timeout, NOT an outage; review round NOT consumed). "
+                f"Re-run codex_lane.py review without --timeout to continue the same Codex session with {recommended_timeout}s timeout; "
+                "escalating to internal review on a thinking timeout is forbidden."
+            ),
+        }
+        if timeout_sid:
+            payload_to["session_id"] = timeout_sid
+        rio.print_cli_json(payload_to)
         return None
     except Exception as exc:
         if proc is not None:
             _kill_process_tree(proc)
-        trip_breaker(f"codex_exec_error:{type(exc).__name__}")
+        if isinstance(exc, PermissionError):
+            return _CodexExecResult(2, "", f"PermissionError: [Errno 13] {exc}", False, None, None, f"PermissionError: [Errno 13] {exc}")
+        _LAST_TIMEOUT_OUTAGE[review_id] = ("error", "")
         rio.print_cli_json({"ok": False, "review_id": review_id, "error": str(exc)})
         return None
     except BaseException:
@@ -1015,16 +1520,31 @@ def _exec_codex_once(
             _kill_process_tree(proc)
         raise
 
-    stdout_text = (out_b or b"").decode("utf-8", errors="replace")
+    raw_stdout_text = (out_b or b"").decode("utf-8", errors="replace")
     stderr_text = (err_b or b"").decode("utf-8", errors="replace")
+    jstream_exit = _parse_codex_json_stream(raw_stdout_text)
+    stream_tid = str(jstream_exit.get("thread_id") or "")
+    stdout_text = str(jstream_exit["agent_text"]) if jstream_exit["saw_jsonl"] else raw_stdout_text
     has_structured_verdict = cwg.extract_review_decision(stdout_text) != (None, None)
-    combined = stdout_text + "\n" + stderr_text
-    outage = (
-        None
-        if (proc.returncode == 0 and has_structured_verdict)
-        else detect_outage_from_output(combined, exit_code=proc.returncode)
+    if proc.returncode == 0 and has_structured_verdict:
+        return _CodexExecResult(0, stdout_text, stderr_text, True, None, None, None, stream_tid)
+    diag_exit = _extract_cli_diagnostic_text(
+        raw_stdout_text,
+        stderr_text,
+        review_id,
+        t_start - 1.0,
+        is_timeout=False,
+        parsed_json=jstream_exit,
     )
-    return _CodexExecResult(proc.returncode, stdout_text, stderr_text, has_structured_verdict, outage)
+    eff_stderr = (
+        "\n".join(str(e) for e in (jstream_exit.get("cli_errors") or []) if e) or stderr_text
+        if jstream_exit["saw_jsonl"]
+        else stderr_text
+    )
+    outage = detect_outage_from_output(diag_exit, exit_code=proc.returncode)
+    net_err = None if outage else (detect_network_timeout_from_output(diag_exit) if proc.returncode != 0 else None)
+    sb_exit = None if (outage or net_err or proc.returncode == 0) else detect_sandbox_restriction(diag_exit)
+    return _CodexExecResult(proc.returncode, stdout_text, eff_stderr, has_structured_verdict, outage, net_err, sb_exit, stream_tid)
 
 
 def cmd_review(args: argparse.Namespace) -> int:
@@ -1043,7 +1563,7 @@ def cmd_review(args: argparse.Namespace) -> int:
     cwd = os.path.abspath(args.cwd or os.getcwd())
     git_root = rio.git_toplevel(cwd) or cwd
     effort = "xhigh" if args.xhigh else "high"
-    phase = "closure" if args.closure else "ordinary"
+    phase = "closure" if (args.closure or getattr(args, "phase", "") == "closure") else "ordinary"
     review_id = args.review_id or f"cwg-{uuid.uuid4().hex[:12]}"
     eff_session = args.session or _infer_single_open_session(cwd)
     cand_first_ts = _candidate_first_ts(eff_session)
@@ -1066,6 +1586,46 @@ def cmd_review(args: argparse.Namespace) -> int:
             diff_text = str(out2 or "")
 
     scope_summary = args.summary or "Review current repository candidate changes."
+    saved_thread = None if args.new_session else active_thread_state(eff_session, git_root, cand_first_ts)
+    is_timeout_continuation = bool(saved_thread and saved_thread.get("pending_timeout_resume"))
+    saved_next_timeout = 0.0
+    if is_timeout_continuation and isinstance(saved_thread, dict):
+        try:
+            saved_next_timeout = float(saved_thread.get("next_timeout_seconds") or 0.0)
+        except (TypeError, ValueError):
+            saved_next_timeout = 0.0
+
+    min_required_timeout = float(required_review_timeout(bool(args.xhigh), saved_next_timeout))
+    if args.timeout is not None and not os.environ.get("CARBON_CODEX_BIN"):
+        # INVARIANT: Reject upfront or shrunk custom `--timeout` in live runs; standard defaults are 600s (HIGH) and 900s (XHIGH).
+        if not is_timeout_continuation:
+            rio.print_cli_json(
+                {
+                    "ok": False,
+                    "invalid_timeout": True,
+                    "error": (
+                        "Upfront custom --timeout is forbidden; omit --timeout so codex_lane.py uses the standard "
+                        f"{DEFAULT_REVIEW_TIMEOUT_SECONDS}s (HIGH) / {DEFAULT_XHIGH_REVIEW_TIMEOUT_SECONDS}s (--xhigh) timeout."
+                    ),
+                },
+                pretty=args.pretty,
+            )
+            return 2
+        if int(args.timeout) < int(min_required_timeout):
+            rio.print_cli_json(
+                {
+                    "ok": False,
+                    "invalid_timeout": True,
+                    "error": (
+                        f"Custom --timeout {args.timeout}s is below required continuation timeout ({int(min_required_timeout)}s); "
+                        "omit --timeout to continue automatically with increased timeout."
+                    ),
+                },
+                pretty=args.pretty,
+            )
+            return 2
+
+    eff_timeout = float(args.timeout) if args.timeout is not None else min_required_timeout
     exec_res: _CodexExecResult | None = None
     launch_wall_ts = 0.0
     used_resume_sid = ""
@@ -1083,6 +1643,7 @@ def cmd_review(args: argparse.Namespace) -> int:
             diff_text=diff_text,
             phase=phase,
             is_resume=bool(cur_resume_sid),
+            is_timeout_resume=bool(cur_resume_sid and is_timeout_continuation),
         )
         record_packet(
             review_id=active_review_id,
@@ -1092,6 +1653,18 @@ def cmd_review(args: argparse.Namespace) -> int:
             phase=phase,
             session=eff_session,
         )
+        if not _packet_path(active_review_id).is_file():
+            # SAFETY: Inside Standard Sandbox (`BypassSandbox=false`), `CARBON_STACK_HOME` is read-only; fail fast without
+            # hanging on blocked network sockets, without tripping the global breaker, and without granting fallback.
+            rio.print_cli_json(
+                {
+                    "ok": False,
+                    "sandbox_blocked": True,
+                    "error": "CARBON_STACK_HOME is not writable in sandbox; re-run codex_lane.py review with BypassSandbox=true",
+                },
+                pretty=args.pretty,
+            )
+            return 2
         packet_committed = False
         try:
             launch_wall_ts = time.time()
@@ -1103,26 +1676,50 @@ def cmd_review(args: argparse.Namespace) -> int:
                 resume_session_id=cur_resume_sid,
             )
             exec_res = _exec_codex_once(
-                cmd, prompt, cwd, float(args.timeout), active_review_id, args.xhigh
+                cmd, prompt, cwd, eff_timeout, active_review_id, args.xhigh
             )
             if exec_res is None:
+                timeout_kind, stream_sid = _LAST_TIMEOUT_OUTAGE.pop(active_review_id, ("thinking", ""))
+                if timeout_kind == "thinking":
+                    # INVARIANT: Persist timed-out Codex thread + elevated timeout so retry resumes the same lane without losing a round.
+                    timeout_sid = (
+                        stream_sid
+                        or _find_session_id_for_review(active_review_id, launch_wall_ts - 1.0)
+                        or (_unwrap_primary_session_id(cur_resume_sid, cand_first_ts) if cur_resume_sid else "")
+                        or str((saved_thread or {}).get("session_id") or "")
+                    )
+                    next_to = next_timeout_after(eff_timeout)
+                    rio.write_json(
+                        _thread_state_path(eff_session, git_root),
+                        {
+                            "session_id": timeout_sid,
+                            "last_review_id": active_review_id,
+                            "session": eff_session,
+                            "git_root": rio.normalize_path(git_root),
+                            "candidate_first_ts": cand_first_ts,
+                            "pending_timeout_resume": True,
+                            "last_timeout_seconds": int(eff_timeout),
+                            "next_timeout_seconds": next_to,
+                            "updated_ts": time.time(),
+                        },
+                    )
+                elif timeout_kind == "network":
+                    _clear_pending_timeout_resume(eff_session, git_root)
                 return 3
             used_resume_sid = cur_resume_sid
-            # SAFETY: Fall back once to a fresh primary session if resuming an invalid or verdict-less thread.
+            _LAST_ROLLOUT_TURN_SID.pop(active_review_id, None)
+            # SAFETY: Fall back once to a fresh primary session if resuming an invalid or verdict-less thread (never on sandbox block).
             if (
                 attempt_idx == 0
                 and cur_resume_sid
                 and not exec_res.has_verdict
                 and not exec_res.outage
+                and not exec_res.network_outage
+                and not exec_res.sandbox_blocked
             ):
-                tpath = _thread_state_path(eff_session, git_root)
-                try:
-                    if tpath.exists():
-                        tpath.unlink()
-                except OSError:
-                    pass
+                cwg.unlink_quiet(_thread_state_path(eff_session, git_root))
                 continue
-            if not exec_res.outage and exec_res.rc == 0:
+            if not exec_res.outage and not exec_res.network_outage and exec_res.rc == 0:
                 packet_committed = True
             break
         finally:
@@ -1130,38 +1727,63 @@ def cmd_review(args: argparse.Namespace) -> int:
                 _unlink_packet(active_review_id)
 
     assert exec_res is not None
-    if exec_res.outage or exec_res.rc != 0:
-        trip_breaker(exec_res.outage or f"codex_nonzero_exit_{exec_res.rc}")
+    if exec_res.outage or exec_res.network_outage or exec_res.rc != 0:
+        if exec_res.sandbox_blocked:
+            rio.print_cli_json(
+                {
+                    "ok": False,
+                    "review_id": active_review_id,
+                    "exit_code": exec_res.rc,
+                    "sandbox_blocked": True,
+                    "error": f"sandbox_restricted ({exec_res.sandbox_blocked}); re-run codex_lane.py review with BypassSandbox=true",
+                },
+                pretty=args.pretty,
+            )
+            return 2
+        eff_outage = exec_res.outage or exec_res.network_outage
+        if exec_res.outage:
+            trip_breaker(exec_res.outage)
+        if eff_outage:
+            _clear_pending_timeout_resume(eff_session, git_root)
         err_detail = (exec_res.stderr or exec_res.stdout or "").strip()
-        if exec_res.outage and err_detail and exec_res.outage not in err_detail:
-            err_msg = f"{exec_res.outage}: {err_detail}"
+        if eff_outage and err_detail and eff_outage not in err_detail:
+            err_msg = f"{eff_outage}: {err_detail}"
         else:
-            err_msg = (exec_res.outage or err_detail).strip()
-        err_obj = {
+            err_msg = (eff_outage or err_detail).strip()
+        err_obj: dict[str, Any] = {
             "ok": False,
             "review_id": active_review_id,
             "exit_code": exec_res.rc,
-            "fallback": _fallback_reviewer(args.xhigh),
             "error": err_msg,
         }
+        if exec_res.network_outage:
+            err_obj["network_outage"] = True
+            err_obj["outage_reason"] = exec_res.network_outage
+        if eff_outage:
+            err_obj["fallback"] = _fallback_reviewer(args.xhigh)
         rio.print_cli_json(err_obj, pretty=args.pretty)
         return 2
 
-    actual_sid = _find_session_id_for_review(active_review_id, launch_wall_ts) or (
-        _unwrap_primary_session_id(used_resume_sid, cand_first_ts) if used_resume_sid else ""
+    actual_sid = (
+        (_unwrap_primary_session_id(exec_res.thread_id, cand_first_ts) if exec_res.thread_id else "")
+        or _find_session_id_for_review(active_review_id, launch_wall_ts)
+        or (_unwrap_primary_session_id(used_resume_sid, cand_first_ts) if used_resume_sid else "")
     )
-    if actual_sid and exec_res.has_verdict:
-        rio.write_json(
-            _thread_state_path(eff_session, git_root),
-            {
-                "session_id": actual_sid,
-                "last_review_id": active_review_id,
-                "session": eff_session,
-                "git_root": rio.normalize_path(git_root),
-                "candidate_first_ts": cand_first_ts,
-                "updated_ts": time.time(),
-            },
-        )
+    if exec_res.has_verdict:
+        if actual_sid:
+            rio.write_json(
+                _thread_state_path(eff_session, git_root),
+                {
+                    "session_id": actual_sid,
+                    "last_review_id": active_review_id,
+                    "session": eff_session,
+                    "git_root": rio.normalize_path(git_root),
+                    "candidate_first_ts": cand_first_ts,
+                    "updated_ts": time.time(),
+                },
+            )
+        elif is_timeout_continuation:
+            cwg.unlink_quiet(_thread_state_path(eff_session, git_root))
 
     session_mode = "resumed" if used_resume_sid else "new"
     sys.stdout.write(
@@ -1196,7 +1818,8 @@ def main() -> int:
     rev.add_argument("--new-session", action="store_true")
     rev.add_argument("--xhigh", action="store_true")
     rev.add_argument("--closure", action="store_true")
-    rev.add_argument("--timeout", type=int, default=240)
+    rev.add_argument("--phase", choices=("ordinary", "closure"), default="")
+    rev.add_argument("--timeout", type=int, default=None)
     rev.add_argument("--pretty", action="store_true")
 
     args = parser.parse_args()

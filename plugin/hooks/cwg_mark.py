@@ -22,7 +22,7 @@ EDIT_TOOLS = frozenset({"edit_file", "write_file"})
 SHELL_TOOLS = frozenset({"run_command"})
 
 CACHE_PATH_RE = re.compile(
-    r"(^|/)(__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.coverage|node_modules/\.cache)(/|$)|\.pyc$",
+    r"(^|/)(__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.coverage|node_modules/\.cache|\.swarm)(/|$)|\.pyc$",
     re.IGNORECASE,
 )
 
@@ -58,7 +58,7 @@ _INSTALL_DIAG_TAIL = r"[^\r\n|;&]*(?<!\S)(?:--diagnose|--dry-run)(?=$|[\s|;&])"
 _WT_MUT_TAIL = r"[^\r\n;|&]*\b(?:snapshot|remove|restore)\b"
 _CHIP_MUT_TAIL = r"[^\r\n;|&]*--merge\b"
 
-_BK_SCRIPTS_TOK = _exe_pat("carbon_memory|gate_inbox|chip_handoff|swarm_cache", _EXT_PY)
+_BK_SCRIPTS_TOK = _exe_pat("carbon_memory|gate_inbox|chip_handoff|swarm_cache|swarm_ctl", _EXT_PY)
 _CONTINUITY_TOK = _exe_pat("continuity", _EXT_PY)
 _CODEX_LANE_TOK = _exe_pat("codex_lane", _EXT_PY)
 _GIT_TOK = _exe_pat("git")
@@ -864,6 +864,19 @@ def estimate_changed_lines(tool_name: str, args: dict[str, Any]) -> int:
     return 10
 
 
+def _refresh_swarm_round_fields(
+    marker: dict[str, Any],
+    session: str,
+    repo_root: str,
+    fp: str | None,
+) -> None:
+    marker["round_id"] = int(marker.get("round_id") or 0) + 1
+    marker["round_start_msg_id"] = cwg.swarm_board_head_seq(session=session, cwd=repo_root)
+    marker["current_diff_hash"] = fp or ""
+    fresh_probe = {"paths": list(marker.get("paths") or []), "changed_lines": int(marker.get("changed_lines") or 0)}
+    marker["diff_metrics"] = cwg.compute_diff_metrics(marker=fresh_probe, repo_root=repo_root)
+
+
 def update_candidate_marker(
     session: str,
     cwd: str,
@@ -928,9 +941,17 @@ def update_candidate_marker(
         mark_obj: dict[str, Any] = {"ts": now, "fp": fp, "cause": cause_label[:120]}
         if not fp and unknown_barrier:
             mark_obj["unknown"] = True
-        if not marks or marks[-1].get("fp") != fp or mark_obj.get("unknown") or marks[-1].get("unknown"):
+        changed_fp = not marks or marks[-1].get("fp") != fp or mark_obj.get("unknown") or marks[-1].get("unknown")
+        if changed_fp:
             marks.append(mark_obj)
         cwg.trim_content_marks(marker, marks)
+        if changed_fp or not marker.get("round_id"):
+            _refresh_swarm_round_fields(
+                marker,
+                session,
+                str(marker.get("git_root") or marker.get("cwd") or eff_cwd),
+                fp,
+            )
     elif operational_mutation:
         marker["operational"] = True
         dpaths = cwg.durable_paths(marker.get("paths"))
@@ -941,10 +962,22 @@ def update_candidate_marker(
             if not fp:
                 marks.append({"ts": now, "fp": None, "unknown": True, "cause": cause_label[:120]})
                 cwg.trim_content_marks(marker, marks)
+                _refresh_swarm_round_fields(
+                    marker,
+                    session,
+                    str(marker.get("git_root") or marker.get("cwd") or eff_cwd),
+                    None,
+                )
             elif fp != last_fp:
                 marks.append({"ts": now, "fp": fp, "cause": cause_label[:120]})
                 marker["last_durable_ts"] = now
                 cwg.trim_content_marks(marker, marks)
+                _refresh_swarm_round_fields(
+                    marker,
+                    session,
+                    str(marker.get("git_root") or marker.get("cwd") or eff_cwd),
+                    fp,
+                )
             elif marks and marks[-1].get("unknown"):
                 # INVARIANT: Clear legacy unknown flag when SHA-256 fingerprint is confirmed identical.
                 cleaned = dict(marks[-1])
@@ -1341,6 +1374,32 @@ def _references_scratch_space(cmd: str, artifact_dir: str | None) -> bool:
     return any(pat.search(norm_cmd) for pat in cwg.USER_SCRATCH_PATTERNS)
 
 
+def extract_ps_redirections(seg: str) -> tuple[str, list[str]]:
+    """Extract unquoted PowerShell redirection targets, returning `(cleaned_seg, non_null_targets)`."""
+    if ">" not in _strip_quoted(seg):
+        return seg, []
+    redir_spans: list[tuple[int, int]] = []
+    targets: list[str] = []
+    q_spans = [(m.start(), m.end()) for m in _PS_QUOTED_RE.finditer(seg)]
+    for rm in _PS_REDIRECT_TOKEN_RE.finditer(seg):
+        if any(qs <= rm.start() < qe for qs, qe in q_spans):
+            continue
+        raw_tgt = rm.group(1) or rm.group(2) or rm.group(3) or ""
+        tgt = _unquote_ps_literal(raw_tgt)
+        redir_spans.append((rm.start(), rm.end()))
+        if tgt and tgt.lower() not in ("$null", "nul", "/dev/null") and not re.match(r"^&[1-6]$", tgt):
+            targets.append(tgt)
+    if not redir_spans:
+        return seg, []
+    buf: list[str] = []
+    prev_idx = 0
+    for rs, re_end in redir_spans:
+        buf.append(seg[prev_idx:rs])
+        prev_idx = re_end
+    buf.append(seg[prev_idx:])
+    return "".join(buf).strip(), targets
+
+
 def is_ephemeral_only_shell_mutation(
     cmd: str,
     artifact_dir: str | None = None,
@@ -1433,28 +1492,13 @@ def is_ephemeral_only_shell_mutation(
 
         # Extract and validate any unquoted file redirections (`>` / `>>`, `2>$null`, `*>` etc.)
         if ">" in seg_unq:
-            redir_spans: list[tuple[int, int]] = []
-            q_spans = [(m.start(), m.end()) for m in _PS_QUOTED_RE.finditer(seg)]
-            for rm in _PS_REDIRECT_TOKEN_RE.finditer(seg):
-                if any(qs <= rm.start() < qe for qs, qe in q_spans):
-                    continue
-                raw_tgt = rm.group(1) or rm.group(2) or rm.group(3) or ""
-                tgt = _unquote_ps_literal(raw_tgt)
-                if tgt.lower() in ("$null", "nul", "/dev/null") or re.match(r"^&[1-6]$", tgt):
-                    redir_spans.append((rm.start(), rm.end()))
-                    continue
-                if _resolve_ephemeral_target(tgt, cur_cwd, artifact_dir, workspace_paths) is None:
-                    return False
-                saw_ephemeral_mutation = True
-                redir_spans.append((rm.start(), rm.end()))
-            if redir_spans:
-                buf: list[str] = []
-                prev_idx = 0
-                for rs, re_end in redir_spans:
-                    buf.append(seg[prev_idx:rs])
-                    prev_idx = re_end
-                buf.append(seg[prev_idx:])
-                seg = "".join(buf).strip()
+            cleaned_seg, redir_targets = extract_ps_redirections(seg)
+            if cleaned_seg != seg:
+                for tgt in redir_targets:
+                    if _resolve_ephemeral_target(tgt, cur_cwd, artifact_dir, workspace_paths) is None:
+                        return False
+                    saw_ephemeral_mutation = True
+                seg = cleaned_seg
                 if not seg:
                     continue
                 seg_unq = _strip_quoted(seg)

@@ -3,9 +3,14 @@ trigger: model_decision
 description: "Load ONLY when delegating to swarm workers, Hydrogen browser/translator subagents, or parallel git worktree chips."
 ---
 
-# Multi-Agent & Hydrogen Routing Rules
+# Multi-Agent & Swarm 2.0 Routing Rules
 
-1. **Запрет `Gemini Flash` и защита квоты Carbon:** никогда не передавайте `Model="flash"`, `flash_lite` или `gemini-3.8-flash-*`. Для вспомогательных ролей (`browser`, `translator`, разведка) используйте **`Gemini 4 Hydrogen`** (`gemini-4-hydrogen-low` для smoke/короткого перевода, `-medium` для UI QA/доков, `-high` для сложных SPA, `-xhigh` для гонок состояния и **fallback-линз `simplify` при исчерпании квоты Sonnet** — прямой вызов `simplify-*-reviewer` из Carbon-сессии заблокирован хуком `safety_guards.py`).
-2. **Делегирование `browser` с не-Hydrogen координатора:** запустите через `swarm` воркера с `model="gemini-4-hydrogen-<level>"`, который вызовет `invoke_subagent(TypeName="browser", Model="inherit")`; проверяйте результат строго по `BROWSER_HOST_FACTS`.
-3. **Одно владение файлом:** при параллельной разработке выдавайте каждому пишущему воркеру `workspace: "share"` / `"branch"` или изолированный worktree через `chip_handoff.py open`. Интеграция изменений в рабочее дерево принадлежит только координатору.
-4. **Защита от вечного ожидания `swarm_wait`:** никогда не вызывайте `read_board` и `swarm_wait` в одной пачке tool calls (одном ходе): `read_board` сдвигает `last_read_seq` до текущего `head`, после чего `swarm_wait` засыпает в ожидании уже несуществующих сообщений. Сначала вызовите только `read_board`, проверьте ответы всех воркеров, убейте завершивших через `swarm(action="kill", ...)` и вызывайте `swarm_wait` только если часть воркеров ещё работает.
+1. **Запрет `Gemini Flash` и асимметричная матрица Swarm 2.0:** никогда не передавайте `Model="flash"`, `flash_lite` или `gemini-3.8-flash-*`.
+   - **Координатор:** `Orchestrator (Argon)` — планирование, владение файлами, слияние, гейт.
+   - **Скауты (`3+` подсистем / `5+` файлов) и `Disjoint Builders`:** `Gemini 4 Hydrogen` (`-medium` / `-high`, `-low` для smoke/короткого перевода, `-xhigh` для сложных гонок и fallback-линз `simplify`).
+   - **Simplify:** `Claude Sonnet 5.5 High` / Argon (`SIMPLIFY_LENS: ALL` Fast-Path при `<= 2` файлов и `<= 30` строк; иначе 3 параллельные линзы; fallback — `gemini-4-hydrogen-xhigh`, никогда Carbon).
+   - **Логика и безопасность:** `codex_lane.py review` (при подтверждённом сбое Codex — `claude-opus-5-5-high` -> `gemini-4-carbon-high`).
+2. **Владение файлами (`File Ownership Guard`):** перед параллельной разработкой разделите файлы через `swarm_ctl.py ownership set --worker <name> --paths <globs>` (либо `worktree create` при пересечении модулей/тестов, либо `workspace: "share"`/`"branch"` / `chip_handoff.py open`). Интеграция принадлежит координатору.
+3. **Тёплый пул (`Warm Pool`), `Pointer-on-Board` и `Cursor Guard`:** будите живых `waiting` воркеров через `post_message` `@mention` вместо холодного респавна и делайте пакетный `kill` перед `--closure`. Объёмные отчёты сохраняйте в `.swarm/artifacts/<worker>-<round>.md` (`<= 12` строк + путь на доске). При `> 15` сообщениях передавайте `read_board(since=<last_seen_id>)` (или `swarm_ctl.py board summary --since <id>`).
+4. **Защита `swarm_wait` и `Stall Watchdog`:** никогда не вызывайте `read_board` и `swarm_wait` в одном ходе; при зависании `in_flight` воркера сверх `SWARM_STALL_TIMEOUT_SEC` (`240` с) перезапускайте только зависший воркер. Подробные шаблоны — в скилле `swarm-orchestration`.
+5. **Делегирование `browser` с не-Hydrogen координатора:** запустите `swarm` воркер с `model="gemini-4-hydrogen-<level>"`, который вызовет `invoke_subagent(TypeName="browser", Model="inherit")`; проверяйте результат строго по `BROWSER_HOST_FACTS`.

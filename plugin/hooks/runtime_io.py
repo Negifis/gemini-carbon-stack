@@ -26,7 +26,14 @@ SUBAGENT_MSG_RE = re.compile(
 SWARM_BOARD_WAKE_BODY_RE = re.compile(
     r"\A\[swarm\]\s+new board message\s+#\d+\s*(?:</SYSTEM_MESSAGE>)?\s*\Z"
 )
+SWARM_WAKE_SEQ_RE = re.compile(
+    r"(?:\[swarm\]\s+new board message|recorded on the board as)\s+#(\d+)",
+    re.IGNORECASE,
+)
 SWARM_ROLE_MEMBER_RE = re.compile(r"^(?:narrator|monitor)(?:-\d+)?$", re.IGNORECASE)
+WORKER_ENV_KEYS = ("SWARM_WORKER_NAME", "WORKER_NAME", "AGY_SWARM_WORKER", "AGY_WORKER_NAME")
+COORDINATOR_ROLE_NAMES = frozenset({"coordinator", "main", "primary", "root", "lead"})
+BG_TASK_ID_RE = re.compile(r"running as a background task with task id:\s*(\S+)", re.IGNORECASE)
 
 NON_ENFORCEABLE_STOP_REASONS = frozenset(
     {
@@ -63,6 +70,10 @@ def plugin_root() -> pathlib.Path:
     if env_root:
         return pathlib.Path(env_root).resolve()
     return pathlib.Path(__file__).resolve().parent.parent
+
+
+def chat_bus_cli_path() -> str:
+    return normalize_path(plugin_root().parent / "chat-bus" / "tools" / "chat_bus_cli.py")
 
 
 def parse_event_arg(default: str = "") -> str:
@@ -476,11 +487,41 @@ def _decode_compact_step_args(steps: list[dict[str, Any]]) -> None:
         tc["args"] = decoded_map
 
 
+def _read_decoded_transcript(tp: pathlib.Path, max_lines: int) -> list[dict[str, Any]]:
+    steps = read_jsonl(tp, max_lines=max_lines)
+    if tp.name == "transcript.jsonl" and steps:
+        _decode_compact_step_args(steps)
+    return steps
+
+
 def read_transcript_steps(transcript_path: str | None, max_lines: int = 4000) -> list[dict[str, Any]]:
     tp = resolve_transcript_path(transcript_path)
     if tp is None:
         return []
-    steps = read_jsonl(tp, max_lines=max_lines)
+    return _read_decoded_transcript(tp, max_lines=max_lines)
+
+
+def read_compact_transcript_steps(transcript_path: str | None, max_lines: int = 16000) -> list[dict[str, Any]]:
+    if not transcript_path:
+        return []
+    return _read_decoded_transcript(pathlib.Path(transcript_path).with_name("transcript.jsonl"), max_lines=max_lines)
+
+
+def read_transcript_head(transcript_path: str | None, head_lines: int = 8) -> list[dict[str, Any]]:
+    tp = resolve_transcript_path(transcript_path)
+    if tp is None or head_lines <= 0:
+        return []
+    raw_lines: list[str] = []
+    try:
+        with tp.open("rb") as fh:
+            for _ in range(head_lines):
+                raw = fh.readline()
+                if not raw:
+                    break
+                raw_lines.append(raw.decode("utf-8", errors="replace"))
+    except OSError:
+        return []
+    steps = _parse_jsonl_lines(raw_lines)
     if tp.name == "transcript.jsonl" and steps:
         _decode_compact_step_args(steps)
     return steps
@@ -490,24 +531,82 @@ def _is_system_message(step: dict[str, Any] | None) -> bool:
     return bool(step and step.get("source") == "SYSTEM" and step.get("type") == "SYSTEM_MESSAGE")
 
 
+def _has_prefix_slice_gap(items: list[dict[str, Any]]) -> bool:
+    if not items or not isinstance(items[0], dict):
+        return False
+    s0 = items[0].get("step_index")
+    if isinstance(s0, int) and s0 > 0:
+        return True
+    if len(items) < 2 or not isinstance(items[1], dict):
+        return False
+    s1 = items[1].get("step_index")
+    if isinstance(s0, int) and isinstance(s1, int):
+        return s1 > s0 + 1
+    return (
+        items[0].get("source") == "SYSTEM_SDK"
+        and items[1].get("source") not in ("SYSTEM_SDK", "USER_EXPLICIT")
+    )
+
+
+has_prefix_slice_gap = _has_prefix_slice_gap
+
+
+def _leading_system_messages(
+    transcript_path: str | None,
+    steps: list[dict[str, Any]] | None = None,
+    max_lines: int = 8,
+) -> list[dict[str, Any]]:
+    # INVARIANT: Read true prefix lines (`read_transcript_head`) whenever `steps` is omitted or has a tail-slice gap
+    # (even when the first tail step happens to be a late `SYSTEM_MESSAGE`), and never cross a `step_index` gap.
+    if steps is None:
+        items = read_transcript_head(transcript_path, head_lines=max_lines)
+    else:
+        items = steps
+        if transcript_path and _has_prefix_slice_gap(items):
+            head_items = read_transcript_head(transcript_path, head_lines=max_lines)
+            if head_items:
+                items = head_items
+    out: list[dict[str, Any]] = []
+    prev_idx: int | None = None
+    for st in items:
+        if not isinstance(st, dict):
+            break
+        cur_idx = st.get("step_index")
+        if isinstance(cur_idx, int):
+            if (prev_idx is None and cur_idx > 0) or (prev_idx is not None and cur_idx > prev_idx + 1):
+                break
+            prev_idx = cur_idx
+        if st.get("source") == "SYSTEM_SDK":
+            if out:
+                break
+            continue
+        if _is_system_message(st):
+            out.append(st)
+        else:
+            break
+    return out
+
+
 def _first_system_content(
     transcript_path: str | None, steps: list[dict[str, Any]] | None = None
 ) -> str | None:
-    items = steps if steps is not None else read_transcript_steps(transcript_path, max_lines=1)
-    if items and _is_system_message(items[0]):
-        return str(items[0].get("content") or "")
+    lead = _leading_system_messages(transcript_path, steps=steps)
+    if lead:
+        return str(lead[0].get("content") or "")
     return None
 
 
 def subagent_parent_id(transcript_path: str | None, steps: list[dict[str, Any]] | None = None) -> str | None:
-    content = _first_system_content(transcript_path, steps=steps)
-    if content is None:
-        return None
-    m = SUBAGENT_MSG_RE.search(content)
-    if m:
-        return m.group("sender")
-    if content.lstrip().startswith("<swarm_worker>") or "post_message" in content or "swarm_wait" in content:
-        return "swarm-coordinator"
+    for st in _leading_system_messages(transcript_path, steps=steps):
+        content = str(st.get("content") or "")
+        m = SUBAGENT_MSG_RE.search(content)
+        if m:
+            sender = m.group("sender")
+            if sender.lower() == "system":
+                continue
+            return sender
+        if content.lstrip().startswith("<swarm_worker>") or "post_message" in content or "swarm_wait" in content:
+            return "swarm-coordinator"
     return None
 
 
@@ -579,32 +678,44 @@ def _swarm_brain_and_cid(
     return derived_brain, worker_cid
 
 
-def _find_active_worker_model(members: dict[str, Any], worker_cid: str) -> str | None:
+def _find_active_worker_entry(
+    members: dict[str, Any], worker_cid: str
+) -> tuple[str, dict[str, Any]] | None:
     for name, meta in members.items():
         if not isinstance(meta, dict) or is_swarm_member_killed(meta) or is_swarm_role_member(name, meta):
             continue
         cid = str(meta.get("conversation_id") or meta.get("conversationId") or "").strip()
         if cid == worker_cid:
-            return str(meta.get("model") or "registered").strip().lower() or "registered"
+            return str(name), meta
     return None
 
 
-def _registered_swarm_worker_model(
+def _resolve_registered_swarm_worker(
     brain_root: pathlib.Path | None,
     worker_cid: str,
     candidate_sessions: list[str] | tuple[str, ...],
-) -> str:
+) -> dict[str, Any] | None:
     if brain_root is None or not worker_cid:
-        return ""
+        return None
     seen: set[str] = set()
+
+    def _pack(coord_sid: str, name: str, meta: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "coordinator": coord_sid,
+            "worker_name": name,
+            "model": str(meta.get("model") or "registered").strip().lower() or "registered",
+            "added_by": str(meta.get("added_by") or "").strip(),
+            "board_path": swarm_dir(brain_root, coord_sid) / "board.jsonl",
+        }
+
     for sid in candidate_sessions:
         clean_sid = (sid or "").strip()
         if not clean_sid or clean_sid in seen:
             continue
         seen.add(clean_sid)
-        found = _find_active_worker_model(load_swarm_members(brain_root, clean_sid), worker_cid)
-        if found is not None:
-            return found
+        hit = _find_active_worker_entry(load_swarm_members(brain_root, clean_sid), worker_cid)
+        if hit is not None:
+            return _pack(clean_sid, hit[0], hit[1])
     # INVARIANT: Peer-sender step-0 on >128KB transcripts may omit step-1 coordinator sender; scan swarm registries on disk.
     try:
         for mf in brain_root.glob("*/.system_generated/swarm/members.json"):
@@ -612,12 +723,39 @@ def _registered_swarm_worker_model(
             if sid in seen:
                 continue
             seen.add(sid)
-            found = _find_active_worker_model(load_swarm_members(brain_root, sid), worker_cid)
-            if found is not None:
-                return found
+            hit = _find_active_worker_entry(load_swarm_members(brain_root, sid), worker_cid)
+            if hit is not None:
+                return _pack(sid, hit[0], hit[1])
     except OSError:
-        return ""
-    return ""
+        return None
+    return None
+
+
+def resolve_swarm_worker_assignment(
+    transcript_path: str | None,
+    steps: list[dict[str, Any]] | None = None,
+    conversation_id: str | None = None,
+) -> dict[str, Any] | None:
+    lead = _leading_system_messages(transcript_path, steps=steps, max_lines=8)
+    if not lead:
+        return None
+    candidate_sids: list[str] = []
+    saw_swarm_wake = False
+    for st in lead:
+        content = str(st.get("content") or "")
+        m = SUBAGENT_MSG_RE.search(content)
+        if m:
+            sender = m.group("sender")
+            if sender.lower() != "system":
+                candidate_sids.append(sender)
+            if SWARM_BOARD_WAKE_BODY_RE.match(m.group("body") or ""):
+                saw_swarm_wake = True
+        elif content.lstrip().startswith("<swarm_worker>"):
+            saw_swarm_wake = True
+    if not saw_swarm_wake:
+        return None
+    brain_root, worker_cid = _swarm_brain_and_cid(transcript_path, conversation_id=conversation_id)
+    return _resolve_registered_swarm_worker(brain_root, worker_cid, candidate_sids)
 
 
 def swarm_worker_model(
@@ -625,21 +763,12 @@ def swarm_worker_model(
     steps: list[dict[str, Any]] | None = None,
     conversation_id: str | None = None,
 ) -> str:
-    items = steps if steps is not None else read_transcript_steps(transcript_path, max_lines=5)
-    if not items or not _is_system_message(items[0]):
-        return ""
-    m0 = SUBAGENT_MSG_RE.search(str(items[0].get("content") or ""))
-    if not m0 or not SWARM_BOARD_WAKE_BODY_RE.match(m0.group("body") or ""):
-        return ""
-
-    candidate_sids = [m0.group("sender")]
-    if len(items) > 1 and _is_system_message(items[1]):
-        m1 = SUBAGENT_MSG_RE.search(str(items[1].get("content") or ""))
-        if m1:
-            candidate_sids.append(m1.group("sender"))
-
-    brain_root, worker_cid = _swarm_brain_and_cid(transcript_path, conversation_id=conversation_id)
-    return _registered_swarm_worker_model(brain_root, worker_cid, candidate_sids)
+    info = resolve_swarm_worker_assignment(
+        transcript_path,
+        steps=steps,
+        conversation_id=conversation_id,
+    )
+    return str(info["model"]) if info else ""
 
 
 def is_swarm_worker_session(
@@ -654,6 +783,111 @@ def is_swarm_worker_session(
             conversation_id=conversation_id,
         )
     )
+
+
+def swarm_mention_patterns(wname: str, *, include_group: bool = True) -> list[re.Pattern[str]]:
+    pats = [re.compile(rf"(?<![A-Za-z0-9_-])@{re.escape(wname)}(?![A-Za-z0-9_-])", re.IGNORECASE)]
+    if include_group and re.search(r"-\d+$", wname):
+        group_prefix = wname.rsplit("-", 1)[0]
+        if group_prefix:
+            pats.append(re.compile(rf"(?<![A-Za-z0-9_-])@{re.escape(group_prefix)}(?![A-Za-z0-9_-])", re.IGNORECASE))
+    return pats
+
+
+def latest_board_assign_and_reply_seq(
+    raw_board: list[dict[str, Any]],
+    wname: str,
+    added_by: str = "",
+) -> tuple[int, int]:
+    clean_added = added_by.strip()
+    assigners = {"coordinator", clean_added} if clean_added else {"coordinator"}
+    mention_pats = swarm_mention_patterns(wname)
+    last_assign_seq = 0
+    last_reply_seq = 0
+    for idx, bp in enumerate(raw_board, start=1):
+        seq = int(bp.get("seq") or idx)
+        poster = str(bp.get("agent") or "")
+        btext = str(bp.get("text") or "")
+        if poster in assigners and (any(mp.search(btext) for mp in mention_pats) or "@all" in btext.lower()):
+            last_assign_seq = seq
+        elif poster == wname:
+            last_reply_seq = seq
+    return last_assign_seq, last_reply_seq
+
+
+def inspect_worker_turn_after_wake(
+    w_steps: list[dict[str, Any]],
+    last_assign_seq: int,
+) -> dict[str, Any]:
+    last_wake_idx = -1
+    max_wake_seq = 0
+    for idx, st in enumerate(w_steps):
+        if st.get("source") == "SYSTEM" and st.get("type") == "SYSTEM_MESSAGE":
+            hits = [int(x) for x in SWARM_WAKE_SEQ_RE.findall(str(st.get("content") or ""))]
+            if hits:
+                max_wake_seq = max(max_wake_seq, max(hits))
+                last_wake_idx = idx
+    tail = w_steps[last_wake_idx + 1 :] if last_wake_idx >= 0 else w_steps
+    saw_model = False
+    called_post = False
+    has_error = False
+    pending_bg: set[str] = set()
+    last_model_tcs: list[Any] = []
+    for st in tail:
+        stype = str(st.get("type") or "")
+        sstatus = str(st.get("status") or "")
+        scontent = str(st.get("content") or "")
+        if st.get("source") == "SYSTEM":
+            for tid in list(pending_bg):
+                if f'Task id "{tid}" finished' in scontent or f'Task id "{tid}" was canceled' in scontent:
+                    pending_bg.discard(tid)
+        if stype == "ERROR_MESSAGE" or (st.get("source") == "MODEL" and stype != "GENERIC" and sstatus == "ERROR"):
+            has_error = True
+        if st.get("source") == "MODEL" and stype == "PLANNER_RESPONSE":
+            saw_model = True
+            last_model_tcs = st.get("tool_calls") or []
+            if any(isinstance(tc, dict) and tc.get("name") == "post_message" for tc in last_model_tcs):
+                called_post = True
+        elif stype == "GENERIC":
+            m_bg = BG_TASK_ID_RE.search(scontent)
+            if m_bg:
+                pending_bg.add(m_bg.group(1))
+
+    terminal_parked = False
+    if tail:
+        last_st = tail[-1]
+        last_type = str(last_st.get("type") or "")
+        last_status = str(last_st.get("status") or "")
+        if (
+            last_st.get("source") == "MODEL"
+            and last_type == "PLANNER_RESPONSE"
+            and last_status == "DONE"
+            and not (last_st.get("tool_calls") or [])
+        ):
+            terminal_parked = True
+        else:
+            prev_called_wait = len(tail) >= 2 and any(
+                isinstance(tc, dict) and tc.get("name") == "swarm_wait"
+                for tc in (tail[-2].get("tool_calls") or [])
+            )
+            terminal_parked = bool(
+                last_type == "GENERIC"
+                and last_status == "DONE"
+                and ("waiting for a message" in str(last_st.get("content") or "").lower() or prev_called_wait)
+            )
+
+    return {
+        "last_wake_idx": last_wake_idx,
+        "max_wake_seq": max_wake_seq,
+        "woke_for_assign": max_wake_seq >= last_assign_seq and last_wake_idx >= 0,
+        "has_tail": bool(tail),
+        "saw_model": saw_model,
+        "called_post": called_post,
+        "has_error": has_error,
+        "pending_bg": pending_bg,
+        "last_model_tcs": last_model_tcs,
+        "terminal_parked": terminal_parked,
+    }
 
 
 def is_subagent_session(transcript_path: str | None, steps: list[dict[str, Any]] | None = None) -> bool:

@@ -4,15 +4,105 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import pathlib
+import re
+import sqlite3
 import sys
 import time
 import uuid
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import cwg_common as cwg
 import runtime_io as rio
+
+SIMPLIFY_LINE_RE = cwg.SIMPLIFY_LINE_RE
+SIMPLIFY_LENS_LINE_RE = cwg.SIMPLIFY_LENS_LINE_RE
+SIMPLIFY_COMBINED_LENS_RE = cwg.SIMPLIFY_COMBINED_LENS_RE
+parse_simplify_verdict = cwg.parse_simplify_verdict
+extract_simplify_verdict = cwg.extract_simplify_verdict
+
+
+def validate_warm_worker_verdicts(
+    messages: list[dict[str, Any]],
+    round_start_msg_id: int = 0,
+    current_diff_hash: str = "",
+    members: dict[str, Any] | None = None,
+    fast_path: bool = False,
+) -> dict[str, Any]:
+    lenses: dict[str, dict[str, Any]] = {}
+    combined: dict[str, Any] | None = None
+    all_verdicts: list[dict[str, Any]] = []
+    stale_rejected = 0
+    multi_lens_spoof = False
+    target_hash = (current_diff_hash or "").strip()
+
+    for idx, raw in enumerate(messages or [], start=1):
+        if not isinstance(raw, dict):
+            continue
+        agent = str(raw.get("agent") or raw.get("worker") or raw.get("sender") or "").strip()
+        role = str(raw.get("role") or "").strip().lower()
+        if not role and members and agent in members and isinstance(members[agent], dict):
+            role = str(members[agent].get("role") or "").strip().lower()
+        if role == "coordinator" or agent.lower() == "coordinator":
+            continue
+
+        seq = cwg._extract_msg_seq(raw, idx)
+        if round_start_msg_id > 0 and seq <= round_start_msg_id:
+            stale_rejected += 1
+            continue
+
+        text = str(raw.get("text") or raw.get("content") or "")
+        msg_hash = str(raw.get("diff_hash") or raw.get("current_diff_hash") or "").strip() or cwg.extract_diff_hash(text)
+        if target_hash and msg_hash and msg_hash != target_hash:
+            stale_rejected += 1
+            continue
+
+        default_lens = ""
+        low_agent = agent.lower()
+        for candidate_lens in cwg.SIMPLIFY_LENSES:
+            if candidate_lens in low_agent:
+                default_lens = candidate_lens
+                break
+        parsed = parse_simplify_verdict(text, default_lens=default_lens)
+        if not parsed.get("verdict"):
+            continue
+        entry = {
+            **parsed,
+            "agent": agent,
+            "seq": seq,
+            "diff_hash": msg_hash,
+            "ts": float(raw.get("ts") or 0.0),
+        }
+        all_verdicts.append(entry)
+        if parsed.get("multi_lens_spoof"):
+            multi_lens_spoof = True
+            continue
+        if parsed.get("clean"):
+            if parsed.get("has_explicit_all"):
+                combined = entry
+            elif parsed.get("lens") in cwg.SIMPLIFY_LENSES:
+                lenses[str(parsed["lens"])] = entry
+        else:
+            if parsed.get("has_explicit_all") or not parsed.get("lens"):
+                combined = None
+            elif parsed.get("lens") in cwg.SIMPLIFY_LENSES:
+                lenses.pop(str(parsed["lens"]), None)
+
+    missing_lenses = [lens for lens in cwg.SIMPLIFY_LENSES if lens not in lenses]
+    satisfied = (not multi_lens_spoof) and (
+        (not missing_lenses) or (fast_path and combined is not None and bool(combined.get("clean")))
+    )
+    return {
+        "lenses": lenses,
+        "combined": combined,
+        "all_verdicts": all_verdicts,
+        "stale_rejected": stale_rejected,
+        "missing_lenses": missing_lenses,
+        "multi_lens_spoof": multi_lens_spoof,
+        "satisfied": satisfied,
+    }
 
 
 def inbox_dir() -> pathlib.Path:
@@ -48,13 +138,17 @@ def get_handler_session(cfg: dict[str, Any] | None = None) -> str:
 
 
 def set_handler_config(session: str = "", stack_repo: str = "", clear: bool = False) -> dict[str, Any]:
-    cfg_path = handler_config_path()
+    try:
+        cfg_path = handler_config_path()
+    except OSError as exc:
+        return {"ok": False, "error": f"cannot access gate state directory: {exc}"}
     if clear:
         if cfg_path.exists():
             try:
                 cfg_path.unlink()
             except OSError:
-                rio.write_json(cfg_path, {})
+                if not rio.write_json(cfg_path, {}):
+                    return {"ok": False, "error": f"failed to clear {cfg_path}"}
         return {"ok": True, "handler_session": "", "cleared": True}
 
     clean_sess = rio.safe_key(session, "")
@@ -67,7 +161,8 @@ def set_handler_config(session: str = "", stack_repo: str = "", clear: bool = Fa
         "installed_plugin": rio.normalize_path(rio.plugin_root()),
         "updated_ts": time.time(),
     }
-    rio.write_json(cfg_path, cfg)
+    if not rio.write_json(cfg_path, cfg):
+        return {"ok": False, "error": f"failed to persist handler config to {cfg_path}"}
     rio.log_hook_event("gate-events", "anomaly_handler_set", handler_session=clean_sess)
     return {"ok": True, **cfg}
 
@@ -97,15 +192,136 @@ def unresolved_summary(limit: int = 5, handler_session: str | None = None) -> st
     return f"[Gate Inbox] {len(items)} unresolved anomaly report(s): " + ", ".join(parts) + suffix
 
 
+_BUS_SNAPSHOT_RE = re.compile(r"^snapshot-[0-9a-f]{12}-\d{12}-[0-9a-f]{8}\.db$")
+_BUS_REPORT_RE = re.compile(
+    r"\[[A-Z0-9_-]{4,}(?:\s+[^\]]*)?\]|GATE_ANOMALY|\banom-[0-9a-f]{6,}\b|"
+    r"\bdeadlock\b|\bcwg_stop\b|\bcodex_lane\b|\bsafety_guards\b|аномал",
+    re.IGNORECASE,
+)
+_ANOM_ID_RE = re.compile(r"\banom-[0-9a-f]{6,}\b", re.IGNORECASE)
+
+
+def _readonly_chat_bus_db_path() -> pathlib.Path | None:
+    bus_dir = rio.stack_home() / "state" / "chat-bus"
+    if not bus_dir.is_dir():
+        return None
+    ptr = rio.read_json(bus_dir / "snapshot_current.json", default=None)
+    if isinstance(ptr, dict):
+        snap_name = str(ptr.get("file") or "").strip()
+        if _BUS_SNAPSHOT_RE.match(snap_name):
+            snap_path = bus_dir / snap_name
+            if snap_path.is_file():
+                return snap_path
+    main_db = bus_dir / "bus.db"
+    return main_db if main_db.is_file() else None
+
+
+@contextmanager
+def _ro_bus_conn() -> Iterator[sqlite3.Connection | None]:
+    db_path = _readonly_chat_bus_db_path()
+    if db_path is None:
+        yield None
+        return
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=1.0)
+    except sqlite3.Error:
+        yield None
+        return
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def unhandled_bus_reports(handler_session: str | None = None, limit: int = 10) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    hsess = rio.safe_key(handler_session, "") if handler_session is not None else get_handler_session()
+    if not hsess:
+        return []
+    resolved_cache: dict[str, bool] = {}
+    newest_first: list[dict[str, Any]] = []
+    with _ro_bus_conn() as conn:
+        if conn is None:
+            return []
+        try:
+            cur = conn.execute(
+                "SELECT msg_id, thread_id, from_id, from_title, body, status, created_ts "
+                "FROM messages WHERE to_id = ? AND status IN ('unread', 'delivered') AND acked_ts <= 0 "
+                "ORDER BY created_ts DESC, msg_id DESC",
+                (hsess,),
+            )
+            while len(newest_first) < limit:
+                batch = cur.fetchmany(64)
+                if not batch:
+                    break
+                for msg_id, thread_id, from_id, from_title, body, status, created_ts in batch:
+                    body_s = str(body or "").strip()
+                    if not body_s or not _BUS_REPORT_RE.search(body_s):
+                        continue
+                    anom_ids = [m.lower() for m in _ANOM_ID_RE.findall(body_s)]
+                    if anom_ids:
+                        for aid in anom_ids:
+                            if aid not in resolved_cache:
+                                resolved_cache[aid] = (_load_report(aid)[1] or {}).get("resolved") is True
+                        if all(resolved_cache[aid] for aid in anom_ids):
+                            continue
+                    newest_first.append(
+                        {
+                            "msg_id": str(msg_id or ""),
+                            "thread_id": str(thread_id or ""),
+                            "from_id": str(from_id or ""),
+                            "from_title": str(from_title or ""),
+                            "body": body_s,
+                            "status": str(status or ""),
+                            "created_ts": float(created_ts or 0.0),
+                        }
+                    )
+                    if len(newest_first) >= limit:
+                        break
+        except sqlite3.Error:
+            return []
+    newest_first.reverse()
+    return newest_first
+
+
+def bus_has_anomaly_notification(
+    from_session: str,
+    handler_session: str,
+    since_ts: float,
+    report_id: str,
+) -> bool:
+    fsess = rio.safe_key(from_session, "")
+    hsess = rio.safe_key(handler_session, "")
+    rid_low = (report_id or "").strip().lower()
+    if not fsess or not hsess or not rid_low:
+        return False
+    with _ro_bus_conn() as conn:
+        if conn is None:
+            return False
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM messages WHERE from_id = ? AND to_id = ? AND created_ts >= ? AND LOWER(body) LIKE ? LIMIT 1",
+                (fsess, hsess, max(0.0, since_ts - 5.0), f"%{rid_low}%"),
+            ).fetchone()
+            return row is not None
+        except sqlite3.Error:
+            return False
+
+
 def format_handler_digest(limit: int = 10, cfg: dict[str, Any] | None = None) -> str:
-    items = unresolved_reports()
-    if not items:
-        return ""
     eff_cfg = cfg if cfg is not None else get_handler_config()
+    hsess = get_handler_session(eff_cfg)
+    items = unresolved_reports()
+    bus_items = unhandled_bus_reports(handler_session=hsess, limit=limit) if hsess else []
+    if not items and not bus_items:
+        return ""
     repo_hint = str(eff_cfg.get("stack_repo") or rio.normalize_path(rio.plugin_root()))
     inbox_script = rio.normalize_path(rio.plugin_root() / "hooks" / "gate_inbox.py")
+    total_cnt = len(items) + len(bus_items)
     lines = [
-        f"[Gate Anomaly Handler — {len(items)} unresolved report(s) awaiting root-cause fix]",
+        f"[Gate Anomaly Handler — {total_cnt} unresolved report(s)/bus message(s) awaiting root-cause fix]",
         f"Stack repo: {repo_hint}",
     ]
     for rec in items[-limit:]:
@@ -116,9 +332,15 @@ def format_handler_digest(limit: int = 10, cfg: dict[str, Any] | None = None) ->
         tp = str(rec.get("transcript") or "")
         tp_part = f" | transcript={tp}" if tp else ""
         lines.append(f"- {rid} (from session={sess}): block=\"{blk}\" | facts=\"{facts}\"{tp_part}")
+    for bmsg in bus_items:
+        one_line = " ".join(bmsg["body"].split())[:240]
+        lines.append(
+            f"- [chat-bus {bmsg['msg_id']}] (from session={bmsg['from_id']} \"{bmsg['from_title'][:60]}\"): {one_line}"
+        )
     lines.append(
-        f"Action: inspect `{inbox_script} show --id <id>`, fix root cause + add test in `{repo_hint}`, "
-        f"run `install.py --force` + tests, then mark `{inbox_script} resolve --id <id> --note \"...\"`."
+        f"Action: inspect `{inbox_script} show --id <id>` (or chat-bus message), fix root cause + add test in `{repo_hint}`, "
+        f"run `install.py --force` + tests, then mark `{inbox_script} resolve --id <id> --note \"...\"` "
+        f"(and reply via `chat_bus_cli.py reply --from-chat {hsess or '<handler>'} --message-id <msg_id> --message \"...\"` for chat-bus reports)."
     )
     return "\n".join(lines)
 
@@ -224,9 +446,20 @@ def cmd_report(args: argparse.Namespace) -> int:
         "notified_handler": handler_sess == session if handler_sess else False,
         "resolved": False,
     }
-    rpath = report_path(report_id)
+    try:
+        rpath = report_path(report_id)
+    except OSError as exc:
+        sys.stderr.write(
+            f"Failed to access gate inbox directory ({exc}); CARBON_STACK_HOME is not writable in this environment.\n"
+        )
+        return 1
     assert rpath is not None
-    rio.write_json(rpath, record)
+    # SAFETY: Fail closed when `write_json` returns False (e.g. read-only filesystem/sandbox) instead of emitting a phantom report_id.
+    if not rio.write_json(rpath, record):
+        sys.stderr.write(
+            f"Failed to persist anomaly report to {rpath}; CARBON_STACK_HOME is read-only or not writable in this environment.\n"
+        )
+        return 1
     rio.log_hook_event(
         "gate-events",
         "anomaly_filed",
@@ -241,10 +474,14 @@ def cmd_report(args: argparse.Namespace) -> int:
             f"[GATE_ANOMALY {report_id}] session={session}; "
             f"block={record['block'][:160]}; facts={record['facts'][:220]}; did={record['did'][:160]}"
         )
+        bus_cli = rio.chat_bus_cli_path()
         resp["handler_session"] = handler_sess
         resp["handler_uri"] = f"conversation://{handler_sess}"
         resp["notify_required"] = True
         resp["send_message_payload"] = msg_payload
+        resp["chat_bus_cli_hint"] = (
+            f'python -X utf8 "{bus_cli}" send --from-chat "{session}" --to "{handler_sess}" --message "{msg_payload}"'
+        )
     rio.print_cli_json(resp, pretty=False)
     return 0
 

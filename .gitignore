@@ -7,3 +7,6 @@ __pycache__/
 
 # tokenade — legacy per-project embedding model cache (now global)
 .fastembed_cache/
+
+# Swarm 2.0 runtime artifacts, ownership manifests, and isolated worktrees
+.swarm/

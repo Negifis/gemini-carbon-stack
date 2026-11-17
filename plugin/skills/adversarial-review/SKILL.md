@@ -6,22 +6,23 @@ description: Triggered by /adversarial-review or HIGH/XHIGH changes requiring in
 # `/adversarial-review` — Независимое критическое ревью кода
 
 Один независимый review-движок на раунд, максимум 3 обычных раунда, строгая криптографическая/системная проверка происхождения вердикта хуком `cwg_stop.py`.
-**Инвариант порядка:** для `HIGH`/`XHIGH` ревью запускается **строго ПОСЛЕ полного завершения всех 3 линз `simplify`** (запуск ревью одновременно с `simplify` блокируется `cwg_stop.py`).
+**Инвариант порядка Swarm 2.0:** для `HIGH`/`XHIGH` сначала проходят локальные тесты (`unittest`), затем **первичное ревью `codex_lane.py review` (`VERDICT: APPROVED`)**, затем **один проход `simplify`**, пакетный `swarm(action="kill", ...)` и финальный `codex_lane.py review --closure` (`CLOSURE_VALIDATION: READY`).
 
 ## Шаг 1. Приоритет №1 (всегда основной контур) — OpenAI Codex CLI (`codex_lane.py`)
 
-Всегда начинайте с проверки и запуска внешнего контура Codex (переход на внутренние модели при доступном Codex запрещён и блокируется `cwg_stop.py`):
+Всегда начинайте с проверки и запуска внешнего контура Codex (переход на внутренние модели при доступном Codex запрещён и блокируется `cwg_stop.py`).
+**Важно (`BypassSandbox: true`):** вызовы `codex_lane.py review` и `codex_lane.py reset` обязательно запускайте **вне песочницы** (`BypassSandbox: true`), так как им требуются исходящий HTTPS-доступ к API OpenAI и запись пакетов в `CARBON_STACK_HOME` (сетевой/файловый отказ песочницы помечается как `sandbox_blocked: true` и не взводит глобальный 30-минутный circuit breaker):
 ```powershell
 python -X utf8 "<PLUGIN_ROOT>/hooks/codex_lane.py" check
 ```
-Если `available: true`, запустите изолированное read-only ревью Codex:
+Если `available: true`, запустите изолированное read-only ревью Codex (с `BypassSandbox: true`):
 ```powershell
 python -X utf8 "<PLUGIN_ROOT>/hooks/codex_lane.py" review `
   --cwd "<путь к репозиторию>" `
   --session "<conversation-id>" `
   --summary "<цель изменений, затронутые контракты и выполненные тесты>"
 ```
-Для `XHIGH` добавьте `--xhigh` (при post-ESCALATE проверке — `--closure`).
+Для `XHIGH` добавьте `--xhigh` (дефолтный таймаут 10–15 мин: `600s` обычно и `900s` для `--xhigh`; при post-ESCALATE проверке добавьте `--closure`). Не передавайте укороченные пользовательские `--timeout` заранее: если Codex не успел уложиться в таймаут (не из-за падения сети/квоты), это **не считается раундом ревью и не является поводом переключаться на внутренние модели** — повторите `codex_lane.py review`, и сохранённая сессия автоматически продолжится с увеличенным таймаутом (`15+` мин).
 
 - **Единая сессия чата в рамках кандидата:** 1-й раунд открывает новую сессию Codex и сохраняет её `session_id` в `state/gate/threads/`; все последующие раунды (`REVISE` -> раунды 2/3 и пост-эскалационный `--closure`) по тому же кандидату (`--session` + `git_root`) **автоматически продолжаются в том же самом чате** через `codex exec resume <session_id>` (`SESSION_MODE: resumed`). Передавайте `--new-session` только для принудительного сброса, а `--resume <id>` — для явного выбора сессии.
 

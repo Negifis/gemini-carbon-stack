@@ -72,12 +72,25 @@ def scan_for_secrets(text: str) -> str | None:
     return None
 
 
-def connect_db() -> sqlite3.Connection:
+def _connect_ro(db_file: pathlib.Path) -> sqlite3.Connection:
+    uri = f"file:{rio.normalize_path(db_file)}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def connect_db(read_only: bool = False) -> sqlite3.Connection:
     db_file = memory_db_path()
+    if read_only:
+        return _connect_ro(db_file)
     conn = sqlite3.connect(str(db_file), timeout=10.0)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+    except sqlite3.OperationalError:
+        conn.close()
+        return _connect_ro(db_file)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS memories (
@@ -315,21 +328,34 @@ def export_notebooklm_bundle(cwd: str = "") -> dict[str, Any]:
 
 def memory_stats(cwd: str = "") -> dict[str, Any]:
     pkey = rio.project_key(cwd or os.getcwd())
-    with connect_db() as conn:
-        total = conn.execute("SELECT COUNT(*) AS c FROM memories").fetchone()["c"]
-        active = conn.execute("SELECT COUNT(*) AS c FROM memories WHERE status = 'ACTIVE'").fetchone()["c"]
-        proj_active = conn.execute(
-            "SELECT COUNT(*) AS c FROM memories WHERE status = 'ACTIVE' AND project_key = ?",
-            (pkey,),
-        ).fetchone()["c"]
-    return {
-        "db_path": str(memory_db_path()),
-        "project_key": pkey,
-        "total_entries": total,
-        "active_entries": active,
-        "project_active_entries": proj_active,
-        "external_nlm_bridge": detect_external_nlm_bridge(),
-    }
+    db_file = memory_db_path()
+    try:
+        with connect_db() as conn:
+            total = conn.execute("SELECT COUNT(*) AS c FROM memories").fetchone()["c"]
+            active = conn.execute("SELECT COUNT(*) AS c FROM memories WHERE status = 'ACTIVE'").fetchone()["c"]
+            proj_active = conn.execute(
+                "SELECT COUNT(*) AS c FROM memories WHERE status = 'ACTIVE' AND project_key = ?",
+                (pkey,),
+            ).fetchone()["c"]
+        return {
+            "db_path": str(db_file),
+            "project_key": pkey,
+            "total_entries": total,
+            "active_entries": active,
+            "project_active_entries": proj_active,
+            "external_nlm_bridge": detect_external_nlm_bridge(),
+        }
+    except sqlite3.OperationalError as exc:
+        return {
+            "db_path": str(db_file),
+            "project_key": pkey,
+            "total_entries": 0,
+            "active_entries": 0,
+            "project_active_entries": 0,
+            "read_only_fallback": True,
+            "error": str(exc),
+            "external_nlm_bridge": detect_external_nlm_bridge(),
+        }
 
 
 def main() -> int:

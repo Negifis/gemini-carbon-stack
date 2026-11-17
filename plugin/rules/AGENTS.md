@@ -19,6 +19,8 @@
 
 - Работайте в штатном Orchestrator (`Plan <-> Execute`). Для понятных follow-up задач сразу передавайте краткий план в `exit_plan_mode`, чтобы чтение и правку сделал исполнитель. Объёмный ресерч репозитория (`code-explorer`/`research`) и проверку живого UI (`browser` на `Gemini 4 Hydrogen`) делегируйте через `invoke_subagent`.
 - Для многосессионного handoff используйте компактный `continuity.py handoff` (без копирования исходников и логов).
+- **Swarm 2.0:** при `3+` подсистемах или параллельных правках загружайте `swarm-orchestration`, делите файлы через `swarm_ctl.py` (или `worktree`), храните отчёты в `.swarm/artifacts/*.md` (`<= 12` строк в `board.jsonl`) и читайте доску с курсором (`since=<id>`).
+- Пайплайн гейта на `HIGH`/`XHIGH`: `unittest` -> первичный `codex_lane.py review` -> `simplify` один раз (`SIMPLIFY_LENS: ALL` если `<= 2` ф. и `<= 30` ст., иначе 3 линзы; Warm Pool через `@mention`) -> пакетный `kill` -> `codex_lane.py review --closure`.
 
 ## 4. Code Work Gate (по риску компонентов и операции, не по числу строк)
 
@@ -27,7 +29,7 @@
 - `PERSISTENT` (правка файлов; квитанция — последняя строка):
   - `LOW` (доки/заметки/статика): проверка содержимого -> `[gate] verified: LOW; <итог>`.
   - `STANDARD` (обычный код, скрипты, UI, аддоны): локальные проверки/тесты после правки (если применимы), без авто-`swarm`/ревью -> `[gate] verified: STANDARD; <кандидат и проверки>`.
-  - `HIGH`/`XHIGH` (auth/crypto/секреты/права, миграции, CI/CD, хуки/манифесты плагина/`install.py`, `.agents/carbon-gate.json`): строго последовательно: 1) тесты -> 2) 3 раздельные линзы `simplify` (`claude-sonnet-5-5-high`, fallback при исчерпании квоты Sonnet строго на `gemini-4-hydrogen-xhigh` через `swarm`, никогда не на Carbon; дождаться их полного завершения до старта ревью, никогда параллельно с ревью) -> 3) свежее независимое `VERDICT: APPROVED` (приоритет всегда `codex_lane.py review`; только при подтверждённой недоступности Codex — эскалация на внутренний `claude-opus-5-5-high` -> `gemini-4-carbon-high` при сбое Opus) -> `[gate] verified: HIGH|XHIGH; <кандидат, тесты и ревью>`.
+  - `HIGH`/`XHIGH` (auth/crypto/секреты/права, миграции, CI/CD, хуки/манифесты плагина/`install.py`, `.agents/carbon-gate.json`): `unittest` -> первичный `APPROVED` review (`codex_lane.py review`, эскалация на `claude-opus-5-5-high` -> `gemini-4-carbon-high` только при сбое) -> `simplify` один раз (`SIMPLIFY_LENS: ALL` Fast-Path при `<= 2` ф. и `<= 30` ст., иначе 3 раздельные линзы `claude-sonnet-5-5-high` / fallback `gemini-4-hydrogen-xhigh`) -> пакетный `kill` -> `--closure` (`CLOSURE_VALIDATION: READY`) -> `[gate] verified: HIGH|XHIGH; <кандидат, тесты и ревью>`.
 
 ## 5. Общение и код
 

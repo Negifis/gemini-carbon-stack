@@ -12,6 +12,8 @@
 
 - Объёмный ресерч по репозиторию делегируйте в `invoke_subagent` (`code-explorer` / `research`), а проверку живого веб-интерфейса — в субагент `browser` на `Gemini 4 Hydrogen`.
 - Модели `Gemini Flash` запрещены — используйте `Gemini 4 Hydrogen` (`low..xhigh`). Овердрафт кредитов (`useG1Credits`) отключён (`false`).
+- Для **Swarm 2.0** (разведка `3+` подсистем, параллельные билдеры, гейт) подключайте скилл `swarm-orchestration`: `swarm_ctl.py` для непересекающихся `owned_paths`/`worktree`, `.swarm/artifacts/*.md` (`<= 12` строк на доске) и `read_board(since=<id>)`.
+- Верификация `HIGH`/`XHIGH` идёт по порядку `unittest -> codex_lane.py review -> simplify (ALL при <=2 ф. и <=30 ст.) -> batch kill -> --closure`, с переиспользованием `waiting` воркеров через `@mention`.
 
 ## 3. Короткие команды проверок и терминала (PowerShell 5.1)
 

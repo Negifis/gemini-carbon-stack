@@ -187,15 +187,10 @@ def safe_remove_worktree(
     }
 
 
-def audit_worktrees(cwd: str = "") -> dict[str, Any]:
-    root = rio.git_toplevel(cwd or os.getcwd())
-    if not root:
-        return {"ok": False, "error": "not_in_git_repo"}
-
+def list_worktrees(root: str) -> tuple[int, list[dict[str, Any]], str]:
     rc, out, err = rio.run_git(root, ["worktree", "list", "--porcelain"], timeout=6.0)
     if rc != 0:
-        return {"ok": False, "error": err.strip()}
-
+        return rc, [], err
     trees: list[dict[str, Any]] = []
     cur: dict[str, Any] = {}
     for line in str(out).splitlines() + [""]:
@@ -205,13 +200,28 @@ def audit_worktrees(cwd: str = "") -> dict[str, Any]:
             cur = {}
             continue
         if line.startswith("worktree "):
-            cur["worktree"] = rio.normalize_path(line[len("worktree ") :].strip())
+            norm = rio.normalize_path(line[len("worktree ") :].strip())
+            cur["worktree"] = norm
+            cur["path"] = norm
         elif line.startswith("HEAD "):
             cur["head"] = line[len("HEAD ") :].strip()
         elif line.startswith("branch "):
             cur["branch"] = line[len("branch ") :].strip()
         elif line == "detached":
             cur["detached"] = True
+        elif line == "bare":
+            cur["bare"] = True
+    return 0, trees, ""
+
+
+def audit_worktrees(cwd: str = "") -> dict[str, Any]:
+    root = rio.git_toplevel(cwd or os.getcwd())
+    if not root:
+        return {"ok": False, "error": "not_in_git_repo"}
+
+    rc, trees, err = list_worktrees(root)
+    if rc != 0:
+        return {"ok": False, "error": err.strip()}
 
     for item in trees:
         wt_path = item["worktree"]
