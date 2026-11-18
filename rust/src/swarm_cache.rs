@@ -312,12 +312,18 @@ pub fn inspect_swarm_workers(
         };
 
         let last_ts = val_to_f64(tinfo.get("last_model_ts"));
+        // INVARIANT: Anthropic 5-minute ephemeral prompt-cache expiry (`270s`) applies only to `claude-*` models; non-Claude Warm Pool workers (`gemini-4-hydrogen-*`) retain warm conversation context across rounds and resume via `@mention`.
+        let uses_ephemeral_ttl = model.is_empty() || model.starts_with("claude-");
         let (cache_state, age_s, rem_s, rec_action) = if last_ts <= 0.0 {
             ("NEW", 0.0, ttl_seconds as f64, "wait_or_assign")
         } else {
             let age = ((now - last_ts).max(0.0) * 10.0).round() / 10.0;
-            let rem = (((ttl_seconds as f64) - age).max(0.0) * 10.0).round() / 10.0;
-            if age <= ttl_seconds as f64 {
+            let rem = if uses_ephemeral_ttl {
+                (((ttl_seconds as f64) - age).max(0.0) * 10.0).round() / 10.0
+            } else {
+                ttl_seconds as f64
+            };
+            if !uses_ephemeral_ttl || age <= ttl_seconds as f64 {
                 ("WARM", age, rem, "resume_in_place")
             } else {
                 ("EXPIRED", age, rem, "rotate_incremental")
@@ -987,6 +993,7 @@ mod tests {
                 "coordinator": {"role": "coordinator", "conversation_id": session},
                 "simp-reuse-r1": {"role": "worker", "model": cwg_common::SONNET_HIGH_MODEL, "conversation_id": worker_cid},
                 "simp-quality-r1": {"role": "worker", "model": cwg_common::SONNET_HIGH_MODEL, "conversation_id": warm_cid},
+                "simp-efficiency-r1": {"role": "worker", "model": cwg_common::SIMPLIFY_FALLBACK_MODEL, "conversation_id": worker_cid},
                 "simplify-efficiency-r0": {"role": "worker", "model": cwg_common::SONNET_HIGH_MODEL, "killed": true}
             }
         });
@@ -1027,11 +1034,11 @@ mod tests {
             Some(now),
             1,
         );
-        assert_eq!(res["active_count"], json!(2));
+        assert_eq!(res["active_count"], json!(3));
         assert_eq!(res["killed_count"], json!(1));
         assert_eq!(res["overall_action"], json!("rotate_incremental"));
         assert_eq!(res["expired_workers"], json!(["simp-reuse-r1"]));
-        assert_eq!(res["warm_workers"], json!(["simp-quality-r1"]));
+        assert_eq!(res["warm_workers"], json!(["simp-efficiency-r1", "simp-quality-r1"]));
 
         let workers = res["workers"].as_array().unwrap();
         let w_warm = workers

@@ -6881,6 +6881,62 @@ class GateSubprocessTestCase(unittest.TestCase):
             )
             self.assertFalse(mfile.exists())
 
+        sc_tool = REPO_ROOT / "plugin" / "tools" / "swarm_cache.py"
+        hyd_brain = self.workspace / "hyd_brain"
+        hyd_sess = "hyd-sess-01"
+        hyd_wcid = "hyd-worker-01"
+        hyd_sdir = hyd_brain / hyd_sess / ".system_generated" / "swarm"
+        hyd_sdir.mkdir(parents=True, exist_ok=True)
+        (hyd_sdir / "members.json").write_text(
+            json.dumps(
+                {
+                    "members": {
+                        "simp-reuse-r1": {
+                            "role": "worker",
+                            "model": "gemini-4-hydrogen-xhigh",
+                            "conversation_id": hyd_wcid,
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        hyd_tp = hyd_brain / hyd_wcid / ".system_generated" / "logs" / "transcript.jsonl"
+        hyd_tp.parent.mkdir(parents=True, exist_ok=True)
+        hyd_tp.write_text(
+            json.dumps({"source": "MODEL", "created_at": "2020-01-01T00:00:00Z", "input_tokens": 100}) + "\n",
+            encoding="utf-8",
+        )
+        for pure_mode in ("0", "1"):
+            hres = subprocess.run(
+                [sys.executable, "-X", "utf8", str(sc_tool), "status", "--session", hyd_sess, "--brain-root", str(hyd_brain), "--label", "simplify"],
+                stdin=subprocess.DEVNULL,
+                env={**base_env, "CARBON_PURE_PYTHON": pure_mode},
+                **kw,
+            )
+            self.assertEqual(hres.returncode, 0, hres.stderr.decode("utf-8", errors="replace"))
+            hdoc = json.loads(hres.stdout.decode("utf-8"))
+            self.assertEqual(hdoc["overall_action"], "resume_in_place")
+            self.assertEqual(hdoc["warm_workers"], ["simp-reuse-r1"])
+            self.assertEqual(hdoc["expired_workers"], [])
+        shutil.rmtree(hyd_brain, ignore_errors=True)
+
+        import install as stack_install
+
+        pe_dir = self.workspace / "mock_pe_vol"
+        pe_dir.mkdir(parents=True, exist_ok=True)
+        src_pe = pe_dir / "new.exe"
+        dst_pe = pe_dir / "carbon-stack.exe"
+        src_pe.write_bytes(b"NEW-PE")
+        dst_pe.write_bytes(b"OLD-PE")
+        tmp_pe = pe_dir / ".carbon-stack.exe.agy-tmp-test"
+        shutil.copy2(src_pe, tmp_pe)
+        with mock.patch("install.os.name", "nt"):
+            self.assertTrue(stack_install._retire_locked_windows_pe(dst_pe, tmp_pe))
+        self.assertEqual(dst_pe.read_bytes(), b"NEW-PE")
+        self.assertEqual(stack_install.tree_manifest(pe_dir), {"carbon-stack.exe": stack_install.sha256_file(dst_pe), "new.exe": stack_install.sha256_file(src_pe)})
+        shutil.rmtree(pe_dir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

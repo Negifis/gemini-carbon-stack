@@ -16,6 +16,7 @@ from typing import Any
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import codex_lane
 import cwg_common as cwg
+import cwg_mark
 import gate_inbox
 import runtime_io as rio
 
@@ -34,6 +35,7 @@ SUBAGENT_URI_RE = re.compile(
     r'(?:.*?"logAbsoluteUri"\s*:\s*"(?P<uri>file:///[^"]+)")?',
     re.DOTALL,
 )
+CHAT_BUS_WAIT_RE = re.compile(r'(?:\bchat-bus(?:\.exe)?|\bchat_bus_cli\.py)["\']?\s+wait\b', re.IGNORECASE)
 
 
 def uri_to_path(uri: str) -> str:
@@ -458,6 +460,7 @@ def scan_swarm_activity(
     worker_add_step: dict[str, int] = {}
     pending_codex_tasks: dict[str, tuple[str, float]] = {}
     pending_bg_tasks: set[str] = set()
+    passive_bg_tasks: set[str] = set()
     idle_unkilled_workers: list[str] = []
 
     def _inspect_swarm_tool_result(
@@ -555,9 +558,11 @@ def scan_swarm_activity(
         if st.get("source") == "SYSTEM":
             sys_ts = rio.parse_iso_ts(st.get("created_at"))
             sys_txt = str(st.get("content") or "")
-            for tid in list(pending_bg_tasks):
-                if f'Task id "{tid}" finished' in sys_txt or f'Task id "{tid}" was canceled' in sys_txt:
-                    pending_bg_tasks.discard(tid)
+            if (pending_bg_tasks or passive_bg_tasks) and 'Task id "' in sys_txt:
+                for tid in list(pending_bg_tasks | passive_bg_tasks):
+                    if f'Task id "{tid}" finished' in sys_txt or f'Task id "{tid}" was canceled' in sys_txt:
+                        pending_bg_tasks.discard(tid)
+                        passive_bg_tasks.discard(tid)
             if not sys_ts or sys_ts >= first_ts - 2.0:
                 for sm in SYSTEM_SWARM_ERR_RE.finditer(sys_txt):
                     if MODEL_FAILURE_RE.search(sm.group("err")):
@@ -617,10 +622,18 @@ def scan_swarm_activity(
                 continue
             g_status, blob, g_ts = generic_steps[pos] if pos < len(generic_steps) else ("", "", 0.0)
             if tc.get("name") == "run_command":
+                targs_cmd = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+                cmd_str = str(targs_cmd.get("CommandLine") or "")
                 bgm_any = BG_TASK_ID_RE.search(blob)
                 if bgm_any:
-                    pending_bg_tasks.add(bgm_any.group(1))
-                cmd_str = str((tc.get("args") or {}).get("CommandLine") or "")
+                    is_passive = bool(targs_cmd.get("IsDaemon")) or (
+                        bool(CHAT_BUS_WAIT_RE.search(cmd_str))
+                        and cwg_mark.classify_shell_command(cmd_str) == "BOOKKEEPING"
+                    )
+                    if is_passive:
+                        passive_bg_tasks.add(bgm_any.group(1))
+                    else:
+                        pending_bg_tasks.add(bgm_any.group(1))
                 if "codex" in cmd_str.lower():
                     res_ts = max(call_ts, g_ts) if g_ts > 0.0 else call_ts
                     is_outage, aborted_rid = codex_lane.inspect_codex_cmd_result(cmd_str, g_status, blob)
@@ -656,6 +669,7 @@ def scan_swarm_activity(
             "in_flight_workers": in_flight_workers,
             "idle_unkilled_workers": idle_unkilled_workers,
             "pending_bg_tasks": sorted(pending_bg_tasks),
+            "passive_bg_tasks": sorted(passive_bg_tasks),
             "opus_issue_verified": opus_issue_verified,
             "opus_issue_ts": opus_issue_ts,
             "sonnet_issue_verified": sonnet_issue_verified,
@@ -1259,7 +1273,6 @@ def _extract_transcript_edit_evidence(
 ) -> dict[str, Any]:
     if not steps:
         return {"covered_from_ts": float("inf"), "edit_spans": [], "proven_change_ts": []}
-    import cwg_mark
 
     has_gap = _steps_have_index_gap(steps)
     iter_steps = steps[1:] if has_gap else steps
@@ -1483,7 +1496,7 @@ def validate_candidate_closure(
         if not simplify_satisfied and not (rkind == "draft-blocked" and simplify_exhausted):
             if effective_risk != "STANDARD" and (
                 multi_lens_spoof
-                or ((not fast_path) and (combined_fresh or raw_sonnet_combined > 0.0 or raw_fallback_combined > 0.0))
+                or ((not fast_path) and (sonnet_combined_fresh or fallback_combined_fresh))
             ):
                 return (
                     False,
@@ -1512,12 +1525,11 @@ def validate_candidate_closure(
                     else f"simplify lenses ({', '.join(stale_simplify_lenses)})"
                 )
                 reverify_model = cwg.SIMPLIFY_FALLBACK_MODEL if sonnet_issue else cwg.SONNET_HIGH_MODEL
-                return (
-                    False,
+                unstarted_simplify_reason = (
                     f"{stale_label} stale because durable files changed after simplify; "
-                    f"re-verify on `{reverify_model}`",
+                    f"re-verify on `{reverify_model}`"
                 )
-            if effective_risk == "STANDARD":
+            elif effective_risk == "STANDARD":
                 unstarted_simplify_reason = (
                     f"STANDARD candidate requires 1 combined `simplify-reviewer` lane (`SIMPLIFY_LENS: ALL`) "
                     f"or all 3 lenses on `{cwg.SONNET_HIGH_MODEL}` (fallback `{cwg.SIMPLIFY_FALLBACK_MODEL}` on Sonnet outage) via `swarm`"
@@ -2029,18 +2041,26 @@ def validate_candidate_closure(
         else (bool(cctx["needs_review"]) or cwg.requires_review(effective_risk, policy))
     )
 
-    simplify_partially_started = bool(effective_lenses or raw_sonnet_map or raw_fallback_map)
+    # INVARIANT: Stale simplify from an earlier round (including a stale Fast-Path combined lane before a 3rd file was edited) must never suppress Logic-First primary review checks when prior reviews exist or no simplify ever ran.
+    simplify_freshly_started = bool(effective_lenses)
+    had_any_simplify = bool(
+        simplify_freshly_started
+        or stale_simplify_lenses
+        or raw_sonnet_combined > 0.0
+        or raw_fallback_combined > 0.0
+    )
     if unstarted_simplify_reason and not (rkind == "draft-blocked" and simplify_exhausted):
-        if needs_review and not simplify_partially_started:
+        if needs_review and not simplify_freshly_started:
             if not cycle_raw_ordinary and not cycle_raw_closure:
                 if cycle_ineligible_ordinary:
                     prio_err = _engine_priority_error(cycle_ineligible_ordinary[-1])
                     if prio_err:
                         return False, prio_err
-                return (
-                    False,
-                    f"{effective_risk} candidate requires primary independent review first (`codex_lane.py review` -> `{cwg.OPUS_HIGH_MODEL}` -> `{cwg.CARBON_HIGH_MODEL}`) BEFORE simplify (`UNITTEST -> REVIEW -> SIMPLIFY -> --closure`)",
-                )
+                if (not had_any_simplify) or cycle_cutoff_ts > 0.0:
+                    return (
+                        False,
+                        f"{effective_risk} candidate requires primary independent review first (`codex_lane.py review` -> `{cwg.OPUS_HIGH_MODEL}` -> `{cwg.CARBON_HIGH_MODEL}`) BEFORE simplify (`UNITTEST -> REVIEW -> SIMPLIFY -> --closure`)",
+                    )
             if cycle_raw_ordinary:
                 last_pre_rev = cycle_raw_ordinary[-1]
                 last_pre_v = str(last_pre_rev.get("verdict") or "")
@@ -2656,8 +2676,12 @@ def main() -> int:
                     + list(swarm_ev.get("in_flight_workers") or [])
                     + [f"bg:{t}" for t in (swarm_ev.get("pending_bg_tasks") or [])]
                 )
-                # SAFETY: Unkilled `waiting` swarm workers keep host `fullyIdle=False` even after replying; require real `in_flight` work.
-                effective_not_idle = (fully_idle is False) and not bool(swarm_ev.get("idle_unkilled_workers"))
+                # SAFETY: Unkilled `waiting` swarm workers and standing passive listeners (`IsDaemon=true`, `chat-bus wait`) keep host `fullyIdle=False`; require real `in_flight` work when either is present.
+                effective_not_idle = (
+                    (fully_idle is False)
+                    and not bool(swarm_ev.get("idle_unkilled_workers"))
+                    and not bool(swarm_ev.get("passive_bg_tasks"))
+                )
                 # Only worker/subagent output advances `progress_sig` (never coordinator turn count), plus a hard per-candidate cap.
                 progress_sig = (
                     f"{swarm_ev.get('worker_activity_count', 0)}:"

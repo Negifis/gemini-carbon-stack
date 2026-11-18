@@ -20,7 +20,8 @@ SOURCE_PLUGIN_DIR = REPO_ROOT / "plugin"
 SOURCE_GLOB_RULE = REPO_ROOT / "rules" / "uiux-design.md"
 PLUGIN_NAME = "gemini-carbon-stack"
 
-SKIP_NAMES = frozenset({"__pycache__", ".DS_Store"})
+RETIRED_BINS_DIR_NAME = ".retired_bins"
+SKIP_NAMES = frozenset({"__pycache__", ".DS_Store", RETIRED_BINS_DIR_NAME})
 IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003
 
 
@@ -141,6 +142,38 @@ def preflight_check(config_dir: pathlib.Path) -> dict[str, Any]:
     }
 
 
+def _retire_locked_windows_pe(dst_file: pathlib.Path, tmp: pathlib.Path) -> bool:
+    # WORKAROUND: Windows NTFS forbids overwriting a mapped `.exe`/`.dll` in place (`WinError 5`/`32`), but permits renaming the live image within the same volume (`dst_file.parent / ".retired_bins"` avoids cross-drive `WinError 17`).
+    if os.name != "nt" or dst_file.suffix.lower() not in (".exe", ".dll") or not dst_file.exists():
+        return False
+    retired_dir = dst_file.parent / RETIRED_BINS_DIR_NAME
+    retired_dir.mkdir(parents=True, exist_ok=True)
+    for stale in retired_dir.glob("retired-*"):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+    retired = retired_dir / f"retired-{os.getpid()}-{int(time.time() * 1000)}-{dst_file.name}"
+    os.replace(dst_file, retired)
+    try:
+        os.replace(tmp, dst_file)
+    except BaseException:
+        try:
+            os.replace(retired, dst_file)
+        except OSError:
+            pass
+        raise
+    try:
+        retired.unlink()
+    except OSError:
+        pass
+    try:
+        retired_dir.rmdir()
+    except OSError:
+        pass
+    return True
+
+
 def _atomic_copy_file(src_file: pathlib.Path, dst_file: pathlib.Path) -> None:
     dst_file.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst_file.with_name(f".{dst_file.name}.agy-tmp-{os.getpid()}")
@@ -152,6 +185,8 @@ def _atomic_copy_file(src_file: pathlib.Path, dst_file: pathlib.Path) -> None:
                 return
             except PermissionError:
                 if attempt == 3:
+                    if _retire_locked_windows_pe(dst_file, tmp):
+                        return
                     shutil.copy2(src_file, dst_file)
                     return
                 time.sleep(0.05 * (attempt + 1))

@@ -332,6 +332,76 @@ SIMPLIFY_COMBINED_LENS_RE = _compile_simplify_tag_re(
     "SIMPLIFY_LENS",
     "ALL|COMBINED",
 )
+def _skip_md_and_ws(s: str, i: int) -> int:
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch.isspace() or ch in ("*", "`"):
+            i += 1
+        elif ch == "_" and i + 1 < n and s[i + 1] == "_":
+            i += 2
+        else:
+            break
+    return i
+
+
+def _is_simplify_line_prefix_clean(prefix: str) -> bool:
+    # INVARIANT: Single-pass O(L) scanner (zero regex backtracking) rejecting inline prose citations (`anom-d6ceeff0`) while allowing `@mention`, bullets, and prior tags.
+    trimmed = prefix.lstrip()
+    s = trimmed[2:] if len(trimmed) >= 2 and trimmed[0] in "-*+>" and trimmed[1].isspace() else trimmed
+    n = len(s)
+    i = 0
+    while True:
+        i = _skip_md_and_ws(s, i)
+        if i >= n:
+            return True
+        if s[i] == "@":
+            i += 1
+            start = i
+            while i < n and (s[i].isalnum() or s[i] in "_-"):
+                i += 1
+            if i == start or (i < n and not s[i].isspace()):
+                return False
+            continue
+        up_tail = s[i : i + 16].upper()
+        klen = 0
+        for k in ("SIMPLIFY_VERDICT", "SIMPLIFY_LENS", "DIFF_HASH"):
+            if up_tail.startswith(k):
+                klen = len(k)
+                break
+        if klen == 0:
+            return False
+        i = _skip_md_and_ws(s, i + klen)
+        if i >= n or s[i] != ":":
+            return False
+        i = _skip_md_and_ws(s, i + 1)
+        vstart = i
+        while i < n and (s[i].isalnum() or s[i] in "_.:-"):
+            i += 1
+        if i == vstart:
+            return False
+        while True:
+            nxt = _skip_md_and_ws(s, i)
+            if nxt < n and s[nxt] in ",.;|/-":
+                i = nxt + 1
+            else:
+                i = nxt
+                break
+
+
+def _find_simplify_tag_matches(tag_re: re.Pattern[str], text: str) -> list[str]:
+    out: list[str] = []
+    for m in tag_re.finditer(text):
+        start = m.start()
+        nl = text.rfind("\n", 0, start)
+        line_before = text[nl + 1 : start]
+        c_idx = line_before.rfind("content=")
+        eff_prefix = line_before[c_idx + len("content=") :] if c_idx >= 0 else line_before
+        if _is_simplify_line_prefix_clean(eff_prefix):
+            out.append(m.group(1))
+    return out
+
+
 REVIEW_TIER_XHIGH_RE = re.compile(
     r"\bREVIEW_TIER\s*:\s*XHIGH\b",
     re.IGNORECASE,
@@ -340,8 +410,8 @@ DIFF_HASH_RE = re.compile(r"\bDIFF_HASH\s*:\s*([A-Za-z0-9_.:-]+)", re.IGNORECASE
 
 
 def extract_diff_hash(text: str) -> str:
-    m = DIFF_HASH_RE.search(text or "")
-    return m.group(1).strip() if m else ""
+    matches = DIFF_HASH_RE.findall(text or "")
+    return matches[-1].strip() if matches else ""
 
 SONNET_HIGH_MODEL = "claude-sonnet-5-5-high"
 OPUS_HIGH_MODEL = "claude-opus-5-5-high"
@@ -413,10 +483,10 @@ def swarm_stall_timeout_sec() -> float:
 
 def parse_simplify_verdict(text: str, default_lens: str = "") -> dict[str, Any]:
     cleaned = _SIMPLIFY_TEMPLATE_PAIR_RE.sub(" ", text or "")
-    has_combined = bool(SIMPLIFY_COMBINED_LENS_RE.search(cleaned))
-    explicit_lenses = [m.lower() for m in SIMPLIFY_LENS_LINE_RE.findall(cleaned)]
+    has_combined = bool(_find_simplify_tag_matches(SIMPLIFY_COMBINED_LENS_RE, cleaned))
+    explicit_lenses = [m.lower() for m in _find_simplify_tag_matches(SIMPLIFY_LENS_LINE_RE, cleaned)]
     unique_lenses = list(dict.fromkeys(explicit_lenses))
-    verdict_matches = SIMPLIFY_LINE_RE.findall(cleaned)
+    verdict_matches = _find_simplify_tag_matches(SIMPLIFY_LINE_RE, cleaned)
     verdict = verdict_matches[-1].upper() if verdict_matches else ""
     multi_lens_spoof = (not has_combined) and len(unique_lenses) > 1
     if has_combined:
@@ -1453,7 +1523,29 @@ def candidate_class(marker: dict[str, Any] | None) -> str:
     return WORK_NO_CHANGE
 
 
-def content_fingerprint(paths: list[str], max_file_bytes: int = 4_000_000) -> str | None:
+MAX_FINGERPRINT_FILE_BYTES = 32_000_000
+
+
+def sha256_file_bounded(path: str, max_bytes: int = MAX_FINGERPRINT_FILE_BYTES) -> tuple[int, str] | None:
+    # INVARIANT: Stream in 64 KiB chunks and re-enforce `max_bytes` on actual bytes read so concurrent growth cannot spike heap or bypass size bounds.
+    with open(path, "rb") as fh:
+        st = os.fstat(fh.fileno())
+        if st.st_size > max_bytes:
+            return None
+        hasher = hashlib.sha256()
+        total = 0
+        while True:
+            chunk = fh.read(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                return None
+            hasher.update(chunk)
+    return total, hasher.hexdigest()
+
+
+def content_fingerprint(paths: list[str], max_file_bytes: int = MAX_FINGERPRINT_FILE_BYTES) -> str | None:
     """Deterministic SHA-256 over normalized durable candidate paths and their exact on-disk bytes."""
     dpaths = sorted(durable_paths(paths), key=rio.fold_path)
     if not dpaths:
@@ -1469,13 +1561,11 @@ def content_fingerprint(paths: list[str], max_file_bytes: int = 4_000_000) -> st
             hasher.update(b"NONFILE\0")
             continue
         try:
-            st = os.stat(p)
-            if st.st_size > max_file_bytes:
+            bounded = sha256_file_bounded(p, max_file_bytes)
+            if bounded is None:
                 return None
-            with open(p, "rb") as fh:
-                blob = fh.read()
-            blob_hash = hashlib.sha256(blob).hexdigest()
-            hasher.update(f"BLOB:{len(blob)}:{blob_hash}\0".encode("ascii"))
+            blob_len, blob_hash = bounded
+            hasher.update(f"BLOB:{blob_len}:{blob_hash}\0".encode("ascii"))
         except OSError:
             return None
     return hasher.hexdigest()

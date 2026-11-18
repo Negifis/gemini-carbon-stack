@@ -239,7 +239,7 @@ pub fn catch_up_unmeasured_changes(marker: &Value) -> Value {
     if dpaths.is_empty() {
         return marker.clone();
     }
-    let now_fp = cwg_common::content_fingerprint(&dpaths, 4_000_000);
+    let now_fp = cwg_common::content_fingerprint(&dpaths, cwg_common::MAX_FINGERPRINT_FILE_BYTES);
     let now_fp_opt = if now_fp.is_empty() {
         None
     } else {
@@ -788,6 +788,19 @@ fn member_transcript_summary(member_tp: Option<&Path>, first_ts: f64) -> MemberT
     }
 }
 
+fn chat_bus_wait_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?i)(?:\bchat-bus(?:\.exe)?|\bchat_bus_cli\.py)["']?\s+wait\b"#)
+            .expect("chat_bus_wait_re")
+    })
+}
+
+fn is_passive_listener_cmd(cmd_str: &str) -> bool {
+    chat_bus_wait_re().is_match(cmd_str)
+        && cwg_mark::classify_shell_command(cmd_str) == "BOOKKEEPING"
+}
+
 fn text_mentions_swarm_worker_exact(text: &str, wname: &str) -> bool {
     rio::text_mentions_swarm_worker(text, wname)
 }
@@ -832,6 +845,7 @@ pub struct SwarmEvidence {
     pub in_flight_workers: Vec<String>,
     pub idle_unkilled_workers: Vec<String>,
     pub pending_bg_tasks: Vec<String>,
+    pub passive_bg_tasks: Vec<String>,
     pub opus_issue_verified: bool,
     pub opus_issue_ts: f64,
     pub sonnet_issue_verified: bool,
@@ -869,6 +883,7 @@ pub fn scan_swarm_activity(
     let mut worker_add_step: HashMap<String, usize> = HashMap::new();
     let mut pending_codex_tasks: HashMap<String, (String, f64)> = HashMap::new();
     let mut pending_bg_tasks: BTreeSet<String> = BTreeSet::new();
+    let mut passive_bg_tasks: BTreeSet<String> = BTreeSet::new();
 
     let mark_opus_issue = |ev: &mut SwarmEvidence, ts_val: f64| {
         ev.opus_issue_verified = true;
@@ -1143,16 +1158,22 @@ pub fn scan_swarm_activity(
                 .map(rio::parse_iso_ts)
                 .unwrap_or(0.0);
             let sys_txt = val_to_str(st.get("content"));
-            let done_tids: Vec<String> = pending_bg_tasks
-                .iter()
-                .filter(|tid| {
-                    sys_txt.contains(&format!("Task id \"{}\" finished", tid))
-                        || sys_txt.contains(&format!("Task id \"{}\" was canceled", tid))
-                })
-                .cloned()
-                .collect();
-            for tid in done_tids {
-                pending_bg_tasks.remove(&tid);
+            if (!pending_bg_tasks.is_empty() || !passive_bg_tasks.is_empty())
+                && sys_txt.contains("Task id \"")
+            {
+                let done_tids: Vec<String> = pending_bg_tasks
+                    .iter()
+                    .chain(passive_bg_tasks.iter())
+                    .filter(|tid| {
+                        sys_txt.contains(&format!("Task id \"{}\" finished", tid))
+                            || sys_txt.contains(&format!("Task id \"{}\" was canceled", tid))
+                    })
+                    .cloned()
+                    .collect();
+                for tid in done_tids {
+                    pending_bg_tasks.remove(&tid);
+                    passive_bg_tasks.remove(&tid);
+                }
             }
             if sys_ts == 0.0 || sys_ts >= first_ts - 2.0 {
                 for sm in system_swarm_err_re().captures_iter(&sys_txt) {
@@ -1297,15 +1318,20 @@ pub fn scan_swarm_activity(
             };
             let tname = tc_obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
             if tname == "run_command" {
-                let bgm_any = rio::extract_bg_task_id(blob);
-                if let Some(ref bg_tid) = bgm_any {
-                    pending_bg_tasks.insert(bg_tid.clone());
-                }
-                let cmd_str = tc_obj
-                    .get("args")
-                    .and_then(|v| v.get("CommandLine"))
+                let targs = tc_obj.get("args").and_then(|v| v.as_object());
+                let cmd_str = targs
+                    .and_then(|m| m.get("CommandLine"))
                     .map(|v| val_to_str(Some(v)))
                     .unwrap_or_default();
+                let bgm_any = rio::extract_bg_task_id(blob);
+                if let Some(ref bg_tid) = bgm_any {
+                    let is_daemon = targs.map_or(false, |m| json_truthy(m.get("IsDaemon")));
+                    if is_daemon || is_passive_listener_cmd(&cmd_str) {
+                        passive_bg_tasks.insert(bg_tid.clone());
+                    } else {
+                        pending_bg_tasks.insert(bg_tid.clone());
+                    }
+                }
                 if cmd_str.to_lowercase().contains("codex") {
                     let res_ts = if g_ts > 0.0 {
                         call_ts.max(g_ts)
@@ -1339,6 +1365,7 @@ pub fn scan_swarm_activity(
     }
 
     ev.pending_bg_tasks = pending_bg_tasks.into_iter().collect();
+    ev.passive_bg_tasks = passive_bg_tasks.into_iter().collect();
 
     let (brain_root_opt, conv_cid) = rio::swarm_brain_and_cid(transcript_path.unwrap_or(""), "");
     let Some(brain_root) = brain_root_opt else {
@@ -3192,10 +3219,7 @@ pub fn validate_candidate_closure(
     if needs_simplify && !simplify_satisfied && !(rkind == "draft-blocked" && simplify_exhausted) {
         if effective_risk != "STANDARD"
             && (multi_lens_spoof
-                || (!fast_path
-                    && (combined_fresh
-                        || raw_sonnet_combined > 0.0
-                        || raw_fallback_combined > 0.0)))
+                || (!fast_path && (sonnet_combined_fresh || fallback_combined_fresh)))
         {
             return (
                 false,
@@ -3240,15 +3264,11 @@ pub fn validate_candidate_closure(
             } else {
                 cwg_common::SONNET_HIGH_MODEL
             };
-            return (
-                false,
-                format!(
-                    "{} stale because durable files changed after simplify; re-verify on `{}`",
-                    stale_label, reverify_model
-                ),
+            unstarted_simplify_reason = format!(
+                "{} stale because durable files changed after simplify; re-verify on `{}`",
+                stale_label, reverify_model
             );
-        }
-        if effective_risk == "STANDARD" {
+        } else if effective_risk == "STANDARD" {
             unstarted_simplify_reason = format!(
                 "STANDARD candidate requires 1 combined `simplify-reviewer` lane (`SIMPLIFY_LENS: ALL`) or all 3 lenses on `{}` (fallback `{}` on Sonnet outage) via `swarm`",
                 cwg_common::SONNET_HIGH_MODEL,
@@ -3576,10 +3596,14 @@ pub fn validate_candidate_closure(
         ctx_needs_review || cwg_common::requires_review(&effective_risk, policy)
     };
 
-    let simplify_partially_started =
-        !effective_lenses.is_empty() || !raw_sonnet_map.is_empty() || !raw_fallback_map.is_empty();
+    // INVARIANT: Stale simplify from an earlier round (including a stale Fast-Path combined lane before a 3rd file was edited) must never suppress Logic-First primary review checks when prior reviews exist or no simplify ever ran.
+    let simplify_freshly_started = !effective_lenses.is_empty();
+    let had_any_simplify = simplify_freshly_started
+        || !stale_simplify_lenses.is_empty()
+        || raw_sonnet_combined > 0.0
+        || raw_fallback_combined > 0.0;
     if !unstarted_simplify_reason.is_empty() && !(rkind == "draft-blocked" && simplify_exhausted) {
-        if needs_review && !simplify_partially_started {
+        if needs_review && !simplify_freshly_started {
             if cycle_raw_ordinary.is_empty() && cycle_raw_closure.is_empty() {
                 if let Some(last_inelig) = cycle_ineligible_ordinary.last() {
                     let prio_err = eval.engine_priority_error(last_inelig);
@@ -3587,15 +3611,17 @@ pub fn validate_candidate_closure(
                         return (false, prio_err);
                     }
                 }
-                return (
-                    false,
-                    format!(
-                        "{} candidate requires primary independent review first (`codex_lane.py review` -> `{}` -> `{}`) BEFORE simplify (`UNITTEST -> REVIEW -> SIMPLIFY -> --closure`)",
-                        effective_risk,
-                        cwg_common::OPUS_HIGH_MODEL,
-                        cwg_common::CARBON_HIGH_MODEL
-                    ),
-                );
+                if !had_any_simplify || cycle_cutoff_ts > 0.0 {
+                    return (
+                        false,
+                        format!(
+                            "{} candidate requires primary independent review first (`codex_lane.py review` -> `{}` -> `{}`) BEFORE simplify (`UNITTEST -> REVIEW -> SIMPLIFY -> --closure`)",
+                            effective_risk,
+                            cwg_common::OPUS_HIGH_MODEL,
+                            cwg_common::CARBON_HIGH_MODEL
+                        ),
+                    );
+                }
             }
             if let Some(last_pre_rev) = cycle_raw_ordinary.last() {
                 let last_pre_v = val_to_str(last_pre_rev.get("verdict"));
@@ -4580,8 +4606,10 @@ pub fn decide_stop(payload: &Value) -> Option<String> {
             for t in &swarm_ev.pending_bg_tasks {
                 in_flight.push(format!("bg:{}", t));
             }
-            // SAFETY: Unkilled `waiting` swarm workers keep host `fullyIdle=False` even after replying; require real `in_flight` work.
-            let effective_not_idle = !fully_idle && swarm_ev.idle_unkilled_workers.is_empty();
+            // SAFETY: Unkilled `waiting` swarm workers and standing passive listeners (`IsDaemon=true`, `chat-bus wait`) keep host `fullyIdle=False`; require real `in_flight` work when either is present.
+            let effective_not_idle = !fully_idle
+                && swarm_ev.idle_unkilled_workers.is_empty()
+                && swarm_ev.passive_bg_tasks.is_empty();
             let has_combined_any = swarm_ev.sonnet_combined_ts > 0.0
                 || swarm_ev.fallback_combined_ts > 0.0
                 || sub_ev.fallback_combined_ts > 0.0;
@@ -4778,6 +4806,7 @@ mod tests {
         assert!(lens_word_re("efficiency").unwrap().is_match("check efficiency"));
         assert!(trailing_digits_suffix_re().is_match("worker-12"));
         assert!(sanitize_ps_arg_re().is_match("`\"$\r\n"));
+        assert!(chat_bus_wait_re().is_match("chat-bus.exe wait --chat s1"));
     }
 
     #[test]
@@ -5014,5 +5043,116 @@ mod tests {
         );
         assert!(!ok2);
         assert!(reason2.contains("thinking timeout is NOT an outage"));
+
+        // INVARIANT: When HIGH has neither primary review nor simplify, report missing primary review BEFORE simplify; when simplify already ran and went stale, report stale simplify.
+        let (ok3a, reason3a) = validate_candidate_closure(
+            Some(&receipt_ok),
+            &marker,
+            &checks_ev,
+            &sub_ev,
+            &SwarmEvidence::default(),
+            &[],
+            None,
+            None,
+            None,
+        );
+        assert!(!ok3a);
+        assert!(
+            reason3a.contains("BEFORE simplify"),
+            "expected Logic-First primary review priority, got: {}",
+            reason3a
+        );
+
+        let mut swarm_stale = SwarmEvidence::default();
+        swarm_stale.sonnet_lenses.insert("reuse".to_string(), 105.0);
+        swarm_stale.sonnet_lenses.insert("quality".to_string(), 105.0);
+        swarm_stale.sonnet_lenses.insert("efficiency".to_string(), 105.0);
+        let (ok3b, reason3b) = validate_candidate_closure(
+            Some(&receipt_ok),
+            &marker,
+            &checks_ev,
+            &sub_ev,
+            &swarm_stale,
+            &[],
+            None,
+            None,
+            None,
+        );
+        assert!(!ok3b);
+        assert!(reason3b.contains("stale because durable files changed after simplify"));
+
+        // INVARIANT: Exiting Fast-Path (2 -> 3 files) after stale APPROVED + combined simplify reports primary review BEFORE simplify.
+        let f2 = tmp.path.join("src").join("auth2.rs");
+        let f3 = tmp.path.join("src").join("auth3.rs");
+        fs::write(&f2, "pub fn b() -> bool { true }\n").unwrap();
+        fs::write(&f3, "pub fn c() -> bool { true }\n").unwrap();
+        let paths3 = vec![
+            auth_file.to_string_lossy().into_owned(),
+            f2.to_string_lossy().into_owned(),
+            f3.to_string_lossy().into_owned(),
+        ];
+        let fp3 = cwg_common::content_fingerprint(&paths3, cwg_common::MAX_FINGERPRINT_FILE_BYTES);
+        let marker3 = json!({
+            "cwd": tmp.path.to_string_lossy(),
+            "paths": paths3,
+            "first_ts": 100.0,
+            "last_durable_ts": 110.0,
+            "content_marks": [{ "ts": 110.0, "fp": fp3 }]
+        });
+        let mut sw_fp_exit = SwarmEvidence::default();
+        sw_fp_exit.sonnet_combined_ts = 105.0;
+        sw_fp_exit.sonnet_combined_end_ts = 106.0;
+        let stale_approved = vec![json!({
+            "engine": "codex",
+            "kind": "ordinary",
+            "verdict": "APPROVED",
+            "launch_ts": 102.0,
+            "verdict_ts": 104.0,
+            "xhigh": false,
+        })];
+        let (ok3c, reason3c) = validate_candidate_closure(
+            Some(&receipt_ok),
+            &marker3,
+            &checks_ev,
+            &sub_ev,
+            &sw_fp_exit,
+            &stale_approved,
+            None,
+            None,
+            None,
+        );
+        assert!(!ok3c);
+        assert!(
+            reason3c.contains("BEFORE simplify"),
+            "expected primary review BEFORE simplify after Fast-Path exit, got: {}",
+            reason3c
+        );
+
+        // INVARIANT: Standing `chat-bus.exe wait` background listener is passive (`passive_bg_tasks`) and never creates an infinite `edit_span`.
+        let wait_steps = vec![
+            json!({
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "1970-01-01T00:01:45Z",
+                "tool_calls": [{
+                    "name": "run_command",
+                    "args": {
+                        "CommandLine": r"$null | C:\Users\in\.gemini\config\plugins\chat-bus\bin\chat-bus.exe wait --chat sess-1"
+                    }
+                }]
+            }),
+            json!({
+                "source": "GENERIC",
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": "1970-01-01T00:01:46Z",
+                "content": "Tool is running as a background task with task id: sess-1/task-99"
+            }),
+        ];
+        let tx_ev = extract_transcript_edit_evidence(&wait_steps, &marker);
+        assert!(tx_ev.edit_spans.is_empty());
+        let sw_wait = scan_swarm_activity(&wait_steps, None, 100.0, 0, "", "");
+        assert!(sw_wait.pending_bg_tasks.is_empty());
+        assert_eq!(sw_wait.passive_bg_tasks, vec!["sess-1/task-99".to_string()]);
     }
 }

@@ -10,3 +10,6 @@ sha2 = "=0.10.9"
 hex = "=0.4.3"
 regex = "=1.12.3"
 globset = "=0.4.18"
+
+[profile.release]
+strip = true

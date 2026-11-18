@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
 import pathlib
 import re
@@ -51,9 +50,8 @@ _PY_INTERP_PAT = _py_interp_pat()
 _PY_MUT_INTERP_PAT = _py_interp_pat(allow_dq_vars=True)
 _PY_SAFE_FLAGS_PAT = r"(?:-(?:X\s+utf8|[uBEsSO])\s+)*"
 _PY_ANY_FLAGS_PAT = r"(?:-(?:X\s+(?!-\w+\s)\S+|\w+)\s+)*"
-_PY_MUT_CLAUSE_PREFIX = (
-    rf"^\s*(?:\$[A-Za-z_]\w*\s*=\s*)?(?:\$null\s*\|\s*)?(?:&\s*)?{_PY_MUT_INTERP_PAT}\s+{_PY_ANY_FLAGS_PAT}"
-)
+_PS_MUT_CLAUSE_LEADER = r"^\s*(?:\$[A-Za-z_]\w*\s*=\s*)?(?:\$null\s*\|\s*)?(?:&\s*)?"
+_PY_MUT_CLAUSE_PREFIX = rf"{_PS_MUT_CLAUSE_LEADER}{_PY_MUT_INTERP_PAT}\s+{_PY_ANY_FLAGS_PAT}"
 _INSTALL_DIAG_TAIL = r"[^\r\n|;&]*(?<!\S)(?:--diagnose|--dry-run)(?=$|[\s|;&])"
 _WT_MUT_TAIL = r"[^\r\n;|&]*\b(?:snapshot|remove|restore)\b"
 _CHIP_MUT_TAIL = r"[^\r\n;|&]*--merge\b"
@@ -61,6 +59,14 @@ _CHIP_MUT_TAIL = r"[^\r\n;|&]*--merge\b"
 _BK_SCRIPTS_TOK = _exe_pat("carbon_memory|gate_inbox|chip_handoff|swarm_cache|swarm_ctl", _EXT_PY)
 _CONTINUITY_TOK = _exe_pat("continuity", _EXT_PY)
 _CODEX_LANE_TOK = _exe_pat("codex_lane", _EXT_PY)
+_CHAT_BUS_PY_TOK = _exe_pat("chat_bus_cli", _EXT_PY)
+_CARBON_STACK_TOK = _exe_pat("carbon-stack")
+_CARBON_STACK_MUT_TOK = _exe_pat("carbon-stack", allow_dq_vars=True)
+_CHAT_BUS_TOK = _exe_pat("chat-bus")
+_CONTINUITY_BK_SUB = r"(?:checkpoint|show|handoff)\b"
+_CODEX_LANE_BK_SUB = r"(?:check|status|reset|review)\b"
+_CHAT_BUS_SUB = r"(?:wait|inbox|list|read|search|send|reply|configure|status)\b"
+_WT_RO_SUB = r"(?:audit|status)\b"
 _GIT_TOK = _exe_pat("git")
 _RG_TOK = _exe_pat("rg")
 _CODEX_TOK = _exe_pat("codex", _EXT_CMD_EXE)
@@ -76,9 +82,12 @@ _RUNNERS_TOK = _exe_pat(r"pytest|py\.test|mypy|flake8")
 _RUFF_TOK = _exe_pat("ruff")
 
 BOOKKEEPING_CMD_RE = re.compile(
-    rf"^\s*(?:\$null\s*\|\s*)?(?:&\s*)?{_PY_INTERP_PAT}\s+{_PY_SAFE_FLAGS_PAT}"
-    rf"(?:{_BK_SCRIPTS_TOK}|{_CONTINUITY_TOK}\s+(?:checkpoint|show|handoff)\b|{_CODEX_LANE_TOK}\s+(?:check|status|reset|review)\b)"
-    r"(?:\s+[^|;&\r\n]*)?$",
+    r"^\s*(?:\$null\s*\|\s*)?(?:&\s*)?(?:"
+    rf"{_PY_INTERP_PAT}\s+{_PY_SAFE_FLAGS_PAT}"
+    rf"(?:{_BK_SCRIPTS_TOK}|{_CONTINUITY_TOK}\s+{_CONTINUITY_BK_SUB}|{_CODEX_LANE_TOK}\s+{_CODEX_LANE_BK_SUB}|{_CHAT_BUS_PY_TOK}\s+{_CHAT_BUS_SUB})"
+    rf"|{_CARBON_STACK_TOK}\s+(?:(?:carbon[-_]memory|gate[-_]inbox|chip[-_]handoff|swarm[-_]cache|swarm[-_]ctl)\b|continuity\s+{_CONTINUITY_BK_SUB}|codex[-_]lane\s+{_CODEX_LANE_BK_SUB})"
+    rf"|{_CHAT_BUS_TOK}\s+{_CHAT_BUS_SUB}"
+    r")(?:\s+[^|;&\r\n]*)?$",
     re.IGNORECASE,
 )
 
@@ -106,7 +115,8 @@ READ_ONLY_CMD_RE = re.compile(
     rf"|(?:&\s*)?{_CODEX_TOK}\s+(?:--version|login\s+status|exec\b[^|;&\r\n]*-s\s+read-only\b)"
     rf"|(?:&\s*)?{_AGY_TOK}\s+(?:--help|--version|plugin\s+(?:list|help)|mcp\s+(?:list|help)|models\b)"
     rf"|(?:&\s*)?{_TOKENADE_TOK}\s+(?:--version|--help|help|map|query|skeleton|semantic|ask|sem|impact|expand-ref|gain|dashboard|healthcheck|detect|measure|statusline)\b"
-    rf"|(?:&\s*)?{_PY_INTERP_PAT}\s+{_PY_SAFE_FLAGS_PAT}(?:{_RO_SCRIPTS_TOK}|{_WT_GUARD_TOK}\s+(?:audit|status)\b)"
+    rf"|(?:&\s*)?{_PY_INTERP_PAT}\s+{_PY_SAFE_FLAGS_PAT}(?:{_RO_SCRIPTS_TOK}|{_WT_GUARD_TOK}\s+{_WT_RO_SUB})"
+    rf"|(?:&\s*)?{_CARBON_STACK_TOK}\s+(?:code[-_]search\b|stack[-_]doctor\b|worktree[-_]guard\s+{_WT_RO_SUB})"
     r")(?:\s+[^|;&\r\n]*)?"
     rf"|(?:&\s*)?{_GIT_TOK}\s+(?:--no-pager\s+)?(?:-C\s+[\"']?[^\"'|;&\r\n]+[\"']?\s+)?branch(?:\s+(?:--list|-l|-a|--all|-r|--remotes|-v|-vv|--show-current|--no-color))*"
     r")$",
@@ -122,7 +132,7 @@ VALIDATION_SEGMENT_RE = re.compile(
     r"|pnpm(?:\.cmd)?\s+(?:test|lint|build|typecheck)\b"
     r"|yarn(?:\.cmd)?\s+(?:test|lint|build|typecheck)\b"
     r"|npx(?:\.cmd)?\s+(?:tsc|vitest|jest|eslint|playwright\s+test)\b"
-    r"|cargo(?:\.exe)?\s+(?:test|check|clippy)\b"
+    r"|cargo(?:\.exe)?\s+(?:\+[A-Za-z0-9._-]+\s+)?(?:test|check|clippy)\b"
     r"|go(?:\.exe)?\s+(?:test|vet)\b"
     r"|dotnet(?:\.exe)?\s+(?:test|build)\b"
     rf"|{_AGY_TOK}\s+plugin\s+validate\b"
@@ -153,12 +163,15 @@ MUTATING_PKG_RE = re.compile(
 )
 
 MUTATING_STACK_RE = re.compile(
-    rf"(?:\bworktree_guard\.py\b{_WT_MUT_TAIL}|\bchip_handoff\.py\b{_CHIP_MUT_TAIL})",
+    rf"(?:(?:\bworktree_guard\.py|carbon-stack(?:\.exe)?\s+worktree[-_]guard)\b{_WT_MUT_TAIL}|(?:\bchip_handoff\.py|carbon-stack(?:\.exe)?\s+chip[-_]handoff)\b{_CHIP_MUT_TAIL})",
     re.IGNORECASE,
 )
 
 MUTATING_STACK_SEG_RE = re.compile(
-    rf"{_PY_MUT_CLAUSE_PREFIX}(?:{_WT_GUARD_MUT_TOK}{_WT_MUT_TAIL}|{_CHIP_MUT_TOK}{_CHIP_MUT_TAIL})",
+    r"(?:"
+    rf"{_PY_MUT_CLAUSE_PREFIX}(?:{_WT_GUARD_MUT_TOK}{_WT_MUT_TAIL}|{_CHIP_MUT_TOK}{_CHIP_MUT_TAIL})"
+    rf"|{_PS_MUT_CLAUSE_LEADER}{_CARBON_STACK_MUT_TOK}\s+(?:worktree[-_]guard\b{_WT_MUT_TAIL}|chip[-_]handoff\b{_CHIP_MUT_TAIL})"
+    r")",
     re.IGNORECASE,
 )
 
@@ -465,7 +478,7 @@ def _has_non_cmdlet_mutation(
     ):
         return True
     low_core = core.lower()
-    if not any(k in low_core for k in ("install.py", "worktree_guard.py", "chip_handoff.py")):
+    if not any(k in low_core for k in ("install.py", "worktree_guard.py", "chip_handoff.py", "carbon-stack")):
         return False
     # INVARIANT: Match quoted script paths (`install.py`, `worktree_guard.py`, `chip_handoff.py`) on raw clauses before `_strip_quoted` erases `'...'`.
     return any(INSTALL_PY_RE.match(cl) or MUTATING_STACK_SEG_RE.match(cl) for cl in _all_ps_clauses(core, subexprs))
@@ -600,7 +613,7 @@ NON_GIT_SKIP_DIRS = frozenset(
 )
 
 
-MAX_HASHED_SNAPSHOT_BYTES = 2_000_000
+MAX_HASHED_SNAPSHOT_BYTES = cwg.MAX_FINGERPRINT_FILE_BYTES
 
 
 def _file_entry_token(
@@ -613,9 +626,10 @@ def _file_entry_token(
         if not stat.S_ISREG(st.st_mode):
             return f"{prefix}dir:{st.st_mtime_ns}"
         if st.st_size <= MAX_HASHED_SNAPSHOT_BYTES:
-            with open(full, "rb") as fh:
-                digest = hashlib.sha256(fh.read()).hexdigest()[:20]
-            return f"{prefix}{st.st_size}:{digest}"
+            bounded = cwg.sha256_file_bounded(full, MAX_HASHED_SNAPSHOT_BYTES)
+            if bounded is not None:
+                total_len, digest = bounded
+                return f"{prefix}{total_len}:{digest[:20]}"
         return f"{prefix}large:{st.st_size}:{st.st_mtime_ns}"
     except FileNotFoundError:
         return f"{prefix}absent"

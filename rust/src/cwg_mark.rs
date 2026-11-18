@@ -18,8 +18,7 @@ const SHELL_TOOLS: &[&str] = &["run_command"];
 
 const NON_GIT_SCAN_MAX_FILES: usize = 400;
 const NON_GIT_SCAN_MAX_DEPTH: usize = 4;
-const MAX_HASHED_SNAPSHOT_BYTES: u64 = 2_000_000;
-const MAX_FINGERPRINT_FILE_BYTES: u64 = 4_000_000;
+const MAX_HASHED_SNAPSHOT_BYTES: u64 = cwg_common::MAX_FINGERPRINT_FILE_BYTES;
 const MAX_VAR_VALUE_LEN: usize = 1024;
 const MAX_EXPANDED_SEG_LEN: usize = 8192;
 const CLAIM_TTL_SECONDS: f64 = 600.0;
@@ -155,6 +154,13 @@ const PS_SQ_PAT: &str = r"'(?:''|[^'])*'";
 const PS_SAFE_BARE_PAT: &str = r"[A-Za-z0-9_./\\:-]+";
 const PS_VAR_NAME_PAT: &str = r"[A-Za-z_]\w*(?::[A-Za-z_]\w*)?";
 const PS_DQ_LITERAL_PAT: &str = r#""[^"`$]*""#;
+const PS_MUT_CLAUSE_LEADER: &str = r"\A\s*(?:\$[A-Za-z_]\w*\s*=\s*)?(?:\$null\s*\|\s*)?(?:&\s*)?";
+const CONTINUITY_BK_SUB: &str = r"(?:checkpoint|show|handoff)\b";
+const CODEX_LANE_BK_SUB: &str = r"(?:check|status|reset|review)\b";
+const CHAT_BUS_BK_SUB: &str = r"(?:wait|inbox|list|read|search|send|reply|configure|status)\b";
+const WT_RO_SUB: &str = r"(?:audit|status)\b";
+const WT_MUT_TAIL: &str = r"[^\r\n;|&]*\b(?:snapshot|remove|restore)\b";
+const CHIP_MUT_TAIL: &str = r"[^\r\n;|&]*--merge\b";
 
 fn cache_path_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -177,12 +183,21 @@ fn bookkeeping_cmd_re() -> &'static Regex {
         );
         let continuity = exe_pat_followed_by_space("continuity", EXT_PY, false);
         let codex_lane = exe_pat_followed_by_space("codex_lane", EXT_PY, false);
+        let chat_bus_py = exe_pat_followed_by_space("chat_bus_cli", EXT_PY, false);
+        let carbon_stack_bin = exe_pat_followed_by_space("carbon-stack", r"(?:\.exe)?", false);
+        let chat_bus_bin = exe_pat_followed_by_space("chat-bus", r"(?:\.exe)?", false);
         let pat = format!(
-            r"(?i)\A\s*(?:\$null\s*\|\s*)?(?:&\s*)?{py}\s+(?:-(?:X\s+utf8|[uBEsSO])\s+)*(?:{bk}|(?:{cont}\s+(?:checkpoint|show|handoff)\b|{cl}\s+(?:check|status|reset|review)\b))(?:\s+[^|;&\r\n]*)?\z",
+            r"(?i)\A\s*(?:\$null\s*\|\s*)?(?:&\s*)?(?:{py}\s+(?:-(?:X\s+utf8|[uBEsSO])\s+)*(?:{bk}|(?:{cont}\s+{cont_sub}|{cl}\s+{cl_sub}|{cb_py}\s+{cb_sub}))|{cs}\s+(?:(?:carbon[-_]memory|gate[-_]inbox|chip[-_]handoff|swarm[-_]cache|swarm[-_]ctl)\b|continuity\s+{cont_sub}|codex[-_]lane\s+{cl_sub})|{cb}\s+{cb_sub})(?:\s+[^|;&\r\n]*)?\z",
             py = py,
             bk = bk_scripts,
             cont = continuity,
             cl = codex_lane,
+            cb_py = chat_bus_py,
+            cs = carbon_stack_bin,
+            cb = chat_bus_bin,
+            cont_sub = CONTINUITY_BK_SUB,
+            cl_sub = CODEX_LANE_BK_SUB,
+            cb_sub = CHAT_BUS_BK_SUB,
         );
         Regex::new(&pat).expect("bookkeeping_cmd_re")
     })
@@ -219,8 +234,9 @@ fn read_only_cmd_re() -> &'static Regex {
         let tokenade_tok = exe_pat_followed_by_space("tokenade", EXT_CMD_EXE, false);
         let ro_scripts = exe_pat_followed_by_space("code_search|stack_doctor", EXT_PY, false);
         let wt_guard = exe_pat_followed_by_space("worktree_guard", EXT_PY, false);
+        let cs_tok = exe_pat_followed_by_space("carbon-stack", r"(?:\.exe)?", false);
         let pat = format!(
-            r#"(?i)\A\s*(?:\$null\s*\|\s*)?(?:(?:(?:&\s*)?{git}\s+(?:--no-pager\s+)?(?:-C\s+["']?[^"'|;&\r\n]+["']?\s+)?(?:status|diff|log|show|rev-parse|ls-files|ls-tree|check-ignore|remote\s+-v|worktree\s+list)|(?:&\s*)?{rg}|findstr(?:\.exe)?\b|where(?:\.exe)?\b|Get-ChildItem\b|gci\b|Get-Content\b|gc\b|Select-String\b|sls\b|Get-Command\b|gcm\b|Test-Path\b|Get-Item\b|gi\b|Get-ItemProperty\b|gp\b|Get-ItemPropertyValue\b|gpv\b|Get-CimInstance\b|gcim\b|Get-WmiObject\b|gwmi\b|Get-WinEvent\b|Get-EventLog\b|Get-Process\b|gps\b|Get-Service\b|gsv\b|Get-Location\b|gl\b|Write-Output\b|(?:&\s*)?{codex}\s+(?:--version|login\s+status|exec\b[^|;&\r\n]*-s\s+read-only\b)|(?:&\s*)?{agy}\s+(?:--help|--version|plugin\s+(?:list|help)|mcp\s+(?:list|help)|models\b)|(?:&\s*)?{tok}\s+(?:--version|--help|help|map|query|skeleton|semantic|ask|sem|impact|expand-ref|gain|dashboard|healthcheck|detect|measure|statusline)\b|(?:&\s*)?{py}\s+(?:-(?:X\s+utf8|[uBEsSO])\s+)*(?:{ro}|{wt}\s+(?:audit|status)\b))(?:\s+[^|;&\r\n]*)?|(?:&\s*)?{git}\s+(?:--no-pager\s+)?(?:-C\s+["']?[^"'|;&\r\n]+["']?\s+)?branch(?:\s+(?:--list|-l|-a|--all|-r|--remotes|-v|-vv|--show-current|--no-color))*)\z"#,
+            r#"(?i)\A\s*(?:\$null\s*\|\s*)?(?:(?:(?:&\s*)?{git}\s+(?:--no-pager\s+)?(?:-C\s+["']?[^"'|;&\r\n]+["']?\s+)?(?:status|diff|log|show|rev-parse|ls-files|ls-tree|check-ignore|remote\s+-v|worktree\s+list)|(?:&\s*)?{rg}|findstr(?:\.exe)?\b|where(?:\.exe)?\b|Get-ChildItem\b|gci\b|Get-Content\b|gc\b|Select-String\b|sls\b|Get-Command\b|gcm\b|Test-Path\b|Get-Item\b|gi\b|Get-ItemProperty\b|gp\b|Get-ItemPropertyValue\b|gpv\b|Get-CimInstance\b|gcim\b|Get-WmiObject\b|gwmi\b|Get-WinEvent\b|Get-EventLog\b|Get-Process\b|gps\b|Get-Service\b|gsv\b|Get-Location\b|gl\b|Write-Output\b|(?:&\s*)?{codex}\s+(?:--version|login\s+status|exec\b[^|;&\r\n]*-s\s+read-only\b)|(?:&\s*)?{agy}\s+(?:--help|--version|plugin\s+(?:list|help)|mcp\s+(?:list|help)|models\b)|(?:&\s*)?{tok}\s+(?:--version|--help|help|map|query|skeleton|semantic|ask|sem|impact|expand-ref|gain|dashboard|healthcheck|detect|measure|statusline)\b|(?:&\s*)?{py}\s+(?:-(?:X\s+utf8|[uBEsSO])\s+)*(?:{ro}|{wt}\s+{wt_ro})|(?:&\s*)?{cs}\s+(?:code[-_]search\b|stack[-_]doctor\b|worktree[-_]guard\s+{wt_ro}))(?:\s+[^|;&\r\n]*)?|(?:&\s*)?{git}\s+(?:--no-pager\s+)?(?:-C\s+["']?[^"'|;&\r\n]+["']?\s+)?branch(?:\s+(?:--list|-l|-a|--all|-r|--remotes|-v|-vv|--show-current|--no-color))*)\z"#,
             git = git_tok,
             rg = rg_tok,
             codex = codex_tok,
@@ -229,6 +245,8 @@ fn read_only_cmd_re() -> &'static Regex {
             py = py,
             ro = ro_scripts,
             wt = wt_guard,
+            cs = cs_tok,
+            wt_ro = WT_RO_SUB,
         );
         Regex::new(&pat).expect("read_only_cmd_re")
     })
@@ -243,7 +261,7 @@ fn validation_non_runner_re() -> &'static Regex {
         let install = exe_pat_followed_by_space("install", EXT_PY, false);
         let agy = exe_pat_followed_by_space("agy", EXT_CMD_EXE, false);
         let pat = format!(
-            r"(?i)\A\s*(?:\$null\s*\|\s*)?(?:&\s*)?(?:{ruff}\s+check\b|{py}\s+(?:-(?:X\s+utf8|[uBEsSO])\s+)*(?:-m\s+(?:pytest|unittest|py_compile|compileall|mypy|ruff|flake8)\b|{inst}\s+(?:[^\r\n|;&]*\s)?(?:--diagnose|--dry-run)(?:\z|[\s|;&]))|npm(?:\.cmd)?\s+(?:test|run\s+(?:test|lint|build|typecheck|check))\b|pnpm(?:\.cmd)?\s+(?:test|lint|build|typecheck)\b|yarn(?:\.cmd)?\s+(?:test|lint|build|typecheck)\b|npx(?:\.cmd)?\s+(?:tsc|vitest|jest|eslint|playwright\s+test)\b|cargo(?:\.exe)?\s+(?:test|check|clippy)\b|go(?:\.exe)?\s+(?:test|vet)\b|dotnet(?:\.exe)?\s+(?:test|build)\b|{agy}\s+plugin\s+validate\b)",
+            r"(?i)\A\s*(?:\$null\s*\|\s*)?(?:&\s*)?(?:{ruff}\s+check\b|{py}\s+(?:-(?:X\s+utf8|[uBEsSO])\s+)*(?:-m\s+(?:pytest|unittest|py_compile|compileall|mypy|ruff|flake8)\b|{inst}\s+(?:[^\r\n|;&]*\s)?(?:--diagnose|--dry-run)(?:\z|[\s|;&]))|npm(?:\.cmd)?\s+(?:test|run\s+(?:test|lint|build|typecheck|check))\b|pnpm(?:\.cmd)?\s+(?:test|lint|build|typecheck)\b|yarn(?:\.cmd)?\s+(?:test|lint|build|typecheck)\b|npx(?:\.cmd)?\s+(?:tsc|vitest|jest|eslint|playwright\s+test)\b|cargo(?:\.exe)?\s+(?:\+[A-Za-z0-9._-]+\s+)?(?:test|check|clippy)\b|go(?:\.exe)?\s+(?:test|vet)\b|dotnet(?:\.exe)?\s+(?:test|build)\b|{agy}\s+plugin\s+validate\b)",
             ruff = ruff,
             py = py,
             inst = install,
@@ -329,9 +347,10 @@ fn mutating_pkg_re() -> &'static Regex {
 fn mutating_stack_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(
-            r"(?i)(?:\bworktree_guard\.py\b[^\r\n;|&]*\b(?:snapshot|remove|restore)\b|\bchip_handoff\.py\b[^\r\n;|&]*--merge\b)",
-        )
+        Regex::new(&format!(
+            r"(?i)(?:(?:\bworktree_guard\.py|carbon-stack(?:\.exe)?\s+worktree[-_]guard)\b{}|(?:\bchip_handoff\.py|carbon-stack(?:\.exe)?\s+chip[-_]handoff)\b{})",
+            WT_MUT_TAIL, CHIP_MUT_TAIL
+        ))
         .expect("mutating_stack_re")
     })
 }
@@ -340,10 +359,7 @@ fn py_mut_clause_head_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         let py = py_interp_pat(true);
-        let pat = format!(
-            r"(?i)\A\s*(?:\$[A-Za-z_]\w*\s*=\s*)?(?:\$null\s*\|\s*)?(?:&\s*)?{}\s+",
-            py
-        );
+        let pat = format!(r"(?i){}{}\s+", PS_MUT_CLAUSE_LEADER, py);
         Regex::new(&pat).expect("py_mut_clause_head_re")
     })
 }
@@ -401,9 +417,7 @@ fn wt_guard_mut_tok_re() -> &'static Regex {
 
 fn wt_mut_tail_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?i)\A[^\r\n;|&]*\b(?:snapshot|remove|restore)\b").expect("wt_mut_tail_re")
-    })
+    RE.get_or_init(|| Regex::new(&format!(r"(?i)\A{}", WT_MUT_TAIL)).expect("wt_mut_tail_re"))
 }
 
 fn chip_mut_tok_re() -> &'static Regex {
@@ -416,7 +430,7 @@ fn chip_mut_tok_re() -> &'static Regex {
 
 fn chip_mut_tail_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)\A[^\r\n;|&]*--merge\b").expect("chip_mut_tail_re"))
+    RE.get_or_init(|| Regex::new(&format!(r"(?i)\A{}", CHIP_MUT_TAIL)).expect("chip_mut_tail_re"))
 }
 
 fn install_mut_tok_re() -> &'static Regex {
@@ -435,7 +449,22 @@ fn install_diag_tail_re() -> &'static Regex {
     })
 }
 
+fn cs_mut_clause_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        let cs = exe_pat_followed_by_space("carbon-stack", r"(?:\.exe)?", true);
+        Regex::new(&format!(
+            r"(?i){}{}\s+(?:worktree[-_]guard\b{}|chip[-_]handoff\b{})",
+            PS_MUT_CLAUSE_LEADER, cs, WT_MUT_TAIL, CHIP_MUT_TAIL
+        ))
+        .expect("cs_mut_clause_re")
+    })
+}
+
 fn is_mutating_stack_seg(clause: &str) -> bool {
+    if cs_mut_clause_re().is_match(clause) {
+        return true;
+    }
     let Some(rest) = strip_py_mut_clause_prefix(clause) else {
         return false;
     };
@@ -1120,6 +1149,7 @@ fn has_non_cmdlet_mutation(
     if !low_core.contains("install.py")
         && !low_core.contains("worktree_guard.py")
         && !low_core.contains("chip_handoff.py")
+        && !low_core.contains("carbon-stack")
     {
         return false;
     }
@@ -1329,11 +1359,11 @@ fn file_entry_token(full: &Path, prefix: &str, meta_opt: Option<&fs::Metadata>) 
         return format!("{}dir:{}", prefix, meta_mtime_ns(st));
     }
     if st.len() <= MAX_HASHED_SNAPSHOT_BYTES {
-        match fs::read(full) {
-            Ok(bytes) => {
-                let digest = sha256_hex(&bytes);
-                return format!("{}{}:{}", prefix, st.len(), &digest[..20]);
+        match cwg_common::sha256_file_bounded(full, MAX_HASHED_SNAPSHOT_BYTES) {
+            Ok(Some((total_len, digest))) => {
+                return format!("{}{}:{}", prefix, total_len, &digest[..20]);
             }
+            Ok(None) => {}
             Err(e) if e.kind() == ErrorKind::NotFound => return format!("{}absent", prefix),
             Err(_) => return format!("{}stat_err", prefix),
         }
@@ -1860,7 +1890,7 @@ fn update_candidate_marker(
         let mut combined = cwg_common::durable_paths_from_val(marker.get("paths"));
         combined.extend(durable_new_paths.iter().cloned());
         let merged_paths = cwg_common::durable_paths(&combined);
-        let fp = cwg_common::content_fingerprint(&merged_paths, MAX_FINGERPRINT_FILE_BYTES);
+        let fp = cwg_common::content_fingerprint(&merged_paths, cwg_common::MAX_FINGERPRINT_FILE_BYTES);
 
         let mut marks = marker
             .get("content_marks")
@@ -1930,7 +1960,7 @@ fn update_candidate_marker(
                 .and_then(|v| v.as_array())
                 .cloned()
                 .unwrap_or_default();
-            let fp = cwg_common::content_fingerprint(&dpaths, MAX_FINGERPRINT_FILE_BYTES);
+            let fp = cwg_common::content_fingerprint(&dpaths, cwg_common::MAX_FINGERPRINT_FILE_BYTES);
             let last_fp = marks
                 .last()
                 .and_then(|v| v.as_str().map(|_| ""))
@@ -3406,6 +3436,7 @@ mod tests {
         let _ = chip_mut_tail_re();
         let _ = install_mut_tok_re();
         let _ = install_diag_tail_re();
+        let _ = cs_mut_clause_re();
         let _ = system_or_net_mutating_re();
         let _ = http_cmd_re();
         let _ = http_method_flag_re();
@@ -3508,6 +3539,34 @@ mod tests {
             ("git status || pytest -q", "UNCERTAIN"),
             (r"& 'C:\tmp\evil_python.exe' -m unittest", "UNCERTAIN"),
             ("python -x -u -x -u -x -u -m unittest", "UNCERTAIN"),
+            (
+                r"$null | C:\Users\in\.gemini\config\plugins\chat-bus\bin\chat-bus.exe wait --chat a508fe71-2b38-458a-b726-7529ddc212ac",
+                "BOOKKEEPING",
+            ),
+            (
+                r#"C:\Python312\python.exe -X utf8 "C:\Users\in\.gemini\config\plugins\chat-bus\tools\chat_bus_cli.py" reply --from-chat a508 --message-id msg-1 --message ok"#,
+                "BOOKKEEPING",
+            ),
+            (
+                r"$null | C:\Users\in\.gemini\config\plugins\gemini-carbon-stack\bin\carbon-stack.exe continuity handoff --session s1 --goal g",
+                "BOOKKEEPING",
+            ),
+            (
+                r"C:\Users\in\.gemini\config\plugins\gemini-carbon-stack\bin\carbon-stack.exe code-search foo",
+                "READ_ONLY",
+            ),
+            (
+                "cargo +stable-x86_64-pc-windows-gnu test --offline",
+                "VALIDATION",
+            ),
+            (
+                r"& 'C:\bin\carbon-stack.exe' worktree-guard remove C:\wt",
+                "MUTATING",
+            ),
+            (
+                r"C:\bin\carbon-stack.exe chip-handoff close --merge --chip c1",
+                "MUTATING",
+            ),
         ];
 
         for (cmd, expected) in cases {
@@ -3556,5 +3615,12 @@ mod tests {
         let (chg, unm) = diff_git_snapshots(Some(&b_snap), Some(&a_snap));
         assert!(chg.is_empty());
         assert!(!unm);
+
+        let tmp_bin = std::env::temp_dir().join(format!("cwg-mark-3mb-{}.bin", std::process::id()));
+        fs::write(&tmp_bin, vec![0xABu8; 2_600_000]).unwrap();
+        let tok_3mb = file_entry_token(&tmp_bin, "??:", None);
+        assert!(tok_3mb.starts_with("??:2600000:"), "tok_3mb: {}", tok_3mb);
+        assert!(git_entry_unchanged_on_disk(&tmp_bin.to_string_lossy(), &tok_3mb, None));
+        let _ = fs::remove_file(&tmp_bin);
     }
 }

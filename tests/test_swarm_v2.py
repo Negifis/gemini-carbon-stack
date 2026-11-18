@@ -205,6 +205,18 @@ class SwarmV2TestCase(unittest.TestCase):
         self.assertEqual(p6["lens"], "all")
         self.assertTrue(p6["clean"])
 
+        p_anom = gate_inbox.parse_simplify_verdict(
+            "@coordinator\n"
+            "All flags and tokens (`DIFF_HASH: <current_diff_hash>`, `VERDICT: APPROVED`, `SIMPLIFY_LENS: ALL`, `CLOSURE_VALIDATION: READY|BLOCKED`) are consistent.\n"
+            "DIFF_HASH: 061484edee70341e\n"
+            "SIMPLIFY_LENS: REUSE\n"
+            "SIMPLIFY_VERDICT: CLEAN"
+        )
+        self.assertEqual(p_anom["lens"], "reuse")
+        self.assertFalse(p_anom["has_explicit_all"])
+        self.assertFalse(p_anom["combined"])
+        self.assertTrue(p_anom["clean"])
+
         # Prompt templates and alternations MUST NOT match as real verdicts
         for tpl in (
             "Respond with SIMPLIFY_VERDICT: CLEAN or ACTIONABLE_FIXES.",
@@ -771,6 +783,13 @@ class SwarmV2TestCase(unittest.TestCase):
         res_ov = gate_inbox.validate_warm_worker_verdicts(override_msgs, round_start_msg_id=1)
         self.assertNotIn("reuse", res_ov["lenses"])
         self.assertFalse(res_ov["satisfied"])
+
+        # INVARIANT: Multi-byte UTF-8 Cyrillic prose before inline tags must neither match nor panic on char boundaries.
+        ru_msg = "Проверьте SIMPLIFY_VERDICT: CLEAN и `SIMPLIFY_LENS: ALL` в строке.\nSIMPLIFY_LENS: QUALITY\nSIMPLIFY_VERDICT: CLEAN"
+        parsed_ru = cwg.parse_simplify_verdict(ru_msg)
+        self.assertEqual(parsed_ru["lens"], "quality")
+        self.assertFalse(parsed_ru["has_explicit_all"])
+        self.assertTrue(parsed_ru["clean"])
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ use crate::win32_sqlite::now_sec;
 pub const WORK_NO_CHANGE: &str = "NO_CHANGE";
 pub const WORK_OPERATIONAL: &str = "OPERATIONAL";
 pub const WORK_PERSISTENT: &str = "PERSISTENT";
+pub const MAX_FINGERPRINT_FILE_BYTES: u64 = 32_000_000;
 
 pub const RISK_LOW: &str = "LOW";
 pub const RISK_STANDARD: &str = "STANDARD";
@@ -304,8 +305,89 @@ fn is_unicode_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+fn skip_md_and_ws(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() {
+        if b[i].is_ascii_whitespace() || b[i] == b'*' || b[i] == b'`' {
+            i += 1;
+        } else if i + 1 < b.len() && b[i] == b'_' && b[i + 1] == b'_' {
+            i += 2;
+        } else {
+            break;
+        }
+    }
+    i
+}
+
+fn is_simplify_line_prefix_clean(prefix: &str) -> bool {
+    // INVARIANT: Single-pass O(L) byte scanner (zero regex backtracking, zero UTF-8 str-slice panics) rejecting inline prose citations (`anom-d6ceeff0`) while allowing `@mention`, bullets, and prior tags.
+    let tb = prefix.trim_start().as_bytes();
+    let b = if tb.len() >= 2
+        && matches!(tb[0], b'-' | b'*' | b'+' | b'>')
+        && tb[1].is_ascii_whitespace()
+    {
+        &tb[2..]
+    } else {
+        tb
+    };
+    let mut i = 0usize;
+    loop {
+        i = skip_md_and_ws(b, i);
+        if i >= b.len() {
+            return true;
+        }
+        if b[i] == b'@' {
+            i += 1;
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'-') {
+                i += 1;
+            }
+            if i == start || (i < b.len() && !b[i].is_ascii_whitespace()) {
+                return false;
+            }
+            continue;
+        }
+        let rest = &b[i..];
+        let key_len = [
+            b"SIMPLIFY_LENS".as_slice(),
+            b"SIMPLIFY_VERDICT".as_slice(),
+            b"DIFF_HASH".as_slice(),
+        ]
+        .iter()
+        .find(|&&k| rest.get(..k.len()).map_or(false, |h| h.eq_ignore_ascii_case(k)))
+        .map(|k| k.len());
+        let Some(klen) = key_len else {
+            return false;
+        };
+        i += klen;
+        i = skip_md_and_ws(b, i);
+        if i >= b.len() || b[i] != b':' {
+            return false;
+        }
+        i += 1;
+        i = skip_md_and_ws(b, i);
+        let val_start = i;
+        while i < b.len()
+            && (b[i].is_ascii_alphanumeric() || matches!(b[i], b'_' | b'.' | b':' | b'-'))
+        {
+            i += 1;
+        }
+        if i == val_start {
+            return false;
+        }
+        loop {
+            let next_i = skip_md_and_ws(b, i);
+            if next_i < b.len() && matches!(b[next_i], b',' | b'.' | b';' | b'|' | b'/' | b'-') {
+                i = next_i + 1;
+            } else {
+                i = next_i;
+                break;
+            }
+        }
+    }
+}
+
 fn simplify_tag_prefix_ok(before: &str) -> bool {
-    // WORKAROUND: Emulates `(?<![A-Za-z0-9_])(?<!\(or )(?<!\(or `)(?<!\bor )(?<!\bor `)(?<!\bили )`.
+    // WORKAROUND: Emulates `(?<![A-Za-z0-9_])(?<!\(or )(?<!\(or `)(?<!\bor )(?<!\bor `)(?<!\bили )` plus O(L) line-prefix guard (`anom-d6ceeff0`).
     if let Some(prev) = before.chars().next_back() {
         if is_ascii_ident_char(prev) {
             return false;
@@ -326,7 +408,12 @@ fn simplify_tag_prefix_ok(before: &str) -> bool {
             }
         }
     }
-    true
+    let line_before = before.rsplit('\n').next().unwrap_or(before);
+    let eff_prefix = match line_before.rfind("content=") {
+        Some(idx) => &line_before[idx + "content=".len()..],
+        None => line_before,
+    };
+    is_simplify_line_prefix_clean(eff_prefix)
 }
 
 fn simplify_tag_suffix_ok(after: &str) -> bool {
@@ -359,7 +446,13 @@ fn find_simplify_tag_matches(core_re: &Regex, text: &str) -> Vec<String> {
         let after = &text[whole.end()..];
         if simplify_tag_prefix_ok(before) && simplify_tag_suffix_ok(after) {
             out.push(val.as_str().to_string());
-            pos = whole.end().max(pos + 1);
+            if whole.end() > pos {
+                pos = whole.end();
+            } else if let Some(ch) = text[pos..].chars().next() {
+                pos += ch.len_utf8();
+            } else {
+                break;
+            }
         } else if let Some(ch) = text[whole.start()..].chars().next() {
             pos = whole.start() + ch.len_utf8();
         } else {
@@ -575,7 +668,8 @@ pub fn extract_review_decision(text: &str) -> (Option<String>, Option<String>) {
 
 pub fn extract_diff_hash(text: &str) -> String {
     diff_hash_re()
-        .captures(text)
+        .captures_iter(text)
+        .last()
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().trim().to_string())
         .unwrap_or_default()
@@ -2335,6 +2429,30 @@ pub fn candidate_class(marker: &Value) -> String {
     WORK_NO_CHANGE.to_string()
 }
 
+pub fn sha256_file_bounded(path: &Path, max_bytes: u64) -> Result<Option<(u64, String)>, std::io::Error> {
+    let mut fh = File::open(path)?;
+    let meta = fh.metadata()?;
+    if meta.len() > max_bytes {
+        return Ok(None);
+    }
+    // INVARIANT: Stream in 64 KiB stack chunks and re-enforce `max_bytes` on actual bytes read so concurrent growth cannot spike heap or bypass size bounds.
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    let mut total: u64 = 0;
+    loop {
+        let n = fh.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        total = total.saturating_add(n as u64);
+        if total > max_bytes {
+            return Ok(None);
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(Some((total, hex::encode(hasher.finalize()))))
+}
+
 pub fn content_fingerprint(paths: &[String], max_file_bytes: u64) -> String {
     let mut dpaths = durable_paths(paths);
     dpaths.sort_by_key(|p| rio::fold_path(p));
@@ -2355,19 +2473,10 @@ pub fn content_fingerprint(paths: &[String], max_file_bytes: u64) -> String {
             hasher.update(b"NONFILE\0");
             continue;
         }
-        let Ok(meta) = fs::metadata(path_obj) else {
+        let Ok(Some((total_len, blob_hex))) = sha256_file_bounded(path_obj, max_file_bytes) else {
             return String::new();
         };
-        if meta.len() > max_file_bytes {
-            return String::new();
-        }
-        let Ok(blob) = fs::read(path_obj) else {
-            return String::new();
-        };
-        let mut blob_hasher = Sha256::new();
-        blob_hasher.update(&blob);
-        let blob_hex = hex::encode(blob_hasher.finalize());
-        hasher.update(format!("BLOB:{}:{}\0", blob.len(), blob_hex).as_bytes());
+        hasher.update(format!("BLOB:{}:{}\0", total_len, blob_hex).as_bytes());
     }
     hex::encode(hasher.finalize())
 }
@@ -3051,6 +3160,20 @@ mod tests {
         let parsed_pair = parse_simplify_verdict(pair_msg, Some("reuse"));
         assert_eq!(parsed_pair["verdict"], "CLEAN");
         assert_eq!(parsed_pair["lens"], "reuse");
+
+        let anom_d6ceeff0 = "@coordinator\nAll flags and tokens (`DIFF_HASH: <current_diff_hash>`, `VERDICT: APPROVED`, `SIMPLIFY_LENS: ALL`, `CLOSURE_VALIDATION: READY|BLOCKED`) are consistent.\nDIFF_HASH: 061484edee70341e\nSIMPLIFY_LENS: REUSE\nSIMPLIFY_VERDICT: CLEAN";
+        let parsed_anom = parse_simplify_verdict(anom_d6ceeff0, None);
+        assert_eq!(parsed_anom["lens"], "reuse");
+        assert_eq!(parsed_anom["has_explicit_all"], false);
+        assert_eq!(parsed_anom["combined"], false);
+        assert_eq!(parsed_anom["clean"], true);
+        assert_eq!(extract_diff_hash(anom_d6ceeff0), "061484edee70341e");
+
+        let ru_prose = "Проверьте SIMPLIFY_VERDICT: CLEAN и `SIMPLIFY_LENS: ALL` в строке.\nSIMPLIFY_LENS: QUALITY\nSIMPLIFY_VERDICT: CLEAN";
+        let parsed_ru = parse_simplify_verdict(ru_prose, None);
+        assert_eq!(parsed_ru["lens"], "quality");
+        assert_eq!(parsed_ru["has_explicit_all"], false);
+        assert_eq!(parsed_ru["clean"], true);
     }
 
     #[test]

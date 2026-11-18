@@ -11,5 +11,6 @@ __pycache__/
 # Swarm 2.0 runtime artifacts, ownership manifests, and isolated worktrees
 .swarm/
 
-# Rust build artifacts
+# Rust build artifacts and retired Windows PE staging
 rust/target/
+.retired_bins/

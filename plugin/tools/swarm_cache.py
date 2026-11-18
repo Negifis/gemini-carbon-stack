@@ -179,6 +179,8 @@ def inspect_swarm_workers(
         )
 
         last_ts = float(tinfo["last_model_ts"] or 0.0)
+        # INVARIANT: Anthropic 5-minute ephemeral prompt-cache expiry (`270s`) applies only to `claude-*` models; non-Claude Warm Pool workers (`gemini-4-hydrogen-*`) retain warm conversation context across rounds and resume via `@mention`.
+        uses_ephemeral_ttl = (not model) or model.startswith("claude-")
         if last_ts <= 0.0:
             cache_state = "NEW"
             age_s = 0.0
@@ -186,8 +188,8 @@ def inspect_swarm_workers(
             rec_action = "wait_or_assign"
         else:
             age_s = round(max(0.0, now - last_ts), 1)
-            rem_s = round(max(0.0, float(ttl_seconds) - age_s), 1)
-            if age_s <= ttl_seconds:
+            rem_s = round(max(0.0, float(ttl_seconds) - age_s), 1) if uses_ephemeral_ttl else float(ttl_seconds)
+            if (not uses_ephemeral_ttl) or age_s <= ttl_seconds:
                 cache_state = "WARM"
                 rec_action = "resume_in_place"
             else:
