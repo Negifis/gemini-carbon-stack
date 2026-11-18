@@ -855,9 +855,52 @@ def scan_swarm_activity(
                 else ("fallback" if cur_model in cwg.SIMPLIFY_FALLBACK_MODELS else "")
             )
             if tier:
+                def _eval_win_outs(
+                    outs: list[tuple[float, str, int]],
+                    win_ts_val: float,
+                ) -> tuple[dict[str, Any], bool] | None:
+                    if not outs:
+                        return None
+                    joined_txt = "\n\n".join(otxt for _, otxt, _ in outs)
+                    parsed = cwg.parse_simplify_verdict(joined_txt, default_lens=slens or "")
+                    if not parsed.get("verdict"):
+                        return None
+                    s_ts_val = max(
+                        (ots for ots, otxt, _ in outs if cwg.SIMPLIFY_LINE_RE.search(otxt)),
+                        default=outs[-1][0],
+                    )
+                    lts_val = win_ts_val or tsum["start_ts"] or first_ts
+                    ets_val = max(lts_val, s_ts_val or max((ots for ots, _, _ in outs), default=lts_val))
+                    spoof_flag = bool(
+                        parsed.get("multi_lens_spoof")
+                        or (
+                            skind == "combined"
+                            and not parsed.get("has_explicit_all")
+                            and not SIMPLIFY_COMBINED_NAME_RE.match(mname.strip())
+                        )
+                    )
+                    max_seq_val = max((obseq for _, _, obseq in outs), default=0)
+                    return (
+                        {
+                            "kind": skind,
+                            "lens": slens if skind == "lens" else None,
+                            "tier": tier,
+                            "launch_ts": lts_val,
+                            "end_ts": ets_val,
+                            "seq": max_seq_val,
+                            "clean": bool(parsed.get("clean")),
+                            "has_explicit_all": bool(parsed.get("has_explicit_all")),
+                        },
+                        spoof_flag,
+                    )
+
                 for w_idx in sorted(bucketed_outputs):
                     win_ts, _, _ = windows[w_idx]
                     win_outs = bucketed_outputs[w_idx]
+                    # INVARIANT: Record every completed window in `simplify_history` (unfiltered by current `round_start_msg_id` / `current_diff_hash`) so prior candidate versions retain historical simplify evidence.
+                    hist_pair = _eval_win_outs(win_outs, win_ts)
+                    if hist_pair is not None:
+                        simplify_history.append(dict(hist_pair[0]))
                     fresh_win_outs: list[tuple[float, str, int]] = []
                     for ots, otxt, obseq in win_outs:
                         if round_start_msg_id > 0 and obseq > 0 and obseq <= round_start_msg_id:
@@ -867,38 +910,17 @@ def scan_swarm_activity(
                             if hm_hash and hm_hash != current_diff_hash:
                                 continue
                         fresh_win_outs.append((ots, otxt, obseq))
-                    if not fresh_win_outs:
-                        continue
-                    joined_win = "\n\n".join(otxt for _, otxt, _ in fresh_win_outs)
-                    win_parsed = cwg.parse_simplify_verdict(joined_win, default_lens=slens or "")
-                    if not win_parsed.get("verdict"):
-                        continue
-                    s_ts = max(
-                        (ots for ots, otxt, _ in fresh_win_outs if cwg.SIMPLIFY_LINE_RE.search(otxt)),
-                        default=fresh_win_outs[-1][0],
+                    fresh_pair = (
+                        hist_pair
+                        if len(fresh_win_outs) == len(win_outs)
+                        else _eval_win_outs(fresh_win_outs, win_ts)
                     )
-                    eff_lts = win_ts or tsum["start_ts"] or first_ts
-                    eff_ets = max(eff_lts, s_ts or max((ots for ots, _, _ in fresh_win_outs), default=eff_lts))
-                    if win_parsed.get("multi_lens_spoof") or (
-                        skind == "combined"
-                        and not win_parsed.get("has_explicit_all")
-                        and not SIMPLIFY_COMBINED_NAME_RE.match(mname.strip())
-                    ):
-                        multi_lens_spoof = True
-                        multi_lens_spoof_ts = max(multi_lens_spoof_ts, eff_ets)
-                    max_seq = max((obseq for _, _, obseq in fresh_win_outs), default=0)
-                    simplify_events.append(
-                        {
-                            "kind": skind,
-                            "lens": slens if skind == "lens" else None,
-                            "tier": tier,
-                            "launch_ts": eff_lts,
-                            "end_ts": eff_ets,
-                            "seq": max_seq,
-                            "clean": bool(win_parsed.get("clean")),
-                            "has_explicit_all": bool(win_parsed.get("has_explicit_all")),
-                        }
-                    )
+                    if fresh_pair is not None:
+                        sev_item, spoof = fresh_pair
+                        if spoof:
+                            multi_lens_spoof = True
+                            multi_lens_spoof_ts = max(multi_lens_spoof_ts, float(sev_item["end_ts"]))
+                        simplify_events.append(sev_item)
             continue
 
         if cur_model not in (cwg.OPUS_HIGH_MODEL, cwg.CARBON_HIGH_MODEL):
@@ -947,9 +969,8 @@ def scan_swarm_activity(
 
     # INVARIANT: Replay simplify events in chronological order across all workers so a stale CLEAN in another
     # member entry can never survive or overwrite a later ACTIONABLE_FIXES verdict.
-    simplify_events.sort(
-        key=lambda ev: (float(ev.get("end_ts") or 0.0), int(ev.get("seq") or 0), float(ev.get("launch_ts") or 0.0))
-    )
+    simplify_history.sort(key=_simplify_chrono_key)
+    simplify_events.sort(key=_simplify_chrono_key)
     for sev in simplify_events:
         sk = sev["kind"]
         sl = sev["lens"]
@@ -962,19 +983,11 @@ def scan_swarm_activity(
                 sonnet_lenses_end.pop(sl, None)
                 fallback_lenses.pop(sl, None)
                 fallback_lenses_end.pop(sl, None)
-                simplify_history[:] = [
-                    item
-                    for item in simplify_history
-                    if not (item.get("kind") == "lens" and item.get("lens") == sl)
-                ]
             else:
                 sonnet_combined_ts = 0.0
                 sonnet_combined_end_ts = 0.0
                 fallback_combined_ts = 0.0
                 fallback_combined_end_ts = 0.0
-                simplify_history[:] = [
-                    item for item in simplify_history if item.get("kind") != "combined"
-                ]
             continue
         if sk == "lens" and sl is not None:
             if tr == "sonnet":
@@ -989,16 +1002,6 @@ def scan_swarm_activity(
         else:
             fallback_combined_ts = max(fallback_combined_ts, eff_lts)
             fallback_combined_end_ts = max(fallback_combined_end_ts, eff_ets)
-        simplify_history.append(
-            {
-                "kind": sk,
-                "lens": sl if sk == "lens" else None,
-                "tier": tr,
-                "launch_ts": eff_lts,
-                "end_ts": eff_ets,
-                "has_explicit_all": bool(sev.get("has_explicit_all")),
-            }
-        )
 
     stalled_workers = (
         cwg.detect_stalled_workers(
@@ -1229,13 +1232,42 @@ def scan_native_subagents(
     }
 
 
-def is_review_fresh(review: dict[str, Any], marker: dict[str, Any]) -> bool:
-    """An APPROVED or READY review is fresh iff current bytes match bytes present when the review launched."""
-    marks = [m for m in (marker.get("content_marks") or []) if isinstance(m, dict)]
+def _simplify_chrono_key(ev: dict[str, Any]) -> tuple[float, int, float]:
+    return (float(ev.get("end_ts") or 0.0), int(ev.get("seq") or 0), float(ev.get("launch_ts") or 0.0))
+
+
+def _closure_ready_tail_ok(
+    effective_risk: str,
+    ord_list: list[dict[str, Any]],
+    cls_rev: dict[str, Any],
+    allow_approved: bool,
+) -> bool:
+    if not ord_list or str(cls_rev.get("verdict") or "") != "READY":
+        return False
+    if not allow_approved and len(ord_list) != MAX_REVIEW_ROUNDS:
+        return False
+    if effective_risk == "XHIGH" and not cls_rev.get("xhigh"):
+        return False
+    last_ord = ord_list[-1]
+    lv = str(last_ord.get("verdict") or "")
+    if allow_approved and lv == "APPROVED":
+        if effective_risk == "XHIGH" and not last_ord.get("xhigh"):
+            return False
+    elif lv in ("REVISE", "ESCALATE"):
+        if len(ord_list) < MAX_REVIEW_ROUNDS:
+            return False
+    else:
+        return False
+    last_ord_vts = max(
+        float(last_ord.get("launch_ts") or 0.0),
+        float(last_ord.get("verdict_ts") or 0.0),
+    )
+    return float(cls_rev.get("launch_ts") or 0.0) >= last_ord_vts
+
+
+def _is_review_fresh_marks(launch_ts: float, marks: list[dict[str, Any]]) -> bool:
     if not marks:
         return True
-    launch_ts = float(review.get("launch_ts") or 0.0)
-
     # INVARIANT: A mark with a concrete SHA-256 `fp` is cryptographically measured; only `fp is None` is unmeasured.
     covered_fps = {
         m.get("fp")
@@ -1250,9 +1282,13 @@ def is_review_fresh(review: dict[str, Any], marker: dict[str, Any]) -> bool:
     current_mark = marks[-1]
     if not current_mark.get("fp"):
         return False
-    if current_mark.get("fp") not in covered_fps:
-        return False
-    return True
+    return current_mark.get("fp") in covered_fps
+
+
+def is_review_fresh(review: dict[str, Any], marker: dict[str, Any]) -> bool:
+    """An APPROVED or READY review is fresh iff current bytes match bytes present when the review launched."""
+    marks = [m for m in (marker.get("content_marks") or []) if isinstance(m, dict)]
+    return _is_review_fresh_marks(float(review.get("launch_ts") or 0.0), marks)
 
 
 def _steps_have_index_gap(step_list: list[dict[str, Any]]) -> bool:
@@ -1588,7 +1624,13 @@ def validate_candidate_closure(
     all_simplify_steps = set(swarm_ev.get("simplify_launch_steps") or set()) | set(
         sub_ev.get("simplify_launch_steps") or set()
     )
-    all_simplify_history = list(swarm_ev.get("simplify_history") or []) + list(sub_ev.get("simplify_history") or [])
+    all_simplify_history = sorted(
+        list(swarm_ev.get("simplify_history") or []) + list(sub_ev.get("simplify_history") or []),
+        key=_simplify_chrono_key,
+    )
+    allowed_tiers = {"sonnet", "fallback"} if sonnet_issue else {"sonnet"}
+    sim_ver_cache: dict[tuple[float, Any], bool] = {}
+    inv_ts_cache: dict[tuple[float, float], float | None] = {}
     candidate_marks = [m for m in (marker.get("content_marks") or []) if isinstance(m, dict)]
     oldest_mark_ts = min((float(m.get("ts") or 0.0) for m in candidate_marks), default=float("inf"))
     first_ts_val = float(marker.get("first_ts") or 0.0)
@@ -1631,6 +1673,51 @@ def validate_candidate_closure(
             return False
         return True
 
+    def _version_edit_bounds(rev_launch_ts: float) -> tuple[float, float] | None:
+        marks_before = [m for m in candidate_marks if float(m.get("ts") or 0.0) <= rev_launch_ts]
+        if marks_before:
+            last_mark = marks_before[-1]
+            rev_fp = last_mark.get("fp")
+            if isinstance(rev_fp, str) and rev_fp:
+                rev_edit_ts = min(
+                    (float(m.get("ts") or 0.0) for m in marks_before if m.get("fp") == rev_fp),
+                    default=0.0,
+                )
+                next_edit_ts = min(
+                    (
+                        float(m.get("ts") or 0.0)
+                        for m in candidate_marks
+                        if float(m.get("ts") or 0.0) > rev_launch_ts and m.get("fp") != rev_fp
+                    ),
+                    default=float("inf"),
+                )
+                return rev_edit_ts, next_edit_ts
+            # INVARIANT: Two `fp: None` marks are never proven equal; isolate the exact mark timestamp and treat any subsequent mark as a new version.
+            rev_edit_ts = float(last_mark.get("ts") or 0.0)
+            next_edit_ts = min(
+                (float(m.get("ts") or 0.0) for m in candidate_marks if float(m.get("ts") or 0.0) > rev_launch_ts),
+                default=float("inf"),
+            )
+            return rev_edit_ts, next_edit_ts
+        if marks_truncated:
+            tx_ev = _get_tx_edits()
+            prior_ends = [ets for sts, ets in tx_ev["edit_spans"] if sts <= rev_launch_ts]
+            rev_edit_ts = max([first_ts_val] + prior_ends)
+            if tx_ev["covered_from_ts"] > rev_edit_ts + 1.0:
+                return None
+            later_starts = [sts for sts, _ in tx_ev["edit_spans"] if sts > rev_launch_ts]
+            later_marks = [
+                float(m.get("ts") or 0.0) for m in candidate_marks if float(m.get("ts") or 0.0) > rev_launch_ts
+            ]
+            return rev_edit_ts, min(later_starts + later_marks, default=float("inf"))
+        return (
+            first_ts_val,
+            min(
+                (float(m.get("ts") or 0.0) for m in candidate_marks if float(m.get("ts") or 0.0) > rev_launch_ts),
+                default=float("inf"),
+            ),
+        )
+
     def _has_completed_simplify_for_version(rev_item: dict[str, Any]) -> bool:
         if not needs_simplify:
             return True
@@ -1638,67 +1725,51 @@ def validate_candidate_closure(
             return True
         rev_launch_ts = float(rev_item.get("launch_ts") or 0.0)
         rev_step_idx = rev_item.get("step_idx")
+        cache_key = (rev_launch_ts, rev_step_idx)
+        if cache_key in sim_ver_cache:
+            return sim_ver_cache[cache_key]
         if rev_step_idx is not None and rev_step_idx in all_simplify_steps:
+            sim_ver_cache[cache_key] = False
             return False
 
-        marks_before = [m for m in candidate_marks if float(m.get("ts") or 0.0) <= rev_launch_ts]
-        if marks_before:
-            rev_fp = marks_before[-1].get("fp")
-            rev_edit_ts = min(
-                (float(m.get("ts") or 0.0) for m in marks_before if m.get("fp") == rev_fp),
-                default=0.0,
-            )
-            next_edit_ts = min(
-                (
-                    float(m.get("ts") or 0.0)
-                    for m in candidate_marks
-                    if float(m.get("ts") or 0.0) > rev_launch_ts and m.get("fp") != rev_fp
-                ),
-                default=float("inf"),
-            )
-        elif marks_truncated:
-            tx_ev = _get_tx_edits()
-            prior_ends = [ets for sts, ets in tx_ev["edit_spans"] if sts <= rev_launch_ts]
-            rev_edit_ts = max([first_ts_val] + prior_ends)
-            if tx_ev["covered_from_ts"] > rev_edit_ts + 1.0:
-                return False
-            later_starts = [sts for sts, _ in tx_ev["edit_spans"] if sts > rev_launch_ts]
-            later_marks = [
-                float(m.get("ts") or 0.0) for m in candidate_marks if float(m.get("ts") or 0.0) > rev_launch_ts
-            ]
-            next_edit_ts = min(later_starts + later_marks, default=float("inf"))
-        else:
-            rev_edit_ts = first_ts_val
-            next_edit_ts = min(
-                (float(m.get("ts") or 0.0) for m in candidate_marks if float(m.get("ts") or 0.0) > rev_launch_ts),
-                default=float("inf"),
-            )
-
-        allowed_tiers = {"sonnet", "fallback"} if sonnet_issue else {"sonnet"}
-        ver_runs = [
-            sr
-            for sr in all_simplify_history
-            if sr.get("tier") in allowed_tiers
-            and (rev_edit_ts - 1e-6) <= float(sr.get("launch_ts") or 0.0) < next_edit_ts
-        ]
-        if not ver_runs:
+        bounds = _version_edit_bounds(rev_launch_ts)
+        if bounds is None:
+            sim_ver_cache[cache_key] = False
             return False
-        completed: list[dict[str, Any]] = []
-        for sr in ver_runs:
+        rev_edit_ts, next_edit_ts = bounds
+
+        any_in_ver = False
+        done_lenses: set[str] = set()
+        done_combined = False
+        for sr in all_simplify_history:
             s_lts = float(sr.get("launch_ts") or 0.0)
+            if sr.get("tier") not in allowed_tiers or s_lts < rev_edit_ts - 1e-6 or s_lts >= next_edit_ts:
+                continue
+            any_in_ver = True
             s_ets = max(s_lts, float(sr.get("end_ts") or s_lts))
             if s_lts <= rev_launch_ts < s_ets:
+                sim_ver_cache[cache_key] = False
                 return False
             if s_lts < rev_launch_ts:
-                completed.append(sr)
-        if (
-            allow_combined
-            and not multi_lens_spoof
-            and any(sr.get("kind") == "combined" and sr.get("has_explicit_all", True) for sr in completed)
-        ):
-            return True
-        done_lenses = {sr.get("lens") for sr in completed if sr.get("kind") == "lens" and sr.get("lens")}
-        return done_lenses >= required_lenses
+                if not sr.get("clean", True):
+                    if sr.get("kind") == "lens":
+                        sl_name = sr.get("lens")
+                        if isinstance(sl_name, str):
+                            done_lenses.discard(sl_name)
+                    else:
+                        done_combined = False
+                elif sr.get("kind") == "lens":
+                    sl_name = sr.get("lens")
+                    if isinstance(sl_name, str) and sl_name:
+                        done_lenses.add(sl_name)
+                elif sr.get("has_explicit_all", True):
+                    done_combined = True
+        res = any_in_ver and (
+            (allow_combined and not multi_lens_spoof and done_combined)
+            or done_lenses >= required_lenses
+        )
+        sim_ver_cache[cache_key] = res
+        return res
 
     def _is_round_after_its_simplify(rev_item: dict[str, Any]) -> bool:
         """Return True iff `rev_item` ran after a completed simplify pass for its candidate version."""
@@ -1811,16 +1882,20 @@ def validate_candidate_closure(
     raw_closure_reviews = [r for r in all_closure_reviews if _is_acceptable_engine(r)]
     ineligible_ordinary_reviews = [r for r in all_ordinary_reviews if not _is_acceptable_engine(r)]
 
-    def _invalidated_at_ts(rev_item: dict[str, Any]) -> float | None:
+    def _compute_invalidated_at_ts(rev_item: dict[str, Any], app_lts: float, app_vts: float) -> float | None:
         if not candidate_marks or is_review_fresh(rev_item, marker):
             return None
-        app_lts = float(rev_item.get("launch_ts") or 0.0)
-        app_vts = max(app_lts, float(rev_item.get("verdict_ts") or app_lts))
         # INVARIANT: Approval/READY must still be fresh at `verdict_ts`; mid-review edits (`launch_ts < ts <= verdict_ts`)
         # mean the verdict arrived already stale and cannot reset `MAX_REVIEW_ROUNDS`.
         marks_by_verdict = [m for m in candidate_marks if float(m.get("ts") or 0.0) <= app_vts]
         if marks_by_verdict:
-            if not is_review_fresh(rev_item, {"content_marks": marks_by_verdict}):
+            last_by_v = marks_by_verdict[-1]
+            verdict_fp = last_by_v.get("fp")
+            if isinstance(verdict_fp, str) and verdict_fp:
+                if not _is_review_fresh_marks(app_lts, marks_by_verdict):
+                    return None
+            elif last_by_v.get("unknown") or any(float(m.get("ts") or 0.0) > app_lts for m in marks_by_verdict):
+                # INVARIANT: Historical `fp: None` marks (superseded by later marks) were valid at `app_vts` only when non-unknown and zero marks occurred in `(app_lts, app_vts]`.
                 return None
             covered_fps = {
                 m.get("fp")
@@ -1832,7 +1907,7 @@ def validate_candidate_closure(
                 if mts <= app_vts:
                     continue
                 mfp = m.get("fp")
-                if (mfp and mfp not in covered_fps) or (not mfp and m.get("unknown")):
+                if not mfp or mfp not in covered_fps:
                     return mts
             return None
         if not marks_truncated or app_lts < first_ts_val - 2.0 or app_vts >= oldest_mark_ts:
@@ -1848,6 +1923,14 @@ def validate_candidate_closure(
         if not post_edits and len(distinct_tail_fps) < 2 and not any(m.get("unknown") for m in candidate_marks):
             return None
         return min([oldest_mark_ts] + post_edits)
+
+    def _invalidated_at_ts(rev_item: dict[str, Any]) -> float | None:
+        app_lts = float(rev_item.get("launch_ts") or 0.0)
+        app_vts = max(app_lts, float(rev_item.get("verdict_ts") or app_lts))
+        cache_key = (app_lts, app_vts)
+        if cache_key not in inv_ts_cache:
+            inv_ts_cache[cache_key] = _compute_invalidated_at_ts(rev_item, app_lts, app_vts)
+        return inv_ts_cache[cache_key]
 
     def _is_valid_cycle_approval(rev_item: dict[str, Any]) -> bool:
         if str(rev_item.get("verdict") or "") != "APPROVED":
@@ -1870,74 +1953,67 @@ def validate_candidate_closure(
     ) -> bool:
         if not (needs_simplify and active_simplify_windows):
             return False
-        if str(cls_rev.get("verdict") or "") != "READY":
-            return False
-        if effective_risk == "XHIGH" and not cls_rev.get("xhigh"):
-            return False
         if not _is_after_simplify(cls_rev) or not is_review_fresh(cls_rev, marker):
             return False
-        if not (1 <= len(ord_list) <= MAX_REVIEW_ROUNDS):
+        if not _closure_ready_tail_ok(effective_risk, ord_list, cls_rev, True):
             return False
         if post_simplify_ordinary or post_simplify_ineligible:
             return False
         min_sim_ts = min((w[0] for w in active_simplify_windows), default=0.0)
-        if min_sim_ts <= 0.0:
-            return False
-        if any(float(r.get("launch_ts") or 0.0) >= min_sim_ts for r in ord_list):
-            return False
-        last_ord = ord_list[-1]
-        last_ord_v = str(last_ord.get("verdict") or "")
-        if last_ord_v not in ("APPROVED", "REVISE", "ESCALATE"):
-            return False
-        if last_ord_v != "APPROVED" and len(ord_list) != MAX_REVIEW_ROUNDS:
-            return False
-        last_ord_vts = max(
-            float(last_ord.get("launch_ts") or 0.0),
-            float(last_ord.get("verdict_ts") or 0.0),
+        return min_sim_ts > 0.0 and not any(float(r.get("launch_ts") or 0.0) >= min_sim_ts for r in ord_list)
+
+    def _is_valid_swarm_v2_cycle_closure_ready(
+        ord_list: list[dict[str, Any]],
+        pre_simplify_only: bool,
+        cls_rev: dict[str, Any],
+    ) -> bool:
+        # INVARIANT: Swarm 2.0 `ORDINARY -> SIMPLIFY -> CLOSURE READY` resets the cycle on post-READY edits without laundering over-limit or mixed post-simplify cycles.
+        return (
+            needs_simplify
+            and pre_simplify_only
+            and _closure_ready_tail_ok(effective_risk, ord_list, cls_rev, True)
+            and _has_completed_simplify_for_version(cls_rev)
         )
-        return float(cls_rev.get("launch_ts") or 0.0) >= last_ord_vts
 
     def _is_valid_cycle_closure_ready(
         ord_list: list[dict[str, Any]],
         cls_rev: dict[str, Any],
     ) -> bool:
-        if len(ord_list) != MAX_REVIEW_ROUNDS or str(cls_rev.get("verdict") or "") != "READY":
+        if not _closure_ready_tail_ok(effective_risk, ord_list, cls_rev, False):
             return False
         if _has_prior_terminal_approval(ord_list):
             return False
-        if effective_risk == "XHIGH" and not cls_rev.get("xhigh"):
-            return False
         if not _has_completed_simplify_for_version(cls_rev):
             return False
-        if not all(_has_completed_simplify_for_version(r) for r in ord_list):
+        return all(_has_completed_simplify_for_version(r) for r in ord_list)
+
+    def _was_invalidated_by_simplify_findings(rev_item: dict[str, Any]) -> bool:
+        if _invalidated_at_ts(rev_item) is None:
             return False
-        last_ord = ord_list[-1]
-        if str(last_ord.get("verdict") or "") not in ("REVISE", "ESCALATE"):
+        rev_lts = float(rev_item.get("launch_ts") or 0.0)
+        rev_vts = max(rev_lts, float(rev_item.get("verdict_ts") or 0.0))
+        bounds = _version_edit_bounds(rev_lts)
+        if bounds is None or bounds[1] == float("inf"):
             return False
-        last_ord_vts = max(
-            float(last_ord.get("launch_ts") or 0.0),
-            float(last_ord.get("verdict_ts") or 0.0),
+        next_edit_ts = bounds[1]
+        return any(
+            not sr.get("clean", True)
+            and sr.get("tier") in allowed_tiers
+            and (rev_vts - 1e-6) <= float(sr.get("launch_ts") or 0.0)
+            and max(float(sr.get("launch_ts") or 0.0), float(sr.get("end_ts") or 0.0)) <= next_edit_ts
+            for sr in all_simplify_history
         )
-        return float(cls_rev.get("launch_ts") or 0.0) >= last_ord_vts
 
     def _is_version_simplify_measured(rev_item: dict[str, Any]) -> bool:
-        rev_launch_ts = float(rev_item.get("launch_ts") or 0.0)
-        if any(float(m.get("ts") or 0.0) <= rev_launch_ts for m in candidate_marks):
-            return True
-        if not marks_truncated:
-            return True
-        tx_ev = _get_tx_edits()
-        prior_ends = [ets for sts, ets in tx_ev["edit_spans"] if sts <= rev_launch_ts]
-        rev_edit_ts = max([first_ts_val] + prior_ends)
-        return bool(tx_ev["covered_from_ts"] <= rev_edit_ts + 1.0)
+        return _version_edit_bounds(float(rev_item.get("launch_ts") or 0.0)) is not None
 
     def _counts_toward_round_cap(rev_item: dict[str, Any]) -> bool:
-        if not (needs_simplify and active_simplify_windows):
+        if not (needs_simplify and (active_simplify_windows or all_simplify_history)):
             return True
         if _is_round_after_its_simplify(rev_item):
             return True
         if str(rev_item.get("verdict") or "") == "APPROVED":
-            return True
+            return not _was_invalidated_by_simplify_findings(rev_item)
         # SAFETY: Fail closed when truncated marks + transcript gap leave an older round's simplify state unmeasured.
         return not _is_version_simplify_measured(rev_item)
 
@@ -1993,7 +2069,10 @@ def validate_candidate_closure(
         else:
             cycle_raw_closure.append(rev)
             valid_so_far = [r for r in cycle_raw_ordinary if _has_completed_simplify_for_version(r)]
-            if _within_cycle_ordinary_caps() and _is_valid_cycle_closure_ready(valid_so_far, rev):
+            if _within_cycle_ordinary_caps() and (
+                _is_valid_cycle_closure_ready(valid_so_far, rev)
+                or _is_valid_swarm_v2_cycle_closure_ready(cycle_raw_ordinary, not valid_so_far, rev)
+            ):
                 pending_reset_ts = _invalidated_at_ts(rev)
                 pending_reset_kind = "READY" if pending_reset_ts is not None else ""
             else:

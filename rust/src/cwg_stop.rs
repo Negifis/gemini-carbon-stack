@@ -812,19 +812,18 @@ pub struct SimplifyHistoryItem {
     pub tier: String,
     pub launch_ts: f64,
     pub end_ts: f64,
+    pub seq: i64,
+    pub clean: bool,
     pub has_explicit_all: bool,
 }
 
-#[derive(Debug, Clone)]
-struct SimplifyEvent {
-    kind: String,
-    lens: Option<String>,
-    tier: String,
-    launch_ts: f64,
-    end_ts: f64,
-    seq: i64,
-    clean: bool,
-    has_explicit_all: bool,
+impl SimplifyHistoryItem {
+    fn chrono_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.end_ts
+            .total_cmp(&other.end_ts)
+            .then_with(|| self.seq.cmp(&other.seq))
+            .then_with(|| self.launch_ts.total_cmp(&other.launch_ts))
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -874,7 +873,7 @@ pub fn scan_swarm_activity(
         codex_issue_step: -1,
         ..SwarmEvidence::default()
     };
-    let mut simplify_events: Vec<SimplifyEvent> = Vec::new();
+    let mut simplify_events: Vec<SimplifyHistoryItem> = Vec::new();
     let mut worker_last_activity: HashMap<String, f64> = HashMap::new();
     let mut requested_models: HashMap<String, HashSet<String>> = HashMap::new();
     let mut model_switches: HashMap<String, Vec<(f64, String, Option<usize>)>> = HashMap::new();
@@ -1639,14 +1638,79 @@ pub fn scan_swarm_activity(
                 ""
             };
             if !tier.is_empty() {
+                let eval_win_outs = |outs: &[&(f64, String, i64)],
+                                     win_ts: f64|
+                 -> Option<(SimplifyHistoryItem, bool)> {
+                    if outs.is_empty() {
+                        return None;
+                    }
+                    let joined = outs
+                        .iter()
+                        .map(|x| x.1.as_str())
+                        .collect::<Vec<&str>>()
+                        .join("\n\n");
+                    let parsed = cwg_common::parse_simplify_verdict(
+                        &joined,
+                        Some(slens.as_deref().unwrap_or("")),
+                    );
+                    if val_to_str(parsed.get("verdict")).is_empty() {
+                        return None;
+                    }
+                    let s_ts = outs
+                        .iter()
+                        .filter(|(_, otxt, _)| {
+                            let p = cwg_common::parse_simplify_verdict(otxt, None);
+                            !val_to_str(p.get("verdict")).is_empty()
+                        })
+                        .map(|(ots, _, _)| *ots)
+                        .reduce(f64::max)
+                        .unwrap_or_else(|| outs.last().map_or(0.0, |x| x.0));
+                    let eff_lts = if win_ts > 0.0 {
+                        win_ts
+                    } else if tsum.start_ts > 0.0 {
+                        tsum.start_ts
+                    } else {
+                        first_ts
+                    };
+                    let max_ots = outs.iter().map(|x| x.0).reduce(f64::max).unwrap_or(eff_lts);
+                    let eff_ets = eff_lts.max(if s_ts > 0.0 { s_ts } else { max_ots });
+                    let has_explicit_all = json_truthy(parsed.get("has_explicit_all"));
+                    let spoof = json_truthy(parsed.get("multi_lens_spoof"))
+                        || (skind == "combined"
+                            && !has_explicit_all
+                            && !simplify_combined_name_re().is_match(mname.trim()));
+                    let max_seq = outs.iter().map(|x| x.2).max().unwrap_or(0);
+                    Some((
+                        SimplifyHistoryItem {
+                            kind: skind.to_string(),
+                            lens: if skind == "lens" { slens.clone() } else { None },
+                            tier: tier.to_string(),
+                            launch_ts: eff_lts,
+                            end_ts: eff_ets,
+                            seq: max_seq,
+                            clean: json_truthy(parsed.get("clean")),
+                            has_explicit_all,
+                        },
+                        spoof,
+                    ))
+                };
+
                 let mut win_keys: Vec<usize> = bucketed_outputs.keys().copied().collect();
                 win_keys.sort();
                 for w_idx in win_keys {
                     let win_ts = windows[w_idx].0;
                     let win_outs = &bucketed_outputs[&w_idx];
-                    let mut fresh_win_outs: Vec<(f64, String, i64)> = Vec::new();
-                    for (ots, otxt, obseq) in win_outs {
-                        if round_start_msg_id > 0 && *obseq > 0 && *obseq <= round_start_msg_id {
+                    let all_refs: Vec<&(f64, String, i64)> = win_outs.iter().collect();
+                    // INVARIANT: Record every completed window in `simplify_history` (unfiltered by current `round_start_msg_id` / `current_diff_hash`) so prior candidate versions retain historical simplify evidence.
+                    let hist_pair = eval_win_outs(&all_refs, win_ts);
+                    if let Some((ref hist_ev, _)) = hist_pair {
+                        ev.simplify_history.push(hist_ev.clone());
+                    }
+                    let mut fresh_refs: Vec<&(f64, String, i64)> =
+                        Vec::with_capacity(win_outs.len());
+                    for item in win_outs {
+                        let (_, ref otxt, obseq) = *item;
+                        if round_start_msg_id > 0 && obseq > 0 && obseq <= round_start_msg_id {
                             continue;
                         }
                         if !current_diff_hash.is_empty() {
@@ -1655,67 +1719,22 @@ pub fn scan_swarm_activity(
                                 continue;
                             }
                         }
-                        fresh_win_outs.push((*ots, otxt.clone(), *obseq));
+                        fresh_refs.push(item);
                     }
-                    if fresh_win_outs.is_empty() {
-                        continue;
-                    }
-                    let joined_win = fresh_win_outs
-                        .iter()
-                        .map(|x| x.1.as_str())
-                        .collect::<Vec<&str>>()
-                        .join("\n\n");
-                    let win_parsed = cwg_common::parse_simplify_verdict(
-                        &joined_win,
-                        Some(slens.as_deref().unwrap_or("")),
-                    );
-                    if val_to_str(win_parsed.get("verdict")).is_empty() {
-                        continue;
-                    }
-                    let s_ts = fresh_win_outs
-                        .iter()
-                        .filter(|(_, otxt, _)| {
-                            let p = cwg_common::parse_simplify_verdict(otxt, None);
-                            !val_to_str(p.get("verdict")).is_empty()
-                        })
-                        .map(|(ots, _, _)| *ots)
-                        .reduce(f64::max)
-                        .unwrap_or_else(|| fresh_win_outs.last().map_or(0.0, |x| x.0));
-                    let eff_lts = if win_ts > 0.0 {
-                        win_ts
-                    } else if tsum.start_ts > 0.0 {
-                        tsum.start_ts
+                    let fresh_pair = if fresh_refs.len() == win_outs.len() {
+                        hist_pair
                     } else {
-                        first_ts
+                        eval_win_outs(&fresh_refs, win_ts)
                     };
-                    let max_fresh_ots = fresh_win_outs
-                        .iter()
-                        .map(|x| x.0)
-                        .reduce(f64::max)
-                        .unwrap_or(eff_lts);
-                    let eff_ets = eff_lts.max(if s_ts > 0.0 { s_ts } else { max_fresh_ots });
-                    let has_explicit_all = json_truthy(win_parsed.get("has_explicit_all"));
-                    if json_truthy(win_parsed.get("multi_lens_spoof"))
-                        || (skind == "combined"
-                            && !has_explicit_all
-                            && !simplify_combined_name_re().is_match(mname.trim()))
-                    {
-                        ev.multi_lens_spoof = true;
-                        if eff_ets > ev.multi_lens_spoof_ts {
-                            ev.multi_lens_spoof_ts = eff_ets;
+                    if let Some((sev, spoof)) = fresh_pair {
+                        if spoof {
+                            ev.multi_lens_spoof = true;
+                            if sev.end_ts > ev.multi_lens_spoof_ts {
+                                ev.multi_lens_spoof_ts = sev.end_ts;
+                            }
                         }
+                        simplify_events.push(sev);
                     }
-                    let max_seq = fresh_win_outs.iter().map(|x| x.2).max().unwrap_or(0);
-                    simplify_events.push(SimplifyEvent {
-                        kind: skind.to_string(),
-                        lens: if skind == "lens" { slens.clone() } else { None },
-                        tier: tier.to_string(),
-                        launch_ts: eff_lts,
-                        end_ts: eff_ets,
-                        seq: max_seq,
-                        clean: json_truthy(win_parsed.get("clean")),
-                        has_explicit_all,
-                    });
                 }
             }
             continue;
@@ -1791,12 +1810,8 @@ pub fn scan_swarm_activity(
     }
 
     // INVARIANT: Replay simplify events in chronological order across all workers so a stale CLEAN in another member entry can never survive or overwrite a later ACTIONABLE_FIXES verdict.
-    simplify_events.sort_by(|a, b| {
-        a.end_ts
-            .total_cmp(&b.end_ts)
-            .then_with(|| a.seq.cmp(&b.seq))
-            .then_with(|| a.launch_ts.total_cmp(&b.launch_ts))
-    });
+    simplify_events.sort_by(SimplifyHistoryItem::chrono_cmp);
+    ev.simplify_history.sort_by(SimplifyHistoryItem::chrono_cmp);
     for sev in simplify_events {
         if !sev.clean {
             if sev.kind == "lens" {
@@ -1805,16 +1820,12 @@ pub fn scan_swarm_activity(
                     ev.sonnet_lenses_end.remove(sl);
                     ev.fallback_lenses.remove(sl);
                     ev.fallback_lenses_end.remove(sl);
-                    ev.simplify_history
-                        .retain(|item| !(item.kind == "lens" && item.lens.as_deref() == Some(sl)));
                 }
             } else {
                 ev.sonnet_combined_ts = 0.0;
                 ev.sonnet_combined_end_ts = 0.0;
                 ev.fallback_combined_ts = 0.0;
                 ev.fallback_combined_end_ts = 0.0;
-                ev.simplify_history
-                    .retain(|item| item.kind != "combined");
             }
             continue;
         }
@@ -1839,14 +1850,6 @@ pub fn scan_swarm_activity(
             ev.fallback_combined_ts = ev.fallback_combined_ts.max(sev.launch_ts);
             ev.fallback_combined_end_ts = ev.fallback_combined_end_ts.max(sev.end_ts);
         }
-        ev.simplify_history.push(SimplifyHistoryItem {
-            kind: sev.kind.clone(),
-            lens: if sev.kind == "lens" { sev.lens } else { None },
-            tier: sev.tier,
-            launch_ts: sev.launch_ts,
-            end_ts: sev.end_ts,
-            has_explicit_all: sev.has_explicit_all,
-        });
     }
 
     if !ev.in_flight_workers.is_empty() {
@@ -2165,6 +2168,8 @@ pub fn scan_native_subagents(
                                     tier: "fallback".to_string(),
                                     launch_ts: eff_launch_ts,
                                     end_ts: eff_end_ts,
+                                    seq: 0,
+                                    clean: true,
                                     has_explicit_all: false,
                                 });
                             }
@@ -2177,6 +2182,8 @@ pub fn scan_native_subagents(
                                 tier: "fallback".to_string(),
                                 launch_ts: eff_launch_ts,
                                 end_ts: eff_end_ts,
+                                seq: 0,
+                                clean: true,
                                 has_explicit_all: true,
                             });
                         }
@@ -2239,28 +2246,19 @@ pub fn scan_native_subagents(
     ev
 }
 
-pub fn is_review_fresh(review: &Value, marker: &Value) -> bool {
-    let marks: Vec<&Map<String, Value>> = marker
-        .get("content_marks")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_object()).collect())
-        .unwrap_or_default();
+fn mark_fp(m: &Map<String, Value>) -> Option<&str> {
+    m.get("fp").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+}
+
+fn is_review_fresh_marks(launch_ts: f64, marks: &[&Map<String, Value>]) -> bool {
     if marks.is_empty() {
         return true;
     }
-    let launch_ts = val_to_f64(review.get("launch_ts"));
-    let fp_of = |m: &Map<String, Value>| -> Option<String> {
-        m.get("fp")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-    };
-
     // INVARIANT: A mark with a concrete SHA-256 `fp` is cryptographically measured; only `fp is None` is unmeasured.
-    let mut covered_fps: HashSet<String> = HashSet::new();
-    for m in &marks {
+    let mut covered_fps: HashSet<&str> = HashSet::new();
+    for m in marks {
         let mts = val_to_f64(m.get("ts"));
-        if let Some(fp) = fp_of(m) {
+        if let Some(fp) = mark_fp(m) {
             if mts <= launch_ts {
                 covered_fps.insert(fp);
             }
@@ -2268,11 +2266,54 @@ pub fn is_review_fresh(review: &Value, marker: &Value) -> bool {
             return false;
         }
     }
-    let current_mark = marks[marks.len() - 1];
-    let Some(cur_fp) = fp_of(current_mark) else {
+    let Some(cur_fp) = mark_fp(marks[marks.len() - 1]) else {
         return false;
     };
-    covered_fps.contains(&cur_fp)
+    covered_fps.contains(cur_fp)
+}
+
+pub fn is_review_fresh(review: &Value, marker: &Value) -> bool {
+    let marks: Vec<&Map<String, Value>> = marker
+        .get("content_marks")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_object()).collect())
+        .unwrap_or_default();
+    is_review_fresh_marks(val_to_f64(review.get("launch_ts")), &marks)
+}
+
+fn closure_ready_tail_ok(
+    effective_risk: &str,
+    ord_list: &[Value],
+    cls_rev: &Value,
+    allow_approved: bool,
+) -> bool {
+    if ord_list.is_empty() || val_to_str(cls_rev.get("verdict")) != "READY" {
+        return false;
+    }
+    if !allow_approved && ord_list.len() != MAX_REVIEW_ROUNDS {
+        return false;
+    }
+    if effective_risk == "XHIGH" && !json_truthy(cls_rev.get("xhigh")) {
+        return false;
+    }
+    let Some(last_ord) = ord_list.last() else {
+        return false;
+    };
+    let lv = val_to_str(last_ord.get("verdict"));
+    if allow_approved && lv == "APPROVED" {
+        if effective_risk == "XHIGH" && !json_truthy(last_ord.get("xhigh")) {
+            return false;
+        }
+    } else if lv == "REVISE" || lv == "ESCALATE" {
+        if ord_list.len() < MAX_REVIEW_ROUNDS {
+            return false;
+        }
+    } else {
+        return false;
+    }
+    let last_ord_vts = val_to_f64(last_ord.get("launch_ts"))
+        .max(val_to_f64(last_ord.get("verdict_ts")));
+    val_to_f64(cls_rev.get("launch_ts")) >= last_ord_vts
 }
 
 fn steps_have_index_gap(step_list: &[Value]) -> bool {
@@ -2495,6 +2536,8 @@ struct ClosureEvalCtx<'a> {
     swarm_ev: &'a SwarmEvidence,
     codex_bin_missing_cache: Option<bool>,
     breaker_info_cache: Option<Value>,
+    sim_ver_cache: HashMap<(u64, i64), bool>,
+    inv_ts_cache: HashMap<(u64, u64), Option<f64>>,
 }
 
 impl<'a> ClosureEvalCtx<'a> {
@@ -2549,47 +2592,43 @@ impl<'a> ClosureEvalCtx<'a> {
         true
     }
 
-    fn has_completed_simplify_for_version(&mut self, rev_item: &Value) -> bool {
-        if !self.needs_simplify {
-            return true;
-        }
-        if !self.active_simplify_windows.is_empty() && self.is_after_simplify(rev_item) {
-            return true;
-        }
-        let rev_launch_ts = val_to_f64(rev_item.get("launch_ts"));
-        if let Some(rev_step_idx) = rev_item
-            .get("step_idx")
-            .and_then(|v| v.as_i64())
-            .filter(|&x| x >= 0)
-        {
-            if self.all_simplify_steps.contains(&(rev_step_idx as usize)) {
-                return false;
-            }
-        }
-
+    fn version_edit_bounds(&mut self, rev_launch_ts: f64) -> Option<(f64, f64)> {
         let marks_before: Vec<&Map<String, Value>> = self
             .candidate_marks
             .iter()
             .copied()
             .filter(|m| val_to_f64(m.get("ts")) <= rev_launch_ts)
             .collect();
-        let (rev_edit_ts, next_edit_ts): (f64, f64) = if !marks_before.is_empty() {
-            let rev_fp = marks_before[marks_before.len() - 1].get("fp");
-            let r_edit = marks_before
-                .iter()
-                .filter(|m| m.get("fp") == rev_fp)
-                .map(|m| val_to_f64(m.get("ts")))
-                .reduce(f64::min)
-                .unwrap_or(0.0);
+        if !marks_before.is_empty() {
+            let last_mark = marks_before[marks_before.len() - 1];
+            if let Some(fp_s) = mark_fp(last_mark) {
+                let r_edit = marks_before
+                    .iter()
+                    .filter(|m| mark_fp(m) == Some(fp_s))
+                    .map(|m| val_to_f64(m.get("ts")))
+                    .reduce(f64::min)
+                    .unwrap_or(0.0);
+                let n_edit = self
+                    .candidate_marks
+                    .iter()
+                    .filter(|m| val_to_f64(m.get("ts")) > rev_launch_ts && mark_fp(m) != Some(fp_s))
+                    .map(|m| val_to_f64(m.get("ts")))
+                    .reduce(f64::min)
+                    .unwrap_or(f64::INFINITY);
+                return Some((r_edit, n_edit));
+            }
+            // INVARIANT: Two `fp: null` marks are never proven equal; isolate the exact mark timestamp and treat any subsequent mark as a new version.
+            let r_edit = val_to_f64(last_mark.get("ts"));
             let n_edit = self
                 .candidate_marks
                 .iter()
-                .filter(|m| val_to_f64(m.get("ts")) > rev_launch_ts && m.get("fp") != rev_fp)
                 .map(|m| val_to_f64(m.get("ts")))
+                .filter(|&mts| mts > rev_launch_ts)
                 .reduce(f64::min)
                 .unwrap_or(f64::INFINITY);
-            (r_edit, n_edit)
-        } else if self.marks_truncated {
+            return Some((r_edit, n_edit));
+        }
+        if self.marks_truncated {
             let tx_ev = self.get_tx_edits();
             let mut r_edit = self.first_ts_val;
             for (sts, ets) in &tx_ev.edit_spans {
@@ -2598,7 +2637,7 @@ impl<'a> ClosureEvalCtx<'a> {
                 }
             }
             if tx_ev.covered_from_ts > r_edit + 1.0 {
-                return false;
+                return None;
             }
             let mut n_edit = f64::INFINITY;
             for (sts, _) in &tx_ev.edit_spans {
@@ -2612,55 +2651,88 @@ impl<'a> ClosureEvalCtx<'a> {
                     n_edit = mts;
                 }
             }
-            (r_edit, n_edit)
-        } else {
-            let n_edit = self
-                .candidate_marks
-                .iter()
-                .map(|m| val_to_f64(m.get("ts")))
-                .filter(|&mts| mts > rev_launch_ts)
-                .reduce(f64::min)
-                .unwrap_or(f64::INFINITY);
-            (self.first_ts_val, n_edit)
-        };
-
-        let ver_runs: Vec<&SimplifyHistoryItem> = self
-            .all_simplify_history
+            return Some((r_edit, n_edit));
+        }
+        let n_edit = self
+            .candidate_marks
             .iter()
-            .filter(|sr| {
-                (sr.tier == "sonnet" || (self.sonnet_issue && sr.tier == "fallback"))
-                    && (rev_edit_ts - 1e-6) <= sr.launch_ts
-                    && sr.launch_ts < next_edit_ts
-            })
-            .collect();
-        if ver_runs.is_empty() {
+            .map(|m| val_to_f64(m.get("ts")))
+            .filter(|&mts| mts > rev_launch_ts)
+            .reduce(f64::min)
+            .unwrap_or(f64::INFINITY);
+        Some((self.first_ts_val, n_edit))
+    }
+
+    fn is_allowed_simplify_tier(&self, tier: &str) -> bool {
+        tier == "sonnet" || (self.sonnet_issue && tier == "fallback")
+    }
+
+    fn has_completed_simplify_for_version(&mut self, rev_item: &Value) -> bool {
+        if !self.needs_simplify {
+            return true;
+        }
+        if !self.active_simplify_windows.is_empty() && self.is_after_simplify(rev_item) {
+            return true;
+        }
+        let rev_launch_ts = val_to_f64(rev_item.get("launch_ts"));
+        let rev_step_key = rev_item
+            .get("step_idx")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(-1);
+        let cache_key = (rev_launch_ts.to_bits(), rev_step_key);
+        if let Some(&cached) = self.sim_ver_cache.get(&cache_key) {
+            return cached;
+        }
+        if rev_step_key >= 0 && self.all_simplify_steps.contains(&(rev_step_key as usize)) {
+            self.sim_ver_cache.insert(cache_key, false);
             return false;
         }
-        let mut completed: Vec<&SimplifyHistoryItem> = Vec::new();
-        for sr in ver_runs {
+
+        let Some((rev_edit_ts, next_edit_ts)) = self.version_edit_bounds(rev_launch_ts) else {
+            self.sim_ver_cache.insert(cache_key, false);
+            return false;
+        };
+
+        let mut any_in_ver = false;
+        let mut done_lenses: HashSet<String> = HashSet::new();
+        let mut done_combined = false;
+        for sr in self.all_simplify_history {
+            if !self.is_allowed_simplify_tier(&sr.tier)
+                || sr.launch_ts < rev_edit_ts - 1e-6
+                || sr.launch_ts >= next_edit_ts
+            {
+                continue;
+            }
+            any_in_ver = true;
             let s_lts = sr.launch_ts;
             let s_ets = s_lts.max(sr.end_ts);
             if s_lts <= rev_launch_ts && rev_launch_ts < s_ets {
+                self.sim_ver_cache.insert(cache_key, false);
                 return false;
             }
             if s_lts < rev_launch_ts {
-                completed.push(sr);
+                if !sr.clean {
+                    if sr.kind == "lens" {
+                        if let Some(ref sl) = sr.lens {
+                            done_lenses.remove(sl);
+                        }
+                    } else {
+                        done_combined = false;
+                    }
+                } else if sr.kind == "lens" {
+                    if let Some(ref sl) = sr.lens {
+                        done_lenses.insert(sl.clone());
+                    }
+                } else if sr.has_explicit_all {
+                    done_combined = true;
+                }
             }
         }
-        if self.allow_combined
-            && !self.multi_lens_spoof
-            && completed
-                .iter()
-                .any(|sr| sr.kind == "combined" && sr.has_explicit_all)
-        {
-            return true;
-        }
-        let done_lenses: HashSet<String> = completed
-            .iter()
-            .filter(|sr| sr.kind == "lens")
-            .filter_map(|sr| sr.lens.clone())
-            .collect();
-        done_lenses.is_superset(self.required_lenses)
+        let res = any_in_ver
+            && ((self.allow_combined && !self.multi_lens_spoof && done_combined)
+                || done_lenses.is_superset(self.required_lenses));
+        self.sim_ver_cache.insert(cache_key, res);
+        res
     }
 
     fn is_round_after_its_simplify(&mut self, rev_item: &Value) -> bool {
@@ -2777,45 +2849,58 @@ impl<'a> ClosureEvalCtx<'a> {
     }
 
     fn invalidated_at_ts(&mut self, rev_item: &Value) -> Option<f64> {
+        let app_lts = val_to_f64(rev_item.get("launch_ts"));
+        let app_vts = app_lts.max(val_to_f64(rev_item.get("verdict_ts")));
+        let cache_key = (app_lts.to_bits(), app_vts.to_bits());
+        if let Some(&cached) = self.inv_ts_cache.get(&cache_key) {
+            return cached;
+        }
+        let res = self.compute_invalidated_at_ts(rev_item, app_lts, app_vts);
+        self.inv_ts_cache.insert(cache_key, res);
+        res
+    }
+
+    fn compute_invalidated_at_ts(
+        &mut self,
+        rev_item: &Value,
+        app_lts: f64,
+        app_vts: f64,
+    ) -> Option<f64> {
         if self.candidate_marks.is_empty() || is_review_fresh(rev_item, self.marker) {
             return None;
         }
-        let app_lts = val_to_f64(rev_item.get("launch_ts"));
-        let app_vts = app_lts.max(val_to_f64(rev_item.get("verdict_ts")));
         // INVARIANT: Approval/READY must still be fresh at `verdict_ts`; mid-review edits (`launch_ts < ts <= verdict_ts`) mean the verdict arrived already stale and cannot reset `MAX_REVIEW_ROUNDS`.
-        let marks_by_verdict: Vec<Value> = self
+        let marks_by_verdict: Vec<&Map<String, Value>> = self
             .candidate_marks
             .iter()
+            .copied()
             .filter(|m| val_to_f64(m.get("ts")) <= app_vts)
-            .map(|m| Value::Object((*m).clone()))
             .collect();
         if !marks_by_verdict.is_empty() {
-            let synthetic_marker = json!({ "content_marks": marks_by_verdict });
-            if !is_review_fresh(rev_item, &synthetic_marker) {
+            let last_by_v = marks_by_verdict[marks_by_verdict.len() - 1];
+            if mark_fp(last_by_v).is_some() {
+                if !is_review_fresh_marks(app_lts, &marks_by_verdict) {
+                    return None;
+                }
+            } else if json_truthy(last_by_v.get("unknown"))
+                || marks_by_verdict
+                    .iter()
+                    .any(|m| val_to_f64(m.get("ts")) > app_lts)
+            {
+                // INVARIANT: Historical `fp: null` marks (superseded by later marks) were valid at `app_vts` only when non-unknown and zero marks occurred in `(app_lts, app_vts]`.
                 return None;
             }
-            let covered_fps: HashSet<String> = marks_by_verdict
+            let covered_fps: HashSet<&str> = marks_by_verdict
                 .iter()
                 .filter(|m| val_to_f64(m.get("ts")) <= app_lts)
-                .filter_map(|m| {
-                    m.get("fp")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string())
-                })
+                .filter_map(|m| mark_fp(m))
                 .collect();
             for m in self.candidate_marks {
                 let mts = val_to_f64(m.get("ts"));
                 if mts <= app_vts {
                     continue;
                 }
-                let mfp = m
-                    .get("fp")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty());
-                if mfp.map_or(false, |s| !covered_fps.contains(s))
-                    || (mfp.is_none() && json_truthy(m.get("unknown")))
-                {
+                if mark_fp(m).map_or(true, |s| !covered_fps.contains(s)) {
                     return Some(mts);
                 }
             }
@@ -2887,67 +2972,68 @@ impl<'a> ClosureEvalCtx<'a> {
     }
 
     fn is_valid_cycle_closure_ready(&mut self, ord_list: &[Value], cls_rev: &Value) -> bool {
-        if ord_list.len() != MAX_REVIEW_ROUNDS || val_to_str(cls_rev.get("verdict")) != "READY" {
+        if !closure_ready_tail_ok(self.effective_risk, ord_list, cls_rev, false) {
             return false;
         }
         if self.has_prior_terminal_approval(ord_list) {
             return false;
         }
-        if self.effective_risk == "XHIGH" && !json_truthy(cls_rev.get("xhigh")) {
-            return false;
-        }
         if !self.has_completed_simplify_for_version(cls_rev) {
             return false;
         }
-        if !ord_list
+        ord_list
             .iter()
             .all(|r| self.has_completed_simplify_for_version(r))
-        {
+    }
+
+    fn is_valid_swarm_v2_cycle_closure_ready(
+        &mut self,
+        ord_list: &[Value],
+        pre_simplify_only: bool,
+        cls_rev: &Value,
+    ) -> bool {
+        // INVARIANT: Swarm 2.0 `ORDINARY -> SIMPLIFY -> CLOSURE READY` resets the cycle on post-READY edits without laundering over-limit or mixed post-simplify cycles.
+        self.needs_simplify
+            && pre_simplify_only
+            && closure_ready_tail_ok(self.effective_risk, ord_list, cls_rev, true)
+            && self.has_completed_simplify_for_version(cls_rev)
+    }
+
+    fn was_invalidated_by_simplify_findings(&mut self, rev_item: &Value) -> bool {
+        if self.invalidated_at_ts(rev_item).is_none() {
             return false;
         }
-        let Some(last_ord) = ord_list.last() else {
+        let rev_lts = val_to_f64(rev_item.get("launch_ts"));
+        let rev_vts = rev_lts.max(val_to_f64(rev_item.get("verdict_ts")));
+        let Some((_, next_edit_ts)) = self.version_edit_bounds(rev_lts) else {
             return false;
         };
-        let lv = val_to_str(last_ord.get("verdict"));
-        if lv != "REVISE" && lv != "ESCALATE" {
-            return false;
-        }
-        let last_ord_vts = val_to_f64(last_ord.get("launch_ts"))
-            .max(val_to_f64(last_ord.get("verdict_ts")));
-        val_to_f64(cls_rev.get("launch_ts")) >= last_ord_vts
+        next_edit_ts.is_finite()
+            && self.all_simplify_history.iter().any(|sr| {
+                let sr_ets = sr.launch_ts.max(sr.end_ts);
+                !sr.clean
+                    && self.is_allowed_simplify_tier(&sr.tier)
+                    && sr.launch_ts >= rev_vts - 1e-6
+                    && sr_ets <= next_edit_ts
+            })
     }
 
     fn is_version_simplify_measured(&mut self, rev_item: &Value) -> bool {
-        let rev_launch_ts = val_to_f64(rev_item.get("launch_ts"));
-        if self
-            .candidate_marks
-            .iter()
-            .any(|m| val_to_f64(m.get("ts")) <= rev_launch_ts)
-        {
-            return true;
-        }
-        if !self.marks_truncated {
-            return true;
-        }
-        let tx_ev = self.get_tx_edits();
-        let mut rev_edit_ts = self.first_ts_val;
-        for (sts, ets) in &tx_ev.edit_spans {
-            if *sts <= rev_launch_ts && *ets > rev_edit_ts {
-                rev_edit_ts = *ets;
-            }
-        }
-        tx_ev.covered_from_ts <= rev_edit_ts + 1.0
+        self.version_edit_bounds(val_to_f64(rev_item.get("launch_ts")))
+            .is_some()
     }
 
     fn counts_toward_round_cap(&mut self, rev_item: &Value) -> bool {
-        if !(self.needs_simplify && !self.active_simplify_windows.is_empty()) {
+        if !(self.needs_simplify
+            && (!self.active_simplify_windows.is_empty() || !self.all_simplify_history.is_empty()))
+        {
             return true;
         }
         if self.is_round_after_its_simplify(rev_item) {
             return true;
         }
         if val_to_str(rev_item.get("verdict")) == "APPROVED" {
-            return true;
+            return !self.was_invalidated_by_simplify_findings(rev_item);
         }
         // SAFETY: Fail closed when truncated marks + transcript gap leave an older round's simplify state unmeasured.
         !self.is_version_simplify_measured(rev_item)
@@ -3353,6 +3439,7 @@ pub fn validate_candidate_closure(
     all_simplify_steps.extend(sub_ev.simplify_launch_steps.iter().copied());
     let mut all_simplify_history: Vec<SimplifyHistoryItem> = swarm_ev.simplify_history.clone();
     all_simplify_history.extend(sub_ev.simplify_history.iter().cloned());
+    all_simplify_history.sort_by(SimplifyHistoryItem::chrono_cmp);
 
     let candidate_marks: Vec<&Map<String, Value>> = marker
         .get("content_marks")
@@ -3394,6 +3481,8 @@ pub fn validate_candidate_closure(
         swarm_ev,
         codex_bin_missing_cache: None,
         breaker_info_cache: None,
+        sim_ver_cache: HashMap::new(),
+        inv_ts_cache: HashMap::new(),
     };
 
     let aborted_codex_map = &swarm_ev.aborted_codex_reviews;
@@ -3505,7 +3594,12 @@ pub fn validate_candidate_closure(
                 .cloned()
                 .collect();
             if within_cycle_ordinary_caps(cycle_counted_ordinary_n, &cycle_raw_ordinary)
-                && eval.is_valid_cycle_closure_ready(&valid_so_far, rev)
+                && (eval.is_valid_cycle_closure_ready(&valid_so_far, rev)
+                    || eval.is_valid_swarm_v2_cycle_closure_ready(
+                        &cycle_raw_ordinary,
+                        valid_so_far.is_empty(),
+                        rev,
+                    ))
             {
                 pending_reset_ts = eval.invalidated_at_ts(rev);
                 pending_reset_kind = if pending_reset_ts.is_some() {
@@ -3702,16 +3796,10 @@ pub fn validate_candidate_closure(
         if !(needs_simplify && !active_simplify_windows.is_empty()) {
             return false;
         }
-        if val_to_str(cls_rev.get("verdict")) != "READY" {
-            return false;
-        }
-        if effective_risk == "XHIGH" && !json_truthy(cls_rev.get("xhigh")) {
-            return false;
-        }
         if !after_sim || !is_review_fresh(cls_rev, marker) {
             return false;
         }
-        if ord_list.is_empty() || ord_list.len() > MAX_REVIEW_ROUNDS {
+        if !closure_ready_tail_ok(&effective_risk, ord_list, cls_rev, true) {
             return false;
         }
         if !post_simplify_ordinary.is_empty() || !post_simplify_ineligible.is_empty() {
@@ -3722,28 +3810,10 @@ pub fn validate_candidate_closure(
             .map(|w| w.0)
             .reduce(f64::min)
             .unwrap_or(0.0);
-        if min_sim_ts <= 0.0 {
-            return false;
-        }
-        if ord_list
-            .iter()
-            .any(|r| val_to_f64(r.get("launch_ts")) >= min_sim_ts)
-        {
-            return false;
-        }
-        let Some(last_ord) = ord_list.last() else {
-            return false;
-        };
-        let last_ord_v = val_to_str(last_ord.get("verdict"));
-        if !matches!(last_ord_v.as_str(), "APPROVED" | "REVISE" | "ESCALATE") {
-            return false;
-        }
-        if last_ord_v != "APPROVED" && ord_list.len() != MAX_REVIEW_ROUNDS {
-            return false;
-        }
-        let last_ord_vts = val_to_f64(last_ord.get("launch_ts"))
-            .max(val_to_f64(last_ord.get("verdict_ts")));
-        val_to_f64(cls_rev.get("launch_ts")) >= last_ord_vts
+        min_sim_ts > 0.0
+            && !ord_list
+                .iter()
+                .any(|r| val_to_f64(r.get("launch_ts")) >= min_sim_ts)
     };
 
     let closure_ready_rev: Option<&Value> = latest_cls_rev.filter(|&cls_rev| {
@@ -4995,6 +5065,8 @@ mod tests {
             tier: "sonnet".to_string(),
             launch_ts: 125.0,
             end_ts: 128.0,
+            seq: 0,
+            clean: true,
             has_explicit_all: true,
         });
         let codex_revs = vec![json!({

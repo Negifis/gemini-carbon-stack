@@ -173,6 +173,50 @@ class SwarmV2TestCase(unittest.TestCase):
             },
         )
 
+    @staticmethod
+    def _empty_sub_ev() -> dict[str, object]:
+        return {
+            "reviews": [],
+            "fallback_lenses": {},
+            "fallback_lenses_end": {},
+            "fallback_combined_ts": 0.0,
+            "fallback_combined_end_ts": 0.0,
+            "simplify_launch_steps": set(),
+            "simplify_history": [],
+            "simplify_failures": 0,
+            "review_failures": [],
+            "in_flight_subagents": [],
+        }
+
+    @staticmethod
+    def _empty_swarm_ev() -> dict[str, object]:
+        return {
+            "sonnet_lenses": {},
+            "fallback_lenses": {},
+            "sonnet_lenses_end": {},
+            "fallback_lenses_end": {},
+            "sonnet_combined_ts": 0.0,
+            "fallback_combined_ts": 0.0,
+            "sonnet_combined_end_ts": 0.0,
+            "fallback_combined_end_ts": 0.0,
+            "simplify_launch_steps": set(),
+            "simplify_history": [],
+            "simplify_failures": 0,
+            "reviews": [],
+            "review_failures": [],
+            "in_flight_workers": [],
+            "idle_unkilled_workers": [],
+            "pending_bg_tasks": [],
+            "opus_issue_verified": False,
+            "opus_issue_ts": 0.0,
+            "sonnet_issue_verified": False,
+            "codex_cmd_failed": False,
+            "codex_issue_ts": 0.0,
+            "codex_issue_step": -1,
+            "aborted_codex_reviews": {},
+            "multi_lens_spoof": False,
+        }
+
     def test_01_anom_94b1b435_verdict_parser_variants_and_template_rejection(self) -> None:
         # Single-line period/comma/semicolon/space & case-insensitive
         p1 = gate_inbox.parse_simplify_verdict("@coordinator SIMPLIFY_LENS: REUSE. SIMPLIFY_VERDICT: CLEAN.")
@@ -346,8 +390,8 @@ class SwarmV2TestCase(unittest.TestCase):
         cctx = cwg.resolve_candidate_context(marker)
         receipt = {"kind": "verified", "risk": "HIGH"}
         checks_ev = cwg_stop.read_checks_evidence(self.conv_id, t0)
-        empty_sub = {"reviews": [], "fallback_lenses": {}, "fallback_lenses_end": {}, "fallback_combined_ts": 0.0, "fallback_combined_end_ts": 0.0, "simplify_launch_steps": set(), "simplify_history": [], "simplify_failures": 0, "review_failures": [], "in_flight_subagents": []}
-        empty_sw = {"sonnet_lenses": {}, "fallback_lenses": {}, "sonnet_lenses_end": {}, "fallback_lenses_end": {}, "sonnet_combined_ts": 0.0, "fallback_combined_ts": 0.0, "sonnet_combined_end_ts": 0.0, "fallback_combined_end_ts": 0.0, "simplify_launch_steps": set(), "simplify_history": [], "simplify_failures": 0, "reviews": [], "review_failures": [], "in_flight_workers": [], "idle_unkilled_workers": [], "pending_bg_tasks": [], "opus_issue_verified": False, "opus_issue_ts": 0.0, "sonnet_issue_verified": False, "codex_cmd_failed": False, "codex_issue_ts": 0.0, "codex_issue_step": -1, "aborted_codex_reviews": {}, "multi_lens_spoof": False}
+        empty_sub = self._empty_sub_ev()
+        empty_sw = self._empty_swarm_ev()
 
         # Step A: Nothing run yet -> blocks asking for PRIMARY REVIEW BEFORE simplify!
         ok0, why0 = cwg_stop.validate_candidate_closure(receipt, marker, checks_ev, empty_sub, empty_sw, [], ctx=cctx)
@@ -790,6 +834,112 @@ class SwarmV2TestCase(unittest.TestCase):
         self.assertEqual(parsed_ru["lens"], "quality")
         self.assertFalse(parsed_ru["has_explicit_all"])
         self.assertTrue(parsed_ru["clean"])
+
+    def test_08_swarm_v2_closure_ready_cycle_reset_and_history_retention(self) -> None:
+        # INVARIANT: Swarm 2.0 `ORDINARY -> SIMPLIFY -> CLOSURE READY` resets review caps on post-READY edits, and later non-CLEAN rounds do not erase earlier version history.
+        t0 = 1000.0
+        sec_paths = [str(self.workspace / f"auth_{k}.py") for k in ("a", "b", "c")]
+        marker = {
+            "session": self.conv_id,
+            "cwd": str(self.workspace),
+            "git_root": str(self.workspace),
+            "paths": sec_paths,
+            "first_ts": t0,
+            "last_ts": t0 + 300.0,
+            "last_durable_ts": t0 + 300.0,
+            "content_marks": [
+                {"ts": t0, "fp": None},
+                {"ts": t0 + 200.0, "fp": "fp-m2-v1"},
+                {"ts": t0 + 300.0, "fp": "fp-m2-v2"},
+            ],
+        }
+        checks_ev = {
+            "checks": [{"kind": "check", "passed": True, "ts": t0 + 310.0}],
+            "passed_count": 1,
+            "failed_count": 0,
+            "latest_pass_ts": t0 + 310.0,
+            "latest_fail_ts": 0.0,
+        }
+        empty_sub = self._empty_sub_ev()
+        swarm_ev = dict(
+            self._empty_swarm_ev(),
+            sonnet_lenses={"reuse": t0 + 330.0, "quality": t0 + 330.0, "efficiency": t0 + 330.0},
+            sonnet_lenses_end={"reuse": t0 + 335.0, "quality": t0 + 335.0, "efficiency": t0 + 335.0},
+            simplify_history=[
+                {"kind": "lens", "lens": lns, "tier": "sonnet", "launch_ts": t0 + 50.0, "end_ts": t0 + 55.0, "seq": 10, "clean": True}
+                for lns in ("reuse", "quality", "efficiency")
+            ]
+            + [
+                {"kind": "lens", "lens": "quality", "tier": "sonnet", "launch_ts": t0 + 250.0, "end_ts": t0 + 255.0, "seq": 20, "clean": False},
+            ]
+            + [
+                {"kind": "lens", "lens": lns, "tier": "sonnet", "launch_ts": t0 + 330.0, "end_ts": t0 + 335.0, "seq": 30, "clean": True}
+                for lns in ("reuse", "quality", "efficiency")
+            ],
+        )
+        revs = [
+            {"engine": "codex", "kind": "ordinary", "verdict": "REVISE", "launch_ts": t0 + 5.0, "verdict_ts": t0 + 8.0, "xhigh": False},
+            {"engine": "codex", "kind": "ordinary", "verdict": "REVISE", "launch_ts": t0 + 12.0, "verdict_ts": t0 + 15.0, "xhigh": False},
+            {"engine": "codex", "kind": "ordinary", "verdict": "REVISE", "launch_ts": t0 + 20.0, "verdict_ts": t0 + 25.0, "xhigh": False},
+            {"engine": "codex", "kind": "ordinary", "verdict": "APPROVED", "launch_ts": t0 + 30.0, "verdict_ts": t0 + 35.0, "xhigh": False},
+            {"engine": "codex", "kind": "closure", "verdict": "READY", "launch_ts": t0 + 60.0, "verdict_ts": t0 + 65.0, "xhigh": False},
+            {"engine": "codex", "kind": "ordinary", "verdict": "REVISE", "launch_ts": t0 + 210.0, "verdict_ts": t0 + 215.0, "xhigh": False},
+            {"engine": "codex", "kind": "ordinary", "verdict": "APPROVED", "launch_ts": t0 + 220.0, "verdict_ts": t0 + 225.0, "xhigh": False},
+            {"engine": "codex", "kind": "ordinary", "verdict": "APPROVED", "launch_ts": t0 + 315.0, "verdict_ts": t0 + 320.0, "xhigh": False},
+            {"engine": "codex", "kind": "closure", "verdict": "READY", "launch_ts": t0 + 340.0, "verdict_ts": t0 + 345.0, "xhigh": False},
+        ]
+        self.assertEqual(
+            cwg_stop.validate_candidate_closure({"kind": "verified", "risk": "HIGH"}, marker, checks_ev, empty_sub, swarm_ev, revs),
+            (True, "verified"),
+        )
+
+        # INVARIANT: Non-CLEAN simplify finishing AFTER an edit (`launch_ts < edit_ts < end_ts`) must NOT exempt the preceding APPROVED from `MAX_REVIEW_ROUNDS`.
+        late_marker = dict(
+            marker,
+            last_ts=t0 + 300.0,
+            last_durable_ts=t0 + 300.0,
+            content_marks=[
+                {"ts": t0, "fp": "fp-l1"},
+                {"ts": t0 + 100.0, "fp": "fp-l2"},
+                {"ts": t0 + 200.0, "fp": "fp-l3"},
+                {"ts": t0 + 300.0, "fp": "fp-l4"},
+            ],
+        )
+        late_swarm = dict(
+            swarm_ev,
+            simplify_history=[
+                {"kind": "lens", "lens": "quality", "tier": "sonnet", "launch_ts": t0 + 80.0, "end_ts": t0 + 120.0, "seq": 1, "clean": False},
+                {"kind": "lens", "lens": "quality", "tier": "sonnet", "launch_ts": t0 + 180.0, "end_ts": t0 + 220.0, "seq": 2, "clean": False},
+                {"kind": "lens", "lens": "quality", "tier": "sonnet", "launch_ts": t0 + 280.0, "end_ts": t0 + 305.0, "seq": 3, "clean": False},
+            ]
+            + [
+                {"kind": "lens", "lens": lns, "tier": "sonnet", "launch_ts": t0 + 330.0, "end_ts": t0 + 335.0, "seq": 4, "clean": True}
+                for lns in ("reuse", "quality", "efficiency")
+            ],
+        )
+        late_revs = [
+            {"engine": "codex", "kind": "ordinary", "verdict": "APPROVED", "launch_ts": t0 + 10.0, "verdict_ts": t0 + 20.0, "xhigh": False},
+            {"engine": "codex", "kind": "ordinary", "verdict": "APPROVED", "launch_ts": t0 + 110.0, "verdict_ts": t0 + 120.0, "xhigh": False},
+            {"engine": "codex", "kind": "ordinary", "verdict": "APPROVED", "launch_ts": t0 + 210.0, "verdict_ts": t0 + 220.0, "xhigh": False},
+            {"engine": "codex", "kind": "ordinary", "verdict": "APPROVED", "launch_ts": t0 + 315.0, "verdict_ts": t0 + 320.0, "xhigh": False},
+            {"engine": "codex", "kind": "closure", "verdict": "READY", "launch_ts": t0 + 340.0, "verdict_ts": t0 + 345.0, "xhigh": False},
+        ]
+        ok_late, why_late = cwg_stop.validate_candidate_closure(
+            {"kind": "verified", "risk": "HIGH"}, late_marker, checks_ev, empty_sub, late_swarm, late_revs
+        )
+        self.assertFalse(ok_late)
+        self.assertIn("MAX_REVIEW_ROUNDS=3", why_late)
+
+        # INVARIANT: Current candidate ending in an unmeasured `fp: None` mark must fail freshness and closure verification.
+        null_tail_marker = dict(
+            marker,
+            content_marks=list(marker["content_marks"][:-1]) + [{"ts": t0 + 300.0, "fp": None}],
+        )
+        self.assertFalse(cwg_stop.is_review_fresh({"launch_ts": t0 + 340.0}, null_tail_marker))
+        ok_null, _ = cwg_stop.validate_candidate_closure(
+            {"kind": "verified", "risk": "HIGH"}, null_tail_marker, checks_ev, empty_sub, swarm_ev, revs
+        )
+        self.assertFalse(ok_null)
 
 
 if __name__ == "__main__":
