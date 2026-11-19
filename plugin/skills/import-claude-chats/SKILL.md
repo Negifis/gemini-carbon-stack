@@ -12,7 +12,7 @@ description: Triggered by /import-claude-chats to import interactive Claude Code
 Проверьте список обнаруженных интерактивных сессий и склеенных цепочек продолжений перед записью:
 
 ```powershell
-python -X utf8 "<PLUGIN_ROOT>/tools/claude_chat_importer.py" --dry-run --json
+& "<PLUGIN_ROOT>/bin/carbon-stack.exe" claude-chat-importer --dry-run --json
 ```
 
 ## 2. Полный импорт и верификация
@@ -20,8 +20,8 @@ python -X utf8 "<PLUGIN_ROOT>/tools/claude_chat_importer.py" --dry-run --json
 Выполните идемпотентный импорт (автоматически создаёт резервную копию в `<antigravity_dir>/backups/pre_claude_import`) и проверку целостности всех 5 слоёв:
 
 ```powershell
-python -X utf8 "<PLUGIN_ROOT>/tools/claude_chat_importer.py" --json
-python -X utf8 "<PLUGIN_ROOT>/tools/claude_chat_importer.py" --verify --json
+& "<PLUGIN_ROOT>/bin/carbon-stack.exe" claude-chat-importer --json
+& "<PLUGIN_ROOT>/bin/carbon-stack.exe" claude-chat-importer --verify --json
 ```
 
 Для выборочного импорта конкретных папок проектов передайте `--projects "<PROJECT_FOLDER_1>,<PROJECT_FOLDER_2>"`.
@@ -31,5 +31,5 @@ python -X utf8 "<PLUGIN_ROOT>/tools/claude_chat_importer.py" --verify --json
 Пока запущен `language_server.exe`, он периодически сбрасывает свой оперативный снимок сводок в `agyhub_summaries_proto.pb`. Если после перезапуска Antigravity новые чаты не отобразились, закройте Antigravity и выполните быструю синхронизацию из SQLite:
 
 ```powershell
-python -X utf8 "<PLUGIN_ROOT>/tools/claude_chat_importer.py" --sync-pb-only
+& "<PLUGIN_ROOT>/bin/carbon-stack.exe" claude-chat-importer --sync-pb-only
 ```

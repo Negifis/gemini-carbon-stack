@@ -43,24 +43,7 @@ fn process_ls_re() -> &'static Regex {
 }
 
 pub fn find_agy_cli() -> Option<String> {
-    for name in ["agy", "agy.exe"] {
-        if let Some(found) = code_search::which_in_path(name) {
-            return Some(found);
-        }
-    }
-    #[cfg(windows)]
-    {
-        let default_win = rio::home_dir()
-            .join("AppData")
-            .join("Local")
-            .join("agy")
-            .join("bin")
-            .join("agy.exe");
-        if default_win.is_file() {
-            return Some(default_win.to_string_lossy().into_owned());
-        }
-    }
-    None
+    rio::find_agy_cli()
 }
 
 pub fn find_rust_binary() -> Option<String> {
@@ -86,10 +69,14 @@ pub fn find_rust_binary() -> Option<String> {
         return Some(plug_bin.to_string_lossy().into_owned());
     }
     if let Ok(cur) = env::current_exe() {
-        if cur
+        let low_name = cur
             .file_name()
             .and_then(|s| s.to_str())
-            .map_or(false, |n| n.eq_ignore_ascii_case(exe_name))
+            .map(|n| n.to_ascii_lowercase())
+            .unwrap_or_default();
+        if (low_name == exe_name
+            || low_name.starts_with("carbon_stack-")
+            || low_name.starts_with("carbon-stack-"))
             && cur.is_file()
         {
             return Some(cur.to_string_lossy().into_owned());
@@ -374,7 +361,11 @@ fn collect_hook_commands(val: &Value, out: &mut Vec<String>) {
     }
 }
 
-fn inspect_hooks_json(bundle_dir: &Path, hooks_val: Option<&Value>) -> (Value, bool) {
+pub(crate) fn inspect_hooks_json_for_os(
+    bundle_dir: &Path,
+    hooks_val: Option<&Value>,
+    is_windows: bool,
+) -> (Value, bool, bool) {
     let Some(Value::Object(root)) = hooks_val else {
         return (
             json!({
@@ -387,43 +378,61 @@ fn inspect_hooks_json(bundle_dir: &Path, hooks_val: Option<&Value>) -> (Value, b
                 "missing_targets": [],
             }),
             false,
+            false,
         );
     };
 
-    let (group_name, group_obj) = if let Some(Value::Object(m)) = root.get("carbon-stack") {
-        (Some("carbon-stack"), Some(m))
-    } else if let Some(Value::Object(m)) = root.get("safety-and-quality-guards") {
-        (Some("safety-and-quality-guards"), Some(m))
-    } else {
-        (None, None)
-    };
+    let mut group_objs: Vec<&serde_json::Map<String, Value>> = Vec::new();
+    let mut group_name: Option<String> = None;
+    if root.get("carbon-stack").and_then(|v| v.as_object()).is_some() {
+        group_name = Some("carbon-stack".to_string());
+    } else if root
+        .get("safety-and-quality-guards")
+        .and_then(|v| v.as_object())
+        .is_some()
+    {
+        group_name = Some("safety-and-quality-guards".to_string());
+    }
+    for (gkey, gval) in root {
+        if let Some(gm) = gval.as_object() {
+            if HOOK_EVENTS.iter().any(|ev| gm.contains_key(*ev)) {
+                if group_name.is_none() {
+                    group_name = Some(gkey.clone());
+                }
+                group_objs.push(gm);
+            }
+        }
+    }
 
     let mut events_present: Vec<String> = Vec::new();
     let mut missing_events: Vec<String> = Vec::new();
     let mut commands: Vec<String> = Vec::new();
-    let mut safety_matcher = String::new();
+    let mut matchers_acc: Vec<String> = Vec::new();
 
-    if let Some(grp) = group_obj {
+    if !group_objs.is_empty() {
         for &ev in HOOK_EVENTS {
-            if let Some(ev_val) = grp.get(ev) {
-                let non_empty = ev_val.as_array().map_or(false, |a| !a.is_empty());
-                if non_empty {
-                    events_present.push(ev.to_string());
-                    collect_hook_commands(ev_val, &mut commands);
-                } else {
-                    missing_events.push(ev.to_string());
+            let mut found_ev = false;
+            for grp in &group_objs {
+                if let Some(ev_val) = grp.get(ev) {
+                    if ev_val.as_array().map_or(false, |a| !a.is_empty()) {
+                        found_ev = true;
+                        collect_hook_commands(ev_val, &mut commands);
+                    }
                 }
+            }
+            if found_ev {
+                events_present.push(ev.to_string());
             } else {
                 missing_events.push(ev.to_string());
             }
         }
-        if let Some(pre_arr) = grp.get("PreToolUse").and_then(|v| v.as_array()) {
-            if let Some(first_obj) = pre_arr.first().and_then(|v| v.as_object()) {
-                safety_matcher = first_obj
-                    .get("matcher")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+        for grp in &group_objs {
+            if let Some(pre_arr) = grp.get("PreToolUse").and_then(|v| v.as_array()) {
+                for item in pre_arr {
+                    if let Some(mstr) = item.get("matcher").and_then(|v| v.as_str()) {
+                        matchers_acc.push(mstr.to_string());
+                    }
+                }
             }
         }
     } else {
@@ -431,6 +440,7 @@ fn inspect_hooks_json(bundle_dir: &Path, hooks_val: Option<&Value>) -> (Value, b
             missing_events.push(ev.to_string());
         }
     }
+    let safety_matcher = matchers_acc.join("|");
 
     let guards_matcher_ok = REQUIRED_GUARD_TOOLS
         .iter()
@@ -442,9 +452,25 @@ fn inspect_hooks_json(bundle_dir: &Path, hooks_val: Option<&Value>) -> (Value, b
             let rel = mat.as_str().replace('\\', "/");
             let candidate = bundle_dir.join(&rel);
             let exists = if rel.to_ascii_lowercase().starts_with("bin/carbon-stack") {
-                candidate.is_file()
-                    || bundle_dir.join("bin").join("carbon-stack.exe").is_file()
-                    || bundle_dir.join("bin").join("carbon-stack").is_file()
+                // INVARIANT: On Unix (`!is_windows`), `hooks.json` must not reference `.exe`, and the exact `candidate` (`bin/carbon-stack`) must exist, be non-empty, lack an `MZ` header, and carry `+x` (`0o111`); on Windows, extensionless `bin/carbon-stack` resolves via `.exe` (`CreateProcessW`).
+                let low_rel = rel.to_ascii_lowercase();
+                let (rel_ok, eff_bin) = if is_windows {
+                    let p = if low_rel.ends_with(".exe") {
+                        candidate
+                    } else {
+                        bundle_dir.join("bin").join("carbon-stack.exe")
+                    };
+                    (true, p)
+                } else {
+                    (!low_rel.ends_with(".exe"), candidate)
+                };
+                let exec_mode_ok =
+                    is_windows || crate::installer::is_posix_executable_file(&eff_bin);
+                rel_ok
+                    && eff_bin.is_file()
+                    && fs::metadata(&eff_bin).map(|m| m.len() > 0).unwrap_or(false)
+                    && (is_windows || !crate::installer::has_mz_header(&eff_bin))
+                    && exec_mode_ok
             } else {
                 candidate.is_file()
             };
@@ -454,6 +480,7 @@ fn inspect_hooks_json(bundle_dir: &Path, hooks_val: Option<&Value>) -> (Value, b
         }
     }
 
+    let commands_ok = !commands.is_empty() && missing_targets.is_empty();
     let info = json!({
         "present": true,
         "group": group_name,
@@ -461,10 +488,10 @@ fn inspect_hooks_json(bundle_dir: &Path, hooks_val: Option<&Value>) -> (Value, b
         "missing_events": missing_events,
         "guards_matcher_ok": guards_matcher_ok,
         "commands_checked": commands.len(),
-        "commands_ok": !commands.is_empty() && missing_targets.is_empty(),
+        "commands_ok": commands_ok,
         "missing_targets": missing_targets,
     });
-    (info, guards_matcher_ok)
+    (info, guards_matcher_ok, commands_ok)
 }
 
 fn detect_external_nlm_bridge() -> Value {
@@ -543,12 +570,12 @@ fn collect_swarm_cache_stats() -> Value {
     let mut sessions_count: usize = 0;
     if let Ok(entries) = fs::read_dir(&brain_root) {
         for ent in entries.flatten() {
-            let p = ent.path();
-            if p.is_dir()
-                && p.join(".system_generated")
-                    .join("swarm")
-                    .join("members.json")
-                    .is_file()
+            if ent
+                .path()
+                .join(".system_generated")
+                .join("swarm")
+                .join("members.json")
+                .is_file()
             {
                 sessions_count += 1;
             }
@@ -579,6 +606,17 @@ fn collect_continuity_status(eff_cwd: &str) -> Value {
 }
 
 pub fn collect_doctor_report(cwd: &str, plugin_dir: Option<&str>, compact: bool) -> Value {
+    collect_doctor_report_for_os(cwd, plugin_dir, compact, None, cfg!(windows), false)
+}
+
+pub(crate) fn collect_doctor_report_for_os(
+    cwd: &str,
+    plugin_dir: Option<&str>,
+    compact: bool,
+    prevalidated_agy: Option<(bool, String)>,
+    is_windows: bool,
+    allow_unbuilt_source_bin: bool,
+) -> Value {
     let installed_dir = rio::home_dir()
         .join(".gemini")
         .join("config")
@@ -617,23 +655,20 @@ pub fn collect_doctor_report(cwd: &str, plugin_dir: Option<&str>, compact: bool)
         }),
     };
 
-    let (hooks_info, swarm_guards_ok) = inspect_hooks_json(&bundle_dir, hooks_json_val.as_ref());
+    let (hooks_info, swarm_guards_ok, commands_ok) =
+        inspect_hooks_json_for_os(&bundle_dir, hooks_json_val.as_ref(), is_windows);
 
     let agy_bin = find_agy_cli();
     let mut agy_validate_ok: Option<bool> = None;
     let mut agy_validate_msg = String::new();
-    if let Some(ref agy) = agy_bin {
+    if let Some((ok, msg)) = prevalidated_agy {
+        agy_validate_ok = Some(ok);
+        agy_validate_msg = msg;
+    } else if let Some(ref agy) = agy_bin {
         if bundle_dir.is_dir() {
-            let args = vec![
-                "plugin".to_string(),
-                "validate".to_string(),
-                bundle_dir.to_string_lossy().into_owned(),
-            ];
-            if let Ok(res) = run_command_with_job(agy, &args, None, &[], None, Some(10_000)) {
-                agy_validate_ok = Some(!res.timed_out && res.code == 0);
-                let combined = format!("{}\n{}", res.stdout_str(), res.stderr_str());
-                agy_validate_msg = combined.trim().to_string();
-            }
+            let (ok, msg) = crate::installer::run_agy_plugin_validate(agy, &bundle_dir, 10_000);
+            agy_validate_ok = Some(ok);
+            agy_validate_msg = msg;
         }
     }
 
@@ -709,8 +744,7 @@ pub fn collect_doctor_report(cwd: &str, plugin_dir: Option<&str>, compact: bool)
     let ls_info = probe_language_server("gemini-carbon-stack");
     let rust_bin = find_rust_binary();
 
-    let swarm_ctl_ok =
-        bundle_dir.join("tools").join("swarm_ctl.py").is_file() || rust_bin.is_some();
+    let swarm_ctl_ok = rust_bin.is_some();
     let swarm_skill_ok = skills.iter().any(|s| s == "swarm-orchestration");
 
     let git_check_dir = PathBuf::from(&eff_cwd);
@@ -751,6 +785,7 @@ pub fn collect_doctor_report(cwd: &str, plugin_dir: Option<&str>, compact: bool)
 
     let ok = plugin_json.as_ref().map_or(false, |v| v.is_object())
         && hooks_json_val.as_ref().map_or(false, |v| v.is_object())
+        && (commands_ok || allow_unbuilt_source_bin)
         && skills.len() >= 10
         && agents.len() >= 4
         && !rules.is_empty()
@@ -863,10 +898,6 @@ pub fn collect_doctor_report(cwd: &str, plugin_dir: Option<&str>, compact: bool)
     }
 
     Value::Object(report)
-}
-
-pub fn run_diagnostics(cwd: &str, compact: bool) -> Value {
-    collect_doctor_report(cwd, None, compact)
 }
 
 pub fn format_doctor_text(report: &Value) -> String {
@@ -1072,8 +1103,12 @@ mod tests {
             r#"{"name":"gemini-carbon-stack","displayName":"Gemini Carbon","version":"1.0.0"}"#,
         )
         .unwrap();
-        fs::write(bundle.join("bin").join("carbon-stack.exe"), b"MZ").unwrap();
-        fs::write(bundle.join("tools").join("swarm_ctl.py"), "# ctl\n").unwrap();
+        let (mock_bin_name, mock_bin_bytes): (&str, &[u8]) = if cfg!(windows) {
+            ("carbon-stack.exe", b"MZ\x90\x00")
+        } else {
+            ("carbon-stack", b"\x7fELF")
+        };
+        fs::write(bundle.join("bin").join(mock_bin_name), mock_bin_bytes).unwrap();
         fs::write(bundle.join("rules").join("AGENTS.md"), "# Rules\n").unwrap();
         for i in 0..4 {
             fs::write(bundle.join("agents").join(format!("agent-{}.md", i)), "# A\n").unwrap();

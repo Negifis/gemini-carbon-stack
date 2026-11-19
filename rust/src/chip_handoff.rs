@@ -166,7 +166,7 @@ pub fn open_chip(
 
     let title_clean = title.trim().to_string();
     let exp_clean = if expected_result.trim().is_empty() {
-        "Проверенный коммит в ветке чипа и краткий отчёт через chip_handoff.py finish".to_string()
+        "Проверенный коммит в ветке чипа и краткий отчёт через carbon-stack chip-handoff finish".to_string()
     } else {
         expected_result.trim().to_string()
     };
@@ -243,20 +243,15 @@ pub fn open_chip(
     });
     write_res?;
 
-    let script_norm = rio::normalize_path(
-        &rio::plugin_root()
-            .join("tools")
-            .join("chip_handoff.py")
-            .to_string_lossy(),
-    );
+    let cs_bin = rio::normalize_path(&rio::carbon_stack_bin_path().to_string_lossy());
     let work_dir = if !wt_norm.is_empty() {
         wt_norm.as_str()
     } else {
         parent_cwd_norm.as_str()
     };
     let brief = format!(
-        "[Chip Handoff: {}]\n- Задача: {}\n- Рабочая директория: {}\n- Ожидаемый результат: {}\n- По завершении закоммитьте изменения (для code-чипа) и выполните:\n  python -X utf8 \"{}\" finish --chip \"{}\" --message \"<итог и выполненные проверки>\"",
-        chip_id, title_clean, work_dir, exp_clean, script_norm, chip_id
+        "[Chip Handoff: {}]\n- Задача: {}\n- Рабочая директория: {}\n- Ожидаемый результат: {}\n- По завершении закоммитьте изменения (для code-чипа) и выполните:\n  & \"{}\" chip-handoff finish --chip \"{}\" --message \"<итог и выполненные проверки>\"",
+        chip_id, title_clean, work_dir, exp_clean, cs_bin, chip_id
     );
     if let Some(obj) = record.as_object_mut() {
         obj.insert("handoff_brief".to_string(), Value::String(brief));

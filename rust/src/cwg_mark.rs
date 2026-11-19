@@ -1,20 +1,18 @@
 use regex::Regex;
 use serde_json::{json, Map, Value};
-use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
-use std::time::UNIX_EPOCH;
 
 use crate::cwg_common;
-use crate::rio;
+use crate::rio::{self, json_truthy, meta_mtime_ns, sha256_hex};
 use crate::win32_sqlite::{is_link_or_junction, now_sec, run_command_with_job};
 
-const EDIT_TOOLS: &[&str] = &["edit_file", "write_file"];
-const SHELL_TOOLS: &[&str] = &["run_command"];
+pub const EDIT_TOOLS: &[&str] = &["edit_file", "write_file"];
+pub const SHELL_TOOLS: &[&str] = &["run_command"];
 
 const NON_GIT_SCAN_MAX_FILES: usize = 400;
 const NON_GIT_SCAN_MAX_DEPTH: usize = 4;
@@ -156,7 +154,7 @@ const PS_VAR_NAME_PAT: &str = r"[A-Za-z_]\w*(?::[A-Za-z_]\w*)?";
 const PS_DQ_LITERAL_PAT: &str = r#""[^"`$]*""#;
 const PS_MUT_CLAUSE_LEADER: &str = r"\A\s*(?:\$[A-Za-z_]\w*\s*=\s*)?(?:\$null\s*\|\s*)?(?:&\s*)?";
 const CONTINUITY_BK_SUB: &str = r"(?:checkpoint|show|handoff)\b";
-const CODEX_LANE_BK_SUB: &str = r"(?:check|status|reset|review)\b";
+const CODEX_LANE_BK_SUB: &str = r"(?:check|status|reset|review|research-reset)\b";
 const CHAT_BUS_BK_SUB: &str = r"(?:wait|inbox|list|read|search|send|reply|configure|status)\b";
 const WT_RO_SUB: &str = r"(?:audit|status)\b";
 const WT_MUT_TAIL: &str = r"[^\r\n;|&]*\b(?:snapshot|remove|restore)\b";
@@ -166,7 +164,7 @@ fn cache_path_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"(?i)(^|/)(__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.coverage|node_modules/\.cache|\.swarm)(/|$)|\.pyc$",
+            r"(?i)(^|/)(__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.coverage|node_modules/\.cache|\.swarm)(/|$)|\.(?:pyc|tokenade-original)$",
         )
         .expect("cache_path_re")
     })
@@ -203,7 +201,7 @@ fn bookkeeping_cmd_re() -> &'static Regex {
     })
 }
 
-fn nav_segment_re() -> &'static Regex {
+pub fn nav_segment_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
@@ -259,13 +257,17 @@ fn validation_non_runner_re() -> &'static Regex {
         let py = py_interp_pat(false);
         let ruff = exe_pat_followed_by_space("ruff", r"(?:\.exe)?", false);
         let install = exe_pat_followed_by_space("install", EXT_PY, false);
+        let cs = exe_pat_followed_by_space("carbon-stack", r"(?:\.exe)?", false);
         let agy = exe_pat_followed_by_space("agy", EXT_CMD_EXE, false);
+        let node = exe_pat_followed_by_space("node", r"(?:\.exe)?", false);
         let pat = format!(
-            r"(?i)\A\s*(?:\$null\s*\|\s*)?(?:&\s*)?(?:{ruff}\s+check\b|{py}\s+(?:-(?:X\s+utf8|[uBEsSO])\s+)*(?:-m\s+(?:pytest|unittest|py_compile|compileall|mypy|ruff|flake8)\b|{inst}\s+(?:[^\r\n|;&]*\s)?(?:--diagnose|--dry-run)(?:\z|[\s|;&]))|npm(?:\.cmd)?\s+(?:test|run\s+(?:test|lint|build|typecheck|check))\b|pnpm(?:\.cmd)?\s+(?:test|lint|build|typecheck)\b|yarn(?:\.cmd)?\s+(?:test|lint|build|typecheck)\b|npx(?:\.cmd)?\s+(?:tsc|vitest|jest|eslint|playwright\s+test)\b|cargo(?:\.exe)?\s+(?:\+[A-Za-z0-9._-]+\s+)?(?:test|check|clippy)\b|go(?:\.exe)?\s+(?:test|vet)\b|dotnet(?:\.exe)?\s+(?:test|build)\b|{agy}\s+plugin\s+validate\b)",
+            r#"(?i)\A\s*(?:\$null\s*\|\s*)?(?:&\s*)?(?:{ruff}\s+check\b|{py}\s+(?:-(?:X\s+utf8|[uBEsSO])\s+)*(?:-m\s+(?:pytest|unittest|py_compile|compileall|mypy|ruff|flake8)\b|{inst}\s+(?:[^\r\n|;&]*\s)?(?:--diagnose|--dry-run)(?:\z|[\s|;&]))|{cs}\s+install\s+(?:[^\r\n|;&]*\s)?(?:--diagnose|--dry-run)(?:\z|[\s|;&])|{node}\s+(?:(?:--no-warnings|--experimental-[A-Za-z0-9_-]+)\s+)*(?:(?:--test|--check)(?:\z|[\s|;&])|["']?(?:\.[/\\])?(?:[A-Za-z0-9_][A-Za-z0-9_.-]*[/\\])*(?:test[-_][A-Za-z0-9_.-]*|[A-Za-z0-9_][A-Za-z0-9_.-]*[-_.]tests?|[A-Za-z0-9_][A-Za-z0-9_.-]*\.spec)\.(?:c?js|mjs)["']?(?:\z|[\s|;&]))|bun(?:\.exe)?\s+test(?:\z|[\s|;&])|deno(?:\.exe)?\s+(?:test|check|lint)(?:\z|[\s|;&])|npm(?:\.cmd)?\s+(?:test|run\s+(?:test|lint|build|typecheck|check))\b|pnpm(?:\.cmd)?\s+(?:test|lint|build|typecheck)\b|yarn(?:\.cmd)?\s+(?:test|lint|build|typecheck)\b|npx(?:\.cmd)?\s+(?:tsc|vitest|jest|eslint|playwright\s+test)\b|cargo(?:\.exe)?\s+(?:\+[A-Za-z0-9._-]+\s+)?(?:test|check|clippy)\b|go(?:\.exe)?\s+(?:test|vet)\b|dotnet(?:\.exe)?\s+(?:test|build)\b|{agy}\s+plugin\s+validate\b)"#,
             ruff = ruff,
             py = py,
             inst = install,
+            cs = cs,
             agy = agy,
+            node = node,
         );
         Regex::new(&pat).expect("validation_non_runner_re")
     })
@@ -461,9 +463,27 @@ fn cs_mut_clause_re() -> &'static Regex {
     })
 }
 
+fn cs_install_clause_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        let cs = exe_pat_followed_by_space("carbon-stack", r"(?:\.exe)?", true);
+        Regex::new(&format!(
+            r"(?i){}{}\s+install(?:\z|[\s|;&])",
+            PS_MUT_CLAUSE_LEADER, cs
+        ))
+        .expect("cs_install_clause_re")
+    })
+}
+
 fn is_mutating_stack_seg(clause: &str) -> bool {
     if cs_mut_clause_re().is_match(clause) {
         return true;
+    }
+    if let Some(m) = cs_install_clause_re().find(clause) {
+        let after_install = &clause[m.end().saturating_sub(1)..];
+        if !install_diag_tail_re().is_match(after_install) {
+            return true;
+        }
     }
     let Some(rest) = strip_py_mut_clause_prefix(clause) else {
         return false;
@@ -738,24 +758,6 @@ fn dot_slash_re() -> &'static Regex {
 fn out_null_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?i)\A\s*Out-Null\s*\z").expect("out_null_re"))
-}
-
-fn user_scratch_patterns() -> &'static [Regex] {
-    static RE: OnceLock<Vec<Regex>> = OnceLock::new();
-    RE.get_or_init(|| {
-        [
-            r"(?i)/\.gemini/antigravity/brain/[^/]+/scratch(?:/|$)",
-            r"(?i)/\.gemini/antigravity/brain/[^/]+/browser_sandbox(?:/|$)",
-        ]
-        .iter()
-        .map(|p| Regex::new(p).expect("user_scratch_pattern"))
-        .collect()
-    })
-}
-
-fn review_id_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"REVIEW_ID\s*:\s*([A-Za-z0-9_-]{6,64})").expect("review_id_re"))
 }
 
 pub fn strip_single_quoted(text: &str) -> String {
@@ -1313,7 +1315,7 @@ fn abs_path_str(p: &Path) -> String {
 pub fn resolve_command_cwd(cmd: &str, default_cwd: &str, session: &str) -> String {
     let mut fallback_root = String::new();
     if !session.is_empty() {
-        if let Some(Value::Object(existing)) = rio::read_json(&cwg_common::marker_path(session)) {
+        if let Some(Value::Object(existing)) = cwg_common::read_marker_with_pending(session) {
             if !json_truthy(existing.get("closed")) {
                 fallback_root = existing
                     .get("git_root")
@@ -1324,19 +1326,6 @@ pub fn resolve_command_cwd(cmd: &str, default_cwd: &str, session: &str) -> Strin
         }
     }
     rio::resolve_command_cwd(cmd, default_cwd, &fallback_root)
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
-}
-
-fn meta_mtime_ns(meta: &fs::Metadata) -> u128 {
-    meta.modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_nanos())
 }
 
 fn file_entry_token(full: &Path, prefix: &str, meta_opt: Option<&fs::Metadata>) -> String {
@@ -1815,20 +1804,46 @@ fn resolve_known_or_git_root(known_git_root: Option<&str>, eff_cwd: &str) -> Str
     }
 }
 
-fn update_candidate_marker(
-    session: &str,
-    cwd: &str,
-    durable_new_paths: &[String],
+#[derive(Copy, Clone)]
+struct CandidateMarkerUpdate<'a> {
+    session: &'a str,
+    cwd: &'a str,
+    durable_new_paths: &'a [String],
     operational_mutation: bool,
     changed_lines_delta: i64,
     shell_durable_edit: bool,
     unknown_barrier: bool,
-    cause_label: &str,
-    known_git_root: Option<&str>,
-) -> (Option<Value>, Value) {
+    cause_label: &'a str,
+    known_git_root: Option<&'a str>,
+}
+
+fn update_candidate_marker(upd: CandidateMarkerUpdate<'_>) -> (Option<Value>, Value, bool) {
+    // SAFETY: Serialize candidate marker read-modify-write via `marker_lock_path`; on lock timeout, journal out-of-band instead of writing `marker_path` unlocked.
+    rio::with_file_lock(&cwg_common::marker_lock_path(upd.session), 5.0, 30.0, |locked| {
+        update_candidate_marker_unlocked(upd, locked)
+    })
+}
+
+fn update_candidate_marker_unlocked(
+    upd: CandidateMarkerUpdate<'_>,
+    persist: bool,
+) -> (Option<Value>, Value, bool) {
+    let CandidateMarkerUpdate {
+        session,
+        cwd,
+        durable_new_paths,
+        operational_mutation,
+        changed_lines_delta,
+        shell_durable_edit,
+        unknown_barrier,
+        cause_label,
+        known_git_root,
+    } = upd;
     let now = now_sec();
     let mp = cwg_common::marker_path(session);
-    let before = rio::read_json(&mp);
+    let raw_before = rio::read_json(&mp);
+    let (before, consumed_pending_ids) =
+        cwg_common::apply_pending_marker_deltas(session, raw_before.as_ref());
     let eff_cwd: String = if !cwd.is_empty() {
         cwd.to_string()
     } else if let Some(first_p) = durable_new_paths.first() {
@@ -2013,8 +2028,39 @@ fn update_candidate_marker(
         }
     }
 
-    let _ = rio::write_json(&mp, &marker);
-    (before_open, marker)
+    let mut persisted_ok = false;
+    if persist && rio::write_json(&mp, &marker).is_ok() {
+        persisted_ok = true;
+        if !consumed_pending_ids.is_empty() {
+            cwg_common::ack_pending_marker_deltas(session, &consumed_pending_ids);
+        }
+    }
+    if !persisted_ok {
+        let m_cwd = marker.get("cwd").and_then(|v| v.as_str()).unwrap_or(&eff_cwd);
+        let m_gr = marker.get("git_root").and_then(|v| v.as_str()).unwrap_or("");
+        let m_paths = cwg_common::durable_paths_from_val(marker.get("paths"));
+        let m_fp_opt = if unknown_barrier {
+            None
+        } else {
+            cwg_common::last_mark_fp(&marker)
+        };
+        persisted_ok = cwg_common::append_pending_marker_delta(cwg_common::PendingMarkerDelta {
+            session,
+            ts: now,
+            cwd: m_cwd,
+            git_root: m_gr,
+            durable_new_paths,
+            operational_mutation,
+            changed_lines_delta,
+            shell_durable_edit,
+            unknown_barrier,
+            cause_label,
+            measured_fp: m_fp_opt,
+            measured_paths: &m_paths,
+        })
+        .is_some();
+    }
+    (before_open, marker, persisted_ok)
 }
 
 fn marker_repo_root(marker: &Value, eff_cwd: &str) -> String {
@@ -2112,14 +2158,14 @@ fn capture_direct_codex_packet(cmd: &str, cwd: &str, session: &str) {
     {
         return;
     }
-    let Some(caps) = review_id_re().captures(cmd) else {
+    let Some(caps) = crate::codex_lane::review_id_re().captures(cmd) else {
         return;
     };
     let Some(rid) = caps.get(1).map(|m| m.as_str()) else {
         return;
     };
     let eff = if low.contains("xhigh") { "xhigh" } else { "high" };
-    let _ = crate::codex_lane::record_packet(rid, cmd, cwd, eff, "ordinary", session);
+    let _ = crate::codex_lane::record_packet_if_absent(rid, cmd, cwd, eff, "", session);
 }
 
 pub fn fold_ps_line_continuations(cmd_str: &str) -> String {
@@ -2566,7 +2612,9 @@ fn references_scratch_space(cmd: &str, artifact_dir: &str) -> bool {
             return true;
         }
     }
-    user_scratch_patterns().iter().any(|p| p.is_match(&norm_cmd))
+    cwg_common::user_scratch_patterns()
+        .iter()
+        .any(|p| p.is_match(&norm_cmd))
 }
 
 pub fn extract_ps_redirections(seg: &str) -> (String, Vec<String>) {
@@ -2991,29 +3039,6 @@ pub fn is_ephemeral_only_shell_mutation(
     saw_ephemeral_mutation
 }
 
-fn json_truthy(v: Option<&Value>) -> bool {
-    match v {
-        Some(Value::Bool(b)) => *b,
-        Some(Value::Number(n)) => n.as_f64().map_or(false, |x| x != 0.0),
-        Some(Value::String(s)) => !s.is_empty(),
-        Some(Value::Array(a)) => !a.is_empty(),
-        Some(Value::Object(m)) => !m.is_empty(),
-        _ => false,
-    }
-}
-
-fn extract_workspace_paths(payload: &Value) -> Vec<String> {
-    payload
-        .get("workspacePaths")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 pub fn record_pre_tool_use(payload: &Value) {
     let tc = payload.get("toolCall").and_then(|v| v.as_object());
     let tool_name = tc
@@ -3031,8 +3056,11 @@ pub fn record_pre_tool_use(payload: &Value) {
         .unwrap_or("");
     let policy = classify_shell_command(cmd);
     let low_cmd = cmd.to_lowercase();
-    let has_direct_codex =
-        low_cmd.contains("codex") && low_cmd.contains("exec") && !low_cmd.contains("codex_lane.py");
+    let has_direct_codex = low_cmd.contains("codex")
+        && low_cmd.contains("exec")
+        && !low_cmd.contains("codex_lane.py")
+        && !low_cmd.contains("codex-lane")
+        && !low_cmd.contains("codex_lane");
     if (policy == "READ_ONLY" || policy == "BOOKKEEPING") && !has_direct_codex {
         return;
     }
@@ -3066,7 +3094,7 @@ pub fn record_pre_tool_use(payload: &Value) {
         capture_direct_codex_packet(cmd, &cwd, &session);
     }
     if policy != "READ_ONLY" && policy != "BOOKKEEPING" {
-        let wps = extract_workspace_paths(payload);
+        let wps = cwg_common::extract_workspace_paths(payload);
         let art_dir = payload
             .get("artifactDirectoryPath")
             .and_then(|v| v.as_str())
@@ -3090,7 +3118,7 @@ pub fn evaluate_pre_tool_use(payload: &Value) {
     rio::emit_pre_tool("allow", None, None);
 }
 
-pub fn record_post_tool_use(payload: &Value) {
+pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
     let tc = payload.get("toolCall").and_then(|v| v.as_object());
     let tool_name = tc
         .and_then(|m| m.get("name"))
@@ -3099,7 +3127,7 @@ pub fn record_post_tool_use(payload: &Value) {
     let is_edit = EDIT_TOOLS.iter().any(|&t| t == tool_name);
     let is_shell = SHELL_TOOLS.iter().any(|&t| t == tool_name);
     if !is_edit && !is_shell {
-        return;
+        return Ok(());
     }
 
     let empty_args = Map::new();
@@ -3113,7 +3141,7 @@ pub fn record_post_tool_use(payload: &Value) {
         .unwrap_or("")
         .trim();
     let failed = !error_text.is_empty();
-    let wps = extract_workspace_paths(payload);
+    let wps = cwg_common::extract_workspace_paths(payload);
     let art_dir = payload
         .get("artifactDirectoryPath")
         .and_then(|v| v.as_str())
@@ -3126,23 +3154,23 @@ pub fn record_post_tool_use(payload: &Value) {
 
     if is_edit {
         if failed {
-            return;
+            return Ok(());
         }
         let target_path = args.get("Path").and_then(|v| v.as_str()).unwrap_or("");
         if target_path.is_empty() {
-            return;
+            return Ok(());
         }
         // INVARIANT: Advance Loop Guard mutation stamp for subagent and scratch edits too without spawning continuity PostToolUse.
         rio::bump_mutation_stamp(&session);
         if json_truthy(args.get("ArtifactMetadata")) {
-            return;
+            return Ok(());
         }
         let cwd = rio::effective_cwd(payload);
         if cwg_common::is_scratch_or_ephemeral(target_path, art_dir, &wps, &cwd) {
-            return;
+            return Ok(());
         }
         if rio::is_subagent_session(tp, None) {
-            return;
+            return Ok(());
         }
         let target_vec = vec![target_path.to_string()];
         cwg_common::publish_claim(&session, &target_vec, false, &cwd);
@@ -3150,17 +3178,18 @@ pub fn record_post_tool_use(payload: &Value) {
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or(target_path);
-        let (before, after) = update_candidate_marker(
-            &session,
-            &cwd,
-            &target_vec,
-            false,
-            estimate_changed_lines(tool_name, args),
-            false,
-            false,
-            &format!("{}:{}", tool_name, base_name),
-            None,
-        );
+        let cause_lbl = format!("{}:{}", tool_name, base_name);
+        let (before, after, persisted) = update_candidate_marker(CandidateMarkerUpdate {
+            session: &session,
+            cwd: &cwd,
+            durable_new_paths: &target_vec,
+            operational_mutation: false,
+            changed_lines_delta: estimate_changed_lines(tool_name, args),
+            shell_durable_edit: false,
+            unknown_barrier: false,
+            cause_label: &cause_lbl,
+            known_git_root: None,
+        });
         let cctx = cwg_common::resolve_candidate_context(&after, false);
         if let Some(note) = build_transition_note(before.as_ref(), &after, Some(&cctx)) {
             cwg_common::queue_pending_note(&session, &note);
@@ -3179,7 +3208,10 @@ pub fn record_post_tool_use(payload: &Value) {
                 "floor": floor,
             }),
         );
-        return;
+        if !persisted {
+            return Err(format!("Failed to persist candidate marker delta for session {}", session));
+        }
+        return Ok(());
     }
 
     let cmd = args
@@ -3191,11 +3223,11 @@ pub fn record_post_tool_use(payload: &Value) {
         rio::bump_mutation_stamp(&session);
     }
     if !failed && (policy == "READ_ONLY" || policy == "BOOKKEEPING") {
-        return;
+        return Ok(());
     }
 
     if rio::is_subagent_session(tp, None) {
-        return;
+        return Ok(());
     }
 
     if failed {
@@ -3226,7 +3258,7 @@ pub fn record_post_tool_use(payload: &Value) {
     }
 
     if policy == "READ_ONLY" || policy == "BOOKKEEPING" {
-        return;
+        return Ok(());
     }
 
     let cwd = rio::effective_cwd(payload);
@@ -3299,17 +3331,18 @@ pub fn record_post_tool_use(payload: &Value) {
     let cmd60: String = cmd.chars().take(60).collect();
     if !changed_paths.is_empty() {
         rio::bump_mutation_stamp(&session);
-        let (before, after) = update_candidate_marker(
-            &session,
-            &cmd_cwd,
-            &changed_paths,
-            false,
-            10,
-            true,
-            unmeasured,
-            &format!("run_command:{}", cmd60),
-            snap_git_root.as_deref(),
-        );
+        let cause_lbl = format!("run_command:{}", cmd60);
+        let (before, after, persisted) = update_candidate_marker(CandidateMarkerUpdate {
+            session: &session,
+            cwd: &cmd_cwd,
+            durable_new_paths: &changed_paths,
+            operational_mutation: false,
+            changed_lines_delta: 10,
+            shell_durable_edit: true,
+            unknown_barrier: unmeasured,
+            cause_label: &cause_lbl,
+            known_git_root: snap_git_root.as_deref(),
+        });
         let cctx = cwg_common::resolve_candidate_context(&after, false);
         if let Some(note) = build_transition_note(before.as_ref(), &after, Some(&cctx)) {
             cwg_common::queue_pending_note(&session, &note);
@@ -3327,6 +3360,9 @@ pub fn record_post_tool_use(payload: &Value) {
                 "floor": floor,
             }),
         );
+        if !persisted {
+            return Err(format!("Failed to persist shell candidate marker delta for session {}", session));
+        }
     } else if !failed {
         let has_opaque = policy == "UNCERTAIN" && has_opaque_script_or_exec(cmd);
         let opaque_unmeasured = has_opaque
@@ -3337,17 +3373,18 @@ pub fn record_post_tool_use(payload: &Value) {
             && !is_ephemeral_only_shell_mutation(cmd, art_dir, &wps, &cwd);
         if is_mutating_non_ephemeral || (policy == "UNCERTAIN" && (unmeasured || opaque_unmeasured))
         {
-            let (before, after) = update_candidate_marker(
-                &session,
-                &cmd_cwd,
-                &[],
-                true,
-                0,
-                false,
-                unmeasured || opaque_unmeasured,
-                &format!("run_command:{}", cmd60),
-                snap_git_root.as_deref(),
-            );
+            let cause_lbl = format!("run_command:{}", cmd60);
+            let (before, after, persisted) = update_candidate_marker(CandidateMarkerUpdate {
+                session: &session,
+                cwd: &cmd_cwd,
+                durable_new_paths: &[],
+                operational_mutation: true,
+                changed_lines_delta: 0,
+                shell_durable_edit: false,
+                unknown_barrier: unmeasured || opaque_unmeasured,
+                cause_label: &cause_lbl,
+                known_git_root: snap_git_root.as_deref(),
+            });
             if let Some(note) = build_transition_note(before.as_ref(), &after, None) {
                 cwg_common::queue_pending_note(&session, &note);
             }
@@ -3361,13 +3398,26 @@ pub fn record_post_tool_use(payload: &Value) {
                     "cmd": cmd80,
                 }),
             );
+            if !persisted {
+                return Err(format!("Failed to persist operational marker delta for session {}", session));
+            }
         }
     }
+    Ok(())
 }
 
-pub fn evaluate_post_tool_use(payload: &Value) {
-    record_post_tool_use(payload);
+pub fn evaluate_post_tool_use(payload: &Value) -> i32 {
+    if let Err(err) = record_post_tool_use(payload) {
+        rio::log_hook_event(
+            "hook-errors",
+            "post_tool_persist_failed",
+            json!({ "error": err }),
+        );
+        eprintln!("[Code Work Gate] {}", err);
+        return 2;
+    }
     rio::emit_json(&json!({}));
+    0
 }
 
 pub fn run_cli(args: &[String]) -> i32 {
@@ -3402,7 +3452,7 @@ pub fn run_cli(args: &[String]) -> i32 {
     if actual_event == "PreToolUse" {
         evaluate_pre_tool_use(&payload);
     } else if actual_event == "PostToolUse" {
-        evaluate_post_tool_use(&payload);
+        return evaluate_post_tool_use(&payload);
     } else {
         rio::emit_default_for_event(&actual_event);
     }
@@ -3461,8 +3511,6 @@ mod tests {
         let _ = ps_control_kw_re();
         let _ = dot_slash_re();
         let _ = out_null_re();
-        let _ = user_scratch_patterns();
-        let _ = review_id_re();
     }
 
     #[test]
@@ -3560,6 +3608,24 @@ mod tests {
                 "VALIDATION",
             ),
             (
+                "$null | node scripts/ci/test-backend-jest-modes.js",
+                "VALIDATION",
+            ),
+            (
+                r"& 'C:/Users/in/AppData/Roaming/npm/node_modules/@tokenade/cli/node_modules/@tokenade/cli-win32-x64/tokenade.exe' wrap --shell powershell '$null | node scripts/ci/test-backend-jest-modes.js'",
+                "VALIDATION",
+            ),
+            ("node --test backend/src/foo.mjs", "VALIDATION"),
+            ("node --check backend/src/index.js", "VALIDATION"),
+            ("node backend/src/maxClient.spec.mjs", "VALIDATION"),
+            ("node --test-reporter=spec app.js", "UNCERTAIN"),
+            ("node -e 'process.exit(0)' test-foo.js", "UNCERTAIN"),
+            ("node scripts/migrate.js", "UNCERTAIN"),
+            (
+                "$null | npm.cmd test -w backend -- --runInBand; $null | git status --short",
+                "UNCERTAIN",
+            ),
+            (
                 r"& 'C:\bin\carbon-stack.exe' worktree-guard remove C:\wt",
                 "MUTATING",
             ),
@@ -3622,5 +3688,150 @@ mod tests {
         assert!(tok_3mb.starts_with("??:2600000:"), "tok_3mb: {}", tok_3mb);
         assert!(git_entry_unchanged_on_disk(&tmp_bin.to_string_lossy(), &tok_3mb, None));
         let _ = fs::remove_file(&tmp_bin);
+
+        // INVARIANT: `carbon-stack install --dry-run/--diagnose` is VALIDATION while `carbon-stack install` without dry-run/diagnose is MUTATING; contended `persist=false` updates never overwrite `marker_path` and journal out-of-band.
+        assert_eq!(
+            classify_shell_command("carbon-stack install --dry-run"),
+            "VALIDATION"
+        );
+        assert_eq!(
+            classify_shell_command("carbon-stack.exe install --diagnose --pretty"),
+            "VALIDATION"
+        );
+        assert_eq!(
+            classify_shell_command("carbon-stack install --force"),
+            "MUTATING"
+        );
+
+        let _lock = crate::win32_sqlite::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp_home = std::env::temp_dir().join(format!("cwg-mark-pend-{}", std::process::id()));
+        let _ = fs::create_dir_all(&tmp_home);
+        let prev_sh = std::env::var_os("CARBON_STACK_HOME");
+        std::env::set_var("CARBON_STACK_HOME", &tmp_home);
+        let sess_p = "sess-contended-rust";
+        let f_edit = tmp_home.join("mod.rs");
+        fs::write(&f_edit, "pub fn a() {}\n").unwrap();
+        let f_vec = vec![f_edit.to_string_lossy().into_owned()];
+        let tmp_home_str = tmp_home.to_string_lossy().into_owned();
+        let (_, _, ok1) = update_candidate_marker_unlocked(
+            CandidateMarkerUpdate {
+                session: sess_p,
+                cwd: &tmp_home_str,
+                durable_new_paths: &f_vec,
+                operational_mutation: false,
+                changed_lines_delta: 1,
+                shell_durable_edit: false,
+                unknown_barrier: false,
+                cause_label: "edit:mod.rs",
+                known_git_root: None,
+            },
+            false,
+        );
+        assert!(ok1);
+        assert!(!cwg_common::marker_path(sess_p).exists());
+        assert!(cwg_common::has_pending_marker_deltas(sess_p));
+        assert!(cwg_common::pending_marker_mtime_ns(sess_p) > 0);
+        let (_, flushed, ok2) = update_candidate_marker_unlocked(
+            CandidateMarkerUpdate {
+                session: sess_p,
+                cwd: &tmp_home_str,
+                durable_new_paths: &f_vec,
+                operational_mutation: false,
+                changed_lines_delta: 1,
+                shell_durable_edit: false,
+                unknown_barrier: false,
+                cause_label: "edit2:mod.rs",
+                known_git_root: None,
+            },
+            true,
+        );
+        assert!(ok2);
+        assert!(cwg_common::marker_path(sess_p).is_file());
+        assert!(!cwg_common::has_pending_marker_deltas(sess_p));
+        assert!(cwg_common::marker_pending_dir(sess_p).is_dir());
+        assert_eq!(cwg_common::pending_marker_mtime_ns(sess_p), 0);
+        assert_eq!(flushed.get("edits").and_then(|v| v.as_i64()), Some(2));
+
+        // INVARIANT: Contended journal preserves edit-time SHA-256 (never backdating later version B to earlier edit timestamp) and `ack_pending_marker_deltas` preserves concurrently appended unacknowledged deltas.
+        let sess_race = "sess-journal-race";
+        let f_race = tmp_home.join("race.rs");
+        fs::write(&f_race, "pub fn v1() {}\n").unwrap();
+        let f_race_str = f_race.to_string_lossy().into_owned();
+        let race_paths = vec![f_race_str.clone()];
+        let fp_v1 = cwg_common::content_fingerprint(&race_paths, cwg_common::MAX_FINGERPRINT_FILE_BYTES);
+        let id1 = cwg_common::append_pending_marker_delta(cwg_common::PendingMarkerDelta {
+            session: sess_race,
+            ts: 10.0,
+            cwd: &tmp_home_str,
+            git_root: "",
+            durable_new_paths: &race_paths,
+            operational_mutation: false,
+            changed_lines_delta: 1,
+            shell_durable_edit: false,
+            unknown_barrier: false,
+            cause_label: "edit:v1",
+            measured_fp: Some(&fp_v1),
+            measured_paths: &race_paths,
+        })
+        .unwrap();
+        fs::write(&f_race, "pub fn v2_after_review() {}\n").unwrap();
+        let fp_v2 = cwg_common::content_fingerprint(&race_paths, cwg_common::MAX_FINGERPRINT_FILE_BYTES);
+        assert_ne!(fp_v1, fp_v2);
+        let id2 = cwg_common::append_pending_marker_delta(cwg_common::PendingMarkerDelta {
+            session: sess_race,
+            ts: 20.0,
+            cwd: &tmp_home_str,
+            git_root: "",
+            durable_new_paths: &race_paths,
+            operational_mutation: false,
+            changed_lines_delta: 1,
+            shell_durable_edit: false,
+            unknown_barrier: false,
+            cause_label: "edit:v2",
+            measured_fp: Some(&fp_v2),
+            measured_paths: &race_paths,
+        })
+        .unwrap();
+        let (folded_opt, cids) = cwg_common::apply_pending_marker_deltas(sess_race, None);
+        assert_eq!(cids, vec![id1.clone(), id2.clone()]);
+        let folded_m = folded_opt.unwrap();
+        let rev_at_15 = json!({"launch_ts": 15.0});
+        assert!(!crate::cwg_stop::is_review_fresh(&rev_at_15, &folded_m));
+        let rev_at_25 = json!({"launch_ts": 25.0});
+        assert!(crate::cwg_stop::is_review_fresh(&rev_at_25, &folded_m));
+
+        let id3_concurrent = cwg_common::append_pending_marker_delta(cwg_common::PendingMarkerDelta {
+            session: sess_race,
+            ts: 30.0,
+            cwd: &tmp_home_str,
+            git_root: "",
+            durable_new_paths: &race_paths,
+            operational_mutation: false,
+            changed_lines_delta: 1,
+            shell_durable_edit: false,
+            unknown_barrier: false,
+            cause_label: "edit:v3-concurrent",
+            measured_fp: Some(&fp_v2),
+            measured_paths: &race_paths,
+        })
+        .unwrap();
+        cwg_common::ack_pending_marker_deltas(sess_race, &cids);
+        assert!(cwg_common::has_pending_marker_deltas(sess_race));
+        assert!(cwg_common::has_unconsumed_pending_deltas(sess_race, &cids));
+        let (folded_after_ack, rem_ids) =
+            cwg_common::apply_pending_marker_deltas(sess_race, Some(&folded_m));
+        assert_eq!(rem_ids, vec![id3_concurrent]);
+        assert_eq!(
+            folded_after_ack.unwrap().get("edits").and_then(|v| v.as_i64()),
+            Some(3)
+        );
+
+        match prev_sh {
+            Some(v) => std::env::set_var("CARBON_STACK_HOME", v),
+            None => std::env::remove_var("CARBON_STACK_HOME"),
+        }
+        let _ = fs::remove_dir_all(&tmp_home);
     }
 }

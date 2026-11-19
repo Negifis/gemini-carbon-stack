@@ -1,6 +1,6 @@
 ---
 name: checkpoint
-description: Triggered by /checkpoint to save repo-backed handoff state (goal, decisions, remaining steps) via continuity.py.
+description: Triggered by /checkpoint to save repo-backed handoff state (goal, decisions, remaining steps) via carbon-stack continuity.
 ---
 
 # `/checkpoint` — Сохранение минимального handoff-состояния
@@ -10,7 +10,7 @@ description: Triggered by /checkpoint to save repo-backed handoff state (goal, d
 ## Компактный repo-backed handoff (рекомендуется)
 
 ```powershell
-python -X utf8 "<PLUGIN_ROOT>/hooks/continuity.py" handoff `
+& "<PLUGIN_ROOT>/bin/carbon-stack.exe" continuity handoff `
   --cwd "<рабочая директория>" `
   --status "<IN_PROGRESS | VERIFYING | BLOCKED | COMPLETED>" `
   --goal "<цель задачи>" `
@@ -22,7 +22,7 @@ python -X utf8 "<PLUGIN_ROOT>/hooks/continuity.py" handoff `
 ## Полный канонический чекпоинт (при необходимости длинного многоэтапного трекинга)
 
 ```powershell
-python -X utf8 "<PLUGIN_ROOT>/hooks/continuity.py" checkpoint `
+& "<PLUGIN_ROOT>/bin/carbon-stack.exe" continuity checkpoint `
   --cwd "<рабочая директория>" `
   --goal "<цель>" --status "<IN_PROGRESS | BLOCKED | COMPLETED>" `
   --authoritative "<действующие требования>" --superseded "<отменённое>" `

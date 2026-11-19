@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use crate::win32_sqlite::{now_sec, run_command_with_job};
 
@@ -33,7 +33,7 @@ pub const NON_ENFORCEABLE_STOP_REASONS: &[&str] = &[
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
-fn subagent_msg_re() -> &'static Regex {
+pub fn subagent_msg_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
@@ -171,10 +171,105 @@ fn expand_tilde(raw: &str) -> PathBuf {
     PathBuf::from(raw)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
+}
+
+pub fn val_to_str(v: Option<&Value>) -> String {
+    match v {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::Bool(b)) => b.to_string(),
+        _ => String::new(),
+    }
+}
+
+pub fn val_to_i64(v: Option<&Value>) -> i64 {
+    match v {
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .or_else(|| n.as_u64().map(|u| u.min(i64::MAX as u64) as i64))
+            .or_else(|| n.as_f64().map(|f| f as i64))
+            .unwrap_or(0),
+        Some(Value::String(s)) => s.trim().parse::<i64>().unwrap_or(0),
+        Some(Value::Bool(b)) => i64::from(*b),
+        _ => 0,
+    }
+}
+
+pub fn val_to_f64(v: Option<&Value>) -> f64 {
+    match v {
+        Some(Value::Number(n)) => n.as_f64().unwrap_or(0.0),
+        Some(Value::String(s)) => s.trim().parse::<f64>().unwrap_or(0.0),
+        Some(Value::Bool(b)) => {
+            if *b {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        _ => 0.0,
+    }
+}
+
+pub fn json_truthy(v: Option<&Value>) -> bool {
+    match v {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_f64().map_or(false, |x| x != 0.0),
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(Value::Array(a)) => !a.is_empty(),
+        Some(Value::Object(m)) => !m.is_empty(),
+        _ => false,
+    }
+}
+
+pub fn truncate_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
+pub fn meta_mtime_sec(meta: &fs::Metadata) -> Option<f64> {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64())
+}
+
+pub fn meta_mtime_ns(meta: &fs::Metadata) -> u128 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos())
+}
+
+pub fn file_mtime_sec(path: &Path) -> Option<f64> {
+    fs::metadata(path).ok().and_then(|m| meta_mtime_sec(&m))
+}
+
+pub fn file_mtime_ns(path: &Path) -> Option<u128> {
+    fs::metadata(path).ok().map(|m| meta_mtime_ns(&m)).filter(|&n| n > 0)
+}
+
+pub fn find_agy_cli() -> Option<String> {
+    for name in ["agy.exe", "agy.cmd", "agy"] {
+        if let Some(found) = which_in_path(name) {
+            return Some(found);
+        }
+    }
+    let default_win = home_dir()
+        .join("AppData")
+        .join("Local")
+        .join("agy")
+        .join("bin")
+        .join("agy.exe");
+    if default_win.is_file() {
+        return Some(default_win.to_string_lossy().into_owned());
+    }
+    None
 }
 
 pub fn home_dir() -> PathBuf {
@@ -241,7 +336,7 @@ pub fn plugin_root() -> PathBuf {
         }
         for anc in exe.ancestors() {
             let cand = anc.join("plugin");
-            if cand.join("hooks").is_dir() || cand.is_dir() {
+            if cand.join("plugin.json").is_file() || cand.is_dir() {
                 return resolve_abs_path(&cand);
             }
         }
@@ -249,7 +344,7 @@ pub fn plugin_root() -> PathBuf {
     if let Ok(cwd) = env::current_dir() {
         for anc in cwd.ancestors() {
             let cand = anc.join("plugin");
-            if cand.join("hooks").is_dir() {
+            if cand.join("plugin.json").is_file() {
                 return resolve_abs_path(&cand);
             }
         }
@@ -269,6 +364,15 @@ pub fn plugin_root() -> PathBuf {
             .join("plugins")
             .join("gemini-carbon-stack"),
     )
+}
+
+pub fn carbon_stack_bin_path() -> PathBuf {
+    let bin_name = if cfg!(windows) {
+        "carbon-stack.exe"
+    } else {
+        "carbon-stack"
+    };
+    plugin_root().join("bin").join(bin_name)
 }
 
 pub fn chat_bus_cli_path() -> PathBuf {
@@ -662,6 +766,11 @@ pub fn write_json(path: &Path, data: &Value) -> Result<(), String> {
                 break;
             }
             Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                // WORKAROUND: Re-create parent directory if concurrent pruning removed it between `create_dir_all` and `open`.
+                let _ = fs::create_dir_all(parent);
+                continue;
+            }
             Err(e) => return Err(e.to_string()),
         }
     }
@@ -728,31 +837,90 @@ pub fn log_hook_event(stream: &str, event_type: &str, extra: Value) {
     let _ = append_jsonl(&target, &Value::Object(rec), 2_000_000);
 }
 
-struct LockGuard<'a> {
-    path: &'a Path,
-    acquired: bool,
+pub(crate) fn kernel_companion_lock_path(lock_path: &Path) -> PathBuf {
+    crate::win32_sqlite::companion_lock_path(lock_path, "k")
 }
 
-impl Drop for LockGuard<'_> {
-    fn drop(&mut self) {
-        if self.acquired {
-            let _ = fs::remove_file(self.path);
+pub(crate) fn v2_lease_path(state_root: &Path) -> PathBuf {
+    state_root.join(".v2_alive.lease")
+}
+
+pub(crate) fn lock_epoch_path(state_root: &Path) -> PathBuf {
+    state_root.join(".lock_epoch")
+}
+
+fn enclosing_state_dir(path: &Path) -> PathBuf {
+    let default_state = state_dir();
+    for anc in path.ancestors() {
+        if anc == default_state {
+            return default_state;
+        }
+        if anc.file_name().and_then(|s| s.to_str()) == Some("state")
+            && (anc.join(".lock_epoch").exists()
+                || anc.join(".v2_alive.lease").exists()
+                || anc.join("gate").is_dir()
+                || anc.join("chips").is_dir()
+                || anc.parent().map_or(false, |p| p.join("backups").is_dir()))
+        {
+            return anc.to_path_buf();
+        }
+    }
+    default_state
+}
+
+fn acquire_v2_shared_lease(state_root: &Path, deadline: Instant) -> Option<(File, bool)> {
+    let _ = fs::create_dir_all(state_root);
+    let lfh = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(v2_lease_path(state_root))
+        .ok()?;
+    loop {
+        match lfh.try_lock_shared() {
+            Ok(()) => {
+                let is_v1 = fs::read_to_string(lock_epoch_path(state_root))
+                    .map(|s| s.trim() == "v1")
+                    .unwrap_or(false);
+                return Some((lfh, is_v1));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(std::fs::TryLockError::Error(_)) => return None,
         }
     }
 }
 
-pub fn with_file_lock<T, F: FnOnce(bool) -> T>(
+struct LegacyV1Guard<'a> {
+    path: &'a Path,
+    v2_lease: File,
+    acquired: bool,
+}
+
+impl Drop for LegacyV1Guard<'_> {
+    fn drop(&mut self) {
+        if self.acquired {
+            let _ = fs::remove_file(self.path);
+        }
+        let _ = self.v2_lease.unlock();
+    }
+}
+
+fn with_legacy_v1_file_lock<T, F: FnOnce(bool) -> T>(
     lock_path: &Path,
-    timeout_sec: f64,
+    deadline: Instant,
     stale_sec: f64,
+    v2_lease: File,
     f: F,
 ) -> T {
-    if let Some(parent) = lock_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        let _ = fs::create_dir_all(parent);
-    }
-    let deadline = Instant::now() + Duration::from_secs_f64(timeout_sec.max(0.0));
+    // INVARIANT: Keep `v2_lease` (`LOCK_SH` on `.v2_alive.lease`) held across `O_CREAT | O_EXCL` acquisition, `f(acquired)`, and `unlink` so `perform_install` (`LOCK_EX` on `.v2_alive.lease`) can never clear `.lock_epoch` while a `v2` caller has observed `is_v1_epoch == true` and is entering or holding a `v1` lock.
     let mut acquired = false;
-    while Instant::now() < deadline {
+    loop {
         match OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -764,23 +932,159 @@ pub fn with_file_lock<T, F: FnOnce(bool) -> T>(
                 break;
             }
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                if let Ok(meta) = fs::metadata(lock_path) {
-                    if let Ok(modified) = meta.modified() {
-                        if let Ok(age) = modified.elapsed() {
-                            if age.as_secs_f64() > stale_sec {
-                                let _ = fs::remove_file(lock_path);
-                                continue;
-                            }
-                        }
-                    }
+                if fs::metadata(lock_path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|mt| mt.elapsed().ok())
+                    .is_some_and(|age| age.as_secs_f64() > stale_sec)
+                {
+                    let _ = fs::remove_file(lock_path);
+                    continue;
                 }
-                thread::sleep(Duration::from_millis(30));
+                if Instant::now() >= deadline {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(15));
             }
             Err(_) => break,
         }
     }
-    let _guard = LockGuard {
+    let _guard = LegacyV1Guard {
         path: lock_path,
+        v2_lease,
+        acquired,
+    };
+    f(acquired)
+}
+
+struct LockGuard<'a> {
+    legacy_path: &'a Path,
+    legacy_token: Option<crate::win32_sqlite::LegacyLockToken>,
+    kernel_file: Option<File>,
+    v2_lease: Option<File>,
+    acquired: bool,
+}
+
+impl Drop for LockGuard<'_> {
+    fn drop(&mut self) {
+        if self.acquired {
+            // INVARIANT: Release `legacy_token` (`SetFileInformationByHandle` on Windows; `rmdir` on Unix) BEFORE unlocking `kernel_file` (`<lock_path>.k`), and unlock `v2_lease` (`LOCK_SH` on `.v2_alive.lease`) LAST so `perform_rollback`'s `LOCK_EX` never observes an unswept `v2` directory.
+            if let Some(tok) = self.legacy_token.take() {
+                crate::win32_sqlite::release_legacy_lock_token(self.legacy_path, tok);
+            }
+            if let Some(kfh) = self.kernel_file.take() {
+                let _ = kfh.unlock();
+            }
+        }
+        if let Some(lfh) = self.v2_lease.take() {
+            let _ = lfh.unlock();
+        }
+    }
+}
+
+pub fn with_file_lock<T, F: FnOnce(bool) -> T>(
+    lock_path: &Path,
+    timeout_sec: f64,
+    stale_sec: f64,
+    f: F,
+) -> T {
+    // INVARIANT: Coordinate with `perform_rollback` via shared kernel lease `.v2_alive.lease` + `.lock_epoch`, then serialize `v2` peers on `<lock_path>.k` and acquire `<lock_path>` (`share_mode(3)` + `SetFileInformationByHandle` on Windows; directory `mkdir`/`rmdir` + `RENAME_EXCHANGE`/`RENAME_SWAP` on Unix).
+    if let Some(parent) = lock_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let _ = fs::create_dir_all(parent);
+    }
+    let deadline = Instant::now() + Duration::from_secs_f64(timeout_sec.max(0.0));
+    let state_root = enclosing_state_dir(lock_path);
+    let Some((v2_lease_fh, is_v1_epoch)) = acquire_v2_shared_lease(&state_root, deadline) else {
+        return f(false);
+    };
+    if is_v1_epoch {
+        return with_legacy_v1_file_lock(lock_path, deadline, stale_sec, v2_lease_fh, f);
+    }
+    let kpath = kernel_companion_lock_path(lock_path);
+    let kfh_opt = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&kpath)
+        .ok();
+    let mut acquired = false;
+    let mut held_kernel: Option<File> = None;
+    let mut held_legacy: Option<crate::win32_sqlite::LegacyLockToken> = None;
+    if let Some(kfh) = kfh_opt {
+        loop {
+            match kfh.try_lock() {
+                Ok(()) => {
+                    let mut retry_legacy = true;
+                    let mut fatal_legacy_err = false;
+                    while retry_legacy {
+                        retry_legacy = false;
+                        if crate::win32_sqlite::has_pending_unix_crash_slots(lock_path) {
+                            match crate::win32_sqlite::reconcile_unix_crash_slots(
+                                lock_path, stale_sec,
+                            ) {
+                                crate::win32_sqlite::UnixDirReclaim::ReclaimedRetry => {}
+                                crate::win32_sqlite::UnixDirReclaim::NotStale
+                                | crate::win32_sqlite::UnixDirReclaim::AcquiredDir => break,
+                            }
+                        }
+                        match crate::win32_sqlite::create_legacy_lock_exclusive(lock_path) {
+                            Ok(tok) => {
+                                held_legacy = Some(tok);
+                                acquired = true;
+                            }
+                            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                                match crate::win32_sqlite::try_reclaim_stale_legacy_lock(
+                                    lock_path, stale_sec,
+                                ) {
+                                    #[cfg(not(windows))]
+                                    crate::win32_sqlite::LegacyLockReclaim::Acquired(tok) => {
+                                        held_legacy = Some(tok);
+                                        acquired = true;
+                                    }
+                                    crate::win32_sqlite::LegacyLockReclaim::ReclaimedRetry => {
+                                        retry_legacy = true;
+                                    }
+                                    crate::win32_sqlite::LegacyLockReclaim::NotStale => {}
+                                }
+                            }
+                            Err(e)
+                                if cfg!(windows)
+                                    && e.kind() == ErrorKind::PermissionDenied
+                                    && !lock_path.is_dir() =>
+                            {
+                                // INVARIANT: On Windows NTFS, `CreateFileW(CREATE_NEW)` transiently returns `PermissionDenied` while a displaced `v1` lock is in `STATUS_DELETE_PENDING`; retry until `deadline`.
+                            }
+                            Err(_) => {
+                                fatal_legacy_err = true;
+                            }
+                        }
+                    }
+                    if acquired {
+                        held_kernel = Some(kfh);
+                        break;
+                    }
+                    let _ = kfh.unlock();
+                    if fatal_legacy_err || Instant::now() >= deadline {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(15));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(15));
+                }
+                Err(std::fs::TryLockError::Error(_)) => break,
+            }
+        }
+    }
+    let _guard = LockGuard {
+        legacy_path: lock_path,
+        legacy_token: held_legacy,
+        kernel_file: held_kernel,
+        v2_lease: Some(v2_lease_fh),
         acquired,
     };
     f(acquired)
@@ -1139,13 +1443,24 @@ pub fn member_transcript_path(brain_root: &Path, cid: &str) -> PathBuf {
 
 pub fn load_swarm_members(brain_root: &Path, session: &str) -> Map<String, Value> {
     let path = swarm_dir(brain_root, session).join("members.json");
-    let Some(Value::Object(doc)) = read_json(&path) else {
-        return Map::new();
+    let array_to_map = |arr: &[Value]| -> Map<String, Value> {
+        let mut out = Map::new();
+        for item in arr {
+            if let Some(name) = item.get("name").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                out.insert(name.to_string(), item.clone());
+            }
+        }
+        out
     };
-    if let Some(Value::Object(members)) = doc.get("members") {
-        return members.clone();
+    match read_json(&path) {
+        Some(Value::Array(arr)) => array_to_map(&arr),
+        Some(Value::Object(doc)) => match doc.get("members") {
+            Some(Value::Object(members)) => members.clone(),
+            Some(Value::Array(arr)) => array_to_map(arr),
+            _ => doc,
+        },
+        _ => Map::new(),
     }
-    doc
 }
 
 pub fn is_swarm_role_member(name: &str, meta: Option<&Value>) -> bool {
@@ -1158,17 +1473,6 @@ pub fn is_swarm_role_member(name: &str, meta: Option<&Value>) -> bool {
     name == "coordinator"
         || matches!(role_val.as_str(), "coordinator" | "narrator" | "monitor")
         || swarm_role_member_re().is_match(name)
-}
-
-fn json_truthy(v: Option<&Value>) -> bool {
-    match v {
-        Some(Value::Bool(b)) => *b,
-        Some(Value::Number(n)) => n.as_f64().map_or(false, |x| x != 0.0),
-        Some(Value::String(s)) => !s.is_empty(),
-        Some(Value::Array(a)) => !a.is_empty(),
-        Some(Value::Object(m)) => !m.is_empty(),
-        _ => false,
-    }
 }
 
 pub fn is_swarm_member_killed(meta: Option<&Value>) -> bool {
@@ -1402,14 +1706,6 @@ pub fn swarm_worker_model(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
-}
-
-pub fn is_swarm_worker_session(
-    transcript_path: &str,
-    steps: Option<&[Value]>,
-    conversation_id: &str,
-) -> bool {
-    swarm_worker_model(transcript_path, steps, conversation_id).is_some()
 }
 
 fn is_mention_ident_byte(b: u8) -> bool {
@@ -1835,7 +2131,7 @@ pub fn git_toplevel(cwd: &str, include_home_root: bool) -> Option<String> {
         let top = resolve_abs_path(Path::new(out.trim()))
             .to_string_lossy()
             .into_owned();
-        // SAFETY: Never climb from a non-git subdirectory (`~/.gemini/antigravity/scratch/...`, `%TEMP%`, etc.) into a stray `$HOME/.git`, which would scan the entire user profile.
+        // INVARIANT: Never climb from a non-git subdirectory (`~/.gemini/antigravity/scratch/...`, `%TEMP%`, etc.) into a stray `$HOME/.git`, which would scan the entire user profile.
         if !include_home_root && is_unapproved_home_git_root(cwd, &top) {
             return None;
         }
@@ -1904,7 +2200,7 @@ pub fn capture_worktree_tree_oid(git_root: &str, timeout_sec: f64) -> String {
     };
     let _guard = TempDirGuard(dir_path.clone());
     let tmp_index = dir_path.join("index");
-    // SAFETY: Abort snapshot capture if an existing Git index cannot be stat'd or copied so tracked gitignored files are never omitted.
+    // INVARIANT: Abort snapshot capture if an existing Git index cannot be stat'd or copied so tracked gitignored files are never omitted.
     match fs::metadata(&src_idx) {
         Ok(meta) => {
             if !meta.is_file() || fs::copy(&src_idx, &tmp_index).is_err() {
@@ -2022,7 +2318,7 @@ fn unwrap_tokenade_pass(s: &str) -> String {
 }
 
 pub fn unwrap_tokenade_command(cmd: &str) -> String {
-    // SAFETY: Unwrap Tokenade CLI wrappers so gate classification and destructive-command guards inspect the real payload.
+    // INVARIANT: Unwrap Tokenade CLI wrappers so gate classification and destructive-command guards inspect the real payload.
     let mut s = leading_null_pipe_re()
         .replace(cmd.trim(), "")
         .into_owned();
@@ -2161,9 +2457,487 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         let lock_file = base.join("contended.lock");
-        fs::write(&lock_file, "held\n").unwrap();
+        // INVARIANT: Rolling-upgrade `v1` (`HEAD`) file-existence lock (`<pid> <ts>`) blocks `v2` `with_file_lock`, AND `v2` `with_file_lock` creates `lock_path` so a concurrent `v1` `create_new(true)` gets `AlreadyExists`.
+        fs::write(&lock_file, "99999 1795000000.0\n").unwrap();
+        let acquired_vs_v1 = with_file_lock(&lock_file, 0.05, 300.0, |acq| acq);
+        assert!(!acquired_vs_v1);
+        let expired_v1_recovered = with_file_lock(&lock_file, 0.2, 0.0, |acq| {
+            assert!(acq);
+            let v1_try = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_file);
+            assert!(v1_try.is_err());
+            acq
+        });
+        assert!(expired_v1_recovered);
+        assert!(!lock_file.exists());
+        // INVARIANT: Crashed `v2` sentinel (`"v2 ..."`) is recovered immediately under `<lock_path>.k` even with large `stale_sec`, while a live `.k` holder blocks acquisition.
+        fs::write(&lock_file, "v2 99999 1795000000.0\n").unwrap();
+        assert!(with_file_lock(&lock_file, 0.2, 300.0, |acq| acq));
+        let held_ext = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(kernel_companion_lock_path(&lock_file))
+            .unwrap();
+        held_ext.try_lock().unwrap();
         let acquired = with_file_lock(&lock_file, 0.05, 300.0, |acq| acq);
         assert!(!acquired);
+        drop(held_ext);
+        let recovered = with_file_lock(&lock_file, 0.2, 0.0, |acq| acq);
+        assert!(recovered);
+        let stamp_expired_v1 = |p: &Path| {
+            fs::write(p, "11111 1000.0\n").unwrap();
+            let old_ft = fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(120));
+            File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_times(old_ft)
+                .unwrap();
+        };
+        // INVARIANT: Deterministic lockstep pause test (Direction 1): `v1` checks `L_old` age (`> 30s`) and pauses right before `fs::remove_file`; while `v2` reclaims `L_old` and holds the critical section, `v1`'s resumed `fs::remove_file` MUST fail (`ERROR_SHARING_VIOLATION` on Windows, `EISDIR`/`EPERM` on Unix) and `v1`'s `create_new` MUST fail with `AlreadyExists`.
+        let det_v1_pause = base.join("det-v1-paused-before-unlink.lock");
+        stamp_expired_v1(&det_v1_pause);
+        let v1_saw_stale = fs::metadata(&det_v1_pause)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .elapsed()
+            .unwrap()
+            .as_secs_f64()
+            > 30.0;
+        assert!(v1_saw_stale);
+        let det1_ok = with_file_lock(&det_v1_pause, 1.0, 30.0, |acq| {
+            assert!(acq);
+            assert!(fs::remove_file(&det_v1_pause).is_err());
+            let v1_create = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&det_v1_pause);
+            assert_eq!(v1_create.unwrap_err().kind(), ErrorKind::AlreadyExists);
+            true
+        });
+        assert!(det1_ok);
+        assert!(!det_v1_pause.exists());
+        // INVARIANT: Deterministic lockstep pause test (Direction 2): `v1` replaces expired `L_old` with fresh `L_new` right before `v2` executes stale deletion; `L_new` MUST survive intact and block `v2`.
+        let det_v2_pause = base.join("det-v2-paused-before-delete.lock");
+        stamp_expired_v1(&det_v2_pause);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let h_old = OpenOptions::new()
+                .read(true)
+                .access_mode(0x8001_0000)
+                .share_mode(7)
+                .open(&det_v2_pause)
+                .unwrap();
+            fs::remove_file(&det_v2_pause).unwrap();
+            let mut l_new = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&det_v2_pause)
+                .unwrap();
+            writeln!(l_new, "22222 {}", now_sec()).unwrap();
+            drop(l_new);
+            let _ = crate::win32_sqlite::delete_open_file_by_handle(&h_old);
+            drop(h_old);
+            assert!(det_v2_pause.is_file());
+            assert!(fs::read_to_string(&det_v2_pause)
+                .unwrap()
+                .starts_with("22222 "));
+            assert!(!with_file_lock(&det_v2_pause, 0.05, 300.0, |acq| acq));
+            fs::remove_file(&det_v2_pause).unwrap();
+        }
+        stamp_expired_v1(&det_v2_pause);
+        fs::remove_file(&det_v2_pause).unwrap();
+        fs::write(&det_v2_pause, format!("33333 {}\n", now_sec())).unwrap();
+        assert!(matches!(
+            crate::win32_sqlite::try_reclaim_stale_legacy_lock(&det_v2_pause, 30.0),
+            crate::win32_sqlite::LegacyLockReclaim::NotStale
+        ));
+        assert!(det_v2_pause.is_file());
+        fs::remove_file(&det_v2_pause).unwrap();
+        // INVARIANT: Deterministic Unix swap-slot tests: (a) `v1` replaces `L_old` with fresh `L_A` in the exact interval between `is_file_stale(lock_path)` and `exchange_fn`, proving rollback to `NotStale`; (b) `v2` crashes mid-swap after displacing fresh `L_A` into `<lock_path>.swap` while `lock_path` is a directory, proving the next `v2` rolls `L_A` back and returns `NotStale` instead of deleting the directory; (c) stale `L_old` is acquired cleanly (`AcquiredDir`) and crashed empty dir returns `ReclaimedRetry`.
+        let unix_sim_lock = base.join("unix-swap-sim.lock");
+        let sim_tmp = base.join("unix-swap-sim.tmp");
+        let mock_exchange = |a: &Path, b: &Path| -> std::io::Result<()> {
+            crate::win32_sqlite::simulated_exchange_paths(a, b, &sim_tmp)
+        };
+        stamp_expired_v1(&unix_sim_lock);
+        assert!(matches!(
+            crate::win32_sqlite::reclaim_unix_dir_lock_with_exchange(
+                &unix_sim_lock,
+                30.0,
+                mock_exchange,
+            ),
+            crate::win32_sqlite::UnixDirReclaim::AcquiredDir
+        ));
+        assert!(unix_sim_lock.is_dir());
+        assert!(matches!(
+            crate::win32_sqlite::reclaim_unix_dir_lock_with_exchange(
+                &unix_sim_lock,
+                30.0,
+                mock_exchange,
+            ),
+            crate::win32_sqlite::UnixDirReclaim::ReclaimedRetry
+        ));
+        assert!(!unix_sim_lock.exists());
+        stamp_expired_v1(&unix_sim_lock);
+        let mut injected_after_precheck = false;
+        assert!(matches!(
+            crate::win32_sqlite::reclaim_unix_dir_lock_with_exchange(
+                &unix_sim_lock,
+                30.0,
+                |a, b| {
+                    if !injected_after_precheck {
+                        injected_after_precheck = true;
+                        fs::remove_file(b)?;
+                        fs::write(b, format!("44444 {}\n", now_sec()))?;
+                    }
+                    mock_exchange(a, b)
+                },
+            ),
+            crate::win32_sqlite::UnixDirReclaim::NotStale
+        ));
+        assert!(unix_sim_lock.is_file());
+        assert!(fs::read_to_string(&unix_sim_lock)
+            .unwrap()
+            .starts_with("44444 "));
+        assert!(!crate::win32_sqlite::legacy_swap_path(&unix_sim_lock).exists());
+        let sim_swap = crate::win32_sqlite::legacy_swap_path(&unix_sim_lock);
+        fs::rename(&unix_sim_lock, &sim_swap).unwrap();
+        fs::write(&unix_sim_lock, "v2-probe 999 1 1000.0\n").unwrap();
+        assert!(matches!(
+            crate::win32_sqlite::reclaim_unix_dir_lock_with_exchange(
+                &unix_sim_lock,
+                30.0,
+                mock_exchange,
+            ),
+            crate::win32_sqlite::UnixDirReclaim::NotStale
+        ));
+        assert!(unix_sim_lock.is_file());
+        assert!(fs::read_to_string(&unix_sim_lock)
+            .unwrap()
+            .starts_with("44444 "));
+        assert!(!sim_swap.exists());
+        fs::remove_file(&unix_sim_lock).unwrap();
+        // INVARIANT: If `v1` finishes its critical section and calls `fs::remove_file(lock_path)` while its fresh lock `L_A` is in `<lock_path>.swap` during Phase-1 probe, `remove_file` succeeds on the regular probe file and `v2` deletes `L_A` (`ReclaimedRetry`) instead of restoring an orphaned lock.
+        stamp_expired_v1(&unix_sim_lock);
+        let mut release_during_probe_n = 0usize;
+        assert!(matches!(
+            crate::win32_sqlite::reclaim_unix_dir_lock_with_exchange(
+                &unix_sim_lock,
+                30.0,
+                |a, b| {
+                    release_during_probe_n += 1;
+                    if release_during_probe_n == 1 {
+                        fs::remove_file(b)?;
+                        fs::write(b, format!("55555 {}\n", now_sec()))?;
+                        mock_exchange(a, b)?;
+                        fs::remove_file(b)?;
+                        return Ok(());
+                    }
+                    mock_exchange(a, b)
+                },
+            ),
+            crate::win32_sqlite::UnixDirReclaim::ReclaimedRetry
+        ));
+        assert!(!unix_sim_lock.exists());
+        assert!(!sim_swap.exists());
+        assert!(!crate::win32_sqlite::legacy_dir_stage_path(&unix_sim_lock).exists());
+        // INVARIANT: Even if `v2` crashed during Phase 1 and dead `v1` (`999999999`) already exited after `fs::remove_file(lock_path)`, the next `v2` cleans `<lock_path>.swap` without restoring the dead lock.
+        fs::write(&sim_swap, format!("999999999 {}\n", now_sec())).unwrap();
+        assert!(matches!(
+            crate::win32_sqlite::reclaim_unix_dir_lock_with_exchange(
+                &unix_sim_lock,
+                30.0,
+                mock_exchange,
+            ),
+            crate::win32_sqlite::UnixDirReclaim::ReclaimedRetry
+        ));
+        assert!(!unix_sim_lock.exists());
+        assert!(!sim_swap.exists());
+        // INVARIANT: End-to-end `with_file_lock` test with FREE `lock_path` and an ACTIVE `v1` lock (`std::process::id()`) in `<lock_path>.swap`: `with_file_lock` reconciles `.swap` BEFORE `mkdir` / `create_legacy_lock_exclusive`, restores the active `v1` lock onto `lock_path`, and refuses concurrent entry (`acq == false`).
+        let free_main_swap = crate::win32_sqlite::legacy_swap_path(&unix_sim_lock);
+        fs::write(&free_main_swap, format!("{} {}\n", std::process::id(), now_sec())).unwrap();
+        let entered_concurrently = with_file_lock(&unix_sim_lock, 0.08, 30.0, |acq| acq);
+        assert!(!entered_concurrently);
+        assert!(unix_sim_lock.is_file());
+        assert!(!free_main_swap.exists());
+        fs::remove_file(&unix_sim_lock).unwrap();
+        // INVARIANT: If `v1` created `lock_path` via `O_EXCL` (0 bytes) and was displaced into `<lock_path>.swap` BEFORE writing its PID while `lock_path` became free, `with_file_lock` treats the empty fresh file as alive, restores its inode via `hard_link`, refuses concurrent entry, and preserves `v1`'s subsequent PID write through its open handle.
+        let mut pending_v1_fh = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&free_main_swap)
+            .unwrap();
+        let entered_on_unwritten = with_file_lock(&unix_sim_lock, 0.08, 30.0, |acq| acq);
+        assert!(!entered_on_unwritten);
+        assert!(unix_sim_lock.is_file());
+        assert!(!free_main_swap.exists());
+        writeln!(pending_v1_fh, "{} {}", std::process::id(), now_sec()).unwrap();
+        drop(pending_v1_fh);
+        assert!(fs::read_to_string(&unix_sim_lock)
+            .unwrap()
+            .starts_with(&format!("{} ", std::process::id())));
+        fs::remove_file(&unix_sim_lock).unwrap();
+        // INVARIANT: If `lock_path` initially holds `v2-probe` when recovery starts (`restore_displaced_v1_lock` branch) and a delayed `v1` `unlink` removes `v2-probe` right before `exchange_fn` (`ErrorKind::NotFound`), `handle_missing_lock_with_slot` restores the live `v1` inode from `.swap` instead of deleting it and returns `NotStale`.
+        let mut not_found_v1_fh = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&free_main_swap)
+            .unwrap();
+        fs::write(&unix_sim_lock, "v2-probe 999 7 0\n").unwrap();
+        assert!(matches!(
+            crate::win32_sqlite::reclaim_unix_dir_lock_with_exchange(
+                &unix_sim_lock,
+                30.0,
+                |_a, b| {
+                    let _ = fs::remove_file(b);
+                    Err(std::io::Error::new(ErrorKind::NotFound, "delayed_unlink_during_exchange"))
+                },
+            ),
+            crate::win32_sqlite::UnixDirReclaim::NotStale
+        ));
+        assert!(unix_sim_lock.is_file());
+        assert!(!free_main_swap.exists());
+        writeln!(not_found_v1_fh, "{} {}", std::process::id(), now_sec()).unwrap();
+        drop(not_found_v1_fh);
+        assert!(fs::read_to_string(&unix_sim_lock)
+            .unwrap()
+            .starts_with(&format!("{} ", std::process::id())));
+        fs::remove_file(&unix_sim_lock).unwrap();
+        // INVARIANT: Phase-2 crash recovery test: if `v2` crashes right after `exchange_fn(&dir_stage, lock_path)` when a paused `v1` had just replaced `probe` with fresh `L_B` (leaving `L_B` in `<lock_path>.dir` and a directory at `lock_path`), the next `v2` rolls `L_B` back to `lock_path`, removes `<lock_path>.dir`, and returns `NotStale` instead of deleting `lock_path`.
+        let sim_dir_stage = crate::win32_sqlite::legacy_dir_stage_path(&unix_sim_lock);
+        fs::write(&sim_dir_stage, format!("77777 {}\n", now_sec())).unwrap();
+        fs::create_dir(&unix_sim_lock).unwrap();
+        assert!(matches!(
+            crate::win32_sqlite::reclaim_unix_dir_lock_with_exchange(
+                &unix_sim_lock,
+                30.0,
+                mock_exchange,
+            ),
+            crate::win32_sqlite::UnixDirReclaim::NotStale
+        ));
+        assert!(unix_sim_lock.is_file());
+        assert!(fs::read_to_string(&unix_sim_lock)
+            .unwrap()
+            .starts_with("77777 "));
+        assert!(!sim_dir_stage.exists());
+        fs::remove_file(&unix_sim_lock).unwrap();
+        // INVARIANT: Phase-1 `.swap` crash recovery race test: if `v1_A` (`77770`) released `v2-probe` and `v1_B` (`88888`) acquired `lock_path` right before recovery's first `exchange_fn`, `restore_displaced_v1_lock` swaps `v1_B`'s active lock back onto `lock_path` instead of deleting `v1_B` or leaving `v1_A` in place.
+        fs::write(&sim_swap, format!("77770 {}\n", now_sec())).unwrap();
+        fs::write(&unix_sim_lock, "v2-probe 999 0 0\n").unwrap();
+        let mut swap_rec_step = 0usize;
+        assert!(matches!(
+            crate::win32_sqlite::reclaim_unix_dir_lock_with_exchange(
+                &unix_sim_lock,
+                30.0,
+                |a, b| {
+                    swap_rec_step += 1;
+                    if swap_rec_step == 1 {
+                        fs::remove_file(b)?;
+                        fs::write(b, format!("88888 {}\n", now_sec()))?;
+                    }
+                    mock_exchange(a, b)
+                },
+            ),
+            crate::win32_sqlite::UnixDirReclaim::NotStale
+        ));
+        assert!(unix_sim_lock.is_file());
+        assert!(fs::read_to_string(&unix_sim_lock)
+            .unwrap()
+            .starts_with("88888 "));
+        assert!(!sim_swap.exists());
+        assert!(!crate::win32_sqlite::legacy_undo_path(&unix_sim_lock).exists());
+        fs::remove_file(&unix_sim_lock).unwrap();
+        // INVARIANT: Double-crash `.swap` + `.undo` recovery test: if `v2` crashes right AFTER its first `exchange_fn` placed dead `v1_A` (`77771`) onto `lock_path` and moved active `v1_B` (`88889`) into `.swap` (before the undo swap can run), the next `v2` sees `undo_rank(v1_B) > undo_rank(v1_A)`, swaps `v1_B` back onto `lock_path`, and removes `v1_A` + `.undo`.
+        let sim_undo = crate::win32_sqlite::legacy_undo_path(&unix_sim_lock);
+        fs::write(&sim_swap, format!("77771 {}\n", now_sec())).unwrap();
+        fs::write(&unix_sim_lock, "v2-probe 999 1 0\n").unwrap();
+        let mut crash_mid_undo_step = 0usize;
+        assert!(matches!(
+            crate::win32_sqlite::reclaim_unix_dir_lock_with_exchange(
+                &unix_sim_lock,
+                30.0,
+                |a, b| {
+                    crash_mid_undo_step += 1;
+                    if crash_mid_undo_step == 1 {
+                        fs::remove_file(b)?;
+                        fs::write(b, format!("88889 {}\n", now_sec()))?;
+                        return mock_exchange(a, b);
+                    }
+                    Err(std::io::Error::new(ErrorKind::Interrupted, "simulated_sigkill_before_undo"))
+                },
+            ),
+            crate::win32_sqlite::UnixDirReclaim::NotStale
+        ));
+        assert!(fs::read_to_string(&unix_sim_lock).unwrap().starts_with("77771 "));
+        assert!(fs::read_to_string(&sim_swap).unwrap().starts_with("88889 "));
+        assert!(sim_undo.is_file());
+        assert!(matches!(
+            crate::win32_sqlite::reclaim_unix_dir_lock_with_exchange(
+                &unix_sim_lock,
+                30.0,
+                mock_exchange,
+            ),
+            crate::win32_sqlite::UnixDirReclaim::NotStale
+        ));
+        assert!(unix_sim_lock.is_file());
+        assert!(fs::read_to_string(&unix_sim_lock)
+            .unwrap()
+            .starts_with("88889 "));
+        assert!(!sim_swap.exists());
+        assert!(!sim_undo.exists());
+        fs::remove_file(&unix_sim_lock).unwrap();
+        // INVARIANT: Exercise simultaneous `v1` (`HEAD`) stale-lock recovery + `v2` stale-lock recovery over an expired `L_old` lock protecting a shared JSON card across 12 rounds (1 `v1` thread + 3 `v2` threads), proving `max_concurrent == 1` and zero lost card updates.
+        let mixed_lock = base.join("mixed-v1-v2-stale.lock");
+        let shared_card = base.join("chips-card.json");
+        write_json(&shared_card, &json!({"updates": 0})).unwrap();
+        let mixed_active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mixed_max = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..12 {
+            stamp_expired_v1(&mixed_lock);
+            let round_bar = std::sync::Arc::new(std::sync::Barrier::new(4));
+            let mut round_handles = Vec::new();
+            {
+                let ml = mixed_lock.clone();
+                let sc = shared_card.clone();
+                let rb = std::sync::Arc::clone(&round_bar);
+                let act = std::sync::Arc::clone(&mixed_active);
+                let mx = std::sync::Arc::clone(&mixed_max);
+                round_handles.push(thread::spawn(move || {
+                    rb.wait();
+                    let dl = Instant::now() + Duration::from_secs(3);
+                    let mut v1_acq = false;
+                    while Instant::now() < dl {
+                        match OpenOptions::new().write(true).create_new(true).open(&ml) {
+                            Ok(mut fh) => {
+                                let _ = writeln!(fh, "{} {}", std::process::id(), now_sec());
+                                v1_acq = true;
+                                break;
+                            }
+                            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                                if fs::metadata(&ml)
+                                    .and_then(|m| m.modified())
+                                    .ok()
+                                    .and_then(|mt| mt.elapsed().ok())
+                                    .is_some_and(|age| age.as_secs_f64() > 30.0)
+                                {
+                                    let _ = fs::remove_file(&ml);
+                                    continue;
+                                }
+                                thread::sleep(Duration::from_millis(8));
+                            }
+                            Err(_) => thread::sleep(Duration::from_millis(8)),
+                        }
+                    }
+                    assert!(v1_acq);
+                    let cur = act.fetch_add(1, Ordering::SeqCst) + 1;
+                    mx.fetch_max(cur, Ordering::SeqCst);
+                    let prev_n = read_json(&sc)
+                        .and_then(|v| v.get("updates").and_then(|x| x.as_i64()))
+                        .unwrap_or(0);
+                    thread::sleep(Duration::from_millis(4));
+                    write_json(&sc, &json!({"updates": prev_n + 1})).unwrap();
+                    act.fetch_sub(1, Ordering::SeqCst);
+                    let _ = fs::remove_file(&ml);
+                }));
+            }
+            for _ in 0..3 {
+                let ml = mixed_lock.clone();
+                let sc = shared_card.clone();
+                let rb = std::sync::Arc::clone(&round_bar);
+                let act = std::sync::Arc::clone(&mixed_active);
+                let mx = std::sync::Arc::clone(&mixed_max);
+                round_handles.push(thread::spawn(move || {
+                    rb.wait();
+                    with_file_lock(&ml, 3.0, 30.0, |acq| {
+                        assert!(acq);
+                        let cur = act.fetch_add(1, Ordering::SeqCst) + 1;
+                        mx.fetch_max(cur, Ordering::SeqCst);
+                        let prev_n = read_json(&sc)
+                            .and_then(|v| v.get("updates").and_then(|x| x.as_i64()))
+                            .unwrap_or(0);
+                        thread::sleep(Duration::from_millis(4));
+                        write_json(&sc, &json!({"updates": prev_n + 1})).unwrap();
+                        act.fetch_sub(1, Ordering::SeqCst);
+                    });
+                }));
+            }
+            for rh in round_handles {
+                rh.join().unwrap();
+            }
+        }
+        assert_eq!(mixed_max.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            read_json(&shared_card).unwrap()["updates"],
+            json!(48)
+        );
+        let race_lock = base.join("race-8threads.lock");
+        let bar = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let active_in_cs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_in_cs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entered_total = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let rl = race_lock.clone();
+            let b = std::sync::Arc::clone(&bar);
+            let act = std::sync::Arc::clone(&active_in_cs);
+            let mx = std::sync::Arc::clone(&max_in_cs);
+            let tot = std::sync::Arc::clone(&entered_total);
+            handles.push(thread::spawn(move || {
+                b.wait();
+                with_file_lock(&rl, 3.0, 0.0, |acq| {
+                    assert!(acq);
+                    let cur = act.fetch_add(1, Ordering::SeqCst) + 1;
+                    mx.fetch_max(cur, Ordering::SeqCst);
+                    tot.fetch_add(1, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(12));
+                    act.fetch_sub(1, Ordering::SeqCst);
+                });
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(entered_total.load(Ordering::SeqCst), 8);
+        assert_eq!(max_in_cs.load(Ordering::SeqCst), 1);
+
+        // INVARIANT: While `with_file_lock` is executing in `.lock_epoch = "v1"` mode (including before `O_EXCL` completes while waiting on an existing `v1` lock), `.v2_alive.lease` `LOCK_SH` stays held so `LOCK_EX` epoch clear cannot race `with_legacy_v1_file_lock`.
+        let epoch_state = base.join("epoch-sync").join("state");
+        fs::create_dir_all(epoch_state.join("chips")).unwrap();
+        fs::write(lock_epoch_path(&epoch_state), "v1\n").unwrap();
+        let contended_v1 = epoch_state.join("chips").join("sync.lock");
+        fs::write(&contended_v1, format!("{} {}\n", std::process::id(), now_sec())).unwrap();
+        let contended_v1_bg = contended_v1.clone();
+        let entered_v1_wait = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let entered_v1_wait_bg = std::sync::Arc::clone(&entered_v1_wait);
+        let bg_v1_caller = thread::spawn(move || {
+            with_file_lock(&contended_v1_bg, 2.0, 30.0, |ok| {
+                assert!(ok);
+                entered_v1_wait_bg.store(true, Ordering::SeqCst);
+            });
+        });
+        thread::sleep(Duration::from_millis(45));
+        let ex_fh = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(v2_lease_path(&epoch_state))
+            .unwrap();
+        // INVARIANT: Even BEFORE `bg_v1_caller` acquires `contended_v1` (`O_EXCL` waiting on `AlreadyExists`), `bg_v1_caller` already holds `LOCK_SH` on `.v2_alive.lease`, blocking `LOCK_EX`.
+        assert!(ex_fh.try_lock().is_err());
+        fs::remove_file(&contended_v1).unwrap();
+        bg_v1_caller.join().unwrap();
+        assert!(entered_v1_wait.load(Ordering::SeqCst));
+        assert!(ex_fh.try_lock().is_ok());
+        let _ = ex_fh.unlock();
 
         let repo = base.join("repo");
         fs::create_dir_all(&repo).unwrap();

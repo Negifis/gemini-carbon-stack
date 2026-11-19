@@ -2,38 +2,9 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
 
-use crate::rio;
+use crate::rio::{self, json_truthy, val_to_i64, val_to_str};
 
 pub const MAX_CHIP_STOP_REMINDERS: i64 = 2;
-
-fn json_truthy(v: Option<&Value>) -> bool {
-    match v {
-        Some(Value::Bool(b)) => *b,
-        Some(Value::Number(n)) => n.as_f64().map_or(false, |x| x != 0.0),
-        Some(Value::String(s)) => !s.is_empty(),
-        Some(Value::Array(a)) => !a.is_empty(),
-        Some(Value::Object(m)) => !m.is_empty(),
-        _ => false,
-    }
-}
-
-fn val_to_str(v: Option<&Value>) -> String {
-    match v {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Number(n)) => n.to_string(),
-        Some(Value::Bool(b)) => b.to_string(),
-        _ => String::new(),
-    }
-}
-
-fn val_to_i64(v: Option<&Value>) -> i64 {
-    match v {
-        Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
-        Some(Value::String(s)) => s.trim().parse::<i64>().unwrap_or(0),
-        Some(Value::Bool(b)) => i64::from(*b),
-        _ => 0,
-    }
-}
 
 fn display_title(v: Option<&Value>) -> String {
     match v {
@@ -165,12 +136,7 @@ pub fn evaluate_pre_invocation(payload: &Value) -> Option<String> {
                 matches_parent = !gr.is_empty() && val_to_str(card.get("repo_root")) == *gr;
             }
             if matches_parent {
-                let script_norm = rio::normalize_path(
-                    &rio::plugin_root()
-                        .join("tools")
-                        .join("chip_handoff.py")
-                        .to_string_lossy(),
-                );
+                let cs_bin = rio::normalize_path(&rio::carbon_stack_bin_path().to_string_lossy());
                 let title = display_title(card.get("title"));
                 let summary = val_to_str(card.get("summary"));
                 let branch_raw = val_to_str(card.get("chip_branch"));
@@ -180,8 +146,8 @@ pub fn evaluate_pre_invocation(payload: &Value) -> Option<String> {
                     branch_raw.as_str()
                 };
                 out.push(format!(
-                    "[Chip Handoff Ready] Дочерняя задача `{}` ({}) передала результат: «{}» (ветка `{}`). Проверьте результат и закройте чип: `python -X utf8 \"{}\" close --chip \"{}\" --accept [--merge]` или `--rework \"<замечания>\"`.",
-                    cid, title, summary, branch, script_norm, cid
+                    "[Chip Handoff Ready] Дочерняя задача `{}` ({}) передала результат: «{}» (ветка `{}`). Проверьте результат и закройте чип: `& \"{}\" chip-handoff close --chip \"{}\" --accept [--merge]` или `--rework \"<замечания>\"`.",
+                    cid, title, summary, branch, cs_bin, cid
                 ));
                 card.insert("parent_notified".to_string(), Value::Bool(true));
                 let _ = rio::write_json(&cpath, &Value::Object(card));
@@ -228,16 +194,11 @@ pub fn decide_stop(payload: &Value) -> Option<String> {
                     let _ = rio::write_json(&card_path(&cid), &Value::Object(child_card.clone()));
                 }
             });
-            let script_norm = rio::normalize_path(
-                &rio::plugin_root()
-                    .join("tools")
-                    .join("chip_handoff.py")
-                    .to_string_lossy(),
-            );
+            let cs_bin = rio::normalize_path(&rio::carbon_stack_bin_path().to_string_lossy());
             let title = display_title(child_card.get("title"));
             return Some(format!(
-                "[Chip Handoff] Эта сессия работает внутри изолированного чипа `{}` ({}), но результат ещё не передан родителю (`status={}`). Закоммитьте проверенные изменения и выполните `python -X utf8 \"{}\" finish --chip \"{}\" --message \"...\"`.",
-                cid, title, status, script_norm, cid
+                "[Chip Handoff] Эта сессия работает внутри изолированного чипа `{}` ({}), но результат ещё не передан родителю (`status={}`). Закоммитьте проверенные изменения и выполните `& \"{}\" chip-handoff finish --chip \"{}\" --message \"...\"`.",
+                cid, title, status, cs_bin, cid
             ));
         }
     }
@@ -279,9 +240,6 @@ pub fn run_cli(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_pre_invocation_and_stop_for_chip_cards() {

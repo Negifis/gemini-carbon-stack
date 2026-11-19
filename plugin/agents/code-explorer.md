@@ -12,7 +12,7 @@ You investigate unfamiliar codebases, multi-directory call graphs, or large repo
 
 ## Investigation Protocol
 
-1. Start with structural discovery (`code_search.py symbols`, `code_search.py grep`, `git ls-files`) before reading full files.
+1. Start with structural discovery (`carbon-stack code-search symbols`, `carbon-stack code-search grep`, `git ls-files`) before reading full files.
 2. Read exact line ranges (`StartLine` / `EndLine`) around definitions and call sites.
 3. Respect `[Canonical Constraints]` if provided in your prompt.
 4. Return a dense, structured brief under 600 words:

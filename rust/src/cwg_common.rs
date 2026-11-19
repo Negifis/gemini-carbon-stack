@@ -6,10 +6,11 @@ use std::env;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::rio;
+use crate::rio::{self, file_mtime_sec, json_truthy, val_to_f64, val_to_i64, val_to_str};
 use crate::win32_sqlite::now_sec;
 
 pub const WORK_NO_CHANGE: &str = "NO_CHANGE";
@@ -21,7 +22,6 @@ pub const RISK_LOW: &str = "LOW";
 pub const RISK_STANDARD: &str = "STANDARD";
 pub const RISK_HIGH: &str = "HIGH";
 pub const RISK_XHIGH: &str = "XHIGH";
-pub const RISK_LEVELS: &[&str] = &[RISK_LOW, RISK_STANDARD, RISK_HIGH, RISK_XHIGH];
 
 pub const SHELL_MUTATION_SENTINEL: &str = "<shell-mutation>";
 pub const MAX_CONTENT_MARKS: usize = 512;
@@ -42,11 +42,34 @@ pub const HYDROGEN_LOW_MODEL: &str = "gemini-4-hydrogen-low";
 pub const HYDROGEN_MEDIUM_MODEL: &str = "gemini-4-hydrogen-medium";
 pub const HYDROGEN_HIGH_MODEL: &str = "gemini-4-hydrogen-high";
 pub const HYDROGEN_XHIGH_MODEL: &str = "gemini-4-hydrogen-xhigh";
+pub const CODEX_SOL_MODEL: &str = "gpt-6.2-sol";
+pub const CODEX_ASTRA_MODEL: &str = "gpt-6.2-astra";
+
+pub fn is_codex_astra_model(model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    m == CODEX_ASTRA_MODEL
+        || (m.starts_with(CODEX_ASTRA_MODEL)
+            && m.as_bytes().get(CODEX_ASTRA_MODEL.len()) == Some(&b'-'))
+}
+
+pub fn is_codex_xhigh_effort(effort: &str) -> bool {
+    matches!(
+        effort.trim().to_ascii_lowercase().as_str(),
+        "xhigh" | "max" | "ultra"
+    )
+}
+
+pub fn is_codex_xhigh_turn(model: &str, effort: &str) -> bool {
+    // INVARIANT: XHIGH Codex verification requires Astra 6.2 (`gpt-6.2-astra`) at XHIGH-tier reasoning; Sol stays on HIGH.
+    is_codex_astra_model(model) && is_codex_xhigh_effort(effort)
+}
 
 pub const SIMPLIFY_LENSES: &[&str] = &["reuse", "quality", "efficiency"];
 pub const SIMPLIFY_FALLBACK_MODEL: &str = HYDROGEN_XHIGH_MODEL;
 pub const ANTHROPIC_EPHEMERAL_TTL_SECONDS: u64 = 300;
 pub const SWARM_CACHE_SAFE_TTL_SECONDS: u64 = 270;
+pub const MAX_CLOSURE_PASSES_PER_CYCLE: usize = 2;
+pub const RESEARCH_RESET_DECISIONS: &[&str] = &["refactor", "refine"];
 
 pub const CODEX_REVIEW_OUTPUT_BANNER: &str = "--- CODEX REVIEW OUTPUT ---";
 
@@ -77,7 +100,7 @@ fn high_risk_patterns() -> &'static [Regex] {
             r"(?i)(?:^|/|_|-)(?:auth|oauth\d*|jwt|crypto|security|permissions?|rbac|acl|secrets?|vault|signing)(?:/|_|-|\.|$)",
             r"(?i)(?:^|/)(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock|cargo\.lock|poetry\.lock|uv\.lock|go\.sum)$",
             r"(?i)(?:^|/)(?:pyproject\.toml|cargo\.toml|go\.mod|tsconfig\.json|webpack\.config\.|vite\.config\.)$",
-            r"(?i)(?:^|/)install\.py$",
+            r"(?i)(?:^|/)(?:install\.py|bin/carbon-stack(?:\.exe)?|rust/src/(?:cwg_(?:common|mark|stop|pre_invocation)|codex_lane|safety_guards|tokenade_hook|installer|gate_inbox|chip_hooks|continuity_hook)\.rs)$",
         ]
         .iter()
         .map(|p| Regex::new(p).expect("high_risk_pattern"))
@@ -97,7 +120,7 @@ fn system_generated_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"(?i)/\.system_generated(?:/|$)").expect("system_generated_re"))
 }
 
-fn user_scratch_patterns() -> &'static [Regex] {
+pub(crate) fn user_scratch_patterns() -> &'static [Regex] {
     static RE: OnceLock<Vec<Regex>> = OnceLock::new();
     RE.get_or_init(|| {
         [
@@ -110,6 +133,18 @@ fn user_scratch_patterns() -> &'static [Regex] {
     })
 }
 
+pub(crate) fn extract_workspace_paths(payload: &Value) -> Vec<String> {
+    payload
+        .get("workspacePaths")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn always_ephemeral_patterns() -> &'static [Regex] {
     static RE: OnceLock<Vec<Regex>> = OnceLock::new();
     RE.get_or_init(|| {
@@ -119,6 +154,7 @@ fn always_ephemeral_patterns() -> &'static [Regex] {
             r"(?i)/\.gemini/antigravity/brain/[^/]+/\.system_generated(?:/|$)",
             r"(?i)/\.gemini/carbon-stack/state(?:/|$)",
             r"(?i)(?:^|/)\.swarm(?:/|$)",
+            r"(?i)\.tokenade-original$",
         ]
         .iter()
         .map(|p| Regex::new(p).expect("always_ephemeral_pattern"))
@@ -193,7 +229,7 @@ fn closure_line_re() -> &'static Regex {
     })
 }
 
-fn codex_cli_wrapper_re() -> &'static Regex {
+pub fn codex_cli_wrapper_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
@@ -768,54 +804,6 @@ pub fn parse_simplify_verdict(text: &str, default_lens: Option<&str>) -> Value {
     })
 }
 
-fn val_to_i64(v: Option<&Value>) -> i64 {
-    match v {
-        Some(Value::Number(n)) => {
-            if let Some(i) = n.as_i64() {
-                i
-            } else if let Some(u) = n.as_u64() {
-                u.min(i64::MAX as u64) as i64
-            } else if let Some(f) = n.as_f64() {
-                f as i64
-            } else {
-                0
-            }
-        }
-        Some(Value::String(s)) => s.trim().parse::<i64>().unwrap_or(0),
-        Some(Value::Bool(b)) => i64::from(*b),
-        _ => 0,
-    }
-}
-
-fn val_to_f64(v: Option<&Value>) -> f64 {
-    match v {
-        Some(Value::Number(n)) => n.as_f64().unwrap_or(0.0),
-        Some(Value::String(s)) => s.trim().parse::<f64>().unwrap_or(0.0),
-        Some(Value::Bool(b)) => if *b { 1.0 } else { 0.0 },
-        _ => 0.0,
-    }
-}
-
-fn val_to_str(v: Option<&Value>) -> String {
-    match v {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Number(n)) => n.to_string(),
-        Some(Value::Bool(b)) => b.to_string(),
-        _ => String::new(),
-    }
-}
-
-fn json_truthy(v: Option<&Value>) -> bool {
-    match v {
-        Some(Value::Bool(b)) => *b,
-        Some(Value::Number(n)) => n.as_f64().map_or(false, |x| x != 0.0),
-        Some(Value::String(s)) => !s.is_empty(),
-        Some(Value::Array(a)) => !a.is_empty(),
-        Some(Value::Object(m)) => !m.is_empty(),
-        _ => false,
-    }
-}
-
 fn normalize_diff_metrics(raw: &Map<String, Value>, default_source: &str) -> Value {
     let files_count = val_to_i64(raw.get("files_count").or_else(|| raw.get("files")));
     let additions = val_to_i64(raw.get("additions")).max(0);
@@ -1098,10 +1086,6 @@ fn resolve_board_path_and_rows(
         return (best_existing, best_rows);
     }
     (candidates.into_iter().next(), Vec::new())
-}
-
-pub fn resolve_swarm_board_path(session: &str, cwd: &str, transcript_path: &str) -> Option<PathBuf> {
-    resolve_board_path_and_rows(session, cwd, transcript_path).0
 }
 
 pub fn load_swarm_board_messages(
@@ -1557,23 +1541,28 @@ fn exact_mention_in_text(text: &str, name: &str) -> bool {
     rio::text_contains_mention(text, name)
 }
 
-fn file_mtime_sec(path: &Path) -> Option<f64> {
-    let meta = fs::metadata(path).ok()?;
-    let modified = meta.modified().ok()?;
-    let dur = modified.duration_since(UNIX_EPOCH).ok()?;
-    Some(dur.as_secs_f64())
+pub struct StallDetectInput<'a> {
+    pub members: &'a Map<String, Value>,
+    pub board_messages: &'a [Value],
+    pub cwd: &'a str,
+    pub brain_root: Option<&'a Path>,
+    pub worker_last_activity: &'a HashMap<String, f64>,
+    pub in_flight_names: &'a [String],
+    pub now_ts: Option<f64>,
+    pub timeout_sec: Option<f64>,
 }
 
-pub fn detect_stalled_workers(
-    members: &Map<String, Value>,
-    board_messages: &[Value],
-    cwd: &str,
-    brain_root: Option<&Path>,
-    worker_last_activity: &HashMap<String, f64>,
-    in_flight_names: &[String],
-    now_ts: Option<f64>,
-    timeout_sec: Option<f64>,
-) -> Vec<Value> {
+pub fn detect_stalled_workers(input: StallDetectInput<'_>) -> Vec<Value> {
+    let StallDetectInput {
+        members,
+        board_messages,
+        cwd,
+        brain_root,
+        worker_last_activity,
+        in_flight_names,
+        now_ts,
+        timeout_sec,
+    } = input;
     let active_set: HashSet<String> = in_flight_names
         .iter()
         .filter(|x| !x.trim().is_empty())
@@ -1753,6 +1742,438 @@ pub fn marker_path(session: &str) -> PathBuf {
     gate_subdir(&["markers"]).join(format!("{}.json", session))
 }
 
+pub fn marker_lock_path(session: &str) -> PathBuf {
+    gate_subdir(&["markers"]).join(format!("{}.lock", rio::safe_key(session, "default")))
+}
+
+pub fn marker_pending_dir(session: &str) -> PathBuf {
+    gate_subdir(&["markers"]).join(format!("{}.pending.d", rio::safe_key(session, "default")))
+}
+
+const MAX_PENDING_DELTA_FILES: usize = 512;
+static PENDING_DELTA_SEQ: AtomicU64 = AtomicU64::new(1);
+
+pub fn last_mark_fp(marker: &Value) -> Option<&str> {
+    marker
+        .get("content_marks")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.last())
+        .and_then(|o| o.get("fp"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+}
+
+fn pending_delta_stem(ent: &fs::DirEntry) -> Option<String> {
+    if !ent.file_type().map_or(false, |ft| ft.is_file()) {
+        return None;
+    }
+    let fname = ent.file_name();
+    let stem = fname.to_str()?.strip_suffix(".json")?;
+    if stem.is_empty() || stem.starts_with('.') {
+        return None;
+    }
+    Some(stem.to_string())
+}
+
+fn list_pending_delta_files(session: &str) -> Vec<(String, PathBuf)> {
+    if session.trim().is_empty() {
+        return Vec::new();
+    }
+    let dir = marker_pending_dir(session);
+    let Ok(rd) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    for ent in rd.flatten() {
+        let Some(stem) = pending_delta_stem(&ent) else {
+            continue;
+        };
+        files.push((stem, ent.path()));
+        if files.len() >= MAX_PENDING_DELTA_FILES * 4 {
+            break;
+        }
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    if files.len() > MAX_PENDING_DELTA_FILES {
+        files.truncate(MAX_PENDING_DELTA_FILES);
+    }
+    files
+}
+
+pub fn has_pending_marker_deltas(session: &str) -> bool {
+    if session.trim().is_empty() {
+        return false;
+    }
+    let Ok(rd) = fs::read_dir(marker_pending_dir(session)) else {
+        return false;
+    };
+    rd.flatten().any(|ent| pending_delta_stem(&ent).is_some())
+}
+
+pub fn pending_marker_mtime_ns(session: &str) -> u128 {
+    if session.trim().is_empty() {
+        return 0;
+    }
+    let Ok(rd) = fs::read_dir(marker_pending_dir(session)) else {
+        return 0;
+    };
+    let mut best = 0u128;
+    for ent in rd.flatten() {
+        if pending_delta_stem(&ent).is_some() {
+            if let Ok(meta) = ent.metadata() {
+                best = best.max(rio::meta_mtime_ns(&meta));
+            }
+        }
+    }
+    best
+}
+
+pub struct PendingMarkerDelta<'a> {
+    pub session: &'a str,
+    pub ts: f64,
+    pub cwd: &'a str,
+    pub git_root: &'a str,
+    pub durable_new_paths: &'a [String],
+    pub operational_mutation: bool,
+    pub changed_lines_delta: i64,
+    pub shell_durable_edit: bool,
+    pub unknown_barrier: bool,
+    pub cause_label: &'a str,
+    pub measured_fp: Option<&'a str>,
+    pub measured_paths: &'a [String],
+}
+
+pub fn append_pending_marker_delta(delta: PendingMarkerDelta<'_>) -> Option<String> {
+    let PendingMarkerDelta {
+        session,
+        ts,
+        cwd,
+        git_root,
+        durable_new_paths,
+        operational_mutation,
+        changed_lines_delta,
+        shell_durable_edit,
+        unknown_barrier,
+        cause_label,
+        measured_fp,
+        measured_paths,
+    } = delta;
+    // SAFETY: Write each lock-contended delta via `rio::write_json` (atomic `.tmp` + rename) under `<session>.pending.d/` so concurrent appends and per-ID acknowledgments never contend on or overwrite a shared file.
+    let ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = PENDING_DELTA_SEQ.fetch_add(1, Ordering::Relaxed);
+    let delta_id = format!("pd-{:020}-{}-{:08}", ns, std::process::id(), seq);
+    let cause_trunc: String = cause_label.chars().take(120).collect();
+    let norm_mpaths = durable_paths(measured_paths);
+    let mfp_val = match measured_fp.filter(|s| !s.is_empty() && !unknown_barrier) {
+        Some(fp) => Value::String(fp.to_string()),
+        None => Value::Null,
+    };
+    let entry = json!({
+        "id": delta_id,
+        "ts": ts,
+        "cwd": if cwd.is_empty() { String::new() } else { rio::normalize_path(cwd) },
+        "git_root": if git_root.is_empty() { String::new() } else { rio::normalize_path(git_root) },
+        "durable_new_paths": durable_new_paths,
+        "operational_mutation": operational_mutation,
+        "changed_lines_delta": changed_lines_delta,
+        "shell_durable_edit": shell_durable_edit,
+        "unknown_barrier": unknown_barrier,
+        "cause_label": cause_trunc,
+        "measured_fp": mfp_val,
+        "measured_paths": norm_mpaths,
+    });
+    let dst_path = marker_pending_dir(session).join(format!("{}.json", delta_id));
+    if let Err(e) = rio::write_json(&dst_path, &entry) {
+        rio::log_hook_event(
+            "hook-errors",
+            "pending_delta_write_failed",
+            json!({ "session": session, "error": e }),
+        );
+        return None;
+    }
+    Some(delta_id)
+}
+
+pub fn has_unconsumed_pending_deltas(session: &str, consumed_ids: &[String]) -> bool {
+    if session.trim().is_empty() {
+        return false;
+    }
+    let Ok(rd) = fs::read_dir(marker_pending_dir(session)) else {
+        return false;
+    };
+    let consumed_set: HashSet<&str> = consumed_ids.iter().map(|s| s.as_str()).collect();
+    rd.flatten()
+        .filter_map(|ent| pending_delta_stem(&ent))
+        .any(|rid| !consumed_set.contains(rid.as_str()))
+}
+
+pub fn ack_pending_marker_deltas(session: &str, consumed_ids: &[String]) {
+    if session.trim().is_empty() || consumed_ids.is_empty() {
+        return;
+    }
+    // SAFETY: Unlink only acknowledged `<id>.json` files and keep `<session>.pending.d/` persistent so concurrent `PostToolUse` opens never fail with `NotFound` from a racing `remove_dir`.
+    let dir = marker_pending_dir(session);
+    for cid in consumed_ids {
+        let safe_cid = rio::safe_key(cid, "");
+        if !safe_cid.is_empty() && safe_cid == *cid {
+            let _ = fs::remove_file(dir.join(format!("{}.json", safe_cid)));
+        }
+    }
+}
+
+pub fn read_marker_with_pending(session: &str) -> Option<Value> {
+    if session.trim().is_empty() {
+        return None;
+    }
+    let skey = rio::safe_key(session, "default");
+    let base = rio::read_json(&marker_path(&skey))
+        .or_else(|| (skey != session).then(|| rio::read_json(&marker_path(session))).flatten());
+    apply_pending_marker_deltas(&skey, base.as_ref()).0
+}
+
+pub fn apply_pending_marker_deltas(
+    session: &str,
+    marker: Option<&Value>,
+) -> (Option<Value>, Vec<String>) {
+    let delta_files = list_pending_delta_files(session);
+    if delta_files.is_empty() {
+        return (marker.cloned(), Vec::new());
+    }
+    let mut rows: Vec<(String, Value)> = Vec::with_capacity(delta_files.len());
+    for (stem_id, fpath) in delta_files {
+        match rio::read_json(&fpath) {
+            Some(val) if val.is_object() => rows.push((stem_id, val)),
+            _ => {
+                // SAFETY: Fail closed on unreadable/corrupt delta files by synthesizing an unmeasured barrier without marking `stem_id` consumed.
+                rows.push((
+                    String::new(),
+                    json!({
+                        "ts": now_sec(),
+                        "operational_mutation": true,
+                        "unknown_barrier": true,
+                        "cause_label": "corrupt_pending_delta",
+                    }),
+                ));
+            }
+        }
+    }
+    if rows.is_empty() {
+        return (marker.cloned(), Vec::new());
+    }
+
+    let existing_applied: HashSet<String> = marker
+        .filter(|v| v.is_object() && !json_truthy(v.get("closed")))
+        .and_then(|v| v.get("applied_pending_ids"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().filter(|s| !s.is_empty()).map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut consumed_ids: Vec<String> = Vec::new();
+    let mut unapplied_rows: Vec<(String, &Map<String, Value>)> = Vec::new();
+    for (stem_id, row) in &rows {
+        let Some(robj) = row.as_object() else {
+            continue;
+        };
+        if !stem_id.is_empty() {
+            consumed_ids.push(stem_id.clone());
+            if !existing_applied.contains(stem_id) {
+                unapplied_rows.push((stem_id.clone(), robj));
+            }
+        } else {
+            unapplied_rows.push((String::new(), robj));
+        }
+    }
+
+    if unapplied_rows.is_empty() {
+        return (marker.cloned(), consumed_ids);
+    }
+
+    let mut out = match marker {
+        Some(v) if v.is_object() && !json_truthy(v.get("closed")) => v.clone(),
+        _ => {
+            let (_, first_robj) = unapplied_rows[0];
+            let first_row_ts = first_robj
+                .get("ts")
+                .and_then(|v| v.as_f64())
+                .unwrap_or_else(now_sec);
+            let row_cwd = first_robj
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let row_gr = first_robj
+                .get("git_root")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            json!({
+                "session": session,
+                "first_ts": first_row_ts,
+                "last_ts": first_row_ts,
+                "last_durable_ts": 0.0,
+                "cwd": row_cwd,
+                "git_root": row_gr,
+                "paths": [],
+                "operational": false,
+                "changed_lines": 0,
+                "edits": 0,
+                "shell_durable_edit": false,
+                "content_marks": [],
+                "applied_pending_ids": [],
+                "closed": false,
+            })
+        }
+    };
+
+    let mut marks = out
+        .get("content_marks")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut applied_list: Vec<String> = out
+        .get("applied_pending_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().filter(|s| !s.is_empty()).map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for (rid, robj) in unapplied_rows {
+        if !rid.is_empty() {
+            applied_list.push(rid);
+        }
+        let rts = robj.get("ts").and_then(|v| v.as_f64()).unwrap_or_else(now_sec);
+        let new_p: Vec<String> = robj
+            .get("durable_new_paths")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().filter(|s| !s.is_empty()).map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let cause = robj
+            .get("cause_label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .chars()
+            .take(120)
+            .collect::<String>();
+        let row_unknown = json_truthy(robj.get("unknown_barrier"));
+        let row_mfp = robj
+            .get("measured_fp")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let row_mpaths = durable_paths_from_val(robj.get("measured_paths"));
+
+        if let Some(m) = out.as_object_mut() {
+            let prev_last = m.get("last_ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            m.insert("last_ts".to_string(), json!(prev_last.max(rts)));
+            if m.get("cwd").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+                if let Some(rcwd) = robj.get("cwd").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                    m.insert("cwd".to_string(), Value::String(rcwd.to_string()));
+                }
+            }
+            if m.get("git_root").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+                if let Some(rgr) = robj.get("git_root").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                    m.insert("git_root".to_string(), Value::String(rgr.to_string()));
+                }
+            }
+        }
+
+        if !new_p.is_empty() {
+            let mut combined = durable_paths_from_val(out.get("paths"));
+            combined.extend(new_p);
+            let merged = durable_paths(&combined);
+            // INVARIANT: Never recompute live-disk SHA-256 under an earlier edit timestamp `rts`; only accept `measured_fp` captured at `rts` when `measured_paths == merged`, else mark `unknown: true` until caught up at `now_sec()`.
+            let exact_fp = if !row_unknown && row_mpaths == merged {
+                row_mfp
+            } else {
+                None
+            };
+            let mut m_entry = Map::new();
+            m_entry.insert("ts".to_string(), json!(rts));
+            match exact_fp {
+                Some(fp) => {
+                    m_entry.insert("fp".to_string(), Value::String(fp.to_string()));
+                }
+                None => {
+                    m_entry.insert("fp".to_string(), Value::Null);
+                    m_entry.insert("unknown".to_string(), Value::Bool(true));
+                }
+            }
+            m_entry.insert("cause".to_string(), Value::String(cause));
+            marks.push(Value::Object(m_entry));
+            if let Some(m) = out.as_object_mut() {
+                m.insert(
+                    "paths".to_string(),
+                    Value::Array(merged.into_iter().map(Value::String).collect()),
+                );
+                let prev_dur = m.get("last_durable_ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                m.insert("last_durable_ts".to_string(), json!(prev_dur.max(rts)));
+                let edits = m.get("edits").and_then(|v| v.as_i64()).unwrap_or(0) + 1;
+                let cl_delta = robj
+                    .get("changed_lines_delta")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                    .max(1);
+                let cl = m.get("changed_lines").and_then(|v| v.as_i64()).unwrap_or(0) + cl_delta;
+                m.insert("edits".to_string(), json!(edits));
+                m.insert("changed_lines".to_string(), json!(cl));
+                if json_truthy(robj.get("shell_durable_edit")) {
+                    m.insert("shell_durable_edit".to_string(), Value::Bool(true));
+                }
+            }
+        } else if json_truthy(robj.get("operational_mutation")) {
+            if let Some(m) = out.as_object_mut() {
+                m.insert("operational".to_string(), Value::Bool(true));
+            }
+            let dpaths = durable_paths_from_val(out.get("paths"));
+            if !dpaths.is_empty() {
+                let exact_fp = if !row_unknown && row_mpaths == dpaths {
+                    row_mfp
+                } else {
+                    None
+                };
+                let mut m_entry = Map::new();
+                m_entry.insert("ts".to_string(), json!(rts));
+                match exact_fp {
+                    Some(fp) => {
+                        m_entry.insert("fp".to_string(), Value::String(fp.to_string()));
+                    }
+                    None => {
+                        m_entry.insert("fp".to_string(), Value::Null);
+                        m_entry.insert("unknown".to_string(), Value::Bool(true));
+                    }
+                }
+                m_entry.insert("cause".to_string(), Value::String(cause));
+                marks.push(Value::Object(m_entry));
+            }
+        }
+    }
+
+    if applied_list.len() > 128 {
+        let drop_n = applied_list.len() - 128;
+        applied_list.drain(0..drop_n);
+    }
+    if let Some(m) = out.as_object_mut() {
+        m.insert(
+            "applied_pending_ids".to_string(),
+            Value::Array(applied_list.into_iter().map(Value::String).collect()),
+        );
+    }
+
+    trim_content_marks(&mut out, marks);
+    (Some(out), consumed_ids)
+}
+
 pub fn enforcement_state_path(session: &str) -> PathBuf {
     gate_subdir(&["states"]).join(format!("{}.json", session))
 }
@@ -1892,7 +2313,7 @@ fn risk_rank(risk: &str) -> usize {
     }
 }
 
-fn is_valid_risk(risk: &str) -> bool {
+pub fn is_valid_risk(risk: &str) -> bool {
     matches!(
         risk.to_uppercase().as_str(),
         "LOW" | "STANDARD" | "HIGH" | "XHIGH"
@@ -2106,6 +2527,13 @@ pub fn load_project_gate_policy(hints: &[String], cwd: &str) -> Value {
 }
 
 fn glob_to_regex(pattern: &str) -> Option<Regex> {
+    static CACHE: OnceLock<std::sync::Mutex<HashMap<String, Option<Regex>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(cached) = guard.get(pattern) {
+            return cached.clone();
+        }
+    }
     let mut out = String::from(r"\A");
     let chars: Vec<char> = pattern.chars().collect();
     let mut i = 0usize;
@@ -2128,7 +2556,14 @@ fn glob_to_regex(pattern: &str) -> Option<Regex> {
         }
     }
     out.push_str(r"\z");
-    Regex::new(&out).ok()
+    let compiled = Regex::new(&out).ok();
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() >= 256 {
+            guard.clear();
+        }
+        guard.insert(pattern.to_string(), compiled.clone());
+    }
+    compiled
 }
 
 fn posix_full_match(path_str: &str, pattern: &str) -> bool {
@@ -2343,6 +2778,9 @@ fn workspace_has_test_harness_opt(
                 if (ft.is_dir() || entry.path().is_dir()) && test_dirs.contains(&name.as_ref()) {
                     return true;
                 }
+                if name == "rust" && entry.path().join("Cargo.toml").is_file() {
+                    return true;
+                }
                 if (ft.is_file() || entry.path().is_file()) && harness_files.contains(&name.as_ref())
                 {
                     return true;
@@ -2361,15 +2799,6 @@ fn workspace_has_test_harness_opt(
         }
     }
     false
-}
-
-pub fn workspace_has_test_harness(cwd: &str, paths: &[String], git_root: &str) -> bool {
-    let git_root_opt = if git_root.trim().is_empty() {
-        None
-    } else {
-        Some(git_root)
-    };
-    workspace_has_test_harness_opt(cwd, paths, git_root_opt)
 }
 
 pub fn max_risk(levels: &[String]) -> String {
@@ -2454,6 +2883,7 @@ pub fn sha256_file_bounded(path: &Path, max_bytes: u64) -> Result<Option<(u64, S
 }
 
 pub fn content_fingerprint(paths: &[String], max_file_bytes: u64) -> String {
+    // SAFETY: Require full-file SHA-256 within `max_file_bytes`; if any file exceeds the read budget or fails to hash, return `""` (`fp: null`) so `is_review_fresh` and `verified` closure fail closed instead of trusting partial samples.
     let mut dpaths = durable_paths(paths);
     dpaths.sort_by_key(|p| rio::fold_path(p));
     if dpaths.is_empty() {
@@ -3086,14 +3516,636 @@ pub fn receipt_requirements_summary(floor: &str, policy: Option<&Value>, has_tes
     }
     if floor == "HIGH" {
         return format!(
-            "decisive test/check execution -> primary independent APPROVED review (`codex_lane.py` -> `{}` -> `{}`) -> simplify once (`SIMPLIFY_LENS: ALL` fast-path if <=2 files & <=30 lines, else 3 separate lenses on `{}`, fallback `{}`) -> batch kill workers -> final `--closure` check",
-            OPUS_HIGH_MODEL, CARBON_HIGH_MODEL, SONNET_HIGH_MODEL, SIMPLIFY_FALLBACK_MODEL
+            "decisive test/check execution -> primary independent APPROVED review (`carbon-stack codex-lane review` on `{}` -> `{}` -> `{}`) -> simplify once (`SIMPLIFY_LENS: ALL` fast-path if <=2 files & <=30 lines, else 3 separate lenses on `{}`, fallback `{}`) -> batch kill workers -> final `--closure` check",
+            CODEX_SOL_MODEL, OPUS_HIGH_MODEL, CARBON_HIGH_MODEL, SONNET_HIGH_MODEL, SIMPLIFY_FALLBACK_MODEL
         );
     }
     format!(
-        "decisive test/check execution -> primary XHIGH APPROVED review (`codex_lane.py --xhigh` -> `{}` -> `{}`) -> simplify once (`SIMPLIFY_LENS: ALL` fast-path if <=2 files & <=30 lines, else 3 separate lenses on `{}`, fallback `{}`) -> batch kill workers -> final `--closure` check",
-        OPUS_HIGH_MODEL, CARBON_HIGH_MODEL, SONNET_HIGH_MODEL, SIMPLIFY_FALLBACK_MODEL
+        "decisive test/check execution -> primary XHIGH APPROVED review (`carbon-stack codex-lane review --xhigh` on `{}` -> `{}` -> `{}`) -> simplify once (`SIMPLIFY_LENS: ALL` fast-path if <=2 files & <=30 lines, else 3 separate lenses on `{}`, fallback `{}`) -> batch kill workers -> final `--xhigh --closure` check",
+        CODEX_ASTRA_MODEL, OPUS_HIGH_MODEL, CARBON_HIGH_MODEL, SONNET_HIGH_MODEL, SIMPLIFY_FALLBACK_MODEL
     )
+}
+
+fn is_research_mcp_server(server_name: &str) -> bool {
+    let s = server_name.trim().to_ascii_lowercase();
+    s.starts_with("context7")
+        || s.starts_with("gemini-api")
+        || s.starts_with("google-developer-knowledge")
+        || s.starts_with("v8std")
+        || s.starts_with("notebooklm")
+}
+
+fn is_research_shell_cmd(raw_cmd: &str) -> bool {
+    let unwrapped = rio::unwrap_tokenade_command(raw_cmd);
+    let low = unwrapped.to_ascii_lowercase();
+    let re = {
+        static RE: OnceLock<Regex> = OnceLock::new();
+        RE.get_or_init(|| {
+            Regex::new(
+                r"(?i)(?:^|[;&|]\s*|\$null\s*\|\s*)(?:&?\s*['\x22]?[^\s'\x22]*?(?:tokenade(?:\.exe|\.cmd)?\s+(?:search|web)\b|nlm-memory(?:\.cmd|\.exe)?\s+recall\b|jev(?:\.exe|\.cmd)?\s+(?:ask|find)\b))",
+            )
+            .expect("research_shell_re")
+        })
+    };
+    re.is_match(&low)
+}
+
+pub fn find_research_evidence_since(
+    steps: &[Value],
+    since_ts: f64,
+    until_ts: Option<f64>,
+) -> Vec<String> {
+    // INVARIANT: Verify external docs/web research executed strictly after the blocking closure verdict before allowing a cycle reset.
+    let mut found: Vec<String> = Vec::new();
+    for (idx, st) in steps.iter().enumerate() {
+        if st.get("source").and_then(|v| v.as_str()) != Some("MODEL")
+            || st.get("type").and_then(|v| v.as_str()) != Some("PLANNER_RESPONSE")
+        {
+            continue;
+        }
+        let step_ts = st
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .map(rio::parse_iso_ts)
+            .unwrap_or(0.0);
+        let Some(tcs) = st.get("tool_calls").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        if tcs.is_empty() {
+            continue;
+        }
+        let mut gen_results: Vec<(&str, f64)> = Vec::new();
+        let mut scan_i = idx + 1;
+        while scan_i < steps.len() {
+            let gst = &steps[scan_i];
+            if gst.get("type").and_then(|v| v.as_str()) != Some("GENERIC") {
+                break;
+            }
+            let status = gst.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            let gts = gst
+                .get("created_at")
+                .and_then(|v| v.as_str())
+                .map(rio::parse_iso_ts)
+                .unwrap_or(0.0);
+            gen_results.push((status, gts));
+            scan_i += 1;
+        }
+        for (pos, tc) in tcs.iter().enumerate() {
+            if pos >= gen_results.len() {
+                continue;
+            }
+            let (g_status, g_ts) = gen_results[pos];
+            if g_status == "ERROR" {
+                continue;
+            }
+            let eff_ts = step_ts.max(g_ts);
+            if eff_ts <= since_ts {
+                continue;
+            }
+            if let Some(u_ts) = until_ts {
+                if eff_ts > u_ts {
+                    continue;
+                }
+            }
+            let name = val_to_str(tc.get("name"));
+            let name_low = name.trim().to_ascii_lowercase();
+            let decoded_args = match tc.get("args") {
+                Some(Value::String(s)) => serde_json::from_str::<Value>(s).unwrap_or(Value::Null),
+                Some(v) => v.clone(),
+                None => Value::Null,
+            };
+            let mut tag = String::new();
+            if name_low == "search_web" {
+                tag = "search_web".to_string();
+            } else if let Some(rest) = name_low.strip_prefix("mcp_") {
+                if is_research_mcp_server(rest) {
+                    tag = name_low.clone();
+                }
+            } else if name_low == "call_mcp_tool" {
+                let srv = val_to_str(decoded_args.get("ServerName"));
+                if is_research_mcp_server(&srv) {
+                    tag = format!("call_mcp_tool:{}", srv.trim().to_ascii_lowercase());
+                }
+            } else if name_low == "invoke_subagent" {
+                let sub_type = val_to_str(decoded_args.get("TypeName"));
+                if sub_type.trim().eq_ignore_ascii_case("research") {
+                    tag = "subagent:research".to_string();
+                }
+            } else if name_low == "run_command" {
+                let cmd_line = val_to_str(decoded_args.get("CommandLine"));
+                if is_research_shell_cmd(&cmd_line) {
+                    tag = "cli:research".to_string();
+                }
+            }
+            if !tag.is_empty() && !found.contains(&tag) {
+                found.push(tag);
+            }
+        }
+    }
+    found
+}
+
+pub fn last_research_reset_ts(marker: &Value) -> f64 {
+    marker
+        .get("research_resets")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|ent| val_to_f64(ent.get("reset_ts")))
+                .fold(0.0f64, f64::max)
+        })
+        .unwrap_or(0.0)
+}
+
+pub fn last_research_reset_board_seq(marker: &Value) -> i64 {
+    marker
+        .get("research_resets")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|ent| ent.get("board_head_seq").and_then(|v| v.as_i64()))
+                .fold(0i64, i64::max)
+        })
+        .unwrap_or(0)
+}
+
+pub fn active_marker_closure_halt(marker: &Value) -> Option<(usize, f64, Vec<String>)> {
+    let ch = marker.get("closure_halt")?.as_object()?;
+    let cnt = ch.get("blocked_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    if cnt < MAX_CLOSURE_PASSES_PER_CYCLE {
+        return None;
+    }
+    let ch_first_ts = val_to_f64(ch.get("candidate_first_ts"));
+    let marker_first_ts = val_to_f64(marker.get("first_ts"));
+    if ch_first_ts > 0.0 && (ch_first_ts - marker_first_ts).abs() > 1e-6 {
+        return None;
+    }
+    let last_blk_ts = val_to_f64(ch.get("last_blocked_ts"));
+    let cycle_base_ts = val_to_f64(ch.get("cycle_base_ts"));
+    let rr_ts = last_research_reset_ts(marker);
+    // INVARIANT: A latched `closure_halt` is bound to `candidate_first_ts` and remains active until a verified `research_resets` entry advances `reset_ts` past `last_blocked_ts` or `cycle_base_ts`.
+    if rr_ts > 0.0 && (rr_ts > last_blk_ts || rr_ts > cycle_base_ts + 1e-6) {
+        return None;
+    }
+    let ids: Vec<String> = ch
+        .get("blocked_review_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|x| val_to_str(Some(x)).trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    Some((cnt, last_blk_ts, ids))
+}
+
+pub struct ClosureHaltLatch<'a> {
+    pub session: &'a str,
+    pub expected_first_ts: f64,
+    pub expected_rr_ts: f64,
+    pub expected_round_start_msg_id: i64,
+    pub blocked_count: usize,
+    pub last_blocked_ts: f64,
+    pub blocked_ids: &'a [String],
+    pub cycle_base_ts: f64,
+}
+
+pub fn latch_marker_closure_halt(latch: ClosureHaltLatch<'_>) {
+    let ClosureHaltLatch {
+        session,
+        expected_first_ts,
+        expected_rr_ts,
+        expected_round_start_msg_id,
+        blocked_count,
+        last_blocked_ts,
+        blocked_ids,
+        cycle_base_ts,
+    } = latch;
+    if session.trim().is_empty()
+        || expected_first_ts <= 0.0
+        || blocked_count < MAX_CLOSURE_PASSES_PER_CYCLE
+    {
+        return;
+    }
+    let skey = rio::safe_key(session, "default");
+    let mpath = marker_path(&skey);
+    let _ = rio::with_file_lock(&marker_lock_path(&skey), 3.0, 30.0, |locked| {
+        if !locked {
+            return false;
+        }
+        let raw = rio::read_json(&mpath);
+        let (merged_opt, consumed_ids) = apply_pending_marker_deltas(&skey, raw.as_ref());
+        let Some(mut fresh) = merged_opt else {
+            return false;
+        };
+        if !fresh.is_object() || json_truthy(fresh.get("closed")) {
+            return false;
+        }
+        // SAFETY: Re-verify candidate identity (`first_ts`) and cycle cursors (`last_research_reset_ts`, `round_start_msg_id`) under `marker_lock_path` so concurrent candidate turnover or `research-reset` never inherits a stale halt.
+        let live_first_ts = val_to_f64(fresh.get("first_ts"));
+        let live_rr_ts = last_research_reset_ts(&fresh);
+        let live_round_seq = fresh
+            .get("round_start_msg_id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        if (live_first_ts - expected_first_ts).abs() > 1e-6
+            || (live_rr_ts - expected_rr_ts).abs() > 1e-6
+            || live_round_seq != expected_round_start_msg_id
+            || (live_rr_ts > 0.0 && (live_rr_ts > last_blocked_ts || live_rr_ts > cycle_base_ts + 1e-6))
+        {
+            return false;
+        }
+        if let Some((cur_cnt, cur_ts, _)) = active_marker_closure_halt(&fresh) {
+            if cur_cnt >= blocked_count && cur_ts >= last_blocked_ts && consumed_ids.is_empty() {
+                return true;
+            }
+        }
+        if let Some(mobj) = fresh.as_object_mut() {
+            mobj.insert(
+                "closure_halt".to_string(),
+                json!({
+                    "candidate_first_ts": expected_first_ts,
+                    "blocked_count": blocked_count,
+                    "last_blocked_ts": last_blocked_ts,
+                    "blocked_review_ids": blocked_ids,
+                    "cycle_base_ts": cycle_base_ts,
+                }),
+            );
+        }
+        if rio::write_json(&mpath, &fresh).is_ok() {
+            if !consumed_ids.is_empty() {
+                ack_pending_marker_deltas(&skey, &consumed_ids);
+            }
+            return true;
+        }
+        false
+    });
+}
+
+pub fn latch_marker_closure_halt_for_marker(
+    session: &str,
+    marker: &Value,
+    blocked_count: usize,
+    last_blocked_ts: f64,
+    blocked_ids: &[String],
+) {
+    let exp_first_ts = val_to_f64(marker.get("first_ts"));
+    let exp_rr_ts = last_research_reset_ts(marker);
+    let exp_round_seq = val_to_i64(marker.get("round_start_msg_id"));
+    latch_marker_closure_halt(ClosureHaltLatch {
+        session,
+        expected_first_ts: exp_first_ts,
+        expected_rr_ts: exp_rr_ts,
+        expected_round_start_msg_id: exp_round_seq,
+        blocked_count,
+        last_blocked_ts,
+        blocked_ids,
+        cycle_base_ts: exp_first_ts.max(exp_rr_ts),
+    });
+}
+
+pub fn research_reset_epoch(marker: &Value) -> usize {
+    marker
+        .get("research_resets")
+        .and_then(|v| v.as_array())
+        .map_or(0, |arr| arr.len())
+}
+
+pub fn active_marker_declared_risk(marker: &Value) -> String {
+    let Some(dr) = marker.get("cycle_declared_risk").and_then(|v| v.as_object()) else {
+        return String::new();
+    };
+    let dr_first_ts = val_to_f64(dr.get("candidate_first_ts"));
+    let marker_first_ts = val_to_f64(marker.get("first_ts"));
+    if marker_first_ts <= 0.0 || (dr_first_ts - marker_first_ts).abs() > 1e-6 {
+        return String::new();
+    }
+    let Some(dr_epoch) = dr.get("reset_epoch").and_then(|v| v.as_u64()) else {
+        return String::new();
+    };
+    if (dr_epoch as usize) != research_reset_epoch(marker) {
+        return String::new();
+    }
+    let r = val_to_str(dr.get("risk")).to_uppercase();
+    if is_valid_risk(&r) {
+        r
+    } else {
+        String::new()
+    }
+}
+
+pub fn latch_marker_declared_risk(
+    session: &str,
+    expected_first_ts: Option<f64>,
+    expected_reset_epoch: Option<usize>,
+    risk: &str,
+) -> bool {
+    let risk_up = risk.trim().to_uppercase();
+    if session.trim().is_empty() || !is_valid_risk(&risk_up) {
+        return false;
+    }
+    let skey = rio::safe_key(session, "default");
+    let mpath = marker_path(&skey);
+    rio::with_file_lock(&marker_lock_path(&skey), 5.0, 30.0, |locked| {
+        if !locked {
+            return false;
+        }
+        let raw = rio::read_json(&mpath);
+        let (merged_opt, consumed_ids) = apply_pending_marker_deltas(&skey, raw.as_ref());
+        let Some(mut fresh) = merged_opt else {
+            return false;
+        };
+        if !fresh.is_object() || json_truthy(fresh.get("closed")) {
+            return false;
+        }
+        // SAFETY: Bind cycle-escalated risk (`--xhigh` or cycle receipt) inside `marker.json` under `marker_lock_path` to `(candidate_first_ts, reset_epoch)` so concurrent `research-reset` can never erase a new cycle's risk or inherit a stale cycle's risk.
+        let live_first_ts = val_to_f64(fresh.get("first_ts"));
+        if live_first_ts <= 0.0 {
+            return false;
+        }
+        if let Some(exp_fts) = expected_first_ts {
+            if (live_first_ts - exp_fts).abs() > 1e-6 {
+                return false;
+            }
+        }
+        let live_epoch = research_reset_epoch(&fresh);
+        if let Some(exp_ep) = expected_reset_epoch {
+            if live_epoch != exp_ep {
+                return false;
+            }
+        }
+        let cur_risk = active_marker_declared_risk(&fresh);
+        let merged_risk = if cur_risk.is_empty() {
+            risk_up
+        } else {
+            max_risk(&[cur_risk.clone(), risk_up])
+        };
+        if cur_risk == merged_risk && consumed_ids.is_empty() {
+            return true;
+        }
+        if let Some(mobj) = fresh.as_object_mut() {
+            mobj.insert(
+                "cycle_declared_risk".to_string(),
+                json!({
+                    "candidate_first_ts": live_first_ts,
+                    "reset_epoch": live_epoch,
+                    "risk": merged_risk,
+                }),
+            );
+        }
+        if rio::write_json(&mpath, &fresh).is_ok() {
+            if !consumed_ids.is_empty() {
+                ack_pending_marker_deltas(&skey, &consumed_ids);
+            }
+            return true;
+        }
+        false
+    })
+}
+
+pub fn latch_marker_declared_risk_for_marker(session: &str, marker: &mut Value, risk: &str) -> bool {
+    let exp_fts = val_to_f64(marker.get("first_ts"));
+    let exp_epoch = research_reset_epoch(marker);
+    if !latch_marker_declared_risk(session, Some(exp_fts), Some(exp_epoch), risk) {
+        return false;
+    }
+    let risk_up = risk.trim().to_uppercase();
+    let cur_risk = active_marker_declared_risk(marker);
+    let merged_risk = if cur_risk.is_empty() {
+        risk_up
+    } else {
+        max_risk(&[cur_risk, risk_up])
+    };
+    if let Some(mobj) = marker.as_object_mut() {
+        mobj.insert(
+            "cycle_declared_risk".to_string(),
+            json!({
+                "candidate_first_ts": exp_fts,
+                "reset_epoch": exp_epoch,
+                "risk": merged_risk,
+            }),
+        );
+    }
+    true
+}
+
+pub fn pre_reset_worker_cids(marker: Option<&Value>) -> (bool, HashSet<String>) {
+    let mut has_snapshot = false;
+    let mut cids: HashSet<String> = HashSet::new();
+    let Some(arr) = marker
+        .and_then(|m| m.get("research_resets"))
+        .and_then(|v| v.as_array())
+    else {
+        return (false, cids);
+    };
+    for ent in arr {
+        if let Some(list) = ent.get("pre_reset_worker_cids").and_then(|v| v.as_array()) {
+            has_snapshot = true;
+            for item in list {
+                let s = val_to_str(Some(item)).trim().to_string();
+                if !s.is_empty() {
+                    cids.insert(s);
+                }
+            }
+        }
+    }
+    (has_snapshot, cids)
+}
+
+pub fn is_worker_spawned_before_reset(
+    wname: &str,
+    meta: Option<&Value>,
+    raw_board: &[Value],
+    rr_ts: f64,
+    rr_board_seq: i64,
+    marker: Option<&Value>,
+    brain_root: Option<&Path>,
+) -> bool {
+    if rr_ts <= 0.0 && rr_board_seq <= 0 {
+        return false;
+    }
+    let wcid = meta
+        .and_then(|m| m.get("conversation_id").or_else(|| m.get("conversationId")))
+        .map(|v| val_to_str(Some(v)).trim().to_string())
+        .unwrap_or_default();
+    let (has_cid_snap, old_cids) = pre_reset_worker_cids(marker);
+    if !wcid.is_empty() && old_cids.contains(&wcid) {
+        return true;
+    }
+    // INVARIANT: Bind post-reset worker freshness to the worker's own session (`conversation_id`, `created_at`, or worker transcript origin) so reusing a standard roster name like `simplify-reuse` never inherits a killed pre-reset worker's board mentions.
+    if let Some(m) = meta {
+        for key in ["created_at", "added_at", "started_at"] {
+            let cts = match m.get(key) {
+                Some(Value::String(s)) => rio::parse_iso_ts(s),
+                Some(v) => val_to_f64(Some(v)),
+                None => 0.0,
+            };
+            if rr_ts > 0.0 && cts > 0.0 {
+                return cts < rr_ts - 0.001;
+            }
+        }
+    }
+    if !wcid.is_empty() && rr_ts > 0.0 {
+        if let Some(br) = brain_root {
+            let head = rio::read_transcript_head(
+                &rio::member_transcript_path(br, &wcid).to_string_lossy(),
+                4,
+            );
+            let w_origin_ts = head
+                .iter()
+                .filter_map(|s| s.get("created_at").and_then(|v| v.as_str()).map(rio::parse_iso_ts))
+                .filter(|&ts| ts > 0.0)
+                .fold(f64::INFINITY, f64::min);
+            if w_origin_ts.is_finite() {
+                return w_origin_ts < rr_ts - 0.001;
+            }
+        }
+    }
+    if has_cid_snap && !wcid.is_empty() {
+        return false;
+    }
+    let clean_added = meta
+        .and_then(|m| m.get("added_by"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    for (idx, bp) in raw_board.iter().enumerate() {
+        let seq = extract_msg_seq(bp, (idx + 1) as i64);
+        let poster = val_to_str(bp.get("agent"));
+        let btext = val_to_str(bp.get("text"));
+        let is_assigner = poster.eq_ignore_ascii_case("coordinator")
+            || (!clean_added.is_empty() && poster == clean_added);
+        if is_assigner && rio::text_mentions_swarm_worker(&btext, wname) {
+            if rr_board_seq > 0 && seq <= rr_board_seq {
+                return true;
+            }
+            let bts = bp
+                .get("time")
+                .and_then(|v| v.as_str())
+                .map(rio::parse_iso_ts)
+                .unwrap_or(0.0);
+            if rr_ts > 0.0 && bts > 0.0 && bts <= rr_ts {
+                return true;
+            }
+            break;
+        }
+    }
+    false
+}
+
+pub fn verified_research_reset_state(
+    marker: &Value,
+    steps: Option<&[Value]>,
+) -> (f64, i64, Option<String>) {
+    let Some(arr) = marker.get("research_resets").and_then(|v| v.as_array()) else {
+        return (0.0, 0, None);
+    };
+    let mut latest_ts = 0.0f64;
+    let mut latest_seq = 0i64;
+    for ent in arr {
+        let dec = val_to_str(ent.get("decision")).trim().to_ascii_lowercase();
+        let findings = val_to_str(ent.get("findings")).trim().to_string();
+        let r_ts = val_to_f64(ent.get("reset_ts"));
+        let blk_ts = val_to_f64(ent.get("last_blocked_ts"));
+        if !RESEARCH_RESET_DECISIONS.contains(&dec.as_str())
+            || findings.chars().count() < 15
+            || r_ts <= 0.0
+            || blk_ts <= 0.0
+            || r_ts < blk_ts
+        {
+            return (
+                0.0,
+                0,
+                Some("invalid `research_resets` metadata in candidate marker".to_string()),
+            );
+        }
+        let has_recorded_tools = ent
+            .get("research_tools")
+            .and_then(|v| v.as_array())
+            .map_or(false, |a| !a.is_empty());
+        if !has_recorded_tools {
+            return (
+                0.0,
+                0,
+                Some("`research_resets` entry has empty `research_tools`".to_string()),
+            );
+        }
+        if let Some(st) = steps {
+            if st.is_empty() {
+                return (
+                    0.0,
+                    0,
+                    Some("`research_resets` entry cannot be verified against an empty transcript".to_string()),
+                );
+            }
+            let earliest_ts = st
+                .iter()
+                .filter_map(|s| s.get("created_at").and_then(|v| v.as_str()).map(rio::parse_iso_ts))
+                .filter(|&ts| ts > 0.0)
+                .fold(f64::INFINITY, f64::min);
+            if !earliest_ts.is_finite() || earliest_ts <= r_ts + 1.0 {
+                let ev = find_research_evidence_since(st, blk_ts, Some(r_ts + 1.0));
+                if ev.is_empty() {
+                    return (
+                        0.0,
+                        0,
+                        Some("`research_resets` entry lacks verified post-BLOCKED documentation/web research in transcript".to_string()),
+                    );
+                }
+            }
+        }
+        if r_ts >= latest_ts {
+            latest_ts = r_ts;
+            let bseq = ent
+                .get("board_head_seq")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            if bseq > latest_seq {
+                latest_seq = bseq;
+            }
+        }
+    }
+    (latest_ts, latest_seq, None)
+}
+
+pub fn is_simplify_or_review_swarm_worker(name: &str, meta: Option<&Value>) -> bool {
+    let low = name.trim().to_ascii_lowercase();
+    if is_simplify_worker_name(&low) || !simplify_lens_from_worker_name(&low).is_empty() {
+        return true;
+    }
+    let mdl = meta
+        .and_then(|m| {
+            m.get("model")
+                .or_else(|| m.get("applied_model"))
+                .or_else(|| m.get("desired_model"))
+        })
+        .map(|v| val_to_str(Some(v)).trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    mdl == OPUS_HIGH_MODEL
+        || mdl == SONNET_HIGH_MODEL
+        || low.contains("review")
+        || low.contains("adversarial")
+        || low.contains("critic")
+        || low.contains("verifier")
+}
+
+pub fn active_simplify_or_review_workers(brain_root: &Path, session: &str) -> Vec<String> {
+    let members = rio::load_swarm_members(brain_root, session);
+    let mut alive: Vec<String> = Vec::new();
+    for (name, meta) in &members {
+        if !meta.is_object()
+            || rio::is_swarm_role_member(name, Some(meta))
+            || rio::is_swarm_member_killed(Some(meta))
+        {
+            continue;
+        }
+        if is_simplify_or_review_swarm_worker(name, Some(meta)) {
+            alive.push(name.clone());
+        }
+    }
+    alive.sort();
+    alive
 }
 
 #[cfg(test)]
@@ -3201,6 +4253,8 @@ mod tests {
         assert_eq!(classify_path_risk("docs/README.md", None), RISK_LOW);
         assert_eq!(classify_path_risk("src/auth/jwt_helper.rs", None), RISK_HIGH);
         assert_eq!(classify_path_risk("src/main.rs", None), RISK_STANDARD);
+        assert_eq!(classify_path_risk("rust/src/cwg_stop.rs", None), RISK_HIGH);
+        assert_eq!(classify_path_risk("plugin/bin/carbon-stack.exe", None), RISK_HIGH);
 
         let pol = json!({
             "policy_root": "",
@@ -3214,5 +4268,9 @@ mod tests {
         assert!(globs_may_overlap("src/**/*.rs", "src/hooks/*.rs", None));
         assert!(!globs_may_overlap("src/hooks/*.rs", "tests/*.rs", None));
         assert!(glob_matches_path("rust/src/**", "rust/src/cwg_common.rs"));
+        assert!(is_ephemeral_path(
+            "c:/repo/worktree/.mcp.json.tokenade-original"
+        ));
+        assert!(!is_ephemeral_path("c:/repo/worktree/.mcp.json"));
     }
 }

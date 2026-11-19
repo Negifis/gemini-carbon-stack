@@ -1,6 +1,6 @@
 ---
 name: chip-handoff
-description: Parallel git-worktree child-task workflow (chip_handoff.py). Load ONLY when splitting concurrent coding tasks across worktrees.
+description: Parallel git-worktree child-task workflow (carbon-stack chip-handoff). Load ONLY when splitting concurrent coding tasks across worktrees.
 ---
 
 # Chip Handoff & Multi-Session Orchestration
@@ -11,7 +11,7 @@ description: Parallel git-worktree child-task workflow (chip_handoff.py). Load O
 
 1. **Регистрация и выделение изолированного worktree (`open`):**
    ```powershell
-   python -X utf8 "<PLUGIN_ROOT>/tools/chip_handoff.py" open `
+   & "<PLUGIN_ROOT>/bin/carbon-stack.exe" chip-handoff open `
      --title "<краткое название>" `
      --expected "<ожидаемый результат и тесты>" `
      --session "<parent-conversation-id>" `
@@ -22,7 +22,7 @@ description: Parallel git-worktree child-task workflow (chip_handoff.py). Load O
 2. **Завершение работы исполнителем (`finish`):**
    После коммита проверенных изменений в ветке чипа исполнитель вызывает:
    ```powershell
-   python -X utf8 "<PLUGIN_ROOT>/tools/chip_handoff.py" finish `
+   & "<PLUGIN_ROOT>/bin/carbon-stack.exe" chip-handoff finish `
      --chip "<chip_id>" `
      --message "<сводка изменений и результаты тестов>"
    ```
@@ -32,14 +32,14 @@ description: Parallel git-worktree child-task workflow (chip_handoff.py). Load O
    Родитель проверяет коммиты/дифф (`git log`/`git diff` по `chip_branch`) и принимает решение:
    ```powershell
    # Принять (опционально слить в текущую ветку через --merge и безопасно удалить worktree)
-   python -X utf8 "<PLUGIN_ROOT>/tools/chip_handoff.py" close --chip "<chip_id>" --accept --merge
+   & "<PLUGIN_ROOT>/bin/carbon-stack.exe" chip-handoff close --chip "<chip_id>" --accept --merge
 
    # Вернуть на доработку
-   python -X utf8 "<PLUGIN_ROOT>/tools/chip_handoff.py" close --chip "<chip_id>" --rework "<что исправить>"
+   & "<PLUGIN_ROOT>/bin/carbon-stack.exe" chip-handoff close --chip "<chip_id>" --rework "<что исправить>"
    ```
 
 4. **Восстановление зависших задач (`recover`):**
    ```powershell
-   python -X utf8 "<PLUGIN_ROOT>/tools/chip_handoff.py" recover
+   & "<PLUGIN_ROOT>/bin/carbon-stack.exe" chip-handoff recover
    ```
    Показывает все незакрытые чипы, число коммитов сверх базы, незакоммиченные файлы и путь к `.bundle`.

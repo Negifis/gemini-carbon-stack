@@ -1,7 +1,7 @@
 use regex::Regex;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,7 +11,9 @@ use crate::codex_lane;
 use crate::cwg_common;
 use crate::cwg_mark;
 use crate::gate_inbox;
-use crate::rio;
+use crate::rio::{self, json_truthy, subagent_msg_re, truncate_chars, val_to_f64, val_to_i64, val_to_str};
+use crate::codex_lane::{NATIVE_REVIEWERS, XHIGH_NATIVE_REVIEWER};
+use crate::cwg_mark::{EDIT_TOOLS, SHELL_TOOLS};
 use crate::win32_sqlite::now_sec;
 
 pub const MAX_BLOCKS_PER_CANDIDATE: i64 = 3;
@@ -20,14 +22,10 @@ pub const MAX_TOTAL_BACKGROUND_WAITS: i64 = 16;
 pub const MAX_REVIEW_ROUNDS: usize = 3;
 // SAFETY: Bound uncounted pre-simplify `REVISE`/`ESCALATE` rounds so broken loops cannot run unboundedly.
 pub const MAX_RAW_ORDINARY_ROUNDS: usize = MAX_REVIEW_ROUNDS * 2;
-pub const MAX_CLOSURE_PASSES: usize = 2;
+pub const MAX_CLOSURE_PASSES: usize = cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE;
 pub const MAX_WORKER_POST_REMINDERS: i64 = 2;
 const CLOSURE_PHASE_FLAG: &str = "--phase closure";
 
-const EDIT_TOOLS: &[&str] = &["edit_file", "write_file"];
-const SHELL_TOOLS: &[&str] = &["run_command"];
-const NATIVE_REVIEWERS: &[&str] = &["adversarial-reviewer", "adversarial-reviewer-xhigh"];
-const XHIGH_NATIVE_REVIEWER: &str = "adversarial-reviewer-xhigh";
 const SIMPLIFY_FALLBACK_MODELS: &[&str] = &[cwg_common::HYDROGEN_XHIGH_MODEL];
 
 const PRE_SIMPLIFY_REVIEW_ERR: &str = "adversarial review ran simultaneously with or before simplify lenses; complete all simplify lenses BEFORE launching adversarial review (or run `--closure` / `--phase closure` once simplify finishes)";
@@ -41,16 +39,6 @@ fn subagent_uri_re() -> &'static Regex {
             r#"(?s)"conversationId"\s*:\s*"(?P<cid>[A-Za-z0-9._-]{4,80})"(?:.*?"logAbsoluteUri"\s*:\s*"(?P<uri>file:///[^"]+)")?"#,
         )
         .expect("subagent_uri_re")
-    })
-}
-
-fn subagent_msg_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"(?s)\[Message\]\s+timestamp=(?P<ts>\S+)\s+sender=(?P<sender>[A-Za-z0-9._-]{4,80})(?:\s+priority=\S+)?\s+content=(?P<body>.*)",
-        )
-        .expect("subagent_msg_re")
     })
 }
 
@@ -111,60 +99,6 @@ fn trailing_digits_suffix_re() -> &'static Regex {
 fn sanitize_ps_arg_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r#"[`'"$\\\r\n]+"#).expect("sanitize_ps_arg_re"))
-}
-
-fn val_to_str(v: Option<&Value>) -> String {
-    match v {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Number(n)) => n.to_string(),
-        Some(Value::Bool(b)) => b.to_string(),
-        _ => String::new(),
-    }
-}
-
-fn val_to_i64(v: Option<&Value>) -> i64 {
-    match v {
-        Some(Value::Number(n)) => n
-            .as_i64()
-            .or_else(|| n.as_f64().map(|f| f as i64))
-            .unwrap_or(0),
-        Some(Value::String(s)) => s.trim().parse::<i64>().unwrap_or(0),
-        Some(Value::Bool(b)) => i64::from(*b),
-        _ => 0,
-    }
-}
-
-fn val_to_f64(v: Option<&Value>) -> f64 {
-    match v {
-        Some(Value::Number(n)) => n.as_f64().unwrap_or(0.0),
-        Some(Value::String(s)) => s.trim().parse::<f64>().unwrap_or(0.0),
-        Some(Value::Bool(b)) => {
-            if *b {
-                1.0
-            } else {
-                0.0
-            }
-        }
-        _ => 0.0,
-    }
-}
-
-fn json_truthy(v: Option<&Value>) -> bool {
-    match v {
-        Some(Value::Bool(b)) => *b,
-        Some(Value::Number(n)) => n.as_f64().map_or(false, |x| x != 0.0),
-        Some(Value::String(s)) => !s.is_empty(),
-        Some(Value::Array(a)) => !a.is_empty(),
-        Some(Value::Object(m)) => !m.is_empty(),
-        _ => false,
-    }
-}
-
-fn truncate_chars(s: &str, max_chars: usize) -> &str {
-    match s.char_indices().nth(max_chars) {
-        Some((idx, _)) => &s[..idx],
-        None => s,
-    }
 }
 
 fn risk_order(risk: &str) -> i32 {
@@ -250,12 +184,7 @@ pub fn catch_up_unmeasured_changes(marker: &Value) -> Value {
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    let last_fp_opt = marks
-        .last()
-        .and_then(|v| v.as_object())
-        .and_then(|m| m.get("fp"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty());
+    let last_fp_opt = cwg_common::last_mark_fp(marker);
 
     if now_fp_opt != last_fp_opt {
         let now = now_sec();
@@ -869,6 +798,137 @@ pub fn scan_swarm_activity(
     current_diff_hash: &str,
     cwd: &str,
 ) -> SwarmEvidence {
+    scan_swarm_activity_with_reset(SwarmScanInput {
+        steps,
+        transcript_path,
+        first_ts,
+        round_start_msg_id,
+        current_diff_hash,
+        cwd,
+        research_reset_ts: 0.0,
+        research_reset_seq: 0,
+        marker: None,
+    })
+}
+
+fn record_compact_system_swarm_errors(
+    step: &Value,
+    first_ts: f64,
+    host_worker_errors: &mut HashMap<(String, String), f64>,
+) {
+    let sys_ts = step
+        .get("created_at")
+        .and_then(|v| v.as_str())
+        .map(rio::parse_iso_ts)
+        .unwrap_or(0.0);
+    if sys_ts > 0.0 && sys_ts < first_ts - 2.0 {
+        return;
+    }
+    let txt = val_to_str(step.get("content"));
+    let ts_val = if sys_ts > 0.0 { sys_ts } else { now_sec() };
+    for sm in system_swarm_err_re().captures_iter(&txt) {
+        let err_txt = sm.name("err").map_or("", |m| m.as_str());
+        if !model_failure_re().is_match(err_txt) {
+            continue;
+        }
+        let key = (
+            sm.name("name").map_or("", |m| m.as_str()).to_string(),
+            sm.name("cid").map_or("", |m| m.as_str()).to_string(),
+        );
+        let entry = host_worker_errors.entry(key).or_insert(0.0);
+        if ts_val > *entry {
+            *entry = ts_val;
+        }
+    }
+}
+
+fn recover_compact_swarm_steps(
+    tp: &str,
+    tail_idx: i64,
+    first_ts: f64,
+    ev: &mut SwarmEvidence,
+    host_worker_errors: &mut HashMap<(String, String), f64>,
+    mut on_swarm_res: impl FnMut(&mut SwarmEvidence, &Value, &str, &str, f64, Option<usize>, bool),
+) -> Vec<Value> {
+    let compact_steps = rio::read_compact_transcript_steps(tp, 16000);
+    for (p_idx, p_st) in compact_steps.iter().enumerate() {
+        let Some(s_idx) = p_st.get("step_index").and_then(|v| v.as_i64()) else {
+            continue;
+        };
+        if s_idx <= 0 || s_idx >= tail_idx {
+            continue;
+        }
+        let p_source = val_to_str(p_st.get("source"));
+        if p_source == "SYSTEM" {
+            record_compact_system_swarm_errors(p_st, first_ts, host_worker_errors);
+            continue;
+        }
+        if p_source != "MODEL"
+            || p_st.get("type").and_then(|v| v.as_str()) != Some("PLANNER_RESPONSE")
+        {
+            continue;
+        }
+        let p_call_ts = p_st
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .map(rio::parse_iso_ts)
+            .unwrap_or(0.0);
+        if p_call_ts > 0.0 && p_call_ts < first_ts - 2.0 {
+            continue;
+        }
+        let Some(p_tcs) = p_st.get("tool_calls").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        if !p_tcs
+            .iter()
+            .any(|tc| tc.get("name").and_then(|v| v.as_str()) == Some("swarm"))
+        {
+            continue;
+        }
+        let p_gen = collect_generic_results(&compact_steps, p_idx);
+        for (p_pos, p_tc) in p_tcs.iter().enumerate() {
+            if p_tc.get("name").and_then(|v| v.as_str()) != Some("swarm") {
+                continue;
+            }
+            let (g_status, blob) = p_gen
+                .get(p_pos)
+                .map(|(st, b, _)| (st.as_str(), b.as_str()))
+                .unwrap_or(("", ""));
+            let has_content_trunc = compact_steps
+                .get(p_idx + 1 + p_pos)
+                .and_then(|s| s.get("truncated_fields"))
+                .and_then(|v| v.as_array())
+                .map_or(false, |arr| arr.iter().any(|x| x.as_str() == Some("content")));
+            on_swarm_res(ev, p_tc, g_status, blob, p_call_ts, None, !has_content_trunc);
+        }
+    }
+    compact_steps
+}
+
+pub struct SwarmScanInput<'a> {
+    pub steps: &'a [Value],
+    pub transcript_path: Option<&'a str>,
+    pub first_ts: f64,
+    pub round_start_msg_id: i64,
+    pub current_diff_hash: &'a str,
+    pub cwd: &'a str,
+    pub research_reset_ts: f64,
+    pub research_reset_seq: i64,
+    pub marker: Option<&'a Value>,
+}
+
+pub fn scan_swarm_activity_with_reset(input: SwarmScanInput<'_>) -> SwarmEvidence {
+    let SwarmScanInput {
+        steps,
+        transcript_path,
+        first_ts,
+        round_start_msg_id,
+        current_diff_hash,
+        cwd,
+        research_reset_ts,
+        research_reset_seq,
+        marker,
+    } = input;
     let mut ev = SwarmEvidence {
         codex_issue_step: -1,
         ..SwarmEvidence::default()
@@ -1049,101 +1109,16 @@ pub fn scan_swarm_activity(
                 .and_then(|v| v.as_str())
                 .map(rio::parse_iso_ts)
                 .unwrap_or(0.0);
-            if let Some(t_idx) = tail_idx {
-                if t_idx > 1 && (tail_ts == 0.0 || tail_ts > first_ts - 2.0) {
-                    // SAFETY: Recover early candidate swarm model/quota signals evicted from `transcript_full.jsonl` tail window via compact `transcript.jsonl` without shifting `steps` indices.
-                    let compact_steps = rio::read_compact_transcript_steps(tp, 16000);
-                    for (p_idx, p_st) in compact_steps.iter().enumerate() {
-                        let Some(s_idx) = p_st.get("step_index").and_then(|v| v.as_i64()) else {
-                            continue;
-                        };
-                        if s_idx <= 0 || s_idx >= t_idx {
-                            continue;
-                        }
-                        let p_source = val_to_str(p_st.get("source"));
-                        if p_source == "SYSTEM" {
-                            let p_sys_ts = p_st
-                                .get("created_at")
-                                .and_then(|v| v.as_str())
-                                .map(rio::parse_iso_ts)
-                                .unwrap_or(0.0);
-                            if p_sys_ts == 0.0 || p_sys_ts >= first_ts - 2.0 {
-                                let p_txt = val_to_str(p_st.get("content"));
-                                for sm in system_swarm_err_re().captures_iter(&p_txt) {
-                                    let err_txt = sm.name("err").map_or("", |m| m.as_str());
-                                    if model_failure_re().is_match(err_txt) {
-                                        let key = (
-                                            sm.name("name").map_or("", |m| m.as_str()).to_string(),
-                                            sm.name("cid").map_or("", |m| m.as_str()).to_string(),
-                                        );
-                                        let ts_val = if p_sys_ts > 0.0 {
-                                            p_sys_ts
-                                        } else {
-                                            now_sec()
-                                        };
-                                        let entry = host_worker_errors.entry(key).or_insert(0.0);
-                                        if ts_val > *entry {
-                                            *entry = ts_val;
-                                        }
-                                    }
-                                }
-                            }
-                            continue;
-                        }
-                        if p_source != "MODEL"
-                            || p_st.get("type").and_then(|v| v.as_str()) != Some("PLANNER_RESPONSE")
-                        {
-                            continue;
-                        }
-                        let p_call_ts = p_st
-                            .get("created_at")
-                            .and_then(|v| v.as_str())
-                            .map(rio::parse_iso_ts)
-                            .unwrap_or(0.0);
-                        if p_call_ts > 0.0 && p_call_ts < first_ts - 2.0 {
-                            continue;
-                        }
-                        let p_tcs = p_st
-                            .get("tool_calls")
-                            .and_then(|v| v.as_array())
-                            .map(|a| a.as_slice())
-                            .unwrap_or(&[]);
-                        if !p_tcs
-                            .iter()
-                            .any(|tc| tc.get("name").and_then(|v| v.as_str()) == Some("swarm"))
-                        {
-                            continue;
-                        }
-                        let p_gen = collect_generic_results(&compact_steps, p_idx);
-                        for (p_pos, p_tc) in p_tcs.iter().enumerate() {
-                            if p_tc.get("name").and_then(|v| v.as_str()) != Some("swarm") {
-                                continue;
-                            }
-                            let (g_status, blob) = if p_pos < p_gen.len() {
-                                (p_gen[p_pos].0.as_str(), p_gen[p_pos].1.as_str())
-                            } else {
-                                ("", "")
-                            };
-                            let has_content_trunc = compact_steps
-                                .get(p_idx + 1 + p_pos)
-                                .and_then(|s| s.get("truncated_fields"))
-                                .and_then(|v| v.as_array())
-                                .map_or(false, |arr| {
-                                    arr.iter().any(|x| x.as_str() == Some("content"))
-                                });
-                            inspect_swarm_tool_result(
-                                &mut ev,
-                                p_tc,
-                                g_status,
-                                blob,
-                                p_call_ts,
-                                None,
-                                !has_content_trunc,
-                            );
-                        }
-                    }
-                    ev.compact_steps = compact_steps;
-                }
+            if let Some(t_idx) = tail_idx.filter(|&i| i > 1 && (tail_ts == 0.0 || tail_ts > first_ts - 2.0)) {
+                // SAFETY: Recover early candidate swarm model/quota signals evicted from `transcript_full.jsonl` tail window via compact `transcript.jsonl` without shifting `steps` indices.
+                ev.compact_steps = recover_compact_swarm_steps(
+                    tp,
+                    t_idx,
+                    first_ts,
+                    &mut ev,
+                    &mut host_worker_errors,
+                    &mut inspect_swarm_tool_result,
+                );
             }
         }
     }
@@ -1366,7 +1341,9 @@ pub fn scan_swarm_activity(
     ev.pending_bg_tasks = pending_bg_tasks.into_iter().collect();
     ev.passive_bg_tasks = passive_bg_tasks.into_iter().collect();
 
-    let (brain_root_opt, conv_cid) = rio::swarm_brain_and_cid(transcript_path.unwrap_or(""), "");
+    let fallback_cid = marker.map(|m| val_to_str(m.get("session"))).unwrap_or_default();
+    let (brain_root_opt, conv_cid) =
+        rio::swarm_brain_and_cid(transcript_path.unwrap_or(""), &fallback_cid);
     let Some(brain_root) = brain_root_opt else {
         return ev;
     };
@@ -1447,12 +1424,36 @@ pub fn scan_swarm_activity(
             ""
         };
 
+        let has_reset = research_reset_ts > 0.0 || research_reset_seq > 0;
+        let is_pre_reset_worker = has_reset
+            && cwg_common::is_worker_spawned_before_reset(
+                mname,
+                Some(minfo),
+                &raw_board,
+                research_reset_ts,
+                research_reset_seq,
+                marker,
+                if brain_root.as_os_str().is_empty() {
+                    None
+                } else {
+                    Some(brain_root.as_path())
+                },
+            );
+
         let mut coord_posts: Vec<(f64, String, Option<usize>, i64)> = Vec::new();
         let mut broadcast_posts: Vec<(f64, String, Option<usize>)> = Vec::new();
         let mut worker_board_posts: Vec<(f64, String, i64)> = Vec::new();
 
         for (poster, btext, bts, bstep_idx, bseq) in &parsed_board {
             if btext.is_empty() {
+                continue;
+            }
+            // INVARIANT: Post-research-reset workers reusing a standard roster name must never inherit pre-reset board posts from a killed Cycle-1 worker.
+            if has_reset
+                && !is_pre_reset_worker
+                && ((research_reset_seq > 0 && *bseq > 0 && *bseq <= research_reset_seq)
+                    || (research_reset_ts > 0.0 && *bts > 0.0 && *bts <= research_reset_ts))
+            {
                 continue;
             }
             if poster == "coordinator" {
@@ -1573,6 +1574,10 @@ pub fn scan_swarm_activity(
         if !killed {
             ev.idle_unkilled_workers.push(mname.clone());
         }
+        if is_pre_reset_worker && cwg_common::is_simplify_or_review_swarm_worker(mname, Some(minfo))
+        {
+            continue;
+        }
         if combined_outputs.is_empty() {
             continue;
         }
@@ -1586,6 +1591,14 @@ pub fn scan_swarm_activity(
         }
         if let Some(switches) = model_switches.get(mname) {
             for item in switches {
+                if has_reset
+                    && !is_pre_reset_worker
+                    && research_reset_ts > 0.0
+                    && item.0 > 0.0
+                    && item.0 <= research_reset_ts
+                {
+                    continue;
+                }
                 windows.push(item.clone());
             }
         }
@@ -1858,16 +1871,16 @@ pub fn scan_swarm_activity(
         } else {
             conv_dir.to_string_lossy().into_owned()
         };
-        ev.stalled_workers = cwg_common::detect_stalled_workers(
-            &members_map,
-            &raw_board,
-            &eff_cwd,
-            Some(&brain_root),
-            &worker_last_activity,
-            &ev.in_flight_workers,
-            None,
-            None,
-        );
+        ev.stalled_workers = cwg_common::detect_stalled_workers(cwg_common::StallDetectInput {
+            members: &members_map,
+            board_messages: &raw_board,
+            cwd: &eff_cwd,
+            brain_root: Some(&brain_root),
+            worker_last_activity: &worker_last_activity,
+            in_flight_names: &ev.in_flight_workers,
+            now_ts: None,
+            timeout_sec: None,
+        });
     }
     ev.worker_activity_count = Some(
         parsed_board
@@ -2742,6 +2755,102 @@ impl<'a> ClosureEvalCtx<'a> {
         self.has_completed_simplify_for_version(rev_item)
     }
 
+    fn has_simplify_between(&self, after_ts: f64, before_ts: f64) -> bool {
+        if !self.needs_simplify {
+            return true;
+        }
+        if before_ts <= after_ts {
+            return false;
+        }
+        if self.all_simplify_history.is_empty() {
+            return !self.active_simplify_windows.is_empty()
+                && self
+                    .active_simplify_windows
+                    .iter()
+                    .all(|&(w_lts, w_ets)| {
+                        w_lts >= after_ts - 1e-6 && w_lts < before_ts && w_lts.max(w_ets) <= before_ts
+                    });
+        }
+        let mut any_in_span = false;
+        let mut done_lenses: HashSet<String> = HashSet::new();
+        let mut done_combined = false;
+        for sr in self.all_simplify_history {
+            if !self.is_allowed_simplify_tier(&sr.tier)
+                || sr.launch_ts < after_ts - 1e-6
+                || sr.launch_ts >= before_ts
+            {
+                continue;
+            }
+            let s_lts = sr.launch_ts;
+            let s_ets = s_lts.max(sr.end_ts);
+            if s_ets > before_ts {
+                return false;
+            }
+            any_in_span = true;
+            if !sr.clean {
+                if sr.kind == "lens" {
+                    if let Some(ref sl) = sr.lens {
+                        done_lenses.remove(sl);
+                    }
+                } else {
+                    done_combined = false;
+                }
+            } else if sr.kind == "lens" {
+                if let Some(ref sl) = sr.lens {
+                    done_lenses.insert(sl.clone());
+                }
+            } else if sr.has_explicit_all {
+                done_combined = true;
+            }
+        }
+        any_in_span
+            && ((self.allow_combined && !self.multi_lens_spoof && done_combined)
+                || done_lenses.is_superset(self.required_lenses))
+    }
+
+    fn partition_cycle_closure(&mut self, cls_slice: &[Value]) -> (Vec<Value>, Option<Value>, &'static str) {
+        // INVARIANT: Every `BLOCKED` verdict permanently consumes a closure slot; a premature `READY` without required simplify is rejected while latest, and superseded (not double-counted) once a fresh simplify + replacement `--closure` pass runs.
+        if !self.needs_simplify {
+            return (cls_slice.to_vec(), None, "");
+        }
+        let mut effective: Vec<Value> = Vec::new();
+        let mut unreplaced_premature: Option<Value> = None;
+        let mut unreplaced_kind = "";
+        let mut min_next_sim_after_ts = 0.0_f64;
+        for rev in cls_slice {
+            let verdict = val_to_str(rev.get("verdict"));
+            let rev_lts = val_to_f64(rev.get("launch_ts"));
+            let rev_vts = rev_lts.max(val_to_f64(rev.get("verdict_ts")));
+            if verdict == "BLOCKED" || effective.len() >= MAX_CLOSURE_PASSES {
+                effective.push(rev.clone());
+                unreplaced_premature = None;
+                unreplaced_kind = "";
+                min_next_sim_after_ts = min_next_sim_after_ts.max(rev_vts);
+                continue;
+            }
+            let has_ver_sim = self.is_round_after_its_simplify(rev);
+            let after_prev_gate = if min_next_sim_after_ts > 0.0 {
+                self.has_simplify_between(min_next_sim_after_ts, rev_lts)
+            } else {
+                true
+            };
+            if has_ver_sim && after_prev_gate {
+                effective.push(rev.clone());
+                unreplaced_premature = None;
+                unreplaced_kind = "";
+            } else {
+                unreplaced_premature = Some(rev.clone());
+                unreplaced_kind = if effective.is_empty() {
+                    "initial"
+                } else {
+                    "inter_pass"
+                };
+            }
+            min_next_sim_after_ts = min_next_sim_after_ts.max(rev_vts);
+        }
+        (effective, unreplaced_premature, unreplaced_kind)
+    }
+
     fn codex_bin_missing(&mut self) -> bool {
         if let Some(cached) = self.codex_bin_missing_cache {
             return cached;
@@ -2766,86 +2875,22 @@ impl<'a> ClosureEvalCtx<'a> {
             || self.codex_bin_missing()
     }
 
-    fn was_codex_unavailable_at(&mut self, rev_item: &Value) -> bool {
-        // INVARIANT: Internal escalation is valid ONLY when launched strictly after Codex unavailability was confirmed.
-        if self.codex_bin_missing() {
-            return true;
-        }
-        let launch_ts = val_to_f64(rev_item.get("launch_ts"));
-        let rev_step = rev_item.get("step_idx").and_then(|v| v.as_i64());
-        let same_or_earlier_step = rev_step.map_or(false, |rs| {
-            self.swarm_ev.codex_issue_step >= 0 && (rs as isize) <= self.swarm_ev.codex_issue_step
-        });
-        if self.swarm_ev.codex_cmd_failed {
-            let ts_ok = self.swarm_ev.codex_issue_ts <= 0.0
-                || (launch_ts > 0.0 && launch_ts >= self.swarm_ev.codex_issue_ts);
-            if !same_or_earlier_step && ts_ok {
-                return true;
-            }
-        }
-        let binfo = self.breaker_info();
-        if json_truthy(binfo.get("tripped")) {
-            let b_ts = val_to_f64(binfo.get("tripped_at"));
-            if b_ts <= 0.0
-                || (launch_ts > 0.0
-                    && (launch_ts > b_ts || (launch_ts == b_ts && !same_or_earlier_step)))
-            {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn is_acceptable_carbon_escalation(&self, rev_item: &Value) -> bool {
-        if !self.swarm_ev.opus_issue_verified {
-            return false;
-        }
-        if json_truthy(rev_item.get("escalated_from_opus")) {
-            return true;
-        }
-        if self.swarm_ev.opus_issue_ts <= 0.0 {
-            return true;
-        }
-        val_to_f64(rev_item.get("launch_ts")) >= self.swarm_ev.opus_issue_ts
-    }
-
     fn engine_priority_error(&mut self, rev_item: &Value) -> String {
-        let inv_eng = val_to_str(rev_item.get("engine"));
-        if (inv_eng == "internal-carbon" || inv_eng == "native")
-            && !self.is_acceptable_carbon_escalation(rev_item)
-        {
-            let m_label = rev_item
-                .get("model")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .unwrap_or(cwg_common::CARBON_HIGH_MODEL);
-            return format!(
-                "internal review ran on `{}` without a verified `{}` error/quota/availability failure; run internal review on `{}` first",
-                m_label,
-                cwg_common::OPUS_HIGH_MODEL,
-                cwg_common::OPUS_HIGH_MODEL
-            );
-        }
-        if (inv_eng == "internal-opus" || inv_eng == "internal-carbon" || inv_eng == "native")
-            && !self.was_codex_unavailable_at(rev_item)
-        {
-            if self.has_codex_issue() {
-                return "internal review ran before primary Codex lane (`codex_lane.py`) became unavailable; run a fresh review after the verified Codex outage".to_string();
-            }
-            if self.swarm_ev.codex_timeout_seen {
-                return "internal review ran after a Codex thinking timeout while primary Codex lane (`codex_lane.py`) remained available; a thinking timeout is NOT an outage and does NOT consume a review round — re-run `codex_lane.py review` without `--timeout` to continue in the same Codex session with an increased timeout".to_string();
-            }
-            return "internal review ran while primary Codex lane (`codex_lane.py`) is available; run `codex_lane.py review` first and escalate to internal review ONLY when Codex is unavailable".to_string();
-        }
-        String::new()
+        engine_priority_error_for_swarm(
+            rev_item,
+            self.swarm_ev,
+            &mut self.codex_bin_missing_cache,
+            &mut self.breaker_info_cache,
+        )
     }
 
     fn is_acceptable_engine(&mut self, rev_item: &Value) -> bool {
-        let eng_name = val_to_str(rev_item.get("engine"));
-        matches!(
-            eng_name.as_str(),
-            "codex" | "internal-opus" | "internal-carbon" | "native"
-        ) && self.engine_priority_error(rev_item).is_empty()
+        is_acceptable_review_engine(
+            rev_item,
+            self.swarm_ev,
+            &mut self.codex_bin_missing_cache,
+            &mut self.breaker_info_cache,
+        )
     }
 
     fn invalidated_at_ts(&mut self, rev_item: &Value) -> Option<f64> {
@@ -2971,8 +3016,13 @@ impl<'a> ClosureEvalCtx<'a> {
         false
     }
 
-    fn is_valid_cycle_closure_ready(&mut self, ord_list: &[Value], cls_rev: &Value) -> bool {
-        if !closure_ready_tail_ok(self.effective_risk, ord_list, cls_rev, false) {
+    fn is_valid_cycle_closure_ready_at_risk(
+        &mut self,
+        risk: &str,
+        ord_list: &[Value],
+        cls_rev: &Value,
+    ) -> bool {
+        if !closure_ready_tail_ok(risk, ord_list, cls_rev, false) {
             return false;
         }
         if self.has_prior_terminal_approval(ord_list) {
@@ -2986,6 +3036,36 @@ impl<'a> ClosureEvalCtx<'a> {
             .all(|r| self.has_completed_simplify_for_version(r))
     }
 
+    fn is_valid_cycle_closure_ready(&mut self, ord_list: &[Value], cls_rev: &Value) -> bool {
+        self.is_valid_cycle_closure_ready_at_risk(self.effective_risk, ord_list, cls_rev)
+    }
+
+    fn min_simplify_launch_for_version(&mut self, rev_item: &Value) -> f64 {
+        if !self.active_simplify_windows.is_empty() && self.is_after_simplify(rev_item) {
+            return self
+                .active_simplify_windows
+                .iter()
+                .map(|w| w.0)
+                .reduce(f64::min)
+                .unwrap_or(0.0);
+        }
+        let rev_launch_ts = val_to_f64(rev_item.get("launch_ts"));
+        let Some((rev_edit_ts, next_edit_ts)) = self.version_edit_bounds(rev_launch_ts) else {
+            return 0.0;
+        };
+        self.all_simplify_history
+            .iter()
+            .filter(|sr| {
+                self.is_allowed_simplify_tier(&sr.tier)
+                    && sr.launch_ts >= rev_edit_ts - 1e-6
+                    && sr.launch_ts < next_edit_ts
+                    && sr.launch_ts < rev_launch_ts
+            })
+            .map(|sr| sr.launch_ts)
+            .reduce(f64::min)
+            .unwrap_or(0.0)
+    }
+
     fn is_valid_swarm_v2_cycle_closure_ready(
         &mut self,
         ord_list: &[Value],
@@ -2993,10 +3073,18 @@ impl<'a> ClosureEvalCtx<'a> {
         cls_rev: &Value,
     ) -> bool {
         // INVARIANT: Swarm 2.0 `ORDINARY -> SIMPLIFY -> CLOSURE READY` resets the cycle on post-READY edits without laundering over-limit or mixed post-simplify cycles.
-        self.needs_simplify
+        if !(self.needs_simplify
             && pre_simplify_only
             && closure_ready_tail_ok(self.effective_risk, ord_list, cls_rev, true)
-            && self.has_completed_simplify_for_version(cls_rev)
+            && self.has_completed_simplify_for_version(cls_rev))
+        {
+            return false;
+        }
+        let min_sim_ts = self.min_simplify_launch_for_version(cls_rev);
+        min_sim_ts > 0.0
+            && !ord_list
+                .iter()
+                .any(|r| val_to_f64(r.get("launch_ts")) >= min_sim_ts)
     }
 
     fn was_invalidated_by_simplify_findings(&mut self, rev_item: &Value) -> bool {
@@ -3018,45 +3106,79 @@ impl<'a> ClosureEvalCtx<'a> {
             })
     }
 
-    fn is_version_simplify_measured(&mut self, rev_item: &Value) -> bool {
-        self.version_edit_bounds(val_to_f64(rev_item.get("launch_ts")))
-            .is_some()
-    }
-
     fn counts_toward_round_cap(&mut self, rev_item: &Value) -> bool {
-        if !(self.needs_simplify
-            && (!self.active_simplify_windows.is_empty() || !self.all_simplify_history.is_empty()))
+        // INVARIANT: Every `REVISE` / `ESCALATE` ordinary round consumes 1 of the cycle's `MAX_REVIEW_ROUNDS` (3) even after `simplify` runs; only a pre-simplify `APPROVED` invalidated by `simplify` findings is exempt.
+        if val_to_str(rev_item.get("verdict")) == "APPROVED"
+            && self.needs_simplify
+            && (!self.active_simplify_windows.is_empty() || !self.all_simplify_history.is_empty())
         {
-            return true;
-        }
-        if self.is_round_after_its_simplify(rev_item) {
-            return true;
-        }
-        if val_to_str(rev_item.get("verdict")) == "APPROVED" {
             return !self.was_invalidated_by_simplify_findings(rev_item);
         }
-        // SAFETY: Fail closed when truncated marks + transcript gap leave an older round's simplify state unmeasured.
-        !self.is_version_simplify_measured(rev_item)
+        true
     }
 }
 
-pub fn validate_candidate_closure(
-    receipt: Option<&Value>,
-    marker: &Value,
-    checks_ev: &ChecksEvidence,
-    sub_ev: &SubagentEvidence,
-    swarm_ev: &SwarmEvidence,
-    codex_reviews: &[Value],
-    ctx: Option<&mut Value>,
-    steps: Option<&[Value]>,
-    transcript_path: Option<&str>,
+fn closure_blocked_halt_msg(blocked_count: usize) -> String {
+    format!(
+        "closure validation reached {}/{} `BLOCKED` verdicts; continuing in the current cycle is forbidden — enter Research Mode (study relevant documentation/best practices via plugins/internet, choose `refactor` or `refine`, kill waiting swarm workers, and run `carbon-stack codex-lane research-reset`) to start fresh simplify and review sessions",
+        blocked_count, MAX_CLOSURE_PASSES
+    )
+}
+
+pub struct CandidateClosureInput<'a> {
+    pub receipt: Option<&'a Value>,
+    pub marker_in: &'a Value,
+    pub checks_ev: &'a ChecksEvidence,
+    pub sub_ev: &'a SubagentEvidence,
+    pub swarm_ev: &'a SwarmEvidence,
+    pub codex_reviews: &'a [Value],
+    pub ctx: Option<&'a mut Value>,
+    pub steps: Option<&'a [Value]>,
+    pub transcript_path: Option<&'a str>,
+}
+
+pub fn validate_candidate_closure(input: CandidateClosureInput<'_>) -> (bool, String) {
+    validate_candidate_closure_inner(input, None)
+}
+
+fn validate_candidate_closure_inner(
+    input: CandidateClosureInput<'_>,
+    mut cycle_probe: Option<&mut codex_lane::ClosureCycleSummary>,
 ) -> (bool, String) {
+    let CandidateClosureInput {
+        receipt,
+        marker_in,
+        checks_ev,
+        sub_ev,
+        swarm_ev,
+        codex_reviews,
+        ctx,
+        steps,
+        transcript_path,
+    } = input;
+    let probing = cycle_probe.is_some();
+    let mut probe_early_reject = false;
+    let sess_for_pend = val_to_str(marker_in.get("session"));
+    let (merged_opt, pend_ids_in_val) =
+        cwg_common::apply_pending_marker_deltas(&sess_for_pend, Some(marker_in));
+    let had_pend_in_val = !pend_ids_in_val.is_empty();
+    let marker_owned: Value;
+    let marker: &Value = if had_pend_in_val {
+        if let Some(m_val) = merged_opt {
+            marker_owned = m_val;
+            &marker_owned
+        } else {
+            marker_in
+        }
+    } else {
+        marker_in
+    };
     let wclass = cwg_common::candidate_class(marker);
     let owned_ctx: Value;
     let mut ctx_opt = ctx;
     let cctx: &Value = match ctx_opt {
-        Some(ref c) => c,
-        None => {
+        Some(ref c) if !had_pend_in_val => c,
+        _ => {
             owned_ctx = cwg_common::resolve_candidate_context(marker, true);
             &owned_ctx
         }
@@ -3139,14 +3261,71 @@ pub fn validate_candidate_closure(
         }
     }
 
-    // INVARIANT: Evaluate PERSISTENT closure (`verified`, `pr-ready`, `draft-blocked`) against candidate risk floor.
-    let declared_risk = rcp
+    let (mut rr_ts, _rr_board_seq, rr_err) = cwg_common::verified_research_reset_state(marker, steps);
+    if let Some(err_msg) = rr_err {
+        if probing && steps.map_or(true, <[Value]>::is_empty) {
+            rr_ts = cwg_common::last_research_reset_ts(marker);
+        } else if rkind == "verified" || rkind == "pr-ready" {
+            if probing {
+                probe_early_reject = true;
+                rr_ts = cwg_common::last_research_reset_ts(marker);
+            } else {
+                return (false, err_msg);
+            }
+        }
+    }
+    if rkind == "verified" || rkind == "pr-ready" {
+        if let Some((h_cnt, _, _)) = cwg_common::active_marker_closure_halt(marker) {
+            if probing {
+                probe_early_reject = true;
+            } else {
+                return (false, closure_blocked_halt_msg(h_cnt));
+            }
+        }
+    }
+    if (rkind == "verified" || rkind == "pr-ready")
+        && !dpaths.is_empty()
+        && cwg_common::last_mark_fp(marker).is_none()
+    {
+        if probing {
+            probe_early_reject = true;
+        } else {
+            return (
+                false,
+                format!(
+                    "`{}` rejected: candidate contains an unmeasured or >32 MB file whose full SHA-256 fingerprint could not be verified within read budget",
+                    rkind
+                ),
+            );
+        }
+    }
+
+    // INVARIANT: Evaluate PERSISTENT closure (`verified`, `pr-ready`, `draft-blocked`) against both candidate path risk floor and active-cycle escalated risk (`--xhigh` or cycle receipt).
+    let first_ts_for_risk = val_to_f64(marker.get("first_ts"));
+    let rr_ts_for_risk = cwg_common::last_research_reset_ts(marker);
+    let mut cycle_risk_inputs = vec![floor.clone()];
+    let marker_dr = cwg_common::active_marker_declared_risk(marker);
+    if !marker_dr.is_empty() {
+        cycle_risk_inputs.push(marker_dr);
+    }
+    if let Some(tx_steps) = steps {
+        let tx_dr = max_cycle_declared_receipt_risk(tx_steps, first_ts_for_risk, rr_ts_for_risk);
+        if !tx_dr.is_empty() {
+            cycle_risk_inputs.push(tx_dr);
+        }
+    }
+    let cycle_min_risk = cwg_common::max_risk(&cycle_risk_inputs);
+    let explicit_rcp_risk = rcp
         .get("risk")
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(&floor)
-        .to_uppercase();
-    if rkind == "verified" && risk_order(&declared_risk) < risk_order(&floor) {
+        .map(|s| s.trim().to_uppercase())
+        .unwrap_or_default();
+    let declared_risk = if explicit_rcp_risk.is_empty() {
+        cycle_min_risk.clone()
+    } else {
+        explicit_rcp_risk
+    };
+    if !probing && rkind == "verified" && risk_order(&declared_risk) < risk_order(&floor) {
         return (
             false,
             format!(
@@ -3155,7 +3334,16 @@ pub fn validate_candidate_closure(
             ),
         );
     }
-    let effective_risk = cwg_common::max_risk(&[floor.clone(), declared_risk]);
+    if !probing && rkind == "verified" && risk_order(&declared_risk) < risk_order(&cycle_min_risk) {
+        return (
+            false,
+            format!(
+                "declared risk `{}` is below active cycle escalated risk `{}` (set by `--xhigh` or an earlier receipt in this cycle)",
+                declared_risk, cycle_min_risk
+            ),
+        );
+    }
+    let effective_risk = cwg_common::max_risk(&[cycle_min_risk, declared_risk]);
 
     // INVARIANT: Deterministic check verification rejects failed validation runs and requires a post-edit check pass when applicable.
     if (rkind == "verified" || rkind == "pr-ready")
@@ -3199,7 +3387,7 @@ pub fn validate_candidate_closure(
         if checks_ev.passed_count == 0 || checks_ev.latest_pass_ts < last_durable - 1.0 {
             return (
                 false,
-                "last passing test/verification command ran BEFORE the latest file edit; re-verify current bytes"
+                "last passing test/verification command ran BEFORE the latest file edit; re-verify current bytes with a standalone test command (no trailing '; cmd' or pipes)"
                     .to_string(),
             );
         }
@@ -3215,10 +3403,18 @@ pub fn validate_candidate_closure(
         .iter()
         .map(|s| (*s).to_string())
         .collect();
-    let raw_sonnet_map = &swarm_ev.sonnet_lenses;
+    let raw_sonnet_map: HashMap<String, f64> = swarm_ev
+        .sonnet_lenses
+        .iter()
+        .filter(|(_, &lts)| rr_ts <= 0.0 || lts >= rr_ts)
+        .map(|(k, &v)| (k.clone(), v))
+        .collect();
     let mut raw_fallback_map: HashMap<String, f64> = HashMap::new();
     for src_map in [&swarm_ev.fallback_lenses, &sub_ev.fallback_lenses] {
         for (k, v) in src_map {
+            if rr_ts > 0.0 && *v < rr_ts {
+                continue;
+            }
             let e = raw_fallback_map.entry(k.clone()).or_insert(0.0);
             if *v > *e {
                 *e = *v;
@@ -3267,10 +3463,19 @@ pub fn validate_candidate_closure(
         .collect();
     missing_lenses.sort();
 
-    let raw_sonnet_combined = swarm_ev.sonnet_combined_ts;
-    let raw_fallback_combined = swarm_ev
+    let raw_sonnet_combined = if rr_ts > 0.0 && swarm_ev.sonnet_combined_ts < rr_ts {
+        0.0
+    } else {
+        swarm_ev.sonnet_combined_ts
+    };
+    let raw_fallback_combined_unfiltered = swarm_ev
         .fallback_combined_ts
         .max(sub_ev.fallback_combined_ts);
+    let raw_fallback_combined = if rr_ts > 0.0 && raw_fallback_combined_unfiltered < rr_ts {
+        0.0
+    } else {
+        raw_fallback_combined_unfiltered
+    };
     let sonnet_combined_fresh = raw_sonnet_combined > 0.0
         && is_review_fresh(&json!({ "launch_ts": raw_sonnet_combined }), marker);
     let fallback_combined_fresh = raw_fallback_combined > 0.0
@@ -3307,15 +3512,19 @@ pub fn validate_candidate_closure(
             && (multi_lens_spoof
                 || (!fast_path && (sonnet_combined_fresh || fallback_combined_fresh)))
         {
-            return (
-                false,
-                format!(
-                    "{} candidate cannot collapse simplify into a single combined lane; run all 3 separate `{}` lenses (`reuse`, `quality`, `efficiency`); missing: {}",
-                    effective_risk,
-                    cwg_common::SONNET_HIGH_MODEL,
-                    missing_lenses.join(", ")
-                ),
-            );
+            if probing {
+                probe_early_reject = true;
+            } else {
+                return (
+                    false,
+                    format!(
+                        "{} candidate cannot collapse simplify into a single combined lane; run all 3 separate `{}` lenses (`reuse`, `quality`, `efficiency`); missing: {}",
+                        effective_risk,
+                        cwg_common::SONNET_HIGH_MODEL,
+                        missing_lenses.join(", ")
+                    ),
+                );
+            }
         }
         let all_combined_union: HashSet<String> =
             sonnet_lenses.union(&fallback_lenses).cloned().collect();
@@ -3328,15 +3537,19 @@ pub fn validate_candidate_closure(
             } else {
                 "all 3 lenses (`reuse`, `quality`, `efficiency`)"
             };
-            return (
-                false,
-                format!(
-                    "simplify ran on fallback model without verified `{}` error/quota issue; run {} on `{}` via `swarm`",
-                    cwg_common::SONNET_HIGH_MODEL,
-                    target,
-                    cwg_common::SONNET_HIGH_MODEL
-                ),
-            );
+            if probing {
+                probe_early_reject = true;
+            } else {
+                return (
+                    false,
+                    format!(
+                        "simplify ran on fallback model without verified `{}` error/quota issue; run {} on `{}` via `swarm`",
+                        cwg_common::SONNET_HIGH_MODEL,
+                        target,
+                        cwg_common::SONNET_HIGH_MODEL
+                    ),
+                );
+            }
         }
         if !stale_simplify_lenses.is_empty() || (allow_combined && combined_stale) {
             let stale_label =
@@ -3437,8 +3650,13 @@ pub fn validate_candidate_closure(
         .unwrap_or(0.0);
     let mut all_simplify_steps: HashSet<usize> = swarm_ev.simplify_launch_steps.clone();
     all_simplify_steps.extend(sub_ev.simplify_launch_steps.iter().copied());
-    let mut all_simplify_history: Vec<SimplifyHistoryItem> = swarm_ev.simplify_history.clone();
-    all_simplify_history.extend(sub_ev.simplify_history.iter().cloned());
+    let mut all_simplify_history: Vec<SimplifyHistoryItem> = swarm_ev
+        .simplify_history
+        .iter()
+        .chain(sub_ev.simplify_history.iter())
+        .filter(|sr| rr_ts <= 0.0 || sr.launch_ts >= rr_ts)
+        .cloned()
+        .collect();
     all_simplify_history.sort_by(SimplifyHistoryItem::chrono_cmp);
 
     let candidate_marks: Vec<&Map<String, Value>> = marker
@@ -3498,13 +3716,35 @@ pub fn validate_candidate_closure(
         ab_call_ts <= 0.0 || rev_lts >= ab_call_ts - 5.0
     };
 
+    let is_post_reset_rev = |rev_item: &Value| -> bool {
+        if rr_ts <= 0.0 {
+            return true;
+        }
+        let lts = val_to_f64(rev_item.get("launch_ts"));
+        let vts = val_to_f64(rev_item.get("verdict_ts"));
+        !((vts > 0.0 && vts <= rr_ts) || (lts > 0.0 && lts < rr_ts))
+    };
+
+    let mut pre_reset_resumed_reviews: Vec<Value> = Vec::new();
     let mut all_reviews: Vec<Value> = Vec::new();
-    all_reviews.extend(sub_ev.reviews.iter().cloned());
-    all_reviews.extend(swarm_ev.reviews.iter().cloned());
-    for r in codex_reviews {
-        if !is_aborted_codex_review(r) {
+    for r in sub_ev.reviews.iter().chain(swarm_ev.reviews.iter()) {
+        if is_post_reset_rev(r) {
             all_reviews.push(r.clone());
         }
+    }
+    for r in codex_reviews {
+        if is_aborted_codex_review(r) || !is_post_reset_rev(r) {
+            continue;
+        }
+        if rr_ts > 0.0 {
+            let sid = val_to_str(r.get("session_id"));
+            let rpath = val_to_str(r.get("rollout_path"));
+            if !codex_lane::is_post_reset_codex_session_proven(&sid, &rpath, rr_ts, first_ts_val) {
+                pre_reset_resumed_reviews.push(r.clone());
+                continue;
+            }
+        }
+        all_reviews.push(r.clone());
     }
     all_reviews.sort_by(|a, b| val_to_f64(a.get("verdict_ts")).total_cmp(&val_to_f64(b.get("verdict_ts"))));
 
@@ -3544,7 +3784,7 @@ pub fn validate_candidate_closure(
             .then_with(|| val_to_f64(a.get("launch_ts")).total_cmp(&val_to_f64(b.get("launch_ts"))))
     });
 
-    let mut cycle_cutoff_ts = 0.0f64;
+    let mut cycle_cutoff_ts = if rr_ts > 0.0 { rr_ts } else { 0.0 };
     let mut cycle_raw_ordinary: Vec<Value> = Vec::new();
     let mut cycle_counted_ordinary_n = 0usize;
     let mut cycle_raw_closure: Vec<Value> = Vec::new();
@@ -3571,7 +3811,9 @@ pub fn validate_candidate_closure(
             if eval.counts_toward_round_cap(rev) {
                 cycle_counted_ordinary_n += 1;
             }
-            if cycle_raw_closure.is_empty()
+            // INVARIANT: Under the Sandwich Gate (`needs_simplify == true`), an ordinary `VERDICT: APPROVED` is NOT a terminal gate-closing verdict (`--closure` `CLOSURE_VALIDATION: READY` is); post-approval edits made during `simplify` must preserve the cycle's primary review history rather than resetting `cycle_raw_ordinary`.
+            if !needs_simplify
+                && cycle_raw_closure.is_empty()
                 && within_cycle_ordinary_caps(cycle_counted_ordinary_n, &cycle_raw_ordinary)
                 && !eval.has_prior_terminal_approval(&cycle_raw_ordinary)
                 && eval.is_valid_cycle_approval(rev)
@@ -3590,16 +3832,44 @@ pub fn validate_candidate_closure(
             cycle_raw_closure.push(rev.clone());
             let valid_so_far: Vec<Value> = cycle_raw_ordinary
                 .iter()
-                .filter(|r| eval.has_completed_simplify_for_version(r))
+                .filter(|r| eval.is_round_after_its_simplify(r))
                 .cloned()
                 .collect();
+            let (eff_cls_so_far, unrep_so_far, _) =
+                eval.partition_cycle_closure(&cycle_raw_closure);
+            let post_sim_eff_cls_all_so_far = eff_cls_so_far
+                .iter()
+                .all(|r| eval.is_round_after_its_simplify(r));
+            let rev_vts = val_to_f64(rev.get("verdict_ts")).max(rev_lts);
+            let live_blk_so_far = eff_cls_so_far
+                .iter()
+                .filter(|r| val_to_str(r.get("verdict")) == "BLOCKED")
+                .count();
+            let latched_blk_so_far = cwg_common::active_marker_closure_halt(marker)
+                .filter(|(_, h_ts, _)| *h_ts > cycle_cutoff_ts && *h_ts <= rev_vts)
+                .map(|(cnt, _, _)| cnt)
+                .unwrap_or(0);
+            let blk_so_far = live_blk_so_far.max(latched_blk_so_far);
+            let has_post_sim_inelig_so_far = ineligible_ordinary_reviews
+                .iter()
+                .filter(|r| {
+                    let lts = val_to_f64(r.get("launch_ts"));
+                    (cycle_cutoff_ts <= 0.0 || lts >= cycle_cutoff_ts) && lts <= rev_vts
+                })
+                .any(|r| eval.is_round_after_its_simplify(r));
             if within_cycle_ordinary_caps(cycle_counted_ordinary_n, &cycle_raw_ordinary)
+                && unrep_so_far.is_none()
+                && post_sim_eff_cls_all_so_far
+                && eff_cls_so_far.len() <= MAX_CLOSURE_PASSES
+                && blk_so_far < MAX_CLOSURE_PASSES
+                && eval.is_round_after_its_simplify(rev)
                 && (eval.is_valid_cycle_closure_ready(&valid_so_far, rev)
-                    || eval.is_valid_swarm_v2_cycle_closure_ready(
-                        &cycle_raw_ordinary,
-                        valid_so_far.is_empty(),
-                        rev,
-                    ))
+                    || (!has_post_sim_inelig_so_far
+                        && eval.is_valid_swarm_v2_cycle_closure_ready(
+                            &cycle_raw_ordinary,
+                            valid_so_far.is_empty(),
+                            rev,
+                        )))
             {
                 pending_reset_ts = eval.invalidated_at_ts(rev);
                 pending_reset_kind = if pending_reset_ts.is_some() {
@@ -3675,13 +3945,17 @@ pub fn validate_candidate_closure(
     };
 
     if !within_cycle_ordinary_caps(cycle_counted_ordinary_n, &cycle_raw_ordinary) {
-        return (
-            false,
-            format!(
-                "ordinary adversarial review exceeded MAX_REVIEW_ROUNDS={}",
-                MAX_REVIEW_ROUNDS
-            ),
-        );
+        if probing {
+            probe_early_reject = true;
+        } else {
+            return (
+                false,
+                format!(
+                    "ordinary adversarial review exceeded MAX_REVIEW_ROUNDS={}",
+                    MAX_REVIEW_ROUNDS
+                ),
+            );
+        }
     }
 
     let needs_review = if effective_risk == floor {
@@ -3697,61 +3971,67 @@ pub fn validate_candidate_closure(
         || raw_sonnet_combined > 0.0
         || raw_fallback_combined > 0.0;
     if !unstarted_simplify_reason.is_empty() && !(rkind == "draft-blocked" && simplify_exhausted) {
-        if needs_review && !simplify_freshly_started {
-            if cycle_raw_ordinary.is_empty() && cycle_raw_closure.is_empty() {
-                if let Some(last_inelig) = cycle_ineligible_ordinary.last() {
-                    let prio_err = eval.engine_priority_error(last_inelig);
-                    if !prio_err.is_empty() {
-                        return (false, prio_err);
+        if probing {
+            probe_early_reject = true;
+        } else {
+            if needs_review && !simplify_freshly_started {
+                if cycle_raw_ordinary.is_empty() && cycle_raw_closure.is_empty() {
+                    if let Some(last_inelig) = cycle_ineligible_ordinary.last() {
+                        let prio_err = eval.engine_priority_error(last_inelig);
+                        if !prio_err.is_empty() {
+                            return (false, prio_err);
+                        }
+                    }
+                    if !had_any_simplify || cycle_cutoff_ts > 0.0 {
+                        return (
+                            false,
+                            format!(
+                                "{} candidate requires primary independent review first (`carbon-stack codex-lane review` -> `{}` -> `{}`) BEFORE simplify (`CARGO TEST -> REVIEW -> SIMPLIFY -> --closure`)",
+                                effective_risk,
+                                cwg_common::OPUS_HIGH_MODEL,
+                                cwg_common::CARBON_HIGH_MODEL
+                            ),
+                        );
                     }
                 }
-                if !had_any_simplify || cycle_cutoff_ts > 0.0 {
-                    return (
-                        false,
-                        format!(
-                            "{} candidate requires primary independent review first (`codex_lane.py review` -> `{}` -> `{}`) BEFORE simplify (`UNITTEST -> REVIEW -> SIMPLIFY -> --closure`)",
-                            effective_risk,
-                            cwg_common::OPUS_HIGH_MODEL,
-                            cwg_common::CARBON_HIGH_MODEL
-                        ),
-                    );
+                if let Some(last_pre_rev) = cycle_raw_ordinary.last() {
+                    let last_pre_v = val_to_str(last_pre_rev.get("verdict"));
+                    if (last_pre_v == "REVISE" || last_pre_v == "ESCALATE")
+                        && cycle_raw_ordinary.len() < MAX_REVIEW_ROUNDS
+                    {
+                        return (
+                            false,
+                            format!(
+                                "invoked adversarial review ended in `{}`, not `APPROVED`; resolve findings with `carbon-stack codex-lane review` BEFORE running simplify",
+                                last_pre_v
+                            ),
+                        );
+                    }
+                    if last_pre_v == "APPROVED" && !is_review_fresh(last_pre_rev, marker) {
+                        return (
+                            false,
+                            format!(
+                                "{} candidate's primary `APPROVED` verdict is stale: run primary `carbon-stack codex-lane review` BEFORE simplify",
+                                effective_risk
+                            ),
+                        );
+                    }
+                    if effective_risk == "XHIGH"
+                        && last_pre_v == "APPROVED"
+                        && !json_truthy(last_pre_rev.get("xhigh"))
+                    {
+                        return (
+                            false,
+                            format!(
+                                "XHIGH candidate's primary `APPROVED` verdict came from standard tier, not XHIGH; run XHIGH review (`carbon-stack codex-lane review --xhigh` on `{}`) BEFORE simplify",
+                                cwg_common::CODEX_ASTRA_MODEL
+                            ),
+                        );
+                    }
                 }
             }
-            if let Some(last_pre_rev) = cycle_raw_ordinary.last() {
-                let last_pre_v = val_to_str(last_pre_rev.get("verdict"));
-                if (last_pre_v == "REVISE" || last_pre_v == "ESCALATE")
-                    && cycle_raw_ordinary.len() < MAX_REVIEW_ROUNDS
-                {
-                    return (
-                        false,
-                        format!(
-                            "invoked adversarial review ended in `{}`, not `APPROVED`; resolve findings with `codex_lane.py review` BEFORE running simplify",
-                            last_pre_v
-                        ),
-                    );
-                }
-                if last_pre_v == "APPROVED" && !is_review_fresh(last_pre_rev, marker) {
-                    return (
-                        false,
-                        format!(
-                            "{} candidate's primary `APPROVED` verdict is stale: run primary `codex_lane.py review` BEFORE simplify",
-                            effective_risk
-                        ),
-                    );
-                }
-                if effective_risk == "XHIGH"
-                    && last_pre_v == "APPROVED"
-                    && !json_truthy(last_pre_rev.get("xhigh"))
-                {
-                    return (
-                        false,
-                        "XHIGH candidate's primary `APPROVED` verdict came from standard tier, not XHIGH; run XHIGH review BEFORE simplify"
-                            .to_string(),
-                    );
-                }
-            }
+            return (false, unstarted_simplify_reason);
         }
-        return (false, unstarted_simplify_reason);
     }
 
     let mut norm_ordinary: Vec<(&Value, String)> = Vec::with_capacity(ordinary_reviews.len());
@@ -3769,11 +4049,15 @@ pub fn validate_candidate_closure(
                 && is_review_fresh(earlier_rev, marker)
                 && (effective_risk != "XHIGH" || json_truthy(earlier_rev.get("xhigh")))
             {
-                return (
-                    false,
-                    "review rounds continued unnecessarily after a current terminal APPROVED"
-                        .to_string(),
-                );
+                if probing {
+                    probe_early_reject = true;
+                } else {
+                    return (
+                        false,
+                        "review rounds continued unnecessarily after a current terminal APPROVED"
+                            .to_string(),
+                    );
+                }
             }
         }
     }
@@ -3792,55 +4076,281 @@ pub fn validate_candidate_closure(
     let review_unavailable = total_review_failures_len >= 2
         || (total_review_failures_len >= 1 && opus_issue && eval.has_codex_issue());
 
-    let is_swarm_v2_closure_ready = |ord_list: &[Value], cls_rev: &Value, after_sim: bool| -> bool {
-        if !(needs_simplify && !active_simplify_windows.is_empty()) {
-            return false;
-        }
-        if !after_sim || !is_review_fresh(cls_rev, marker) {
-            return false;
-        }
-        if !closure_ready_tail_ok(&effective_risk, ord_list, cls_rev, true) {
-            return false;
-        }
-        if !post_simplify_ordinary.is_empty() || !post_simplify_ineligible.is_empty() {
-            return false;
-        }
-        let min_sim_ts = active_simplify_windows
-            .iter()
-            .map(|w| w.0)
-            .reduce(f64::min)
-            .unwrap_or(0.0);
-        min_sim_ts > 0.0
-            && !ord_list
+    let (effective_cycle_closure, unreplaced_premature_cls, unreplaced_premature_kind) =
+        eval.partition_cycle_closure(&cycle_raw_closure);
+    let post_simplify_eff_closure_all = effective_cycle_closure
+        .iter()
+        .all(|r| eval.is_round_after_its_simplify(r));
+    let latest_eff_cls_rev: Option<&Value> = effective_cycle_closure.last();
+
+    let is_swarm_v2_closure_ready =
+        |risk: &str, ord_list: &[Value], cls_rev: &Value, after_sim: bool| -> bool {
+            if !(needs_simplify && !active_simplify_windows.is_empty()) {
+                return false;
+            }
+            if !post_simplify_eff_closure_all {
+                return false;
+            }
+            if !after_sim || !is_review_fresh(cls_rev, marker) {
+                return false;
+            }
+            if !closure_ready_tail_ok(risk, ord_list, cls_rev, true) {
+                return false;
+            }
+            if !post_simplify_ordinary.is_empty() || !post_simplify_ineligible.is_empty() {
+                return false;
+            }
+            let min_sim_ts = active_simplify_windows
                 .iter()
-                .any(|r| val_to_f64(r.get("launch_ts")) >= min_sim_ts)
+                .map(|w| w.0)
+                .reduce(f64::min)
+                .unwrap_or(0.0);
+            min_sim_ts > 0.0
+                && !ord_list
+                    .iter()
+                    .any(|r| val_to_f64(r.get("launch_ts")) >= min_sim_ts)
+        };
+
+    let live_blocked_closure_count = effective_cycle_closure
+        .iter()
+        .filter(|r| val_to_str(r.get("verdict")) == "BLOCKED")
+        .count();
+    let latched_blocked_count = cwg_common::active_marker_closure_halt(marker)
+        .filter(|(_, h_ts, _)| *h_ts > cycle_cutoff_ts)
+        .map(|(cnt, _, _)| cnt)
+        .unwrap_or(0);
+    let blocked_closure_count = live_blocked_closure_count.max(latched_blocked_count);
+
+    // INVARIANT: Hard-cap effective closure passes at `MAX_CLOSURE_PASSES` (2) per cycle; superseded premature pre-simplify READY passes do not deadlock recovery once simplify + replacement `--closure` runs.
+    if pending_reset_kind != "READY"
+        && rkind != "draft-blocked"
+        && effective_cycle_closure.len() > MAX_CLOSURE_PASSES
+    {
+        if probing {
+            probe_early_reject = true;
+        } else {
+            return (
+                false,
+                format!(
+                    "closure validation exceeded MAX_CLOSURE_PASSES={}; enter Research Mode and run `carbon-stack codex-lane research-reset` to start a fresh cycle",
+                    MAX_CLOSURE_PASSES
+                ),
+            );
+        }
+    }
+
+    let closure_ready_rev: Option<&Value> = if unreplaced_premature_cls.is_none()
+        && post_simplify_eff_closure_all
+        && effective_cycle_closure.len() <= MAX_CLOSURE_PASSES
+        && blocked_closure_count < MAX_CLOSURE_PASSES
+    {
+        latest_eff_cls_rev.filter(|&cls_rev| {
+            let after_sim = eval.is_after_simplify(cls_rev);
+            is_review_fresh(cls_rev, marker)
+                && after_sim
+                && (eval.is_valid_cycle_closure_ready(&ordinary_reviews, cls_rev)
+                    || is_swarm_v2_closure_ready(&effective_risk, &cycle_raw_ordinary, cls_rev, after_sim))
+        })
+    } else {
+        None
     };
 
-    let closure_ready_rev: Option<&Value> = latest_cls_rev.filter(|&cls_rev| {
-        let after_sim = eval.is_after_simplify(cls_rev);
-        is_review_fresh(cls_rev, marker)
-            && after_sim
-            && (eval.is_valid_cycle_closure_ready(&ordinary_reviews, cls_rev)
-                || is_swarm_v2_closure_ready(&cycle_raw_ordinary, cls_rev, after_sim))
-    });
+    if probing && pending_reset_ts.is_some_and(|p_ts| now_sec() >= p_ts) {
+        if let Some(probe) = cycle_probe {
+            *probe = codex_lane::ClosureCycleSummary::default();
+        }
+        return (false, String::new());
+    }
+    if let Some(ref mut probe) = cycle_probe {
+        let mut blk_ids: Vec<String> = Vec::new();
+        let mut last_blk_ts = 0.0f64;
+        let mut last_cls_ts = 0.0f64;
+        for cr in &effective_cycle_closure {
+            let lts = val_to_f64(cr.get("launch_ts"));
+            let vts = lts.max(val_to_f64(cr.get("verdict_ts")));
+            last_cls_ts = last_cls_ts.max(vts);
+            if val_to_str(cr.get("verdict")) == "BLOCKED" {
+                blk_ids.push(val_to_str(cr.get("review_id")));
+                last_blk_ts = last_blk_ts.max(vts);
+            }
+        }
+        let mut blk_cnt = blk_ids.len();
+        if let Some((h_cnt, h_ts, h_ids)) = cwg_common::active_marker_closure_halt(marker)
+            .filter(|(_, h_ts, _)| *h_ts > cycle_cutoff_ts)
+        {
+            if blk_cnt < h_cnt {
+                blk_cnt = h_cnt;
+                last_blk_ts = h_ts.max(last_blk_ts);
+                if !h_ids.is_empty() {
+                    blk_ids = h_ids;
+                }
+            }
+        }
+        probe.blocked_count = blk_cnt;
+        probe.last_blocked_ts = last_blk_ts;
+        probe.blocked_ids = blk_ids;
+        probe.effective_pass_count = effective_cycle_closure.len();
+        probe.last_closure_ts = last_cls_ts;
+        probe.counted_ordinary_rounds = cycle_counted_ordinary_n;
+        probe.raw_ordinary_rounds = cycle_raw_ordinary.len();
+        probe.needs_simplify = needs_simplify;
+        let min_cycle_ts = cycle_cutoff_ts.max(first_ts_val);
+        probe.simplify_started_in_cycle = had_any_simplify
+            || swarm_ev
+                .simplify_history
+                .iter()
+                .any(|it| it.launch_ts > min_cycle_ts);
+        let hyp_ord_ts = now_sec().max(last_cls_ts + 0.001);
+        let hyp_ord = json!({
+            "kind": "ordinary",
+            "verdict": "REVISE",
+            "launch_ts": hyp_ord_ts,
+            "verdict_ts": hyp_ord_ts + 0.001,
+            "engine": "codex",
+            "xhigh": effective_risk == "XHIGH",
+        });
+        let next_counted_ord =
+            cycle_counted_ordinary_n + usize::from(eval.counts_toward_round_cap(&hyp_ord));
+        let next_raw_ord = cycle_raw_ordinary.len() + 1;
+        probe.ordinary_cap_reached =
+            next_counted_ord > MAX_REVIEW_ROUNDS || next_raw_ord > MAX_RAW_ORDINARY_ROUNDS;
+        let is_fresh_tier_approved = |r: &Value, v: &str| -> bool {
+            v == "APPROVED"
+                && is_review_fresh(r, marker)
+                && (effective_risk != "XHIGH" || json_truthy(r.get("xhigh")))
+        };
+        let has_post_sim_app = norm_ordinary
+            .iter()
+            .any(|(r, v)| is_fresh_tier_approved(r, v));
+        let has_pre_sim_app = cycle_raw_closure.is_empty()
+            && cycle_raw_ordinary
+                .last()
+                .is_some_and(|r| is_fresh_tier_approved(r, &val_to_str(r.get("verdict"))));
+        probe.has_fresh_ordinary_approved = has_post_sim_app || has_pre_sim_app;
+    }
 
-    if closure_ready_rev.is_none()
+    let is_closing_kind = rkind == "verified" || rkind == "pr-ready";
+    let eff_cls_len = effective_cycle_closure.len();
+    let append_exhausted_reset_hint = !probing
+        && is_closing_kind
+        && closure_ready_rev.is_none()
         && pending_reset_kind != "READY"
-        && rkind != "draft-blocked"
-        && cycle_raw_closure.len() > MAX_CLOSURE_PASSES
+        && eff_cls_len >= MAX_CLOSURE_PASSES
+        && blocked_closure_count < MAX_CLOSURE_PASSES;
+
+    let (tail_ok, mut tail_msg) = (|| -> (bool, String) {
+        if !probing && is_closing_kind {
+            let marker_sess = val_to_str(marker.get("session"));
+            if !marker_sess.is_empty() {
+                let tp_hint = transcript_path.unwrap_or("");
+                let brain_root = rio::swarm_brain_and_cid(tp_hint, &marker_sess)
+                    .0
+                    .unwrap_or_else(|| rio::resolve_brain_root(""));
+                let alive_workers =
+                    cwg_common::active_simplify_or_review_workers(&brain_root, &marker_sess);
+                if !alive_workers.is_empty() {
+                    return (
+                        false,
+                        format!(
+                            "waiting/active simplify or review swarm workers ({}) must be killed via `swarm(action=\"kill\", ...)` before closing the gate",
+                            alive_workers.join(", ")
+                        ),
+                    );
+                }
+            }
+        }
+        if is_closing_kind && blocked_closure_count >= MAX_CLOSURE_PASSES {
+            return (false, closure_blocked_halt_msg(blocked_closure_count));
+        }
+
+    if is_closing_kind
+        && closure_ready_rev.is_none()
+        && unreplaced_premature_cls.is_some()
+    {
+        if unreplaced_premature_kind == "inter_pass" {
+            return (
+                false,
+                format!(
+                    "closure validation pass 2/{} ran without a fresh `simplify` pass after pass 1 `BLOCKED`; run `simplify` before final `{}`",
+                    MAX_CLOSURE_PASSES, CLOSURE_PHASE_FLAG
+                ),
+            );
+        }
+        return (false, PRE_SIMPLIFY_REVIEW_ERR.to_string());
+    }
+
+    if is_closing_kind
+        && raw_ordinary_reviews.is_empty()
+        && raw_closure_reviews.is_empty()
+        && !pre_reset_resumed_reviews.is_empty()
     {
         return (
             false,
-            format!(
-                "closure validation exceeded MAX_CLOSURE_PASSES={}",
-                MAX_CLOSURE_PASSES
-            ),
+            "post-research-reset review resumed a pre-reset Codex session; start a brand-new review session without `--resume`"
+                .to_string(),
         );
     }
 
     if rkind == "verified" {
         if closure_ready_rev.is_some() {
             return (true, "verified".to_string());
+        }
+        if effective_cycle_closure.len() == 1
+            && val_to_str(effective_cycle_closure[0].get("verdict")) == "BLOCKED"
+        {
+            if !post_simplify_eff_closure_all {
+                return (false, PRE_SIMPLIFY_REVIEW_ERR.to_string());
+            }
+            if is_review_fresh(&effective_cycle_closure[0], marker) {
+                return (
+                    false,
+                    format!(
+                        "closure validation pass 1/{} returned `BLOCKED`; fix the blocking issue, run tests, run `simplify` on the updated diff, and run final `{}` pass 2/{}",
+                        MAX_CLOSURE_PASSES, CLOSURE_PHASE_FLAG, MAX_CLOSURE_PASSES
+                    ),
+                );
+            }
+            return (
+                false,
+                format!(
+                    "closure validation pass 1/{} returned `BLOCKED`; run final `{}` pass 2/{} for `CLOSURE_VALIDATION: READY`",
+                    MAX_CLOSURE_PASSES, CLOSURE_PHASE_FLAG, MAX_CLOSURE_PASSES
+                ),
+            );
+        }
+        if effective_risk == "XHIGH" {
+            if let Some(cls_rev) = latest_eff_cls_rev.filter(|&r| {
+                let after_sim = eval.is_after_simplify(r);
+                is_review_fresh(r, marker)
+                    && after_sim
+                    && (eval.is_valid_cycle_closure_ready_at_risk("HIGH", &ordinary_reviews, r)
+                        || is_swarm_v2_closure_ready("HIGH", &cycle_raw_ordinary, r, after_sim))
+            }) {
+                if !json_truthy(cls_rev.get("xhigh")) {
+                    return (
+                        false,
+                        format!(
+                            "XHIGH candidate's `CLOSURE_VALIDATION: READY` verdict came from standard tier (`{}`), not XHIGH (`codex --xhigh --closure` on `{}` or internal `{}` with `REVIEW_TIER: XHIGH`)",
+                            val_to_str(cls_rev.get("engine")),
+                            cwg_common::CODEX_ASTRA_MODEL,
+                            cwg_common::OPUS_HIGH_MODEL
+                        ),
+                    );
+                }
+                if let Some(last_ord) = cycle_raw_ordinary.last().filter(|r| {
+                    val_to_str(r.get("verdict")) == "APPROVED" && !json_truthy(r.get("xhigh"))
+                }) {
+                    return (
+                        false,
+                        format!(
+                            "XHIGH candidate's `APPROVED` verdict came from standard tier (`{}`), not XHIGH (`codex --xhigh` on `{}` or internal `{}` with `REVIEW_TIER: XHIGH`)",
+                            val_to_str(last_ord.get("engine")),
+                            cwg_common::CODEX_ASTRA_MODEL,
+                            cwg_common::OPUS_HIGH_MODEL
+                        ),
+                    );
+                }
+            }
         }
         if pending_reset_kind == "READY" {
             return (
@@ -3851,9 +4361,19 @@ pub fn validate_candidate_closure(
                 ),
             );
         }
-        if ordinary_reviews.len() == MAX_REVIEW_ROUNDS
+        let cap_exhausted_verdict: Option<String> = if ordinary_reviews.len() == MAX_REVIEW_ROUNDS
             && (latest_ord_verdict == "REVISE" || latest_ord_verdict == "ESCALATE")
         {
+            Some(latest_ord_verdict.to_string())
+        } else if ordinary_reviews.is_empty() && cycle_counted_ordinary_n == MAX_REVIEW_ROUNDS {
+            cycle_raw_ordinary
+                .last()
+                .map(|r| val_to_str(r.get("verdict")))
+                .filter(|v| v == "REVISE" || v == "ESCALATE")
+        } else {
+            None
+        };
+        if let Some(ref cap_v) = cap_exhausted_verdict {
             if post_simplify_closure.len() < cycle_raw_closure.len() {
                 return (false, PRE_SIMPLIFY_REVIEW_ERR.to_string());
             }
@@ -3864,7 +4384,7 @@ pub fn validate_candidate_closure(
                     false,
                     format!(
                         "invoked adversarial review ended in `{}` and closure validation returned `BLOCKED`, not `READY`",
-                        latest_ord_verdict
+                        cap_v
                     ),
                 );
             }
@@ -3872,8 +4392,15 @@ pub fn validate_candidate_closure(
                 false,
                 format!(
                     "invoked adversarial review ended in `{}`, not `APPROVED` (all {} ordinary rounds used; run `{}` for `CLOSURE_VALIDATION: READY`)",
-                    latest_ord_verdict, MAX_REVIEW_ROUNDS, CLOSURE_PHASE_FLAG
+                    cap_v, MAX_REVIEW_ROUNDS, CLOSURE_PHASE_FLAG
                 ),
+            );
+        }
+        if latest_cls_verdict == "BLOCKED" {
+            return (
+                false,
+                "closure validation returned `BLOCKED`, not `READY`; resolve blocking findings before closing"
+                    .to_string(),
             );
         }
         if !latest_ord_verdict.is_empty() && latest_ord_verdict != "APPROVED" {
@@ -3930,7 +4457,7 @@ pub fn validate_candidate_closure(
                 return (
                     false,
                     format!(
-                        "{} candidate lacks an independent `VERDICT: APPROVED` from Codex lane (`codex_lane.py review`, or internal `{}` -> `{}` only on verified outage)",
+                        "{} candidate lacks an independent `VERDICT: APPROVED` from Codex lane (`carbon-stack codex-lane review`, or internal `{}` -> `{}` only on verified outage)",
                         effective_risk,
                         cwg_common::OPUS_HIGH_MODEL,
                         cwg_common::CARBON_HIGH_MODEL
@@ -3946,17 +4473,27 @@ pub fn validate_candidate_closure(
                     ),
                 );
             }
-            if !eval.is_after_simplify(ord_rev) {
-                return (false, PRE_SIMPLIFY_REVIEW_ERR.to_string());
-            }
             let eng = val_to_str(ord_rev.get("engine"));
             if effective_risk == "XHIGH" && !json_truthy(ord_rev.get("xhigh")) {
                 return (
                     false,
                     format!(
-                        "XHIGH candidate's `APPROVED` verdict came from standard tier (`{}`), not XHIGH (`codex --xhigh` or internal `{}` with `REVIEW_TIER: XHIGH`)",
+                        "XHIGH candidate's `APPROVED` verdict came from standard tier (`{}`), not XHIGH (`codex --xhigh` on `{}` or internal `{}` with `REVIEW_TIER: XHIGH`)",
                         eng,
+                        cwg_common::CODEX_ASTRA_MODEL,
                         cwg_common::OPUS_HIGH_MODEL
+                    ),
+                );
+            }
+            if !eval.is_after_simplify(ord_rev) {
+                return (false, PRE_SIMPLIFY_REVIEW_ERR.to_string());
+            }
+            if needs_simplify {
+                return (
+                    false,
+                    format!(
+                        "{} candidate requires final `carbon-stack codex-lane review --closure` (`{}` / `CLOSURE_VALIDATION: READY`) after `simplify`; ordinary `VERDICT: APPROVED` cannot replace `--closure`",
+                        effective_risk, CLOSURE_PHASE_FLAG
                     ),
                 );
             }
@@ -4007,6 +4544,19 @@ pub fn validate_candidate_closure(
     }
 
     (false, format!("unsupported receipt kind `{}`", rkind))
+    })();
+
+    if let Some(probe) = cycle_probe {
+        probe.has_fresh_ready = !probe_early_reject && tail_ok;
+        return (probe.has_fresh_ready, String::new());
+    }
+    if !tail_ok && append_exhausted_reset_hint && !tail_msg.contains("research-reset") {
+        tail_msg = format!(
+            "{} (all {}/{} closure passes in this cycle are consumed; enter Research Mode and run `carbon-stack codex-lane research-reset` to start a fresh cycle)",
+            tail_msg, eff_cls_len, MAX_CLOSURE_PASSES
+        );
+    }
+    (tail_ok, tail_msg)
 }
 
 pub fn merge_sticky_outage_state(state: &mut Map<String, Value>, swarm_ev: &mut SwarmEvidence) {
@@ -4032,20 +4582,541 @@ pub fn merge_sticky_outage_state(state: &mut Map<String, Value>, swarm_ev: &mut 
     }
 }
 
-pub fn retire_candidate(
+pub fn has_simplify_in_span(
     session: &str,
-    marker_file: &Path,
-    state_file: &Path,
-    state: &mut Map<String, Value>,
-    receipt_summary: &str,
-) {
-    if marker_file.exists() && fs::remove_file(marker_file).is_err() {
-        let mut cur = match rio::read_json(marker_file) {
-            Some(Value::Object(m)) => m,
-            _ => Map::new(),
+    marker_in: &Value,
+    transcript_path: &str,
+    after_ts: f64,
+    before_ts: f64,
+    require_fresh: bool,
+) -> bool {
+    if after_ts <= 0.0 || !marker_in.is_object() || json_truthy(marker_in.get("closed")) {
+        return true;
+    }
+    if before_ts <= after_ts {
+        return false;
+    }
+    let (merged_opt, _) = cwg_common::apply_pending_marker_deltas(session, Some(marker_in));
+    let Some(eff_marker) = merged_opt else {
+        return true;
+    };
+    let cctx = cwg_common::resolve_candidate_context(&eff_marker, false);
+    if !json_truthy(cctx.get("needs_simplify")) {
+        return true;
+    }
+    let eff_tp = resolve_session_transcript_path(session, transcript_path);
+    let steps = if !eff_tp.is_empty() {
+        rio::read_transcript_steps(&eff_tp, 4000)
+    } else {
+        Vec::new()
+    };
+    let tp_opt = if eff_tp.is_empty() {
+        None
+    } else {
+        Some(eff_tp.as_str())
+    };
+    let first_ts = val_to_f64(eff_marker.get("first_ts"));
+    let rr_ts = cwg_common::last_research_reset_ts(&eff_marker);
+    let rr_seq = cwg_common::last_research_reset_board_seq(&eff_marker);
+    let eff_first_ts = first_ts.max(rr_ts);
+    let eff_round_start = val_to_i64(eff_marker.get("round_start_msg_id")).max(rr_seq);
+    let gr = val_to_str(eff_marker.get("git_root"));
+    let eff_cwd = if !gr.is_empty() {
+        gr
+    } else {
+        val_to_str(eff_marker.get("cwd"))
+    };
+    let sub_ev = scan_native_subagents(&steps, tp_opt, eff_first_ts);
+    let cur_dh = val_to_str(eff_marker.get("current_diff_hash"));
+    let mut swarm_ev = scan_swarm_activity_with_reset(SwarmScanInput {
+        steps: &steps,
+        transcript_path: tp_opt,
+        first_ts: eff_first_ts,
+        round_start_msg_id: eff_round_start,
+        current_diff_hash: &cur_dh,
+        cwd: &eff_cwd,
+        research_reset_ts: rr_ts,
+        research_reset_seq: rr_seq,
+        marker: Some(&eff_marker),
+    });
+    if let Some(Value::Object(mut st)) = rio::read_json(&cwg_common::enforcement_state_path(session))
+    {
+        merge_sticky_outage_state(&mut st, &mut swarm_ev);
+    }
+    let sonnet_issue = swarm_ev.sonnet_issue_verified;
+    let multi_spoof = swarm_ev.multi_lens_spoof;
+    let swarm_ev_for_fp = json!({ "multi_lens_spoof": multi_spoof });
+    let effective_risk = val_to_str(cctx.get("floor"));
+    let fast_path = cwg_common::is_simplify_fast_path_eligible(
+        &eff_marker,
+        Some(&swarm_ev_for_fp),
+        None,
+        &eff_cwd,
+    );
+    let allow_combined = effective_risk == "STANDARD" || fast_path;
+
+    let min_lts = rr_ts.max(after_ts - 1e-6);
+    let mut hist: Vec<SimplifyHistoryItem> = swarm_ev
+        .simplify_history
+        .into_iter()
+        .chain(sub_ev.simplify_history.into_iter())
+        .filter(|sr| sr.launch_ts >= min_lts && sr.launch_ts < before_ts)
+        .collect();
+    if hist.is_empty() {
+        return false;
+    }
+    hist.sort_by(|a, b| {
+        a.launch_ts
+            .total_cmp(&b.launch_ts)
+            .then_with(|| a.end_ts.total_cmp(&b.end_ts))
+    });
+
+    let mut done_lenses: HashMap<String, f64> = HashMap::new();
+    let mut done_combined_lts = 0.0_f64;
+    for sr in &hist {
+        if !(sr.tier == "sonnet" || (sonnet_issue && sr.tier == "fallback")) {
+            continue;
+        }
+        if sr.launch_ts.max(sr.end_ts) > before_ts {
+            return false;
+        }
+        if !sr.clean {
+            if sr.kind == "lens" {
+                if let Some(ref sl) = sr.lens {
+                    done_lenses.remove(sl);
+                }
+            } else {
+                done_combined_lts = 0.0;
+            }
+        } else if sr.kind == "lens" {
+            if let Some(ref sl) = sr.lens {
+                done_lenses.insert(sl.clone(), sr.launch_ts);
+            }
+        } else if sr.has_explicit_all {
+            done_combined_lts = sr.launch_ts;
+        }
+    }
+
+    let comb_ok = allow_combined
+        && !multi_spoof
+        && done_combined_lts > 0.0
+        && (!require_fresh
+            || is_review_fresh(&json!({ "launch_ts": done_combined_lts }), &eff_marker));
+    let lenses_ok = ["reuse", "quality", "efficiency"].iter().all(|req| {
+        done_lenses.get(*req).copied().map_or(false, |lts| {
+            !require_fresh || is_review_fresh(&json!({ "launch_ts": lts }), &eff_marker)
+        })
+    });
+    comb_ok || lenses_ok
+}
+
+pub fn has_completed_simplify_after(
+    session: &str,
+    marker_in: &Value,
+    transcript_path: &str,
+    after_ts: f64,
+) -> bool {
+    has_simplify_in_span(session, marker_in, transcript_path, after_ts, f64::INFINITY, true)
+}
+
+fn engine_priority_error_for_swarm(
+    rev_item: &Value,
+    swarm_ev: &SwarmEvidence,
+    codex_bin_missing_cache: &mut Option<bool>,
+    breaker_info_cache: &mut Option<Value>,
+) -> String {
+    // INVARIANT: Internal escalation is valid ONLY when launched strictly after Codex unavailability was confirmed.
+    let codex_missing = *codex_bin_missing_cache
+        .get_or_insert_with(|| codex_lane::find_codex_binary().is_none());
+    let breaker_val: &Value = breaker_info_cache.get_or_insert_with(codex_lane::breaker_status);
+    let hist_slice = codex_lane::breaker_history_slice(breaker_val);
+    let has_codex_issue = swarm_ev.codex_cmd_failed
+        || json_truthy(breaker_val.get("tripped"))
+        || !hist_slice.is_empty()
+        || codex_missing;
+
+    let was_codex_unavailable = if codex_missing {
+        true
+    } else {
+        let launch_ts = val_to_f64(rev_item.get("launch_ts"));
+        let rev_step = rev_item.get("step_idx").and_then(|v| v.as_i64());
+        let same_or_earlier_step = rev_step.map_or(false, |rs| {
+            swarm_ev.codex_issue_step >= 0 && (rs as isize) <= swarm_ev.codex_issue_step
+        });
+        let cmd_failed_ok = swarm_ev.codex_cmd_failed
+            && !same_or_earlier_step
+            && (swarm_ev.codex_issue_ts <= 0.0
+                || (launch_ts > 0.0 && launch_ts >= swarm_ev.codex_issue_ts));
+        let breaker_ok = json_truthy(breaker_val.get("tripped")) && {
+            let b_ts = val_to_f64(breaker_val.get("tripped_at"));
+            b_ts <= 0.0
+                || (launch_ts > 0.0
+                    && (launch_ts > b_ts || (launch_ts == b_ts && !same_or_earlier_step)))
         };
-        cur.insert("closed".to_string(), Value::Bool(true));
-        let _ = rio::write_json(marker_file, &Value::Object(cur));
+        let hist_ok = hist_slice.iter().any(|w| {
+            let w_at = val_to_f64(w.get("tripped_at"));
+            let w_until = val_to_f64(w.get("until_ts"));
+            w_at > 0.0
+                && launch_ts > 0.0
+                && (launch_ts > w_at || (launch_ts == w_at && !same_or_earlier_step))
+                && (w_until <= 0.0 || launch_ts <= w_until)
+        });
+        cmd_failed_ok || breaker_ok || hist_ok
+    };
+
+    let inv_eng = val_to_str(rev_item.get("engine"));
+    let carbon_ok = swarm_ev.opus_issue_verified
+        && (json_truthy(rev_item.get("escalated_from_opus"))
+            || swarm_ev.opus_issue_ts <= 0.0
+            || val_to_f64(rev_item.get("launch_ts")) >= swarm_ev.opus_issue_ts);
+
+    if (inv_eng == "internal-carbon" || inv_eng == "native") && !carbon_ok {
+        let m_label = rev_item
+            .get("model")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(cwg_common::CARBON_HIGH_MODEL);
+        return format!(
+            "internal review ran on `{}` without a verified `{}` error/quota/availability failure; run internal review on `{}` first",
+            m_label,
+            cwg_common::OPUS_HIGH_MODEL,
+            cwg_common::OPUS_HIGH_MODEL
+        );
+    }
+    if (inv_eng == "internal-opus" || inv_eng == "internal-carbon" || inv_eng == "native")
+        && !was_codex_unavailable
+    {
+        if has_codex_issue {
+            return "internal review ran before primary Codex lane (`carbon-stack codex-lane`) became unavailable; run a fresh review after the verified Codex outage".to_string();
+        }
+        if swarm_ev.codex_timeout_seen {
+            return "internal review ran after a Codex thinking timeout while primary Codex lane (`carbon-stack codex-lane`) remained available; a thinking timeout is NOT an outage and does NOT consume a review round — re-run `carbon-stack codex-lane review` without `--timeout` to continue in the same Codex session with an increased timeout".to_string();
+        }
+        return "internal review ran while primary Codex lane (`carbon-stack codex-lane`) is available; run `carbon-stack codex-lane review` first and escalate to internal review ONLY when Codex is unavailable".to_string();
+    }
+    String::new()
+}
+
+fn is_acceptable_review_engine(
+    rev_item: &Value,
+    swarm_ev: &SwarmEvidence,
+    codex_bin_missing_cache: &mut Option<bool>,
+    breaker_info_cache: &mut Option<Value>,
+) -> bool {
+    let eng_name = val_to_str(rev_item.get("engine"));
+    matches!(
+        eng_name.as_str(),
+        "codex" | "internal-opus" | "internal-carbon" | "native"
+    ) && engine_priority_error_for_swarm(
+        rev_item,
+        swarm_ev,
+        codex_bin_missing_cache,
+        breaker_info_cache,
+    )
+    .is_empty()
+}
+
+fn resolve_session_transcript_path(session: &str, transcript_path: &str) -> String {
+    let trimmed = transcript_path.trim();
+    if !trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    let sess = session.trim();
+    if sess.is_empty() {
+        return String::new();
+    }
+    let broot = rio::resolve_brain_root("");
+    let base_tp = rio::member_transcript_path(&broot, sess);
+    let full_tp = base_tp.with_file_name("transcript_full.jsonl");
+    if full_tp.is_file() {
+        return full_tp.to_string_lossy().into_owned();
+    }
+    base_tp.to_string_lossy().into_owned()
+}
+
+fn max_cycle_declared_receipt_risk(steps: &[Value], min_ts: f64, rr_ts: f64) -> String {
+    let mut found: Vec<String> = Vec::new();
+    for step in steps.iter().rev() {
+        let source = step.get("source").and_then(|v| v.as_str()).unwrap_or("");
+        let stype = step.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if source != "MODEL" || stype != "PLANNER_RESPONSE" {
+            continue;
+        }
+        let sts = step
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .map(rio::parse_iso_ts)
+            .unwrap_or(0.0);
+        if rr_ts > 0.0 && sts <= rr_ts {
+            if sts > 0.0 {
+                break;
+            }
+            continue;
+        }
+        if sts > 0.0 && sts < min_ts - 1.0 {
+            break;
+        }
+        let content = step.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if let Some(rcp) = cwg_common::parse_terminal_receipt(content) {
+            let rk = val_to_str(rcp.get("kind"));
+            if rk == "verified" || rk == "pr-ready" {
+                let r = val_to_str(rcp.get("risk")).to_uppercase();
+                if cwg_common::is_valid_risk(&r) {
+                    found.push(r);
+                }
+            }
+        }
+    }
+    if found.is_empty() {
+        String::new()
+    } else {
+        cwg_common::max_risk(&found)
+    }
+}
+
+pub fn evaluate_closure_cycle_for_marker(
+    marker: &Value,
+    session: &str,
+    git_root: &str,
+    transcript_path: &str,
+    min_risk_override: &str,
+) -> codex_lane::ClosureCycleSummary {
+    // INVARIANT: Evaluate CLI closure pass limits, `has_fresh_ready`, and `research-reset` eligibility through `validate_candidate_closure_inner` so CLI and `Stop` share a single cycle state machine.
+    if session.trim().is_empty() || !marker.is_object() || json_truthy(marker.get("closed")) {
+        return codex_lane::ClosureCycleSummary::default();
+    }
+    let mut marker_with_sess: Value;
+    let base_marker: &Value = if val_to_str(marker.get("session")).is_empty() {
+        marker_with_sess = marker.clone();
+        if let Some(obj) = marker_with_sess.as_object_mut() {
+            obj.insert("session".to_string(), Value::String(session.to_string()));
+        }
+        &marker_with_sess
+    } else {
+        marker
+    };
+    let caught_marker = catch_up_unmeasured_changes(base_marker);
+    let eff_marker: &Value = &caught_marker;
+    let first_ts_val = val_to_f64(eff_marker.get("first_ts"));
+    let rr_ts = cwg_common::last_research_reset_ts(eff_marker);
+    let rr_seq = cwg_common::last_research_reset_board_seq(eff_marker);
+    let eff_first_ts = first_ts_val.max(rr_ts);
+    if eff_first_ts <= 0.0 {
+        return codex_lane::ClosureCycleSummary::default();
+    }
+    let eff_round_start = val_to_i64(eff_marker.get("round_start_msg_id")).max(rr_seq);
+    let eff_tp = resolve_session_transcript_path(session, transcript_path);
+    let tp_opt = if eff_tp.is_empty() {
+        None
+    } else {
+        Some(eff_tp.as_str())
+    };
+    let steps = if !eff_tp.is_empty() {
+        rio::read_transcript_steps(&eff_tp, 4000)
+    } else {
+        Vec::new()
+    };
+    let sub_ev = scan_native_subagents(&steps, tp_opt, eff_first_ts);
+    let eff_cwd = if !git_root.is_empty() {
+        git_root.to_string()
+    } else {
+        let gr = val_to_str(eff_marker.get("git_root"));
+        if !gr.is_empty() {
+            gr
+        } else {
+            val_to_str(eff_marker.get("cwd"))
+        }
+    };
+    let cur_dh = val_to_str(eff_marker.get("current_diff_hash"));
+    let mut swarm_ev = scan_swarm_activity_with_reset(SwarmScanInput {
+        steps: &steps,
+        transcript_path: tp_opt,
+        first_ts: eff_first_ts,
+        round_start_msg_id: eff_round_start,
+        current_diff_hash: &cur_dh,
+        cwd: &eff_cwd,
+        research_reset_ts: rr_ts,
+        research_reset_seq: rr_seq,
+        marker: Some(eff_marker),
+    });
+    if let Some(Value::Object(st)) = rio::read_json(&cwg_common::enforcement_state_path(session)) {
+        if (val_to_f64(st.get("candidate_first_ts")) - first_ts_val).abs() < 1e-6 {
+            if json_truthy(st.get("sonnet_issue_verified")) {
+                swarm_ev.sonnet_issue_verified = true;
+            }
+            if json_truthy(st.get("opus_issue_verified")) {
+                swarm_ev.opus_issue_verified = true;
+                let pts = val_to_f64(st.get("opus_issue_ts"));
+                if pts > 0.0 && (swarm_ev.opus_issue_ts <= 0.0 || pts < swarm_ev.opus_issue_ts) {
+                    swarm_ev.opus_issue_ts = pts;
+                }
+            }
+        }
+    }
+    let mut cctx = cwg_common::resolve_candidate_context(eff_marker, false);
+    let override_up = min_risk_override.trim().to_uppercase();
+    let rcp_risk = if cwg_common::is_valid_risk(&override_up) {
+        override_up
+    } else {
+        String::new()
+    };
+
+    let codex_reviews = codex_lane::scan_verified_codex_reviews(eff_first_ts, session, git_root);
+    let synthetic_checks = ChecksEvidence {
+        checks_count: 1,
+        passed_count: 1,
+        failed_count: 0,
+        latest_pass_ts: f64::MAX / 2.0,
+        latest_fail_ts: 0.0,
+    };
+    let synthetic_rcp = json!({
+        "kind": "verified",
+        "risk": rcp_risk,
+    });
+    let mut summary = codex_lane::ClosureCycleSummary::default();
+    let _ = validate_candidate_closure_inner(
+        CandidateClosureInput {
+            receipt: Some(&synthetic_rcp),
+            marker_in: eff_marker,
+            checks_ev: &synthetic_checks,
+            sub_ev: &sub_ev,
+            swarm_ev: &swarm_ev,
+            codex_reviews: &codex_reviews,
+            ctx: Some(&mut cctx),
+            steps: Some(&steps),
+            transcript_path: tp_opt,
+        },
+        Some(&mut summary),
+    );
+    summary
+}
+
+type PathStatMap = BTreeMap<String, Option<(u64, u128)>>;
+
+fn snapshot_path_stats(marker: &Value) -> PathStatMap {
+    let mut out = BTreeMap::new();
+    for p in cwg_common::durable_paths_from_val(marker.get("paths")) {
+        let stat = fs::metadata(Path::new(&p))
+            .ok()
+            .map(|m| (m.len(), rio::meta_mtime_ns(&m)));
+        out.insert(rio::fold_path(&p), stat);
+    }
+    out
+}
+
+fn marker_matches_validated(
+    live_merged: Option<&Value>,
+    expected: &Value,
+    expected_stats: Option<&PathStatMap>,
+    allow_unhashed: bool,
+) -> bool {
+    // SAFETY: Re-verify under `marker_lock_path` that neither `marker.json`, cycle-reset metadata, nor live candidate file bytes mutated while `decide_stop` ran unlocked validation; unhashed (>32 MB) files fail closed on `verified`/`pr-ready` closure and require unchanged `(len, mtime_ns)` on `no-change`/`draft-blocked`/exhaustion/anomaly retirement.
+    let Some(live) = live_merged else {
+        return false;
+    };
+    if json_truthy(live.get("closed")) {
+        return false;
+    }
+    let live_paths = cwg_common::durable_paths_from_val(live.get("paths"));
+    let exp_paths = cwg_common::durable_paths_from_val(expected.get("paths"));
+    if val_to_i64(live.get("edits")) != val_to_i64(expected.get("edits"))
+        || json_truthy(live.get("operational")) != json_truthy(expected.get("operational"))
+        || live_paths != exp_paths
+        || (val_to_f64(live.get("last_durable_ts")) - val_to_f64(expected.get("last_durable_ts"))).abs() > 1e-6
+        || val_to_f64(live.get("last_ts")) > val_to_f64(expected.get("last_ts")) + 1e-6
+        || live.get("research_resets") != expected.get("research_resets")
+        || live.get("closure_halt") != expected.get("closure_halt")
+        || live.get("cycle_declared_risk") != expected.get("cycle_declared_risk")
+        || val_to_i64(live.get("round_start_msg_id")) != val_to_i64(expected.get("round_start_msg_id"))
+        || val_to_i64(live.get("round_id")) != val_to_i64(expected.get("round_id"))
+    {
+        return false;
+    }
+    let exp_fp = cwg_common::last_mark_fp(expected);
+    if cwg_common::last_mark_fp(live) != exp_fp {
+        return false;
+    }
+    if !live_paths.is_empty() {
+        let disk_fp = cwg_common::content_fingerprint(&live_paths, cwg_common::MAX_FINGERPRINT_FILE_BYTES);
+        if disk_fp.is_empty() {
+            if !allow_unhashed || exp_fp.is_some() {
+                return false;
+            }
+            let Some(exp_st) = expected_stats else {
+                return false;
+            };
+            if &snapshot_path_stats(live) != exp_st {
+                return false;
+            }
+        } else if Some(disk_fp.as_str()) != exp_fp.as_deref() {
+            return false;
+        }
+    }
+    true
+}
+
+struct RetireCandidateInput<'a> {
+    session: &'a str,
+    marker_file: &'a Path,
+    state_file: &'a Path,
+    state: &'a mut Map<String, Value>,
+    receipt_summary: &'a str,
+    expected_marker: Option<&'a Value>,
+    expected_stats: Option<&'a PathStatMap>,
+    consumed_pending_ids: &'a [String],
+    allow_unhashed: bool,
+}
+
+fn retire_candidate_checked(input: RetireCandidateInput<'_>) -> bool {
+    let RetireCandidateInput {
+        session,
+        marker_file,
+        state_file,
+        state,
+        receipt_summary,
+        expected_marker,
+        expected_stats,
+        consumed_pending_ids,
+        allow_unhashed,
+    } = input;
+    let retired = rio::with_file_lock(&cwg_common::marker_lock_path(session), 5.0, 30.0, |locked| {
+        if !locked {
+            return false;
+        }
+        if cwg_common::has_unconsumed_pending_deltas(session, consumed_pending_ids) {
+            return false;
+        }
+        let live_raw = rio::read_json(marker_file);
+        if let Some(exp) = expected_marker {
+            let (live_merged, _) =
+                cwg_common::apply_pending_marker_deltas(session, live_raw.as_ref());
+            if !marker_matches_validated(live_merged.as_ref(), exp, expected_stats, allow_unhashed) {
+                return false;
+            }
+            if receipt_summary == "no-change"
+                && cwg_common::last_mark_fp(exp).is_none()
+                && !live_merged
+                    .as_ref()
+                    .map_or(false, |lm| candidate_restored_to_clean_head(lm).0)
+            {
+                return false;
+            }
+        }
+        if marker_file.exists() && fs::remove_file(marker_file).is_err() {
+            let mut cur = match live_raw {
+                Some(Value::Object(m)) => m,
+                _ => return false,
+            };
+            cur.insert("closed".to_string(), Value::Bool(true));
+            if rio::write_json(marker_file, &Value::Object(cur)).is_err() {
+                return false;
+            }
+        }
+        cwg_common::ack_pending_marker_deltas(session, consumed_pending_ids);
+        true
+    });
+    if !retired {
+        return false;
     }
     state.insert("blocks".to_string(), json!(0));
     state.insert("waits".to_string(), json!(0));
@@ -4064,6 +5135,7 @@ pub fn retire_candidate(
     let _ = rio::write_json(state_file, &Value::Object(state.clone()));
     cwg_common::clear_claim(session);
     cwg_common::clear_swarm_rounds(session);
+    true
 }
 
 fn has_notified_anomaly_handler(
@@ -4299,12 +5371,16 @@ pub fn format_block_message(
         Some(rt) => rt,
         None => cwg_common::requires_tests(&floor, &cwd, &dpaths, policy, &git_root),
     };
-    let proot = rio::plugin_root();
-    let inbox_script = rio::normalize_path(&proot.join("hooks").join("gate_inbox.py").to_string_lossy());
-    let codex_script = rio::normalize_path(&proot.join("hooks").join("codex_lane.py").to_string_lossy());
+    let cs_bin = rio::normalize_path(&rio::carbon_stack_bin_path().to_string_lossy());
 
     let guidance = if wclass == cwg_common::WORK_OPERATIONAL {
         "Для OPERATIONAL-работы завершите ответ последней строкой:\n`[gate] operational: <предпроверка>; <подтверждённый эффект>`\nили `[gate] no-change: <причина>`, если изменений не произошло.".to_string()
+    } else if reason.contains("research-reset") {
+        let reqs = cwg_common::receipt_requirements_summary(&floor, policy, has_tests);
+        format!(
+            "Кандидат `PERSISTENT` (риск `{}`). Обязательные условия: {}.\n- Режим исследования после 2 блокировок `--closure`: изучите документацию и лучшие практики через плагины/интернет (`search_web`, `tokenade search/web`, `Context7`, `Developer Knowledge` / `Gemini Docs`, субагент `research`), определите сценарий (`refactor` или `refine`), завершите ожидающих swarm-воркеров через `swarm(action=\"kill\", ...)` и выполните `& \"{}\" codex-lane research-reset --session \"{}\" --decision <refactor|refine> --findings \"...\"`, чтобы обнулить раунды и начать новый цикл в чистых сессиях.\n- Завершите финальный ответ строкой `[gate] verified: {}; <кандидат и решающие проверки>`.",
+            floor, reqs, cs_bin, session, floor
+        )
     } else {
         let reqs = cwg_common::receipt_requirements_summary(&floor, policy, has_tests);
         let xhigh_hint = if floor == "XHIGH" {
@@ -4372,9 +5448,9 @@ pub fn format_block_message(
                 ""
             };
             format!(
-                "- Для независимого ревью сначала проверьте `python -X utf8 \"{}\" check`; если доступно — запустите `python -X utf8 \"{}\" review --session \"{}\" {}{}--summary \"...\"`{} (при недоступности Codex запустите внутреннее ревью{} на `{}`{} через `swarm`, с эскалацией на `{}` при ошибке/квоте Opus).\n",
-                codex_script,
-                codex_script,
+                "- Для независимого ревью сначала проверьте `& \"{}\" codex-lane check`; если доступно — запустите `& \"{}\" codex-lane review --session \"{}\" {}{}--summary \"...\"`{} (при недоступности Codex запустите внутреннее ревью{} на `{}`{} через `swarm`, с эскалацией на `{}` при ошибке/квоте Opus).\n",
+                cs_bin,
+                cs_bin,
                 session,
                 phase_flag,
                 xhigh_flag,
@@ -4393,7 +5469,7 @@ pub fn format_block_message(
         )
     };
 
-    // SAFETY: Strip PowerShell metacharacters from CLI/tool hint arguments so copy-pasted `gate_inbox.py report --block "..."` commands never suffer PS escape corruption.
+    // SAFETY: Strip PowerShell metacharacters from CLI/tool hint arguments so copy-pasted `carbon-stack gate-inbox report --block "..."` commands never suffer PS escape corruption.
     let cleaned_reason = sanitize_ps_arg_re().replace_all(reason, "");
     let safe_reason_owned = cleaned_reason.trim();
     let safe_reason = if safe_reason_owned.is_empty() {
@@ -4419,18 +5495,22 @@ pub fn format_block_message(
     };
 
     format!(
-        "[Code Work Gate] Остановка заблокирована ({}/{} для неизменённого кандидата): {}.\n{}\nЕсли блокировка противоречит проверяемым фактам транскрипта, не уходите в цикл: зафиксируйте отчёт (с `BypassSandbox=true`) `python -X utf8 \"{}\" report --session \"{}\" --nonce \"{}\" --block \"{}\" --facts \"<факты>\" --did \"<выполненные проверки>\"`, {}",
+        "[Code Work Gate] Остановка заблокирована ({}/{} для неизменённого кандидата): {}.\n{}\nЕсли блокировка противоречит проверяемым фактам транскрипта, не уходите в цикл: зафиксируйте отчёт (с `BypassSandbox=true`) `& \"{}\" gate-inbox report --session \"{}\" --nonce \"{}\" --block \"{}\" --facts \"<факты>\" --did \"<выполненные проверки>\"`, {}",
         block_num,
         MAX_BLOCKS_PER_CANDIDATE,
         reason,
         guidance,
-        inbox_script,
+        cs_bin,
         session,
         nonce,
         truncate_chars(safe_reason, 120),
         escape_tail
     )
 }
+
+#[cfg(test)]
+static TEST_MID_DECIDE_STOP_HOOK: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    std::sync::Mutex::new(None);
 
 pub fn decide_stop(payload: &Value) -> Option<String> {
     let term_reason = val_to_str(payload.get("terminationReason"));
@@ -4451,23 +5531,48 @@ pub fn decide_stop(payload: &Value) -> Option<String> {
     }
 
     let mfile = cwg_common::marker_path(&session);
-    if !mfile.is_file() {
+    if !mfile.is_file() && !cwg_common::has_pending_marker_deltas(&session) {
         return None;
     }
-    let raw_marker = rio::read_json(&mfile)?;
-    if !raw_marker.is_object() || json_truthy(raw_marker.get("closed")) {
-        return None;
-    }
-
     let tp_str = transcript_path.unwrap_or("");
     let steps = rio::read_transcript_steps(tp_str, 4000);
     if rio::is_subagent_session(tp_str, Some(&steps)) {
         return None;
     }
 
-    let marker = catch_up_unmeasured_changes(&raw_marker);
-    if marker != raw_marker {
-        let _ = rio::write_json(&mfile, &marker);
+    let (marker_opt, stop_consumed_ids, start_stats): (Option<Value>, Vec<String>, PathStatMap) =
+        rio::with_file_lock(&cwg_common::marker_lock_path(&session), 5.0, 30.0, |locked| {
+            let raw_marker = rio::read_json(&mfile);
+            let (merged_opt, consumed_ids) =
+                cwg_common::apply_pending_marker_deltas(&session, raw_marker.as_ref());
+            let Some(merged) = merged_opt else {
+                return (None, Vec::new(), BTreeMap::new());
+            };
+            if !merged.is_object() || json_truthy(merged.get("closed")) {
+                return (None, Vec::new(), BTreeMap::new());
+            }
+            let caught = catch_up_unmeasured_changes(&merged);
+            let stats = snapshot_path_stats(&caught);
+            if locked && (!consumed_ids.is_empty() || Some(&caught) != raw_marker.as_ref()) {
+                if rio::write_json(&mfile, &caught).is_ok() && !consumed_ids.is_empty() {
+                    cwg_common::ack_pending_marker_deltas(&session, &consumed_ids);
+                }
+            }
+            (Some(caught), consumed_ids, stats)
+        });
+    let mut marker = marker_opt?;
+    if val_to_str(marker.get("session")).is_empty() {
+        if let Some(obj) = marker.as_object_mut() {
+            obj.insert("session".to_string(), Value::String(session.clone()));
+        }
+    }
+    #[cfg(test)]
+    if let Some(cb) = TEST_MID_DECIDE_STOP_HOOK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        cb();
     }
 
     if cwg_common::candidate_class(&marker) == cwg_common::WORK_NO_CHANGE {
@@ -4481,8 +5586,12 @@ pub fn decide_stop(payload: &Value) -> Option<String> {
     };
 
     let ckey = cwg_common::candidate_key(&marker);
-    if val_to_str(state.get("candidate_key")) != ckey {
+    let cur_reset_epoch = cwg_common::research_reset_epoch(&marker) as i64;
+    if val_to_str(state.get("candidate_key")) != ckey
+        || val_to_i64(state.get("reset_epoch")) != cur_reset_epoch
+    {
         state.insert("candidate_key".to_string(), Value::String(ckey));
+        state.insert("reset_epoch".to_string(), json!(cur_reset_epoch));
         state.insert("blocks".to_string(), json!(0));
         state.insert("waits".to_string(), json!(0));
         state.insert("total_waits".to_string(), json!(0));
@@ -4491,7 +5600,7 @@ pub fn decide_stop(payload: &Value) -> Option<String> {
     }
 
     let first_ts = val_to_f64(marker.get("first_ts"));
-    if val_to_f64(state.get("candidate_first_ts")) != first_ts {
+    if (val_to_f64(state.get("candidate_first_ts")) - first_ts).abs() >= 1e-6 {
         state.insert("candidate_first_ts".to_string(), json!(first_ts));
         state.insert("sonnet_issue_verified".to_string(), Value::Bool(false));
         state.insert("opus_issue_verified".to_string(), Value::Bool(false));
@@ -4507,8 +5616,29 @@ pub fn decide_stop(payload: &Value) -> Option<String> {
         }
     };
     let receipt = cwg_common::parse_terminal_receipt(&assistant_msg);
+    let receipt_declared_risk = receipt
+        .as_ref()
+        .filter(|r| {
+            let rk = val_to_str(r.get("kind"));
+            rk == "verified" || rk == "pr-ready"
+        })
+        .map(|r| val_to_str(r.get("risk")).to_uppercase())
+        .filter(|r| cwg_common::is_valid_risk(r))
+        .unwrap_or_default();
+    let tx_decl_risk = max_cycle_declared_receipt_risk(
+        &steps,
+        first_ts,
+        cwg_common::last_research_reset_ts(&marker),
+    );
+    let cycle_receipt_risk = match (receipt_declared_risk.is_empty(), tx_decl_risk.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => receipt_declared_risk,
+        (true, false) => tx_decl_risk,
+        (false, false) => cwg_common::max_risk(&[receipt_declared_risk, tx_decl_risk]),
+    };
     let mut cctx: Value;
-    let reason: String;
+    let mut reason: String;
+    let mut concurrent_mutation = false;
 
     if let Some(rcp_ref) = receipt
         .as_ref()
@@ -4565,29 +5695,43 @@ pub fn decide_stop(payload: &Value) -> Option<String> {
                     }
                 }
             }
-            retire_candidate(
-                &session,
-                &mfile,
-                &sfile,
-                &mut state,
-                &format!("anomaly-reported:{}", anom_note),
-            );
-            rio::log_hook_event(
-                "gate-events",
-                "close",
-                json!({
-                    "session": session,
-                    "receipt": "anomaly-reported",
-                    "report": anom_note,
-                }),
-            );
-            return None;
+            let anom_summary = format!("anomaly-reported:{}", anom_note);
+            if retire_candidate_checked(RetireCandidateInput {
+                session: &session,
+                marker_file: &mfile,
+                state_file: &sfile,
+                state: &mut state,
+                receipt_summary: &anom_summary,
+                expected_marker: Some(&marker),
+                expected_stats: Some(&start_stats),
+                consumed_pending_ids: &stop_consumed_ids,
+                allow_unhashed: true,
+            }) {
+                rio::log_hook_event(
+                    "gate-events",
+                    "close",
+                    json!({
+                        "session": session,
+                        "receipt": "anomaly-reported",
+                        "report": anom_note,
+                    }),
+                );
+                return None;
+            }
+            concurrent_mutation = true;
+            reason = "Обнаружены новые параллельные правки или занятая блокировка маркера во время закрытия гейта; повторите финальную проверку на актуальном содержимом файлов.".to_string();
+            cctx = cwg_common::resolve_candidate_context(&marker, true);
+        } else {
+            reason = anom_note;
+            cctx = cwg_common::resolve_candidate_context(&marker, true);
         }
-        reason = anom_note;
-        cctx = cwg_common::resolve_candidate_context(&marker, true);
     } else {
+        let rr_ts = cwg_common::last_research_reset_ts(&marker);
+        let rr_seq = cwg_common::last_research_reset_board_seq(&marker);
+        let eff_first_ts = first_ts.max(rr_ts);
+        let eff_round_start_msg_id = val_to_i64(marker.get("round_start_msg_id")).max(rr_seq);
         let checks_ev = read_checks_evidence(&session, first_ts);
-        let sub_ev = scan_native_subagents(&steps, transcript_path, first_ts);
+        let sub_ev = scan_native_subagents(&steps, transcript_path, eff_first_ts);
         let eff_cwd = {
             let gr = val_to_str(marker.get("git_root"));
             if !gr.is_empty() {
@@ -4601,32 +5745,36 @@ pub fn decide_stop(payload: &Value) -> Option<String> {
                 }
             }
         };
-        let mut swarm_ev = scan_swarm_activity(
-            &steps,
+        let cur_dh = val_to_str(marker.get("current_diff_hash"));
+        let mut swarm_ev = scan_swarm_activity_with_reset(SwarmScanInput {
+            steps: &steps,
             transcript_path,
-            first_ts,
-            val_to_i64(marker.get("round_start_msg_id")),
-            &val_to_str(marker.get("current_diff_hash")),
-            &eff_cwd,
-        );
+            first_ts: eff_first_ts,
+            round_start_msg_id: eff_round_start_msg_id,
+            current_diff_hash: &cur_dh,
+            cwd: &eff_cwd,
+            research_reset_ts: rr_ts,
+            research_reset_seq: rr_seq,
+            marker: Some(&marker),
+        });
         merge_sticky_outage_state(&mut state, &mut swarm_ev);
         let codex_revs = codex_lane::scan_verified_codex_reviews(
-            first_ts,
+            eff_first_ts,
             &session,
             &val_to_str(marker.get("git_root")),
         );
         cctx = cwg_common::resolve_candidate_context(&marker, true);
-        let (valid, val_reason) = validate_candidate_closure(
-            receipt.as_ref(),
-            &marker,
-            &checks_ev,
-            &sub_ev,
-            &swarm_ev,
-            &codex_revs,
-            Some(&mut cctx),
-            Some(&steps),
+        let (valid, val_reason) = validate_candidate_closure(CandidateClosureInput {
+            receipt: receipt.as_ref(),
+            marker_in: &marker,
+            checks_ev: &checks_ev,
+            sub_ev: &sub_ev,
+            swarm_ev: &swarm_ev,
+            codex_reviews: &codex_revs,
+            ctx: Some(&mut cctx),
+            steps: Some(&steps),
             transcript_path,
-        );
+        });
         if valid {
             let rkind = receipt
                 .as_ref()
@@ -4634,20 +5782,31 @@ pub fn decide_stop(payload: &Value) -> Option<String> {
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .unwrap_or("verified");
-            retire_candidate(&session, &mfile, &sfile, &mut state, rkind);
-            rio::log_hook_event(
-                "gate-events",
-                "close",
-                json!({
-                    "session": session,
-                    "receipt": rkind,
-                    "floor": val_to_str(cctx.get("floor")),
-                }),
-            );
-            return None;
-        }
-
-        if !swarm_ev.stalled_workers.is_empty() {
+            if retire_candidate_checked(RetireCandidateInput {
+                session: &session,
+                marker_file: &mfile,
+                state_file: &sfile,
+                state: &mut state,
+                receipt_summary: rkind,
+                expected_marker: Some(&marker),
+                expected_stats: Some(&start_stats),
+                consumed_pending_ids: &stop_consumed_ids,
+                allow_unhashed: rkind != "verified" && rkind != "pr-ready",
+            }) {
+                rio::log_hook_event(
+                    "gate-events",
+                    "close",
+                    json!({
+                        "session": session,
+                        "receipt": rkind,
+                        "floor": val_to_str(cctx.get("floor")),
+                    }),
+                );
+                return None;
+            }
+            concurrent_mutation = true;
+            reason = "Обнаружены новые параллельные правки или занятая блокировка маркера во время закрытия гейта; повторите финальную проверку на актуальном содержимом файлов.".to_string();
+        } else if !swarm_ev.stalled_workers.is_empty() {
             let stalled_desc: Vec<String> = swarm_ev
                 .stalled_workers
                 .iter()
@@ -4720,28 +5879,65 @@ pub fn decide_stop(payload: &Value) -> Option<String> {
         }
     }
 
-    let blocks = val_to_i64(state.get("blocks"));
-    if blocks >= MAX_BLOCKS_PER_CANDIDATE {
-        retire_candidate(
+    if !concurrent_mutation && !cycle_receipt_risk.is_empty() {
+        cwg_common::latch_marker_declared_risk_for_marker(
             &session,
-            &mfile,
-            &sfile,
-            &mut state,
-            &format!("exhausted:{}", truncate_chars(&reason, 100)),
+            &mut marker,
+            &cycle_receipt_risk,
         );
-        rio::log_hook_event(
-            "gate-events",
-            "exhausted",
-            json!({
-                "session": session,
-                "reason": reason,
-            }),
-        );
-        return None;
     }
 
+    let (live_cls_blks, live_cls_ts, live_cls_ids) =
+        codex_lane::active_cycle_closure_blocks_for_marker(
+            &marker,
+            &session,
+            &val_to_str(cctx.get("git_root")),
+            &tp_str,
+        );
+    let closure_halt_active = live_cls_blks >= MAX_CLOSURE_PASSES;
+    if !concurrent_mutation && closure_halt_active {
+        cwg_common::latch_marker_closure_halt_for_marker(
+            &session,
+            &marker,
+            live_cls_blks,
+            live_cls_ts,
+            &live_cls_ids,
+        );
+    }
+
+    let blocks = val_to_i64(state.get("blocks"));
+    // SAFETY: Never allow `MAX_BLOCKS_PER_CANDIDATE` retry exhaustion to retire a candidate halted after 2 `CLOSURE_VALIDATION: BLOCKED` passes; require `research-reset` (or explicit `draft-blocked` / `no-change` / `anomaly-reported`).
+    if !concurrent_mutation && !closure_halt_active && blocks >= MAX_BLOCKS_PER_CANDIDATE {
+        let exh_summary = format!("exhausted:{}", truncate_chars(&reason, 100));
+        if retire_candidate_checked(RetireCandidateInput {
+            session: &session,
+            marker_file: &mfile,
+            state_file: &sfile,
+            state: &mut state,
+            receipt_summary: &exh_summary,
+            expected_marker: Some(&marker),
+            expected_stats: Some(&start_stats),
+            consumed_pending_ids: &stop_consumed_ids,
+            allow_unhashed: true,
+        }) {
+            rio::log_hook_event(
+                "gate-events",
+                "exhausted",
+                json!({
+                    "session": session,
+                    "reason": reason,
+                }),
+            );
+            return None;
+        }
+        // SAFETY: Concurrent edit or lock contention raced with retry exhaustion; refuse to wipe the newer unvalidated candidate and block instead.
+        concurrent_mutation = true;
+        reason = "Обнаружены новые параллельные правки или занятая блокировка маркера во время закрытия гейта; повторите финальную проверку на актуальном содержимом файлов.".to_string();
+    }
+
+    let next_blocks = if concurrent_mutation { 1 } else { blocks + 1 };
     let nonce = generate_nonce_hex12();
-    state.insert("blocks".to_string(), json!(blocks + 1));
+    state.insert("blocks".to_string(), json!(next_blocks));
     state.insert(
         "last_block_reason".to_string(),
         Value::String(reason.clone()),
@@ -4754,7 +5950,7 @@ pub fn decide_stop(payload: &Value) -> Option<String> {
         "block",
         json!({
             "session": session,
-            "block": blocks + 1,
+            "block": next_blocks,
             "reason": reason,
             "floor": val_to_str(cctx.get("floor")),
         }),
@@ -5042,21 +6238,21 @@ mod tests {
         // INVARIANT: Missing simplify and review must reject closure.
         let mut swarm_empty = SwarmEvidence::default();
         let receipt_ok = cwg_common::parse_terminal_receipt("[gate] verified: HIGH; all checks passed").unwrap();
-        let (ok0, reason0) = validate_candidate_closure(
-            Some(&receipt_ok),
-            &marker,
-            &checks_ev,
-            &sub_ev,
-            &swarm_empty,
-            &[],
-            None,
-            None,
-            None,
-        );
+        let (ok0, reason0) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&receipt_ok),
+            marker_in: &marker,
+            checks_ev: &checks_ev,
+            sub_ev: &sub_ev,
+            swarm_ev: &swarm_empty,
+            codex_reviews: &[],
+            ctx: None,
+            steps: None,
+            transcript_path: None,
+        });
         assert!(!ok0);
         assert!(reason0.contains("requires primary independent review first"));
 
-        // INVARIANT: Fast-Path combined simplify plus Codex APPROVED after simplify passes closure.
+        // INVARIANT: Under Sandwich Gate on `HIGH`, post-simplify `ordinary` `APPROVED` without `--closure` MUST be rejected, whereas primary `ordinary` `APPROVED` -> `simplify` -> `--closure` `READY` passes closure (including when `simplify` prompted a durable fix before `--closure`).
         swarm_empty.sonnet_combined_ts = 125.0;
         swarm_empty.sonnet_combined_end_ts = 128.0;
         swarm_empty.simplify_history.push(SimplifyHistoryItem {
@@ -5069,27 +6265,120 @@ mod tests {
             clean: true,
             has_explicit_all: true,
         });
-        let codex_revs = vec![json!({
-            "engine": "codex",
-            "kind": "ordinary",
-            "verdict": "APPROVED",
-            "launch_ts": 130.0,
-            "verdict_ts": 135.0,
-            "xhigh": false,
-        })];
-        let (ok1, res1) = validate_candidate_closure(
-            Some(&receipt_ok),
-            &marker,
-            &checks_ev,
-            &sub_ev,
-            &swarm_empty,
-            &codex_revs,
-            None,
-            None,
-            None,
+        let post_sim_ord_only = vec![
+            json!({
+                "engine": "codex",
+                "kind": "ordinary",
+                "verdict": "APPROVED",
+                "launch_ts": 118.0,
+                "verdict_ts": 120.0,
+                "xhigh": false,
+            }),
+            json!({
+                "engine": "codex",
+                "kind": "ordinary",
+                "verdict": "APPROVED",
+                "launch_ts": 130.0,
+                "verdict_ts": 135.0,
+                "xhigh": false,
+            }),
+        ];
+        let (ok_no_cls, res_no_cls) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&receipt_ok),
+            marker_in: &marker,
+            checks_ev: &checks_ev,
+            sub_ev: &sub_ev,
+            swarm_ev: &swarm_empty,
+            codex_reviews: &post_sim_ord_only,
+            ctx: None,
+            steps: None,
+            transcript_path: None,
+        });
+        assert!(!ok_no_cls, "post-simplify ordinary APPROVED must not bypass --closure");
+        assert!(
+            res_no_cls.contains("--closure") || res_no_cls.contains("unnecessarily"),
+            "got: {}",
+            res_no_cls
         );
+
+        let codex_revs = vec![
+            json!({
+                "engine": "codex",
+                "kind": "ordinary",
+                "verdict": "APPROVED",
+                "launch_ts": 118.0,
+                "verdict_ts": 120.0,
+                "xhigh": false,
+            }),
+            json!({
+                "engine": "codex",
+                "kind": "closure",
+                "verdict": "READY",
+                "launch_ts": 130.0,
+                "verdict_ts": 135.0,
+                "xhigh": false,
+            }),
+        ];
+        let (ok1, res1) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&receipt_ok),
+            marker_in: &marker,
+            checks_ev: &checks_ev,
+            sub_ev: &sub_ev,
+            swarm_ev: &swarm_empty,
+            codex_reviews: &codex_revs,
+            ctx: None,
+            steps: None,
+            transcript_path: None,
+        });
         assert!(ok1, "expected closure pass, got: {}", res1);
         assert_eq!(res1, "verified");
+
+        let marker_post_sim_edit = json!({
+            "cwd": tmp.path.to_string_lossy(),
+            "paths": [auth_file.to_string_lossy()],
+            "first_ts": 100.0,
+            "last_durable_ts": 122.0,
+            "content_marks": [
+                { "ts": 110.0, "fp": "stale_pre_simplify_fp" },
+                { "ts": 122.0, "fp": fp }
+            ]
+        });
+        let checks_post_sim_edit = ChecksEvidence {
+            checks_count: 2,
+            passed_count: 2,
+            failed_count: 0,
+            latest_pass_ts: 123.0,
+            latest_fail_ts: 0.0,
+        };
+        let (ok1_edit, res1_edit) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&receipt_ok),
+            marker_in: &marker_post_sim_edit,
+            checks_ev: &checks_post_sim_edit,
+            sub_ev: &sub_ev,
+            swarm_ev: &swarm_empty,
+            codex_reviews: &codex_revs,
+            ctx: None,
+            steps: None,
+            transcript_path: None,
+        });
+        assert!(
+            ok1_edit,
+            "expected post-simplify edit + fresh simplify + --closure READY to pass, got: {}",
+            res1_edit
+        );
+        let (ok1_bypass, res1_bypass) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&receipt_ok),
+            marker_in: &marker_post_sim_edit,
+            checks_ev: &checks_post_sim_edit,
+            sub_ev: &sub_ev,
+            swarm_ev: &swarm_empty,
+            codex_reviews: &post_sim_ord_only,
+            ctx: None,
+            steps: None,
+            transcript_path: None,
+        });
+        assert!(!ok1_bypass, "post-simplify edit must still require --closure, got: {}", res1_bypass);
+        assert!(res1_bypass.contains("--closure"), "got: {}", res1_bypass);
 
         // INVARIANT: Codex thinking timeout followed by internal Opus must be rejected.
         let mut swarm_timeout = swarm_empty.clone();
@@ -5102,32 +6391,33 @@ mod tests {
             "verdict_ts": 135.0,
             "xhigh": false,
         }));
-        let (ok2, reason2) = validate_candidate_closure(
-            Some(&receipt_ok),
-            &marker,
-            &checks_ev,
-            &sub_ev,
-            &swarm_timeout,
-            &[],
-            None,
-            None,
-            None,
-        );
+        let (ok2, reason2) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&receipt_ok),
+            marker_in: &marker,
+            checks_ev: &checks_ev,
+            sub_ev: &sub_ev,
+            swarm_ev: &swarm_timeout,
+            codex_reviews: &[],
+            ctx: None,
+            steps: None,
+            transcript_path: None,
+        });
         assert!(!ok2);
         assert!(reason2.contains("thinking timeout is NOT an outage"));
 
         // INVARIANT: When HIGH has neither primary review nor simplify, report missing primary review BEFORE simplify; when simplify already ran and went stale, report stale simplify.
-        let (ok3a, reason3a) = validate_candidate_closure(
-            Some(&receipt_ok),
-            &marker,
-            &checks_ev,
-            &sub_ev,
-            &SwarmEvidence::default(),
-            &[],
-            None,
-            None,
-            None,
-        );
+        let def_sw = SwarmEvidence::default();
+        let (ok3a, reason3a) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&receipt_ok),
+            marker_in: &marker,
+            checks_ev: &checks_ev,
+            sub_ev: &sub_ev,
+            swarm_ev: &def_sw,
+            codex_reviews: &[],
+            ctx: None,
+            steps: None,
+            transcript_path: None,
+        });
         assert!(!ok3a);
         assert!(
             reason3a.contains("BEFORE simplify"),
@@ -5139,17 +6429,17 @@ mod tests {
         swarm_stale.sonnet_lenses.insert("reuse".to_string(), 105.0);
         swarm_stale.sonnet_lenses.insert("quality".to_string(), 105.0);
         swarm_stale.sonnet_lenses.insert("efficiency".to_string(), 105.0);
-        let (ok3b, reason3b) = validate_candidate_closure(
-            Some(&receipt_ok),
-            &marker,
-            &checks_ev,
-            &sub_ev,
-            &swarm_stale,
-            &[],
-            None,
-            None,
-            None,
-        );
+        let (ok3b, reason3b) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&receipt_ok),
+            marker_in: &marker,
+            checks_ev: &checks_ev,
+            sub_ev: &sub_ev,
+            swarm_ev: &swarm_stale,
+            codex_reviews: &[],
+            ctx: None,
+            steps: None,
+            transcript_path: None,
+        });
         assert!(!ok3b);
         assert!(reason3b.contains("stale because durable files changed after simplify"));
 
@@ -5182,17 +6472,17 @@ mod tests {
             "verdict_ts": 104.0,
             "xhigh": false,
         })];
-        let (ok3c, reason3c) = validate_candidate_closure(
-            Some(&receipt_ok),
-            &marker3,
-            &checks_ev,
-            &sub_ev,
-            &sw_fp_exit,
-            &stale_approved,
-            None,
-            None,
-            None,
-        );
+        let (ok3c, reason3c) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&receipt_ok),
+            marker_in: &marker3,
+            checks_ev: &checks_ev,
+            sub_ev: &sub_ev,
+            swarm_ev: &sw_fp_exit,
+            codex_reviews: &stale_approved,
+            ctx: None,
+            steps: None,
+            transcript_path: None,
+        });
         assert!(!ok3c);
         assert!(
             reason3c.contains("BEFORE simplify"),
@@ -5226,5 +6516,807 @@ mod tests {
         let sw_wait = scan_swarm_activity(&wait_steps, None, 100.0, 0, "", "");
         assert!(sw_wait.pending_bg_tasks.is_empty());
         assert_eq!(sw_wait.passive_bg_tasks, vec!["sess-1/task-99".to_string()]);
+    }
+
+    #[test]
+    fn test_sandwich_closure_premature_recovery_two_block_halt_and_post_reset_workers() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempEnvDir::new("sandwich-stop");
+        let ws = tmp.path.join("ws");
+        let brain = tmp.path.join("brain");
+        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&brain).unwrap();
+
+        let auth_rs = ws.join("auth_guard.rs");
+        fs::write(&auth_rs, "pub fn ok() -> bool { true }\n").unwrap();
+        let t0 = 1000.0_f64;
+        let sess = "sess-sandwich-rust";
+        let marker = json!({
+            "session": sess,
+            "class": cwg_common::WORK_PERSISTENT,
+            "first_ts": t0,
+            "last_durable_ts": t0,
+            "cwd": rio::normalize_path(&ws.to_string_lossy()),
+            "git_root": "",
+            "paths": [rio::normalize_path(&auth_rs.to_string_lossy())],
+            "changed_lines": 1,
+            "shell_durable_edit": false,
+            "content_marks": [{"ts": t0, "fp": "aa11bb22cc33dd44", "unknown": false}],
+            "closed": false,
+        });
+        let receipt = json!({"kind": "verified", "risk": "HIGH"});
+        let checks_ev = ChecksEvidence {
+            checks_count: 1,
+            passed_count: 1,
+            failed_count: 0,
+            latest_pass_ts: t0 + 0.2,
+            latest_fail_ts: 0.0,
+        };
+        let sub_ev = SubagentEvidence::default();
+
+        let sim1 = SimplifyHistoryItem {
+            kind: "combined".to_string(),
+            lens: None,
+            tier: "sonnet".to_string(),
+            launch_ts: t0 + 1.0,
+            end_ts: t0 + 1.2,
+            seq: 1,
+            clean: true,
+            has_explicit_all: true,
+        };
+        let mut sw_pass1 = SwarmEvidence::default();
+        sw_pass1.sonnet_combined_ts = t0 + 1.0;
+        sw_pass1.sonnet_combined_end_ts = t0 + 1.2;
+        sw_pass1.simplify_history = vec![sim1.clone()];
+
+        let ord_app = json!({"review_id": "cwg-o1", "engine": "codex", "kind": "ordinary", "verdict": "APPROVED", "launch_ts": t0 + 0.4, "verdict_ts": t0 + 0.6, "xhigh": false});
+        let cls_b1 = json!({"review_id": "cwg-b1", "engine": "codex", "kind": "closure", "verdict": "BLOCKED", "launch_ts": t0 + 1.5, "verdict_ts": t0 + 1.7, "xhigh": false});
+        let cls_premature_rdy = json!({"review_id": "cwg-r-prem", "engine": "codex", "kind": "closure", "verdict": "READY", "launch_ts": t0 + 2.0, "verdict_ts": t0 + 2.2, "xhigh": false});
+
+        // INVARIANT: Premature 2nd READY without simplify after BLOCKED #1 is rejected.
+        let prem_revs = [ord_app.clone(), cls_b1.clone(), cls_premature_rdy.clone()];
+        let (ok_prem, why_prem) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&receipt),
+            marker_in: &marker,
+            checks_ev: &checks_ev,
+            sub_ev: &sub_ev,
+            swarm_ev: &sw_pass1,
+            codex_reviews: &prem_revs,
+            ctx: None,
+            steps: None,
+            transcript_path: None,
+        });
+        assert!(!ok_prem);
+        assert!(why_prem.contains("without a fresh `simplify` pass"), "got: {}", why_prem);
+
+        // INVARIANT: Running simplify + replacement `--closure` READY supersedes the premature pass within MAX_CLOSURE_PASSES=2.
+        let sim2 = SimplifyHistoryItem {
+            kind: "combined".to_string(),
+            lens: None,
+            tier: "sonnet".to_string(),
+            launch_ts: t0 + 3.0,
+            end_ts: t0 + 3.2,
+            seq: 2,
+            clean: true,
+            has_explicit_all: true,
+        };
+        let mut sw_rec = SwarmEvidence::default();
+        sw_rec.sonnet_combined_ts = t0 + 3.0;
+        sw_rec.sonnet_combined_end_ts = t0 + 3.2;
+        sw_rec.simplify_history = vec![sim1.clone(), sim2.clone()];
+        let cls_rec_rdy = json!({"review_id": "cwg-r-rec", "engine": "codex", "kind": "closure", "verdict": "READY", "launch_ts": t0 + 3.5, "verdict_ts": t0 + 3.7, "xhigh": false});
+        let rec_revs = [ord_app.clone(), cls_b1.clone(), cls_premature_rdy, cls_rec_rdy];
+        let (ok_rec, why_rec) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&receipt),
+            marker_in: &marker,
+            checks_ev: &checks_ev,
+            sub_ev: &sub_ev,
+            swarm_ev: &sw_rec,
+            codex_reviews: &rec_revs,
+            ctx: None,
+            steps: None,
+            transcript_path: None,
+        });
+        assert!(ok_rec, "expected recovery to close cleanly, got: {}", why_rec);
+
+        // INVARIANT: 2 BLOCKED closure verdicts strictly halt the cycle, and a 3rd READY pass cannot launder 2 BLOCKED passes.
+        let cls_b2 = json!({"review_id": "cwg-b2", "engine": "codex", "kind": "closure", "verdict": "BLOCKED", "launch_ts": t0 + 3.5, "verdict_ts": t0 + 3.7, "xhigh": false});
+        let blk2_revs = [ord_app.clone(), cls_b1.clone(), cls_b2.clone()];
+        let (ok_2blk, why_2blk) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&receipt),
+            marker_in: &marker,
+            checks_ev: &checks_ev,
+            sub_ev: &sub_ev,
+            swarm_ev: &sw_rec,
+            codex_reviews: &blk2_revs,
+            ctx: None,
+            steps: None,
+            transcript_path: None,
+        });
+        assert!(!ok_2blk);
+        assert!(why_2blk.contains("2/2 `BLOCKED`"), "got: {}", why_2blk);
+
+        let cls_forged3 = json!({"review_id": "cwg-r3", "engine": "codex", "kind": "closure", "verdict": "READY", "launch_ts": t0 + 4.5, "verdict_ts": t0 + 4.7, "xhigh": false});
+        let forged3_revs = [ord_app, cls_b1, cls_b2, cls_forged3];
+        let (ok_3rd, why_3rd) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&receipt),
+            marker_in: &marker,
+            checks_ev: &checks_ev,
+            sub_ev: &sub_ev,
+            swarm_ev: &sw_rec,
+            codex_reviews: &forged3_revs,
+            ctx: None,
+            steps: None,
+            transcript_path: None,
+        });
+        assert!(!ok_3rd);
+        assert!(why_3rd.contains("MAX_CLOSURE_PASSES=2"), "got: {}", why_3rd);
+
+        // INVARIANT: Post-research-reset worker reusing standard name `simplify-reviewer` with new `conversation_id` is counted without inheriting Cycle-1 board messages.
+        let sdir = brain.join(sess).join(".system_generated").join("swarm");
+        let ldir = brain.join(sess).join(".system_generated").join("logs");
+        fs::create_dir_all(&sdir).unwrap();
+        fs::create_dir_all(&ldir).unwrap();
+        let tp_fake = ldir.join("transcript.jsonl");
+        fs::write(&tp_fake, "").unwrap();
+        let rr_marker = json!({
+            "session": sess,
+            "research_resets": [{
+                "reset_ts": 2000.0,
+                "last_blocked_ts": 1990.0,
+                "board_head_seq": 5,
+                "pre_reset_worker_cids": ["cid-old-cycle1"],
+                "decision": "refactor",
+                "findings": "docs",
+                "research_tools": ["search_web"]
+            }]
+        });
+        fs::write(
+            sdir.join("members.json"),
+            json!({
+                "members": {
+                    "simplify-reviewer": {
+                        "conversation_id": "cid-new-cycle2",
+                        "model": cwg_common::SONNET_HIGH_MODEL,
+                        "role": "worker",
+                        "killed": true,
+                        "created_at": "1970-01-01T00:33:25Z"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let board_rows = [
+            json!({"seq": 1, "agent": "coordinator", "time": "1970-01-01T00:20:00Z", "text": "@simplify-reviewer old cycle"}),
+            json!({"seq": 6, "agent": "coordinator", "time": "1970-01-01T00:33:26Z", "text": "@simplify-reviewer SIMPLIFY_LENS: ALL\nDIFF_HASH: h2"}),
+            json!({"seq": 7, "agent": "simplify-reviewer", "time": "1970-01-01T00:33:30Z", "text": "SIMPLIFY_LENS: ALL\nDIFF_HASH: h2\nSIMPLIFY_VERDICT: CLEAN"}),
+        ];
+        fs::write(
+            sdir.join("board.jsonl"),
+            board_rows.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        let tp_fake_str = tp_fake.to_string_lossy().into_owned();
+        let ws_str = ws.to_string_lossy().into_owned();
+        let scanned_new = scan_swarm_activity_with_reset(SwarmScanInput {
+            steps: &[],
+            transcript_path: Some(&tp_fake_str),
+            first_ts: 2000.0,
+            round_start_msg_id: 5,
+            current_diff_hash: "h2",
+            cwd: &ws_str,
+            research_reset_ts: 2000.0,
+            research_reset_seq: 5,
+            marker: Some(&rr_marker),
+        });
+        assert!(scanned_new.sonnet_combined_ts > 2000.0);
+
+        // SAFETY: `retire_candidate_checked` refuses to close/delete `marker.json` if a concurrent `PostToolUse` persisted a newer edit into `marker.json` after Stop's initial snapshot.
+        let sess_conc = "sess-retire-toctou";
+        let mfile_conc = cwg_common::marker_path(sess_conc);
+        let sfile_conc = cwg_common::enforcement_state_path(sess_conc);
+        let mut st_conc = Map::new();
+        let auth_norm = rio::normalize_path(&auth_rs.to_string_lossy());
+        let auth_fp = cwg_common::content_fingerprint(
+            std::slice::from_ref(&auth_norm),
+            cwg_common::MAX_FINGERPRINT_FILE_BYTES,
+        );
+        let snap_v1 = json!({
+            "session": sess_conc,
+            "first_ts": 100.0,
+            "last_ts": 100.0,
+            "last_durable_ts": 100.0,
+            "edits": 1,
+            "operational": false,
+            "paths": [auth_norm],
+            "content_marks": [{"ts": 100.0, "fp": auth_fp}],
+            "closed": false,
+        });
+        let persisted_v2 = json!({
+            "session": sess_conc,
+            "first_ts": 100.0,
+            "last_ts": 105.0,
+            "last_durable_ts": 105.0,
+            "edits": 2,
+            "operational": false,
+            "paths": [auth_norm],
+            "content_marks": [{"ts": 105.0, "fp": auth_fp}],
+            "closed": false,
+        });
+        rio::write_json(&mfile_conc, &persisted_v2).unwrap();
+        assert!(!retire_candidate_checked(RetireCandidateInput {
+            session: sess_conc,
+            marker_file: &mfile_conc,
+            state_file: &sfile_conc,
+            state: &mut st_conc,
+            receipt_summary: "verified",
+            expected_marker: Some(&snap_v1),
+            expected_stats: None,
+            consumed_pending_ids: &[],
+            allow_unhashed: false,
+        }));
+        assert!(mfile_conc.is_file());
+        assert!(retire_candidate_checked(RetireCandidateInput {
+            session: sess_conc,
+            marker_file: &mfile_conc,
+            state_file: &sfile_conc,
+            state: &mut st_conc,
+            receipt_summary: "verified",
+            expected_marker: Some(&persisted_v2),
+            expected_stats: None,
+            consumed_pending_ids: &[],
+            allow_unhashed: false,
+        }));
+        assert!(!mfile_conc.exists());
+
+        // SAFETY: `decide_stop` at `blocks == MAX_BLOCKS_PER_CANDIDATE` never force-retires an unvalidated concurrent file mutation on either the `valid` or `invalid` path.
+        let sess_exh = "sess-decide-stop-exhaust-race";
+        let notes_md = ws.join("notes.md");
+        fs::write(&notes_md, "# v1\n").unwrap();
+        let notes_norm = rio::normalize_path(&notes_md.to_string_lossy());
+        let notes_fp_v1 = cwg_common::content_fingerprint(
+            std::slice::from_ref(&notes_norm),
+            cwg_common::MAX_FINGERPRINT_FILE_BYTES,
+        );
+        let exh_marker = json!({
+            "session": sess_exh,
+            "first_ts": 200.0,
+            "last_ts": 200.0,
+            "last_durable_ts": 200.0,
+            "edits": 1,
+            "operational": false,
+            "paths": [notes_norm],
+            "content_marks": [{"ts": 200.0, "fp": notes_fp_v1}],
+            "closed": false,
+        });
+        let mfile_exh = cwg_common::marker_path(sess_exh);
+        let sfile_exh = cwg_common::enforcement_state_path(sess_exh);
+        rio::write_json(&mfile_exh, &exh_marker).unwrap();
+        rio::write_json(
+            &sfile_exh,
+            &json!({
+                "candidate_key": cwg_common::candidate_key(&exh_marker),
+                "candidate_first_ts": 200.0,
+                "blocks": MAX_BLOCKS_PER_CANDIDATE,
+            }),
+        )
+        .unwrap();
+        let notes_for_hook1 = notes_md.clone();
+        *TEST_MID_DECIDE_STOP_HOOK.lock().unwrap() = Some(Box::new(move || {
+            fs::write(&notes_for_hook1, "# v2 concurrent edit\n").unwrap();
+        }));
+
+        let blk_valid_race = decide_stop(&json!({
+            "conversationId": sess_exh,
+            "lastAssistantMessage": "[gate] verified: LOW; checked v1",
+        }));
+        assert!(blk_valid_race.is_some());
+        assert!(mfile_exh.is_file());
+        assert_eq!(
+            rio::read_json(&sfile_exh)
+                .and_then(|v| v.get("blocks").and_then(|b| b.as_i64())),
+            Some(1)
+        );
+
+        fs::write(&notes_md, "# v1\n").unwrap();
+        rio::write_json(&mfile_exh, &exh_marker).unwrap();
+        rio::write_json(
+            &sfile_exh,
+            &json!({
+                "candidate_key": cwg_common::candidate_key(&exh_marker),
+                "candidate_first_ts": 200.0,
+                "blocks": MAX_BLOCKS_PER_CANDIDATE,
+            }),
+        )
+        .unwrap();
+        let notes_for_hook2 = notes_md.clone();
+        *TEST_MID_DECIDE_STOP_HOOK.lock().unwrap() = Some(Box::new(move || {
+            fs::write(&notes_for_hook2, "# v3 concurrent edit during exhaustion\n").unwrap();
+        }));
+        let blk_invalid_race = decide_stop(&json!({
+            "conversationId": sess_exh,
+            "lastAssistantMessage": "missing receipt",
+        }));
+        assert!(blk_invalid_race.is_some());
+        assert!(mfile_exh.is_file());
+        assert_eq!(
+            rio::read_json(&sfile_exh)
+                .and_then(|v| v.get("blocks").and_then(|b| b.as_i64())),
+            Some(1)
+        );
+
+        // SAFETY: Concurrent `research-reset` (`research_resets` + `round_start_msg_id` updated without file edits) also prevents `decide_stop` exhaustion from deleting the marker.
+        fs::write(&notes_md, "# v1\n").unwrap();
+        rio::write_json(&mfile_exh, &exh_marker).unwrap();
+        rio::write_json(
+            &sfile_exh,
+            &json!({
+                "candidate_key": cwg_common::candidate_key(&exh_marker),
+                "candidate_first_ts": 200.0,
+                "blocks": MAX_BLOCKS_PER_CANDIDATE,
+            }),
+        )
+        .unwrap();
+        let mfile_for_rr = mfile_exh.clone();
+        *TEST_MID_DECIDE_STOP_HOOK.lock().unwrap() = Some(Box::new(move || {
+            let mut m = rio::read_json(&mfile_for_rr).unwrap();
+            m["research_resets"] = json!([{"reset_ts": 205.0, "board_head_seq": 12, "decision": "refine"}]);
+            m["round_start_msg_id"] = json!(12);
+            rio::write_json(&mfile_for_rr, &m).unwrap();
+        }));
+        let blk_rr_race = decide_stop(&json!({
+            "conversationId": sess_exh,
+            "lastAssistantMessage": "missing receipt",
+        }));
+        assert!(blk_rr_race.is_some());
+        assert!(mfile_exh.is_file());
+        assert_eq!(
+            rio::read_json(&mfile_exh)
+                .and_then(|v| v.get("round_start_msg_id").and_then(|x| x.as_i64())),
+            Some(12)
+        );
+
+        // SAFETY: Files exceeding `MAX_FINGERPRINT_FILE_BYTES` (32 MB) yield `""` (`fp: null`) so `is_review_fresh` and `verified` closure fail closed (even on middle-byte edits with preserved size/mtime), while `decide_stop` retry exhaustion retires finitely when `(len, mtime_ns)` did not mutate mid-Stop.
+        let big_bin = ws.join("oversized.md");
+        {
+            let mut bf = fs::File::create(&big_bin).unwrap();
+            std::io::Write::write_all(&mut bf, b"# oversized v1\n").unwrap();
+            bf.set_len(cwg_common::MAX_FINGERPRINT_FILE_BYTES + 4096).unwrap();
+        }
+        let big_norm = rio::normalize_path(&big_bin.to_string_lossy());
+        let big_fp_v1 = cwg_common::content_fingerprint(
+            std::slice::from_ref(&big_norm),
+            cwg_common::MAX_FINGERPRINT_FILE_BYTES,
+        );
+        assert!(big_fp_v1.is_empty());
+        let sess_big = "sess-oversized-fp";
+        let mfile_big = cwg_common::marker_path(sess_big);
+        let sfile_big = cwg_common::enforcement_state_path(sess_big);
+        let big_marker = json!({
+            "session": sess_big,
+            "first_ts": 300.0,
+            "last_ts": 300.0,
+            "last_durable_ts": 300.0,
+            "edits": 1,
+            "operational": false,
+            "paths": [big_norm],
+            "content_marks": [{"ts": 300.0, "fp": Value::Null}],
+            "closed": false,
+        });
+        assert!(!is_review_fresh(&json!({"launch_ts": 305.0}), &big_marker));
+        let big_stats = snapshot_path_stats(&big_marker);
+        assert!(!marker_matches_validated(Some(&big_marker), &big_marker, Some(&big_stats), false));
+        assert!(marker_matches_validated(Some(&big_marker), &big_marker, Some(&big_stats), true));
+        rio::write_json(&mfile_big, &big_marker).unwrap();
+        for expected_blk in 1..=MAX_BLOCKS_PER_CANDIDATE {
+            let blk_msg = decide_stop(&json!({
+                "conversationId": sess_big,
+                "lastAssistantMessage": "[gate] verified: LOW; checked oversized",
+            }));
+            assert!(
+                blk_msg.as_deref().map_or(false, |m| m.contains(">32 MB")),
+                "expected >32 MB validation rejection, got: {:?}",
+                blk_msg
+            );
+            assert_eq!(
+                rio::read_json(&sfile_big).and_then(|v| v.get("blocks").and_then(|b| b.as_i64())),
+                Some(expected_blk)
+            );
+        }
+        assert!(mfile_big.is_file());
+        let big_for_hook = big_bin.clone();
+        *TEST_MID_DECIDE_STOP_HOOK.lock().unwrap() = Some(Box::new(move || {
+            let bf = fs::OpenOptions::new().write(true).open(&big_for_hook).unwrap();
+            bf.set_len(cwg_common::MAX_FINGERPRINT_FILE_BYTES + 8192).unwrap();
+        }));
+        assert!(decide_stop(&json!({
+            "conversationId": sess_big,
+            "lastAssistantMessage": "[gate] verified: LOW; checked oversized",
+        }))
+        .is_some());
+        assert_eq!(
+            rio::read_json(&sfile_big).and_then(|v| v.get("blocks").and_then(|b| b.as_i64())),
+            Some(1)
+        );
+        assert!(mfile_big.is_file());
+        for expected_blk in 2..=MAX_BLOCKS_PER_CANDIDATE {
+            assert!(decide_stop(&json!({
+                "conversationId": sess_big,
+                "lastAssistantMessage": "[gate] verified: LOW; checked oversized",
+            }))
+            .is_some());
+            assert_eq!(
+                rio::read_json(&sfile_big).and_then(|v| v.get("blocks").and_then(|b| b.as_i64())),
+                Some(expected_blk)
+            );
+        }
+        assert!(decide_stop(&json!({
+            "conversationId": sess_big,
+            "lastAssistantMessage": "[gate] verified: LOW; checked oversized",
+        }))
+        .is_none());
+        assert!(!mfile_big.exists());
+        let _ = fs::remove_file(&big_bin);
+
+        // SAFETY: A tracked >32 MB file restored to clean `HEAD` closes immediately on the first `[gate] no-change: ...` Stop call.
+        let git_big_dir = tmp.path.join("git_big_nc");
+        fs::create_dir_all(&git_big_dir).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&git_big_dir)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&git_big_dir)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&git_big_dir)
+            .status()
+            .unwrap()
+            .success());
+        let tracked_big = git_big_dir.join("tracked_oversized.bin");
+        {
+            let tf = fs::File::create(&tracked_big).unwrap();
+            tf.set_len(cwg_common::MAX_FINGERPRINT_FILE_BYTES + 4096).unwrap();
+        }
+        assert!(std::process::Command::new("git")
+            .args(["add", "tracked_oversized.bin"])
+            .current_dir(&git_big_dir)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["commit", "-q", "-m", "add oversized"])
+            .current_dir(&git_big_dir)
+            .status()
+            .unwrap()
+            .success());
+        let sess_big_nc = "sess-oversized-no-change";
+        let mfile_big_nc = cwg_common::marker_path(sess_big_nc);
+        let git_big_norm = rio::normalize_path(&git_big_dir.to_string_lossy());
+        let tracked_big_norm = rio::normalize_path(&tracked_big.to_string_lossy());
+        rio::write_json(
+            &mfile_big_nc,
+            &json!({
+                "session": sess_big_nc,
+                "first_ts": 310.0,
+                "last_ts": 310.0,
+                "last_durable_ts": 310.0,
+                "edits": 2,
+                "operational": false,
+                "cwd": git_big_norm,
+                "git_root": git_big_norm,
+                "paths": [tracked_big_norm],
+                "content_marks": [{"ts": 310.0, "fp": Value::Null}],
+                "closed": false,
+            }),
+        )
+        .unwrap();
+        assert!(decide_stop(&json!({
+            "conversationId": sess_big_nc,
+            "lastAssistantMessage": "[gate] no-change: reverted oversized file to clean HEAD",
+        }))
+        .is_none());
+        assert!(!mfile_big_nc.exists());
+        let _ = fs::remove_dir_all(&git_big_dir);
+
+        // SAFETY: With empty `transcript_path` (CLI mode), `active_cycle_closure_blocks_for_marker` resolves `<brain_root>/<session>`, rejects scouts, and clamps overlapping `breaker.json` outage windows on `reset_breaker_at`.
+        let sess_board_cli = "sess-board-cli-parity";
+        let swarm_cli_dir = tmp
+            .path
+            .join("brain")
+            .join(sess_board_cli)
+            .join(".system_generated")
+            .join("swarm");
+        fs::create_dir_all(&swarm_cli_dir).unwrap();
+        rio::write_json(
+            &swarm_cli_dir.join("members.json"),
+            &json!({
+                "members": {
+                    "scout-1": {"model": "gemini-4-hydrogen-medium", "state": "killed", "killed": true},
+                    "rev-opus": {"model": "claude-opus-5-5-high", "state": "killed", "killed": true},
+                }
+            }),
+        )
+        .unwrap();
+        let board_cli_lines = [
+            json!({"seq": 1, "agent": "coordinator", "time": "2026-11-18 10:00:05", "text": "@scout-1 inspect"}),
+            json!({"seq": 2, "agent": "scout-1", "time": "2026-11-18 10:00:10", "text": "CLOSURE_VALIDATION: BLOCKED"}),
+            json!({"seq": 3, "agent": "coordinator", "time": "2026-11-18 10:00:12", "text": "@scout-1 inspect again"}),
+            json!({"seq": 4, "agent": "scout-1", "time": "2026-11-18 10:00:15", "text": "CLOSURE_VALIDATION: BLOCKED"}),
+            json!({"seq": 5, "agent": "coordinator", "time": "2026-11-18 10:01:10", "text": "@rev-opus closure pass 1"}),
+            json!({"seq": 6, "agent": "rev-opus", "time": "2026-11-18 10:01:20", "text": "CLOSURE_VALIDATION: BLOCKED"}),
+            json!({"seq": 7, "agent": "coordinator", "time": "2026-11-18 10:02:10", "text": "@rev-opus closure pass 2"}),
+            json!({"seq": 8, "agent": "rev-opus", "time": "2026-11-18 10:02:20", "text": "CLOSURE_VALIDATION: BLOCKED"}),
+            json!({"seq": 9, "agent": "coordinator", "time": "2026-11-18 10:05:10", "text": "@rev-opus post-recovery unauthorized pass"}),
+            json!({"seq": 10, "agent": "rev-opus", "time": "2026-11-18 10:05:20", "text": "CLOSURE_VALIDATION: BLOCKED"}),
+        ];
+        fs::write(
+            swarm_cli_dir.join("board.jsonl"),
+            board_cli_lines.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        let cli_marker = json!({
+            "session": sess_board_cli,
+            "first_ts": 100.0,
+            "last_ts": 100.0,
+            "last_durable_ts": 100.0,
+            "edits": 1,
+            "cwd": ws.to_string_lossy(),
+            "git_root": ws.to_string_lossy(),
+            "paths": [notes_norm],
+            "content_marks": [{"ts": 100.0, "fp": notes_fp_v1}],
+            "closed": false,
+        });
+        codex_lane::wipe_breaker_for_test();
+        let (cnt_codex_up, _, _) = codex_lane::active_cycle_closure_blocks_for_marker(
+            &cli_marker,
+            sess_board_cli,
+            &ws.to_string_lossy(),
+            "",
+        );
+        assert_eq!(cnt_codex_up, 0);
+
+        let rev1_launch_ts = rio::parse_iso_ts("2026-11-18 10:01:10");
+        let rev2_launch_ts = rio::parse_iso_ts("2026-11-18 10:02:10");
+        let post_rec_first_ts = rio::parse_iso_ts("2026-11-18 10:04:00");
+        // SAFETY: Exercise overlapping legacy windows `[rev1 - 60, rev1 + 900]` and `[rev1 - 10, rev2 + 60]` followed by recovery at `rev2 + 5`.
+        rio::write_json(
+            &cwg_common::gate_dir().join("codex_lane.json"),
+            &json!({
+                "tripped": true,
+                "reason": "overlapping_outage",
+                "tripped_at": rev1_launch_ts - 10.0,
+                "tripped_until": rev2_launch_ts + 60.0,
+                "history": [
+                    {"tripped_at": rev1_launch_ts - 60.0, "until_ts": rev1_launch_ts + 900.0},
+                    {"tripped_at": rev1_launch_ts - 10.0, "until_ts": rev2_launch_ts + 60.0},
+                ],
+            }),
+        )
+        .unwrap();
+        codex_lane::reset_breaker_at(rev2_launch_ts + 5.0);
+        assert_eq!(
+            codex_lane::breaker_status().get("tripped").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        let (cnt_during_outage, _, _) = codex_lane::active_cycle_closure_blocks_for_marker(
+            &cli_marker,
+            sess_board_cli,
+            &ws.to_string_lossy(),
+            "",
+        );
+        assert_eq!(cnt_during_outage, 2);
+
+        // SAFETY: Durable `closure_halt` latched on `marker.json` preserves the 2-BLOCKED hard stop even after rollout/packet/board eviction until `research_resets` advances past `last_blocked_ts`.
+        let mfile_cli = cwg_common::marker_path(sess_board_cli);
+        rio::write_json(&mfile_cli, &cli_marker).unwrap();
+        let (latched_n, latched_ts, latched_ids) =
+            codex_lane::active_cycle_closure_blocks(sess_board_cli, &ws.to_string_lossy(), "");
+        assert_eq!(latched_n, 2);
+        assert!(latched_ts > 0.0);
+        let _ = fs::remove_file(swarm_cli_dir.join("board.jsonl"));
+        codex_lane::wipe_breaker_for_test();
+        let (cnt_after_eviction, _, _) =
+            codex_lane::active_cycle_closure_blocks(sess_board_cli, &ws.to_string_lossy(), "");
+        assert_eq!(cnt_after_eviction, 2);
+        let halted_marker = rio::read_json(&mfile_cli).unwrap();
+        let rcp_evict = json!({"kind": "verified", "risk": "HIGH"});
+        let chk_evict = ChecksEvidence {
+            checks_count: 1,
+            passed_count: 1,
+            failed_count: 0,
+            latest_pass_ts: 105.0,
+            latest_fail_ts: 0.0,
+        };
+        let sub_evict = SubagentEvidence::default();
+        let sw_evict = SwarmEvidence::default();
+        let (ok_evicted_stop, why_evicted_stop) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_evict),
+            marker_in: &halted_marker,
+            checks_ev: &chk_evict,
+            sub_ev: &sub_evict,
+            swarm_ev: &sw_evict,
+            codex_reviews: &[],
+            ctx: None,
+            steps: None,
+            transcript_path: None,
+        });
+        assert!(!ok_evicted_stop);
+        assert!(
+            why_evicted_stop.contains("2/2 `BLOCKED` verdicts"),
+            "expected 2/2 BLOCKED halt after eviction, got: {}",
+            why_evicted_stop
+        );
+        // SAFETY: `MAX_BLOCKS_PER_CANDIDATE` retry exhaustion in `decide_stop` must never retire a candidate halted after 2 `BLOCKED` passes without `research-reset`, and `latch_marker_closure_halt` must reject cross-candidate turnover (`first_ts` mismatch).
+        let sfile_cli = cwg_common::enforcement_state_path(sess_board_cli);
+        rio::write_json(
+            &sfile_cli,
+            &json!({
+                "candidate_key": cwg_common::candidate_key(&halted_marker),
+                "candidate_first_ts": 100.0,
+                "blocks": MAX_BLOCKS_PER_CANDIDATE + 1,
+            }),
+        )
+        .unwrap();
+        let blk_halted_exhaust = decide_stop(&json!({
+            "conversationId": sess_board_cli,
+            "lastAssistantMessage": "[gate] verified: HIGH; attempted exhaustion bypass",
+        }));
+        assert!(
+            blk_halted_exhaust
+                .as_deref()
+                .map_or(false, |m| m.contains("2/2 `BLOCKED` verdicts")),
+            "expected decide_stop to stay halted past MAX_BLOCKS_PER_CANDIDATE, got: {:?}",
+            blk_halted_exhaust
+        );
+        assert!(mfile_cli.is_file());
+        let _ = fs::remove_file(&sfile_cli);
+
+        let newer_candidate = json!({
+            "session": sess_board_cli,
+            "first_ts": 250.0,
+            "last_ts": 250.0,
+            "last_durable_ts": 250.0,
+            "edits": 1,
+            "cwd": ws.to_string_lossy(),
+            "git_root": ws.to_string_lossy(),
+            "paths": [notes_norm],
+            "content_marks": [{"ts": 250.0, "fp": notes_fp_v1}],
+            "closed": false,
+        });
+        rio::write_json(&mfile_cli, &newer_candidate).unwrap();
+        cwg_common::latch_marker_closure_halt(cwg_common::ClosureHaltLatch {
+            session: sess_board_cli,
+            expected_first_ts: 100.0,
+            expected_rr_ts: 0.0,
+            expected_round_start_msg_id: 0,
+            blocked_count: 2,
+            last_blocked_ts: latched_ts,
+            blocked_ids: &latched_ids,
+            cycle_base_ts: 100.0,
+        });
+        let after_stale_latch = rio::read_json(&mfile_cli).unwrap();
+        assert!(after_stale_latch.get("closure_halt").is_none());
+
+        let mut cleared_marker = halted_marker.clone();
+        cleared_marker["research_resets"] = json!([{
+            "reset_ts": latched_ts + 1.0,
+            "last_blocked_ts": latched_ts,
+            "blocked_review_ids": latched_ids,
+            "decision": "refine",
+            "findings": "verified durable halt clear",
+            "research_tools": ["search_web"],
+            "board_head_seq": 8,
+        }]);
+        assert!(cwg_common::active_marker_closure_halt(&cleared_marker).is_none());
+        let _ = fs::remove_file(&mfile_cli);
+        fs::write(
+            swarm_cli_dir.join("board.jsonl"),
+            board_cli_lines.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        rio::write_json(
+            &cwg_common::gate_dir().join("codex_lane.json"),
+            &json!({
+                "tripped": false,
+                "tripped_at": rev1_launch_ts - 10.0,
+                "tripped_until": 0.0,
+                "history": [
+                    {"tripped_at": rev1_launch_ts - 60.0, "until_ts": rev2_launch_ts + 5.0},
+                    {"tripped_at": rev1_launch_ts - 10.0, "until_ts": rev2_launch_ts + 5.0},
+                ],
+            }),
+        )
+        .unwrap();
+
+        let mut post_rec_marker = cli_marker.clone();
+        post_rec_marker["first_ts"] = json!(post_rec_first_ts);
+        post_rec_marker["last_ts"] = json!(post_rec_first_ts);
+        post_rec_marker["last_durable_ts"] = json!(post_rec_first_ts);
+        post_rec_marker["round_start_msg_id"] = json!(8);
+        let (cnt_post_recovery, _, _) = codex_lane::active_cycle_closure_blocks_for_marker(
+            &post_rec_marker,
+            sess_board_cli,
+            &ws.to_string_lossy(),
+            "",
+        );
+        codex_lane::wipe_breaker_for_test();
+        assert_eq!(cnt_post_recovery, 0);
+
+        fs::write(&notes_md, "# v1\n").unwrap();
+        rio::write_json(&mfile_exh, &exh_marker).unwrap();
+        rio::write_json(
+            &sfile_exh,
+            &json!({
+                "candidate_key": cwg_common::candidate_key(&exh_marker),
+                "candidate_first_ts": 200.0,
+                "blocks": MAX_BLOCKS_PER_CANDIDATE,
+            }),
+        )
+        .unwrap();
+        let allow_unchanged_exhaust = decide_stop(&json!({
+            "conversationId": sess_exh,
+            "lastAssistantMessage": "missing receipt",
+        }));
+        assert!(allow_unchanged_exhaust.is_none());
+        assert!(!mfile_exh.exists());
+
+        // SAFETY: If `marker.json` cannot be deleted or overwritten (`FILE_SHARE_READ`-only handle on Windows), `retire_candidate_checked` fails closed without acking pending deltas or clearing state.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let sess_locked = "sess-retire-write-locked";
+            let mfile_locked = cwg_common::marker_path(sess_locked);
+            let sfile_locked = cwg_common::enforcement_state_path(sess_locked);
+            let locked_marker = json!({
+                "session": sess_locked,
+                "first_ts": 400.0,
+                "last_ts": 400.0,
+                "last_durable_ts": 400.0,
+                "edits": 1,
+                "operational": false,
+                "paths": [notes_norm],
+                "content_marks": [{"ts": 400.0, "fp": notes_fp_v1}],
+                "closed": false,
+            });
+            rio::write_json(&mfile_locked, &locked_marker).unwrap();
+            let pend_dir = cwg_common::marker_pending_dir(sess_locked);
+            fs::create_dir_all(&pend_dir).unwrap();
+            let pend_file = pend_dir.join("0001.json");
+            rio::write_json(&pend_file, &json!({"ts": 400.0, "edits": 0, "paths": []})).unwrap();
+            let stats_locked = snapshot_path_stats(&locked_marker);
+            let mut st_locked = Map::new();
+            st_locked.insert("blocks".to_string(), json!(2));
+            let hold_read_only = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .open(&mfile_locked)
+                .unwrap();
+            let pend_ids_locked = ["0001.json".to_string()];
+            let retired_while_locked = retire_candidate_checked(RetireCandidateInput {
+                session: sess_locked,
+                marker_file: &mfile_locked,
+                state_file: &sfile_locked,
+                state: &mut st_locked,
+                receipt_summary: "verified",
+                expected_marker: Some(&locked_marker),
+                expected_stats: Some(&stats_locked),
+                consumed_pending_ids: &pend_ids_locked,
+                allow_unhashed: false,
+            });
+            assert!(!retired_while_locked);
+            assert!(pend_file.is_file());
+            assert_eq!(st_locked.get("blocks").and_then(|v| v.as_i64()), Some(2));
+            drop(hold_read_only);
+            let _ = fs::remove_file(&pend_file);
+            let _ = fs::remove_file(&mfile_locked);
+        }
     }
 }

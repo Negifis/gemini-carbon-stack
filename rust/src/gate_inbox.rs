@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use crate::cwg_common;
-use crate::rio;
+use crate::rio::{self, json_truthy, truncate_chars, val_to_f64, val_to_str};
 use crate::win32_sqlite::{now_sec, SqlParam, SqliteConn, SQLITE_OPEN_READONLY};
 
 static REPORT_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -44,48 +44,6 @@ fn bus_report_re() -> &'static Regex {
 fn anom_id_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?i)\banom-[0-9a-f]{6,}\b").expect("anom_id_re"))
-}
-
-fn truncate_chars(s: &str, max_chars: usize) -> &str {
-    match s.char_indices().nth(max_chars) {
-        Some((idx, _)) => &s[..idx],
-        None => s,
-    }
-}
-
-fn json_truthy(v: Option<&Value>) -> bool {
-    match v {
-        Some(Value::Bool(b)) => *b,
-        Some(Value::Number(n)) => n.as_f64().map_or(false, |x| x != 0.0),
-        Some(Value::String(s)) => !s.is_empty(),
-        Some(Value::Array(a)) => !a.is_empty(),
-        Some(Value::Object(m)) => !m.is_empty(),
-        _ => false,
-    }
-}
-
-fn val_to_str(v: Option<&Value>) -> String {
-    match v {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Number(n)) => n.to_string(),
-        Some(Value::Bool(b)) => b.to_string(),
-        _ => String::new(),
-    }
-}
-
-fn val_to_f64(v: Option<&Value>) -> f64 {
-    match v {
-        Some(Value::Number(n)) => n.as_f64().unwrap_or(0.0),
-        Some(Value::String(s)) => s.trim().parse::<f64>().unwrap_or(0.0),
-        Some(Value::Bool(b)) => {
-            if *b {
-                1.0
-            } else {
-                0.0
-            }
-        }
-        _ => 0.0,
-    }
 }
 
 fn eprintln_str(msg: &str) {
@@ -575,12 +533,7 @@ pub fn format_handler_digest(limit: usize, cfg: Option<&Value>) -> String {
     } else {
         repo_hint_raw
     };
-    let inbox_script = rio::normalize_path(
-        &rio::plugin_root()
-            .join("hooks")
-            .join("gate_inbox.py")
-            .to_string_lossy(),
-    );
+    let cs_bin = rio::normalize_path(&rio::carbon_stack_bin_path().to_string_lossy());
     let total_cnt = items.len() + bus_items.len();
     let mut lines = vec![
         format!(
@@ -627,8 +580,8 @@ pub fn format_handler_digest(limit: usize, cfg: Option<&Value>) -> String {
         hsess.as_str()
     };
     lines.push(format!(
-        "Action: inspect `{} show --id <id>` (or chat-bus message), fix root cause + add test in `{}`, run `install.py --force` + tests, then mark `{} resolve --id <id> --note \"...\"` (and reply via `chat_bus_cli.py reply --from-chat {} --message-id <msg_id> --message \"...\"` for chat-bus reports).",
-        inbox_script, repo_hint, inbox_script, hsess_label
+        "Action: inspect `& \"{}\" gate-inbox show --id <id>` (or chat-bus message), fix root cause + add Rust test in `{}`, build release `carbon-stack.exe` + run `carbon-stack install --force`, then mark `& \"{}\" gate-inbox resolve --id <id> --note \"...\"` (and reply via `chat_bus_cli.py reply --from-chat {} --message-id <msg_id> --message \"...\"` for chat-bus reports).",
+        cs_bin, repo_hint, cs_bin, hsess_label
     ));
     lines.join("\n")
 }
@@ -663,7 +616,7 @@ fn discover_session_transcript(session: &str) -> String {
 
 fn capture_session_forensics(session: &str) -> Value {
     let mut out = Map::new();
-    if let Some(Value::Object(mdata)) = rio::read_json(&cwg_common::marker_path(session)) {
+    if let Some(Value::Object(mdata)) = cwg_common::read_marker_with_pending(session) {
         let paths: Vec<Value> = mdata
             .get("paths")
             .and_then(|v| v.as_array())
@@ -1170,9 +1123,6 @@ mod tests {
     use super::*;
     use crate::win32_sqlite::SQLITE_OPEN_CREATE;
     use crate::win32_sqlite::SQLITE_OPEN_READWRITE;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_all_regexes_compile() {

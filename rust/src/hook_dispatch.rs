@@ -35,6 +35,7 @@ pub fn run_unified_hook(args: &[String]) -> i32 {
 
     match actual_event.as_str() {
         "SessionStart" => {
+            crate::installer::try_auto_heal_default_stage_retire();
             let (sys_msg, user_md) = continuity_hook::evaluate_session_start(&payload);
             if let Some(msg) = sys_msg {
                 rio::emit_inject_system(&msg, user_md.as_deref());
@@ -43,6 +44,7 @@ pub fn run_unified_hook(args: &[String]) -> i32 {
             }
         }
         "PreInvocation" => {
+            crate::installer::try_auto_heal_default_stage_retire();
             let mut blocks: Vec<String> = Vec::new();
             if let Some(s) = continuity_hook::evaluate_pre_invocation(&payload) {
                 if !s.trim().is_empty() {
@@ -89,8 +91,7 @@ pub fn run_unified_hook(args: &[String]) -> i32 {
             rio::emit_pre_tool("allow", None, sg_overwrite);
         }
         "PostToolUse" => {
-            cwg_mark::record_post_tool_use(&payload);
-            rio::emit_json(&json!({}));
+            return cwg_mark::evaluate_post_tool_use(&payload);
         }
         "Stop" => {
             if let Some(cont_reason) = continuity_hook::decide_stop(&payload) {

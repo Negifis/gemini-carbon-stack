@@ -1,6 +1,6 @@
 ---
 name: windows-and-stack-ops
-description: Windows file-lock inspection (file-holders.ps1), NTFS junction recovery (worktree_guard.py), and swarm_cache.py CLI. Do NOT load for ordinary PowerShell commands.
+description: Windows file-lock inspection (file-holders.ps1), NTFS junction recovery (carbon-stack worktree-guard), and carbon-stack swarm-cache CLI. Do NOT load for ordinary PowerShell commands.
 ---
 
 # Windows Runtime & Stack Operations
@@ -14,7 +14,7 @@ description: Windows file-lock inspection (file-holders.ps1), NTFS junction reco
 | `cmd1 && cmd2` или `cmd1 \|\| cmd2` | `cmd1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cmd2` |
 | `python - <<'EOF' ... EOF` или `< file` | `@' ... '@ \| python -X utf8 -` |
 | `(Get-Content f)[10:20]` (срез Python) | `(Get-Content f)[10..20]` или `read_file(Path=..., StartLine=11, EndLine=21)` |
-| `sed`, `awk`, `head`, `tail`, `rg` | `read_file`, `code_search.py`, `git grep -n`, `Select-String`, `Select-Object -First/-Last` |
+| `sed`, `awk`, `head`, `tail`, `rg` | `read_file`, `carbon-stack code-search`, `git grep -n`, `Select-String`, `Select-Object -First/-Last` |
 | `python -m pyflakes ...` | `python -X utf8 -m py_compile ...` или `ast.parse` (пакет `pyflakes` не установлен) |
 | `2>/dev/null` или `python ...` без кодировки | `2>$null` / `$null \| ...` и всегда `python -X utf8` |
 | `python -m unittest ... 2>&1 \| Select-Object` | Запускайте `python -X utf8 -m unittest ...` напрямую (вывод `OK` в `stderr` порождает `NativeCommandError`) |
@@ -25,13 +25,13 @@ description: Windows file-lock inspection (file-holders.ps1), NTFS junction reco
 
 - **Контроль 5-минутного TTL кэша `swarm` и генерация инкрементального диффа:**
   ```powershell
-  python -X utf8 "<PLUGIN_ROOT>/tools/swarm_cache.py" status --session "<id>" --label simplify
-  python -X utf8 "<PLUGIN_ROOT>/tools/swarm_cache.py" prepare --session "<id>" --cwd "<путь>" --label simplify
+  & "<PLUGIN_ROOT>/bin/carbon-stack.exe" swarm-cache status --session "<id>" --label simplify
+  & "<PLUGIN_ROOT>/bin/carbon-stack.exe" swarm-cache prepare --session "<id>" --cwd "<путь>" --label simplify
   ```
 - **Поиск символов и кода (замена отсутствующим `rg`/`jev`):**
   ```powershell
-  python -X utf8 "<PLUGIN_ROOT>/tools/code_search.py" symbols "<имя>" --cwd "<путь>"
-  python -X utf8 "<PLUGIN_ROOT>/tools/code_search.py" grep "<шаблон>" --cwd "<путь>"
+  & "<PLUGIN_ROOT>/bin/carbon-stack.exe" code-search symbols "<имя>" --cwd "<путь>"
+  & "<PLUGIN_ROOT>/bin/carbon-stack.exe" code-search grep "<шаблон>" --cwd "<путь>"
   ```
 - **Кто держит заблокированный файл на Windows (`ERROR_SHARING_VIOLATION`):**
   ```powershell
@@ -39,7 +39,7 @@ description: Windows file-lock inspection (file-holders.ps1), NTFS junction reco
   ```
 - **Безопасная работа с git worktrees и снимками грязного дерева:**
   ```powershell
-  python -X utf8 "<PLUGIN_ROOT>/tools/worktree_guard.py" audit --cwd "<путь>"
-  python -X utf8 "<PLUGIN_ROOT>/tools/worktree_guard.py" snapshot --worktree "<путь>" --label "pre-op"
-  python -X utf8 "<PLUGIN_ROOT>/tools/worktree_guard.py" remove --worktree "<путь>"
+  & "<PLUGIN_ROOT>/bin/carbon-stack.exe" worktree-guard audit --cwd "<путь>"
+  & "<PLUGIN_ROOT>/bin/carbon-stack.exe" worktree-guard snapshot --worktree "<путь>" --label "pre-op"
+  & "<PLUGIN_ROOT>/bin/carbon-stack.exe" worktree-guard remove --worktree "<путь>"
   ```

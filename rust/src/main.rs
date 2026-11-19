@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 pub mod carbon_memory;
 pub mod chip_handoff;
 pub mod chip_hooks;
@@ -13,6 +11,7 @@ pub mod cwg_pre_invocation;
 pub mod cwg_stop;
 pub mod gate_inbox;
 pub mod hook_dispatch;
+pub mod installer;
 pub mod rio;
 pub mod safety_guards;
 pub mod stack_doctor;
@@ -29,7 +28,7 @@ fn main() {
     let all_args: Vec<String> = env::args().collect();
     if all_args.len() < 2 {
         eprintln!(
-            "usage: carbon-stack <hook|safety-guards|tokenade-hook|continuity|chip-hooks|cwg-pre-invocation|cwg-mark|cwg-stop|codex-lane|gate-inbox|swarm-cache|swarm-ctl|worktree-guard|carbon-memory|chip-handoff|code-search|stack-doctor|claude-chat-importer|--version> [args...]"
+            "usage: carbon-stack <install|hook|safety-guards|tokenade-hook|continuity|chip-hooks|cwg-pre-invocation|cwg-mark|cwg-stop|codex-lane|gate-inbox|swarm-cache|swarm-ctl|worktree-guard|carbon-memory|chip-handoff|code-search|stack-doctor|claude-chat-importer|--version> [args...]"
         );
         process::exit(2);
     }
@@ -40,6 +39,7 @@ fn main() {
             println!("carbon-stack {}", env!("CARGO_PKG_VERSION"));
             0
         }
+        "install" => installer::run_cli(rest),
         "hook" => hook_dispatch::run_unified_hook(rest),
         "safety-guards" | "safety_guards" => safety_guards::run_cli(rest),
         "tokenade-hook" | "tokenade_hook" => tokenade_hook::run_cli(rest),

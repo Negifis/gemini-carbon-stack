@@ -1143,21 +1143,36 @@ pub fn encode_trajectory_metadata(
     out
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn encode_step_metadata(
-    trajectory_id: &str,
-    conversation_id: &str,
-    step_idx: i64,
-    meta_idx: i64,
-    source: i64,
-    created_sec: i64,
-    created_nanos: i64,
-    completed_sec: i64,
-    completed_nanos: i64,
-    exec_id: &str,
-    content_id: &str,
-    is_model: bool,
-) -> Vec<u8> {
+pub struct StepMetadataSpec<'a> {
+    pub trajectory_id: &'a str,
+    pub conversation_id: &'a str,
+    pub step_idx: i64,
+    pub meta_idx: i64,
+    pub source: i64,
+    pub created_sec: i64,
+    pub created_nanos: i64,
+    pub completed_sec: i64,
+    pub completed_nanos: i64,
+    pub exec_id: &'a str,
+    pub content_id: &'a str,
+    pub is_model: bool,
+}
+
+pub fn encode_step_metadata(spec: StepMetadataSpec<'_>) -> Vec<u8> {
+    let StepMetadataSpec {
+        trajectory_id,
+        conversation_id,
+        step_idx,
+        meta_idx,
+        source,
+        created_sec,
+        created_nanos,
+        completed_sec,
+        completed_nanos,
+        exec_id,
+        content_id,
+        is_model,
+    } = spec;
     let created_ts = encode_timestamp(created_sec, created_nanos);
     let completed_ts = encode_timestamp(completed_sec, completed_nanos);
 
@@ -1232,17 +1247,28 @@ pub fn encode_planner_response_step(
     out
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn encode_checkpoint_step(
-    meta_bytes: &[u8],
-    ckpt_idx: i64,
-    end_step_idx: i64,
-    title: &str,
-    user_intent: &str,
-    session_summary: &str,
-    user_requests: &[String],
-    seed_prefix: &str,
-) -> Vec<u8> {
+pub struct CheckpointStepSpec<'a> {
+    pub meta_bytes: &'a [u8],
+    pub ckpt_idx: i64,
+    pub end_step_idx: i64,
+    pub title: &'a str,
+    pub user_intent: &'a str,
+    pub session_summary: &'a str,
+    pub user_requests: &'a [String],
+    pub seed_prefix: &'a str,
+}
+
+pub fn encode_checkpoint_step(spec: CheckpointStepSpec<'_>) -> Vec<u8> {
+    let CheckpointStepSpec {
+        meta_bytes,
+        ckpt_idx,
+        end_step_idx,
+        title,
+        user_intent,
+        session_summary,
+        user_requests,
+        seed_prefix,
+    } = spec;
     let mut buf = Vec::new();
     buf.extend(field_varint(1, ckpt_idx, false));
     buf.extend(field_str(4, user_intent));
@@ -1268,20 +1294,34 @@ pub fn encode_checkpoint_step(
     out
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn encode_cascade_summary(
-    title: &str,
-    step_count: i64,
-    last_mod_sec: i64,
-    last_mod_nanos: i64,
-    trajectory_id: &str,
-    created_sec: i64,
-    created_nanos: i64,
-    last_user_sec: i64,
-    last_user_nanos: i64,
-    last_user_step_idx: i64,
-    traj_meta_bytes: &[u8],
-) -> Vec<u8> {
+pub struct CascadeSummarySpec<'a> {
+    pub title: &'a str,
+    pub step_count: i64,
+    pub last_mod_sec: i64,
+    pub last_mod_nanos: i64,
+    pub trajectory_id: &'a str,
+    pub created_sec: i64,
+    pub created_nanos: i64,
+    pub last_user_sec: i64,
+    pub last_user_nanos: i64,
+    pub last_user_step_idx: i64,
+    pub traj_meta_bytes: &'a [u8],
+}
+
+pub fn encode_cascade_summary(spec: CascadeSummarySpec<'_>) -> Vec<u8> {
+    let CascadeSummarySpec {
+        title,
+        step_count,
+        last_mod_sec,
+        last_mod_nanos,
+        trajectory_id,
+        created_sec,
+        created_nanos,
+        last_user_sec,
+        last_user_nanos,
+        last_user_step_idx,
+        traj_meta_bytes,
+    } = spec;
     let last_mod_ts = encode_timestamp(last_mod_sec, last_mod_nanos);
     let created_ts = encode_timestamp(created_sec, created_nanos);
     let last_user_ts = encode_timestamp(last_user_sec, last_user_nanos);
@@ -2103,32 +2143,34 @@ pub fn build_steps_and_artifacts(
             let (ckpt_sec, ckpt_nanos) =
                 parse_iso_timestamp(ckpt_ts_ref, sess.last_mod_sec as f64);
 
-            let ckpt_meta = encode_step_metadata(
+            let ckpt_cid = stable_hex32(&format!("{}:ckpt:meta", conv_id));
+            let ckpt_meta = encode_step_metadata(StepMetadataSpec {
                 trajectory_id,
-                conv_id,
+                conversation_id: conv_id,
                 step_idx,
                 meta_idx,
-                5,
-                ckpt_sec,
-                ckpt_nanos,
-                ckpt_sec,
-                ckpt_nanos,
-                &exec_id,
-                &stable_hex32(&format!("{}:ckpt:meta", conv_id)),
-                false,
-            );
+                source: 5,
+                created_sec: ckpt_sec,
+                created_nanos: ckpt_nanos,
+                completed_sec: ckpt_sec,
+                completed_nanos: ckpt_nanos,
+                exec_id: &exec_id,
+                content_id: &ckpt_cid,
+                is_model: false,
+            });
             let user_requests: Vec<String> =
                 turns_covered.iter().map(|x| x.user_text.clone()).collect();
-            let ckpt_payload = encode_checkpoint_step(
-                &ckpt_meta,
-                1,
-                step_idx,
+            let ckpt_seed = format!("{}:ckpt", conv_id);
+            let ckpt_payload = encode_checkpoint_step(CheckpointStepSpec {
+                meta_bytes: &ckpt_meta,
+                ckpt_idx: 1,
+                end_step_idx: step_idx,
                 title,
-                &user_intent,
-                &summary_text,
-                &user_requests,
-                &format!("{}:ckpt", conv_id),
-            );
+                user_intent: &user_intent,
+                session_summary: &summary_text,
+                user_requests: &user_requests,
+                seed_prefix: &ckpt_seed,
+            });
             db_steps.push(DbStep {
                 idx: step_idx,
                 step_type: 23,
@@ -2154,20 +2196,21 @@ pub fn build_steps_and_artifacts(
         last_user_step_idx = step_idx;
         exec_id = stable_uuid(&format!("{}:exec:{}", conv_id, t_i));
 
-        let u_meta = encode_step_metadata(
+        let u_cid = stable_hex32(&format!("{}:u:{}", conv_id, t_i));
+        let u_meta = encode_step_metadata(StepMetadataSpec {
             trajectory_id,
-            conv_id,
+            conversation_id: conv_id,
             step_idx,
             meta_idx,
-            4,
-            u_sec,
-            u_nanos,
-            u_sec,
-            u_nanos,
-            &exec_id,
-            &stable_hex32(&format!("{}:u:{}", conv_id, t_i)),
-            false,
-        );
+            source: 4,
+            created_sec: u_sec,
+            created_nanos: u_nanos,
+            completed_sec: u_sec,
+            completed_nanos: u_nanos,
+            exec_id: &exec_id,
+            content_id: &u_cid,
+            is_model: false,
+        });
         let u_text_for_step = if t_i == 0 {
             // INVARIANT: Place working directory note at the end of Step 0 so userInputSummary preview starts with user prompt.
             let cwd_banner = format!("\n\n[Claude Code • Рабочая папка: `{}`]", sess.cwd);
@@ -2220,20 +2263,21 @@ pub fn build_steps_and_artifacts(
         let resp_text = format_assistant_response(turn);
         let think_text = format_thinking(turn);
 
-        let a_meta = encode_step_metadata(
+        let a_cid = stable_hex32(&format!("{}:a:{}", conv_id, t_i));
+        let a_meta = encode_step_metadata(StepMetadataSpec {
             trajectory_id,
-            conv_id,
+            conversation_id: conv_id,
             step_idx,
             meta_idx,
-            2,
-            a_start_sec,
-            a_start_nanos,
-            a_end_sec,
-            a_end_nanos,
-            &exec_id,
-            &stable_hex32(&format!("{}:a:{}", conv_id, t_i)),
-            true,
-        );
+            source: 2,
+            created_sec: a_start_sec,
+            created_nanos: a_start_nanos,
+            completed_sec: a_end_sec,
+            completed_nanos: a_end_nanos,
+            exec_id: &exec_id,
+            content_id: &a_cid,
+            is_model: true,
+        });
         let a_payload = encode_planner_response_step(
             &a_meta,
             &resp_text,
@@ -2543,19 +2587,19 @@ pub fn run_import(opts: &ImportOptions) -> Result<Value, String> {
                 sess.created_nanos,
                 &init_state_id,
             );
-            let raw_summary = encode_cascade_summary(
-                final_title,
+            let raw_summary = encode_cascade_summary(CascadeSummarySpec {
+                title: final_title,
                 step_count,
-                sess.last_mod_sec,
-                sess.last_mod_nanos,
-                &trajectory_id,
-                sess.created_sec,
-                sess.created_nanos,
-                built.last_user_sec,
-                built.last_user_nanos,
-                built.last_user_step_idx,
-                &traj_meta_bytes,
-            );
+                last_mod_sec: sess.last_mod_sec,
+                last_mod_nanos: sess.last_mod_nanos,
+                trajectory_id: &trajectory_id,
+                created_sec: sess.created_sec,
+                created_nanos: sess.created_nanos,
+                last_user_sec: built.last_user_sec,
+                last_user_nanos: built.last_user_nanos,
+                last_user_step_idx: built.last_user_step_idx,
+                traj_meta_bytes: &traj_meta_bytes,
+            });
 
             write_conversation_db(
                 &opts.antigravity_dir,
@@ -3290,38 +3334,38 @@ mod tests {
         assert!(parsed_tm.iter().any(|f| f.fn_num == 18
             && matches!(&f.val, WireValue::Bytes(b) if b == b"outside-of-project")));
 
-        let step_meta = encode_step_metadata(
-            "traj-1",
-            "conv-123",
-            0,
-            0,
-            4,
-            1_760_000_000,
-            0,
-            1_760_000_005,
-            500,
-            "exec-1",
-            "content-1",
-            true,
-        );
+        let step_meta = encode_step_metadata(StepMetadataSpec {
+            trajectory_id: "traj-1",
+            conversation_id: "conv-123",
+            step_idx: 0,
+            meta_idx: 0,
+            source: 4,
+            created_sec: 1_760_000_000,
+            created_nanos: 0,
+            completed_sec: 1_760_000_005,
+            completed_nanos: 500,
+            exec_id: "exec-1",
+            content_id: "content-1",
+            is_model: true,
+        });
         let u_step = encode_user_input_step(&step_meta, "Привет, мир!", "msg-1");
         let parsed_u = parse_wire_fields(&u_step).expect("parse u_step");
         assert_eq!(parsed_u[0].fn_num, 1);
         assert_eq!(parsed_u[0].val, WireValue::Varint(14));
 
-        let sum = encode_cascade_summary(
-            "Test Title",
-            2,
-            1_760_000_010,
-            0,
-            "traj-1",
-            1_760_000_000,
-            0,
-            1_760_000_000,
-            0,
-            0,
-            &traj_meta,
-        );
+        let sum = encode_cascade_summary(CascadeSummarySpec {
+            title: "Test Title",
+            step_count: 2,
+            last_mod_sec: 1_760_000_010,
+            last_mod_nanos: 0,
+            trajectory_id: "traj-1",
+            created_sec: 1_760_000_000,
+            created_nanos: 0,
+            last_user_sec: 1_760_000_000,
+            last_user_nanos: 0,
+            last_user_step_idx: 0,
+            traj_meta_bytes: &traj_meta,
+        });
         let parsed_sum = parse_wire_fields(&sum).expect("parse summary");
         assert!(parsed_sum.iter().any(|f| f.fn_num == 1
             && matches!(&f.val, WireValue::Bytes(b) if b == b"Test Title")));

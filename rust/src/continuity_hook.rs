@@ -1,15 +1,17 @@
 use regex::Regex;
 use serde_json::{json, Map, Value};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::UNIX_EPOCH;
 
-use crate::rio;
+use crate::cwg_common;
+use crate::rio::{
+    self, file_mtime_ns, json_truthy, sha256_hex, truncate_chars, val_to_f64, val_to_i64,
+    val_to_str,
+};
 use crate::win32_sqlite::{format_iso_utc, now_sec};
 
 pub const READ_REPEAT_DENY_LIMIT: i64 = 3;
@@ -84,90 +86,14 @@ fn closed_status_re() -> &'static Regex {
     })
 }
 
-fn truncate_chars(s: &str, max_chars: usize) -> &str {
-    match s.char_indices().nth(max_chars) {
-        Some((idx, _)) => &s[..idx],
-        None => s,
-    }
-}
-
 fn char_len(s: &str) -> usize {
     s.chars().count()
-}
-
-fn json_truthy(v: Option<&Value>) -> bool {
-    match v {
-        Some(Value::Bool(b)) => *b,
-        Some(Value::Number(n)) => n.as_f64().map_or(false, |x| x != 0.0),
-        Some(Value::String(s)) => !s.is_empty(),
-        Some(Value::Array(a)) => !a.is_empty(),
-        Some(Value::Object(m)) => !m.is_empty(),
-        _ => false,
-    }
-}
-
-fn val_to_str(v: Option<&Value>) -> String {
-    match v {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Number(n)) => n.to_string(),
-        Some(Value::Bool(b)) => b.to_string(),
-        _ => String::new(),
-    }
-}
-
-fn val_to_i64(v: Option<&Value>) -> i64 {
-    match v {
-        Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
-        Some(Value::String(s)) => s.trim().parse::<i64>().unwrap_or(0),
-        Some(Value::Bool(b)) => i64::from(*b),
-        _ => 0,
-    }
-}
-
-fn val_to_f64(v: Option<&Value>) -> f64 {
-    match v {
-        Some(Value::Number(n)) => n.as_f64().unwrap_or(0.0),
-        Some(Value::String(s)) => s.trim().parse::<f64>().unwrap_or(0.0),
-        Some(Value::Bool(b)) => {
-            if *b {
-                1.0
-            } else {
-                0.0
-            }
-        }
-        _ => 0.0,
-    }
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
-}
-
-fn file_mtime_ns(path: &Path) -> Option<u128> {
-    let meta = fs::metadata(path).ok()?;
-    let modified = meta.modified().ok()?;
-    let dur = modified.duration_since(UNIX_EPOCH).ok()?;
-    Some(dur.as_nanos())
 }
 
 fn eprintln_str(msg: &str) {
     let mut err = std::io::stderr().lock();
     let _ = err.write_all(msg.as_bytes());
     let _ = err.flush();
-}
-
-fn extract_workspace_paths(payload: &Value) -> Vec<String> {
-    payload
-        .get("workspacePaths")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 pub fn continuity_dir(parts: &[&str]) -> PathBuf {
@@ -472,17 +398,11 @@ fn collect_git_brief(cwd: &str) -> Option<Map<String, Value>> {
     Some(map)
 }
 
-fn gate_marker_file(session: &str) -> PathBuf {
-    let dir = rio::state_dir().join("gate").join("markers");
-    let _ = fs::create_dir_all(&dir);
-    dir.join(format!("{}.json", rio::safe_key(session, "default")))
-}
-
 fn open_candidate_brief(session: &str) -> String {
     if session.is_empty() {
         return String::new();
     }
-    let Some(Value::Object(marker)) = rio::read_json(&gate_marker_file(session)) else {
+    let Some(Value::Object(marker)) = cwg_common::read_marker_with_pending(session) else {
         return String::new();
     };
     if json_truthy(marker.get("closed")) {
@@ -631,7 +551,7 @@ pub fn touch_tree_lock(
             .map(|s| truncate_chars(s, 12).to_string())
             .collect();
         return Some(format!(
-            "[Session Hygiene] Внимание: это рабочее дерево (`{}`) сейчас открыто в другой активной сессии ({}). Не перезаписывайте чужие незакоммиченные изменения; для параллельной кодовой работы используйте изолированный worktree (`chip_handoff.py open`).",
+            "[Session Hygiene] Внимание: это рабочее дерево (`{}`) сейчас открыто в другой активной сессии ({}). Не перезаписывайте чужие незакоммиченные изменения; для параллельной кодовой работы используйте изолированный worktree (`carbon-stack chip-handoff open`).",
             root_name,
             preview.join(", ")
         ));
@@ -952,11 +872,11 @@ fn gate_marker_mtime_ns(session: &str) -> u128 {
     if session.is_empty() {
         return 0;
     }
-    let mp = gate_marker_file(session);
-    if !mp.is_file() {
-        return 0;
-    }
-    file_mtime_ns(&mp).unwrap_or(0)
+    let skey = rio::safe_key(session, "default");
+    let mp = cwg_common::marker_path(&skey);
+    file_mtime_ns(&mp)
+        .unwrap_or(0)
+        .max(cwg_common::pending_marker_mtime_ns(&skey))
 }
 
 fn mutation_sync_token(session: &str) -> String {
@@ -979,7 +899,7 @@ pub fn evaluate_session_start(payload: &Value) -> (Option<String>, Option<String
 
     let session = rio::session_key(payload);
     let cwd = rio::effective_cwd(payload);
-    let wps = extract_workspace_paths(payload);
+    let wps = cwg_common::extract_workspace_paths(payload);
     let git_root = if cwd.is_empty() {
         String::new()
     } else {
@@ -1075,7 +995,7 @@ pub fn evaluate_pre_invocation(payload: &Value) -> Option<String> {
 
     let session = rio::session_key(payload);
     let cwd = rio::effective_cwd(payload);
-    let wps = extract_workspace_paths(payload);
+    let wps = cwg_common::extract_workspace_paths(payload);
     let mut state = load_session_state(&session);
 
     let mut injected: Vec<String> = state
@@ -1108,7 +1028,7 @@ pub fn evaluate_pre_invocation(payload: &Value) -> Option<String> {
             state.insert("strong_correction_streak".to_string(), json!(streak));
             if streak >= 2 {
                 injected.push(
-                    "[Continuity — Clean-Room Rebuild Escalation] Два сильных корректирующих указания подряд. Остановите инкрементальные заплатки: зафиксируйте обновлённый `AUTHORITATIVE STATE` и отменённые требования в `SUPERSEDED / CANCELLED` (через `/rebuild` или `continuity.py checkpoint`), перепроверьте состояние файлов с диска и стройте финальный ответ без упоминания отвергнутых черновиков.".to_string(),
+                    "[Continuity — Clean-Room Rebuild Escalation] Два сильных корректирующих указания подряд. Остановите инкрементальные заплатки: зафиксируйте обновлённый `AUTHORITATIVE STATE` и отменённые требования в `SUPERSEDED / CANCELLED` (через `/rebuild` или `carbon-stack continuity checkpoint`), перепроверьте состояние файлов с диска и стройте финальный ответ без упоминания отвергнутых черновиков.".to_string(),
                 );
             } else {
                 injected.push(
@@ -1803,9 +1723,6 @@ pub fn run_cli(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_all_regexes_compile() {

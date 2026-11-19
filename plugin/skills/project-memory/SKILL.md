@@ -1,6 +1,6 @@
 ---
 name: project-memory
-description: CLI reference for carbon_memory.py (SQLite FTS5 durable facts and export-nlm). Load ONLY when storing, superseding, or recalling memory entries.
+description: CLI reference for carbon-stack carbon-memory (SQLite FTS5 durable facts and export-nlm). Load ONLY when storing, superseding, or recalling memory entries.
 ---
 
 # Project & Global Engineering Memory
@@ -20,10 +20,10 @@ description: CLI reference for carbon_memory.py (SQLite FTS5 durable facts and e
 
 ```powershell
 # Поиск релевантных знаний проекта и глобального уровня
-python -X utf8 "<PLUGIN_ROOT>/tools/carbon_memory.py" recall --query "<запрос>" --cwd "<путь>"
+& "<PLUGIN_ROOT>/bin/carbon-stack.exe" carbon-memory recall --query "<запрос>" --cwd "<путь>"
 
 # Сохранение подтверждённого факта (секреты и токены автоматически блокируются)
-python -X utf8 "<PLUGIN_ROOT>/tools/carbon_memory.py" remember `
+& "<PLUGIN_ROOT>/bin/carbon-stack.exe" carbon-memory remember `
   --category GOTCHA `
   --scope project `
   --cwd "<путь>" `
@@ -31,15 +31,15 @@ python -X utf8 "<PLUGIN_ROOT>/tools/carbon_memory.py" remember `
   --evidence "<файл/тест/команда>"
 
 # Замена устаревшего факта новым (старый получает статус SUPERSEDED и больше не всплывает)
-python -X utf8 "<PLUGIN_ROOT>/tools/carbon_memory.py" supersede `
+& "<PLUGIN_ROOT>/bin/carbon-stack.exe" carbon-memory supersede `
   --id "mem-xxxxxxxxxxxx" `
   --text "<обновлённый факт>"
 
 # Экспорт Markdown-пакета для последующей синхронизации с NotebookLM
-python -X utf8 "<PLUGIN_ROOT>/tools/carbon_memory.py" export-nlm --cwd "<путь>"
+& "<PLUGIN_ROOT>/bin/carbon-stack.exe" carbon-memory export-nlm --cwd "<путь>"
 ```
 
 ## 3. Правила безопасности и честности
 
-- Никогда не передавайте в `remember` API-ключи, пароли, токены, приватные ключи или строки подключения с учётными данными (`carbon_memory.py` отклонит их с кодом `2`).
+- Никогда не передавайте в `remember` API-ключи, пароли, токены, приватные ключи или строки подключения с учётными данными (`carbon-stack carbon-memory` отклонит их с кодом `2`).
 - Если внешний мост `nlm-memory` отсутствует в системе, никогда не заявляйте об облачной синхронизации с NotebookLM — сообщайте честно о сохранении в локальную FTS5-базу (и локальном экспорте `export-nlm`, если он выполнялся).

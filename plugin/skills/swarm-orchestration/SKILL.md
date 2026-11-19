@@ -1,6 +1,6 @@
 ---
 name: swarm-orchestration
-description: Swarm 2.0 three-phase orchestration (Scout Swarm, Disjoint Builder Swarm, Asymmetric Verification Gate), Warm Pool reuse, Pointer-on-Board, and File Ownership Guard via swarm_ctl.py.
+description: Swarm 2.0 three-phase orchestration (Scout Swarm, Disjoint Builder Swarm, Asymmetric Verification Gate), Warm Pool reuse, Pointer-on-Board, and File Ownership Guard via carbon-stack swarm-ctl.
 ---
 
 # Swarm 2.0 Orchestration Playbook
@@ -10,8 +10,8 @@ description: Swarm 2.0 three-phase orchestration (Scout Swarm, Disjoint Builder 
 ## 1. Инварианты Swarm 2.0
 
 - **Pointer-on-Board (`<= 12` строк в `board.jsonl`):** объёмные отчёты скаутов и дифф-разборы сохраняются в `.swarm/artifacts/<worker>-<round>.md`; на доску публикуется выжимка до 12 строк + путь к артефакту.
-- **Cursor Guard:** при `> 15` сообщениях на доске повторный `read_board` обязан передавать `since=<last_seen_id>` (или используйте `python -X utf8 plugin/tools/swarm_ctl.py board summary --since <id> --session <sid> --cwd <repo>`).
-- **Warm Pool & Batch Kill:** не пересоздавайте воркеров на каждый фикс — будите живых `waiting` воркеров через `post_message` `@mention` (`validate_warm_worker_verdicts` / `cwg_stop.py` сверяют вердикт строго по `round_start_msg_id` и `current_diff_hash`). Пакетное `swarm(action="kill", ...)` выполняется один раз перед `--closure`.
+- **Cursor Guard:** при `> 15` сообщениях на доске повторный `read_board` обязан передавать `since=<last_seen_id>` (или используйте `.\plugin\bin\carbon-stack.exe swarm-ctl board summary --since <id> --session <sid> --cwd <repo>`).
+- **Warm Pool & Batch Kill:** не пересоздавайте воркеров на каждый фикс — будите живых `waiting` воркеров через `post_message` `@mention` (`validate_warm_worker_verdicts` / `cwg_stop.rs` сверяют вердикт строго по `round_start_msg_id` и `current_diff_hash`). Пакетное `swarm(action="kill", ...)` выполняется один раз перед `--closure`.
 - **Stall Watchdog:** `in_flight` воркер без сообщений и активности в `.swarm/` дольше `SWARM_STALL_TIMEOUT_SEC` (по умолчанию `240` с) диагностируется `[Swarm Stall Watchdog]` вместо немого ожидания.
 
 ## 2. Асимметричная матрица моделей
@@ -21,10 +21,10 @@ description: Swarm 2.0 three-phase orchestration (Scout Swarm, Disjoint Builder 
 | **Координатор** | `Orchestrator (Argon)` | Декомпозиция, владение файлами, слияние, гейт |
 | **Фаза 1 — Scout Swarm** | `gemini-4-hydrogen-medium` / `-high` | Параллельное исследование 3+ подсистем или 5+ файлов |
 | **Фаза 2 — Disjoint Builders** | `gemini-4-hydrogen-high` | Реализация непересекающихся `owned_paths` или `worktree` |
-| **Фаза 3a — Primary Logic Review** | `codex_lane.py review` (fallback `claude-opus-5-5-high` -> `gemini-4-carbon-high`) | Проверка логики и багов ДО `simplify` |
+| **Фаза 3a — Primary Logic Review** | `carbon-stack codex-lane review` (fallback `claude-opus-5-5-high` -> `gemini-4-carbon-high`) | Проверка логики и багов ДО `simplify` |
 | **Фаза 3b — Simplify (`<= 2` ф. и `<= 30` ст.)** | 1 воркер `claude-sonnet-5-5-high` (`SIMPLIFY_LENS: ALL`) | Fast-Path (fallback `gemini-4-hydrogen-xhigh`) |
 | **Фаза 3b — Simplify (`> 2` ф. или `> 30` ст.)** | 3 линзы `claude-sonnet-5-5-high` (`REUSE`, `QUALITY`, `EFFICIENCY`) | Параллельная полировка один раз после `APPROVED` |
-| **Фаза 3c — Final Closure** | `codex_lane.py review --closure` | Финальное подтверждение `CLOSURE_VALIDATION: READY` |
+| **Фаза 3c — Final Closure** | `carbon-stack codex-lane review --closure` | Финальное подтверждение `CLOSURE_VALIDATION: READY` |
 
 ## 3. Трёхфазный протокол
 
@@ -45,19 +45,19 @@ description: Swarm 2.0 three-phase orchestration (Scout Swarm, Disjoint Builder 
 Запускается при параллельной реализации независимых модулей:
 1. Разделите зоны ответственности **без пересечений** перед спавном воркеров:
    ```powershell
-   $null | python -X utf8 plugin/tools/swarm_ctl.py ownership set --worker builder-a --paths "src/api/**" --cwd <repo>
-   $null | python -X utf8 plugin/tools/swarm_ctl.py ownership set --worker builder-b --paths "tests/api/**" --cwd <repo>
+   $null | .\plugin\bin\carbon-stack.exe swarm-ctl ownership set --worker builder-a --paths "src/api/**" --cwd <repo>
+   $null | .\plugin\bin\carbon-stack.exe swarm-ctl ownership set --worker builder-b --paths "tests/api/**" --cwd <repo>
    ```
    При необходимости менять пересекающиеся модули или гонять конфликтующие тесты изолируйте воркеров через worktree:
    ```powershell
-   $null | python -X utf8 plugin/tools/swarm_ctl.py worktree create --worker builder-a --cwd <repo>
+   $null | .\plugin\bin\carbon-stack.exe swarm-ctl worktree create --worker builder-a --cwd <repo>
    ```
-2. `safety_guards.py` автоматически блокирует любые `edit_file` / `write_file` / shell-записи воркера за пределами его `owned_paths` (артефакты `.swarm/artifacts/**` разрешены всегда).
+2. `safety_guards.rs` автоматически блокирует любые `edit_file` / `write_file` / shell-записи воркера за пределами его `owned_paths` (артефакты `.swarm/artifacts/**` разрешены всегда).
 3. По завершении проверьте чистоту границ и очистите worktree:
    ```powershell
-   $null | python -X utf8 plugin/tools/swarm_ctl.py ownership verify-git-diff --strict --cwd <repo>
-   $null | python -X utf8 plugin/tools/swarm_ctl.py worktree cleanup --cwd <repo>
-   $null | python -X utf8 plugin/tools/swarm_ctl.py ownership clear --cwd <repo>
+   $null | .\plugin\bin\carbon-stack.exe swarm-ctl ownership verify-git-diff --strict --cwd <repo>
+   $null | .\plugin\bin\carbon-stack.exe swarm-ctl worktree cleanup --cwd <repo>
+   $null | .\plugin\bin\carbon-stack.exe swarm-ctl ownership clear --cwd <repo>
    ```
 
 **Шаблон промпта билдера:**
@@ -69,13 +69,13 @@ description: Swarm 2.0 three-phase orchestration (Scout Swarm, Disjoint Builder 
 ```
 
 ### Фаза 3 — Verification Gate (`UNITTEST -> REVIEW -> SIMPLIFY -> KILL -> --CLOSURE`)
-1. Прогоните локальные тесты (`python -X utf8 -m unittest discover -s tests -v`).
-2. Запустите первичный `codex_lane.py review --session <sid> --summary "..."`; закройте функциональные замечания (`REVISE` -> фикс -> тест -> повторный `review` до `APPROVED`).
-3. Подготовьте дифф-метрики: `python -X utf8 plugin/tools/swarm_cache.py prepare --session <sid> --cwd <repo> --label simplify`.
+1. Прогоните локальные тесты проекта (например, `$null | cargo test --manifest-path rust/Cargo.toml`, `pytest`, `npm test` или `flutter test`).
+2. Запустите первичный `carbon-stack codex-lane review --session <sid> --summary "..."`; закройте функциональные замечания (`REVISE` -> фикс -> тест -> повторный `review` до `APPROVED`).
+3. Подготовьте дифф-метрики: `.\plugin\bin\carbon-stack.exe swarm-cache prepare --session <sid> --cwd <repo> --label simplify`.
    - Если `fast_path_eligible == true` (`<= 2` файлов и `<= 30` строк `additions + deletions`), запустите 1 воркер `simplify-reviewer` (`SIMPLIFY_LENS: ALL`).
    - Иначе запустите 3 параллельные линзы (`reuse`, `quality`, `efficiency`).
    - При последующем раунде будите тех же `waiting` воркеров через `post_message` `@mention` вместо холодного респавна.
-4. Перед `--closure` выполните пакетный `swarm(action="kill", ...)` всех `waiting` воркеров (кроме активно продолжающих работу) и закройте гейт через `codex_lane.py review --session <sid> --closure --summary "..."`.
+4. Перед `--closure` выполните пакетный `swarm(action="kill", ...)` всех `waiting` воркеров (кроме активно продолжающих работу) и закройте гейт через `carbon-stack codex-lane review --session <sid> --closure --summary "..."`.
 
 **Шаблон тёплого воркера simplify (`REUSE|QUALITY|EFFICIENCY` или `ALL`):**
 ```text

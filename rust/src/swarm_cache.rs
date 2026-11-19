@@ -1,13 +1,12 @@
 use regex::Regex;
 use serde_json::{json, Map, Value};
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::cwg_common;
-use crate::rio;
+use crate::rio::{self, val_to_f64, val_to_i64, val_to_str};
 use crate::win32_sqlite::now_sec;
 
 pub const EMPTY_TREE_OID: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
@@ -24,49 +23,6 @@ fn eprintln_line(msg: &str) {
     let _ = err.write_all(msg.as_bytes());
     let _ = err.write_all(b"\n");
     let _ = err.flush();
-}
-
-fn val_to_i64(v: Option<&Value>) -> i64 {
-    match v {
-        Some(Value::Number(n)) => n
-            .as_i64()
-            .or_else(|| n.as_u64().map(|u| u.min(i64::MAX as u64) as i64))
-            .or_else(|| n.as_f64().map(|f| f as i64))
-            .unwrap_or(0),
-        Some(Value::String(s)) => s.trim().parse::<i64>().unwrap_or(0),
-        Some(Value::Bool(b)) => i64::from(*b),
-        _ => 0,
-    }
-}
-
-fn val_to_f64(v: Option<&Value>) -> f64 {
-    match v {
-        Some(Value::Number(n)) => n.as_f64().unwrap_or(0.0),
-        Some(Value::String(s)) => s.trim().parse::<f64>().unwrap_or(0.0),
-        Some(Value::Bool(b)) => {
-            if *b {
-                1.0
-            } else {
-                0.0
-            }
-        }
-        _ => 0.0,
-    }
-}
-
-fn val_to_str(v: Option<&Value>) -> String {
-    match v {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Number(n)) => n.to_string(),
-        Some(Value::Bool(b)) => b.to_string(),
-        _ => String::new(),
-    }
-}
-
-fn sha256_hex_str(raw: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(raw.as_bytes());
-    hex::encode(hasher.finalize())
 }
 
 pub fn base_worker_name(worker_name: &str) -> String {
@@ -107,7 +63,7 @@ pub fn rotated_worker_name(base_name: &str, round_num: i64) -> String {
         let head: String = stem.chars().take(limit).collect();
         return format!("{}{}", head, suffix);
     }
-    let full_hex = sha256_hex_str(&stem);
+    let full_hex = rio::sha256_hex(stem.as_bytes());
     let digest = &full_hex[..4];
     if cwg_common::is_simplify_worker_name(&low_stem) {
         let raw_tag = cwg_common::simplify_lens_from_worker_name(&low_stem);
@@ -433,17 +389,30 @@ struct SyncDiffResult {
     incremental_stat: String,
 }
 
-fn sync_round_diffs(
-    git_root: &str,
-    head_oid: &str,
-    cur_tree_oid: &str,
-    prev_tree_oid: &str,
-    rel_paths: &[String],
-    scratch_dir: &Path,
-    clean_label: &str,
+struct RoundSyncInput<'a> {
+    git_root: &'a str,
+    head_oid: &'a str,
+    cur_tree_oid: &'a str,
+    prev_tree_oid: &'a str,
+    rel_paths: &'a [String],
+    scratch_dir: &'a Path,
+    clean_label: &'a str,
     cur_round: i64,
     regen: bool,
-) -> Result<SyncDiffResult, String> {
+}
+
+fn sync_round_diffs(input: RoundSyncInput<'_>) -> Result<SyncDiffResult, String> {
+    let RoundSyncInput {
+        git_root,
+        head_oid,
+        cur_tree_oid,
+        prev_tree_oid,
+        rel_paths,
+        scratch_dir,
+        clean_label,
+        cur_round,
+        regen,
+    } = input;
     let full_file = scratch_dir.join(format!("{}_r{}_full.diff", clean_label, cur_round));
     let need_full = regen || !full_file.is_file();
     let full_diff = if need_full {
@@ -526,16 +495,28 @@ fn entry_paths(entry: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-pub fn prepare_round(
-    session: &str,
-    cwd: &str,
-    brain_root: &Path,
-    label: &str,
-    ttl_seconds: u64,
-    paths: &[String],
-    reset: bool,
-    now_ts: Option<f64>,
-) -> Value {
+pub struct PrepareRoundInput<'a> {
+    pub session: &'a str,
+    pub cwd: &'a str,
+    pub brain_root: &'a Path,
+    pub label: &'a str,
+    pub ttl_seconds: u64,
+    pub paths: &'a [String],
+    pub reset: bool,
+    pub now_ts: Option<f64>,
+}
+
+pub fn prepare_round(input: PrepareRoundInput<'_>) -> Value {
+    let PrepareRoundInput {
+        session,
+        cwd,
+        brain_root,
+        label,
+        ttl_seconds,
+        paths,
+        reset,
+        now_ts,
+    } = input;
     let now = now_ts.unwrap_or_else(now_sec);
     let raw_label = if label.is_empty() { "simplify" } else { label };
     let clean_label = rio::safe_key(raw_label, "simplify");
@@ -578,8 +559,9 @@ pub fn prepare_round(
     }
 
     let skey = rio::safe_key(session, "default");
-    let marker = rio::read_json(&cwg_common::marker_path(&skey));
-    let marker_first_ts = val_to_f64(marker.as_ref().and_then(|m| m.get("first_ts")));
+    let marker = cwg_common::read_marker_with_pending(&skey);
+    let marker_first_ts = val_to_f64(marker.as_ref().and_then(|m| m.get("first_ts")))
+        .max(marker.as_ref().map_or(0.0, cwg_common::last_research_reset_ts));
 
     let rounds_file = cwg_common::swarm_rounds_path(&skey);
     let loaded_state = rio::read_json(&rounds_file);
@@ -665,17 +647,17 @@ pub fn prepare_round(
 
     let proj_key = rio::project_key(&git_root, &[], &git_root, "");
     let scratch_dir = brain_root.join(session).join("scratch").join(proj_key);
-    let diff_res = match sync_round_diffs(
-        &git_root,
-        &head_oid,
-        &cur_tree_oid,
-        &prev_tree_oid,
-        &rel_paths,
-        &scratch_dir,
-        &clean_label,
+    let diff_res = match sync_round_diffs(RoundSyncInput {
+        git_root: &git_root,
+        head_oid: &head_oid,
+        cur_tree_oid: &cur_tree_oid,
+        prev_tree_oid: &prev_tree_oid,
+        rel_paths: &rel_paths,
+        scratch_dir: &scratch_dir,
+        clean_label: &clean_label,
         cur_round,
-        changed_tree || changed_paths,
-    ) {
+        regen: changed_tree || changed_paths,
+    }) {
         Ok(res) => res,
         Err(err) => {
             return json!({
@@ -723,7 +705,7 @@ pub fn prepare_round(
         }
     }
 
-    let marker_doc = rio::read_json(&cwg_common::marker_path(session))
+    let marker_doc = cwg_common::read_marker_with_pending(session)
         .filter(|v| v.is_object())
         .unwrap_or_else(|| json!({}));
     let eff_repo_root = if !git_root.is_empty() {
@@ -892,16 +874,16 @@ pub fn run_cli(args: &[String]) -> i32 {
         "prepare" => match parse_prepare_args(&args[1..]) {
             Ok(pargs) => {
                 let broot = resolve_brain_root(&pargs.brain_root);
-                let out = prepare_round(
-                    &pargs.session,
-                    &pargs.cwd,
-                    &broot,
-                    &pargs.label,
-                    pargs.ttl,
-                    &pargs.paths,
-                    pargs.reset,
-                    None,
-                );
+                let out = prepare_round(PrepareRoundInput {
+                    session: &pargs.session,
+                    cwd: &pargs.cwd,
+                    brain_root: &broot,
+                    label: &pargs.label,
+                    ttl_seconds: pargs.ttl,
+                    paths: &pargs.paths,
+                    reset: pargs.reset,
+                    now_ts: None,
+                });
                 rio::print_cli_json(&out, pargs.pretty);
                 if out.get("ok").and_then(|v| v.as_bool()) == Some(true) {
                     0
@@ -1063,16 +1045,17 @@ mod tests {
 
         let non_git = make_temp_dir("swarm-cache-nongit");
         let brain = make_temp_dir("swarm-cache-brain");
-        let err_res = prepare_round(
-            "sess-nongit",
-            &non_git.to_string_lossy(),
-            &brain,
-            "simplify",
-            270,
-            &[],
-            false,
-            None,
-        );
+        let non_git_s = non_git.to_string_lossy().into_owned();
+        let err_res = prepare_round(PrepareRoundInput {
+            session: "sess-nongit",
+            cwd: &non_git_s,
+            brain_root: &brain,
+            label: "simplify",
+            ttl_seconds: 270,
+            paths: &[],
+            reset: false,
+            now_ts: None,
+        });
         assert_eq!(err_res["ok"], json!(false));
         assert!(err_res["error"]
             .as_str()
@@ -1090,14 +1073,32 @@ mod tests {
             let _ = rio::run_git(&repo_s, &["commit", "-m", "init"], 5.0);
             fs::write(repo.join("a.txt"), "one\ntwo\n").unwrap();
 
-            let r1 = prepare_round("sess-git", &repo_s, &brain, "simplify", 270, &[], false, Some(1000.0));
+            let r1 = prepare_round(PrepareRoundInput {
+                session: "sess-git",
+                cwd: &repo_s,
+                brain_root: &brain,
+                label: "simplify",
+                ttl_seconds: 270,
+                paths: &[],
+                reset: false,
+                now_ts: Some(1000.0),
+            });
             assert_eq!(r1["ok"], json!(true));
             assert_eq!(r1["round"], json!(1));
             assert_eq!(r1["fast_path_eligible"], json!(true));
             assert!(Path::new(r1["full_diff_path"].as_str().unwrap()).is_file());
 
             fs::write(repo.join("a.txt"), "one\ntwo\nthree\n").unwrap();
-            let r2 = prepare_round("sess-git", &repo_s, &brain, "simplify", 270, &[], false, Some(1005.0));
+            let r2 = prepare_round(PrepareRoundInput {
+                session: "sess-git",
+                cwd: &repo_s,
+                brain_root: &brain,
+                label: "simplify",
+                ttl_seconds: 270,
+                paths: &[],
+                reset: false,
+                now_ts: Some(1005.0),
+            });
             assert_eq!(r2["ok"], json!(true));
             assert_eq!(r2["round"], json!(2));
             assert!(Path::new(r2["incremental_diff_path"].as_str().unwrap()).is_file());

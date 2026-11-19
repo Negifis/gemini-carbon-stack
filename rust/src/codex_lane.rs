@@ -1,21 +1,19 @@
 use regex::Regex;
 use serde_json::{json, Map, Value};
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::cwg_common;
-use crate::rio;
+use crate::cwg_common::{self, codex_cli_wrapper_re};
+use crate::rio::{self, json_truthy, sha256_hex, val_to_f64, val_to_str};
 use crate::win32_sqlite::{now_sec, run_command_with_job};
 
 pub const BREAKER_TTL_SECONDS: i64 = 1800;
-pub const DEFAULT_REVIEW_TIMEOUT_SEC: i64 = 600;
 pub const DEFAULT_REVIEW_TIMEOUT_SECONDS: i64 = 600;
 pub const DEFAULT_XHIGH_REVIEW_TIMEOUT_SECONDS: i64 = 900;
 pub const TIMEOUT_STEP_SECONDS: i64 = 300;
@@ -24,16 +22,22 @@ pub const PACKET_TTL_SECONDS: f64 = 86400.0;
 pub const MAX_DIFF_SNAPSHOT_CHARS: usize = 160_000;
 
 pub const NATIVE_REVIEWERS: &[&str] = &["adversarial-reviewer", "adversarial-reviewer-xhigh"];
-const XHIGH_NATIVE_REVIEWER: &str = "adversarial-reviewer-xhigh";
+pub const XHIGH_NATIVE_REVIEWER: &str = "adversarial-reviewer-xhigh";
 const JSONL_EVENT_PREFIXES: &[&str] = &["thread.", "turn.", "item."];
 pub const REVIEW_VAL_FLAGS: &[&str] = &[
     "--cwd",
+    "--cwd-hex",
     "--summary",
+    "--summary-hex",
     "--diff-file",
+    "--diff-file-hex",
     "--review-id",
     "--session",
+    "--session-hex",
     "--model",
+    "--model-hex",
     "--resume",
+    "--resume-hex",
     "--timeout",
     "--phase",
 ];
@@ -49,6 +53,28 @@ fn last_timeout_outage_map() -> &'static Mutex<HashMap<String, (String, String)>
 fn last_rollout_turn_sid_map() -> &'static Mutex<HashMap<String, String>> {
     static MAP: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn defer_timeout_print_map() -> &'static Mutex<HashMap<String, bool>> {
+    static MAP: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn set_defer_timeout_print(review_id: &str, defer: bool) {
+    if let Ok(mut guard) = defer_timeout_print_map().lock() {
+        if defer {
+            guard.insert(review_id.to_string(), true);
+        } else {
+            guard.remove(review_id);
+        }
+    }
+}
+
+fn take_defer_timeout_print(review_id: &str) -> bool {
+    if let Ok(mut guard) = defer_timeout_print_map().lock() {
+        return guard.remove(review_id).unwrap_or(false);
+    }
+    false
 }
 
 fn set_last_timeout_outage(review_id: &str, kind: &str, sid: &str) {
@@ -104,9 +130,16 @@ fn outage_patterns() -> &'static [Regex] {
     })
 }
 
-fn review_id_re() -> &'static Regex {
+pub(crate) fn review_id_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"REVIEW_ID\s*:\s*([A-Za-z0-9_-]{6,64})").expect("review_id_re"))
+}
+
+fn packet_nonce_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"PACKET_NONCE\s*:\s*([A-Fa-f0-9]{12,64})").expect("packet_nonce_re")
+    })
 }
 
 fn aborted_rid_re() -> &'static Regex {
@@ -214,63 +247,12 @@ fn safe_sid_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^[A-Za-z0-9_-]{6,80}$").expect("safe_sid_re"))
 }
 
-fn codex_cli_wrapper_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"\AREVIEW_ID:\s*[A-Za-z0-9_-]+[ \t]*\r?\n(?:(?:SESSION_ID|SESSION_MODE|ENGINE):[^\r\n]*\r?\n){0,3}--- CODEX REVIEW OUTPUT ---[ \t]*\r?\n",
-        )
-        .expect("codex_cli_wrapper_re")
-    })
-}
-
-fn json_truthy(v: Option<&Value>) -> bool {
-    match v {
-        Some(Value::Bool(b)) => *b,
-        Some(Value::Number(n)) => n.as_f64().map_or(false, |x| x != 0.0),
-        Some(Value::String(s)) => !s.is_empty(),
-        Some(Value::Array(a)) => !a.is_empty(),
-        Some(Value::Object(m)) => !m.is_empty(),
-        _ => false,
-    }
-}
-
-fn val_to_f64(v: Option<&Value>) -> f64 {
-    match v {
-        Some(Value::Number(n)) => n.as_f64().unwrap_or(0.0),
-        Some(Value::String(s)) => s.trim().parse::<f64>().unwrap_or(0.0),
-        Some(Value::Bool(b)) => {
-            if *b {
-                1.0
-            } else {
-                0.0
-            }
-        }
-        _ => 0.0,
-    }
-}
-
-fn val_to_str(v: Option<&Value>) -> String {
-    match v {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Number(n)) => n.to_string(),
-        Some(Value::Bool(b)) => b.to_string(),
-        _ => String::new(),
-    }
-}
-
 fn parse_ts_val(v: Option<&Value>) -> f64 {
     match v {
         Some(Value::Number(n)) => n.as_f64().unwrap_or(0.0),
         Some(Value::String(s)) => rio::parse_iso_ts(s),
         _ => 0.0,
     }
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
 }
 
 fn random_hex_12() -> String {
@@ -281,7 +263,7 @@ fn random_hex_12() -> String {
     let seq = RID_SEQ.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
     let seed = format!("{}:{}:{}", nanos, pid, seq);
-    sha256_hex(seed.as_bytes())[..12].to_string()
+    rio::sha256_hex(seed.as_bytes())[..12].to_string()
 }
 
 fn abs_path_from_str(raw: &str) -> PathBuf {
@@ -292,15 +274,6 @@ fn unlink_quiet(path: &Path) {
     if path.exists() {
         let _ = fs::remove_file(path);
     }
-}
-
-fn file_mtime_sec(path: &Path) -> f64 {
-    fs::metadata(path)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
 }
 
 pub fn strip_task_envelope_tail(blob: &str) -> String {
@@ -345,6 +318,157 @@ fn fallback_reviewer(xhigh: bool) -> &'static str {
     }
 }
 
+pub fn resolve_review_model(explicit_model: &str, xhigh: bool) -> String {
+    let m = explicit_model.trim();
+    if !m.is_empty() {
+        return m.to_string();
+    }
+    if xhigh {
+        cwg_common::CODEX_ASTRA_MODEL.to_string()
+    } else {
+        cwg_common::CODEX_SOL_MODEL.to_string()
+    }
+}
+
+pub fn canonical_lane_effort(effort: &str) -> String {
+    let e = effort.trim().to_ascii_lowercase();
+    if cwg_common::is_codex_xhigh_effort(&e) {
+        "xhigh".to_string()
+    } else if matches!(e.as_str(), "" | "high" | "medium" | "low") {
+        "high".to_string()
+    } else {
+        e
+    }
+}
+
+pub fn review_lane_key(model: &str, effort: &str) -> String {
+    format!(
+        "{}|{}",
+        model.trim().to_ascii_lowercase(),
+        canonical_lane_effort(effort)
+    )
+}
+
+fn is_bare_safe_cli_arg(val: &str) -> bool {
+    val.chars().next().map_or(false, |c| c.is_ascii_alphabetic())
+        && val
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '\\' | ':'))
+}
+
+fn needs_hex_transport(val: &str) -> bool {
+    // SAFETY: Windows PowerShell 5.1 (`Legacy` native argument passing) strips unescaped `"` and lets a trailing `\` in whitespace-quoted args escape the closing quote, while `is_direct_codex_invocation` rejects raw `\r`/`\n`/backticks; transport such values as UTF-8 hex so PS 5.1 and PS 7 deliver identical `argv`.
+    val.chars()
+        .any(|ch| matches!(ch, '"' | '\r' | '\n' | '`' | '\0'))
+        || (val.ends_with('\\') && !is_bare_safe_cli_arg(val))
+}
+
+pub fn encode_utf8_hex(val: &str) -> String {
+    hex::encode(val.as_bytes())
+}
+
+pub fn decode_utf8_hex(hex_str: &str) -> Result<String, String> {
+    let bytes = hex::decode(hex_str).map_err(|e| e.to_string())?;
+    if bytes.contains(&0) {
+        return Err("nul byte in hex".to_string());
+    }
+    String::from_utf8(bytes).map_err(|_| "invalid utf-8".to_string())
+}
+
+pub fn quote_cli_arg(val: &str) -> String {
+    // SAFETY: Single-quote non-trivial PowerShell tokens (doubling all PowerShell single-quote variants) so `;`, `$`, whitespace, and numeric literals pass through as a single literal argument without expansion.
+    if is_bare_safe_cli_arg(val) {
+        return val.to_string();
+    }
+    let mut out = String::with_capacity(val.len() + 4);
+    out.push('\'');
+    for ch in val.chars() {
+        if matches!(ch, '\'' | '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}') {
+            out.push(ch);
+        }
+        out.push(ch);
+    }
+    out.push('\'');
+    out
+}
+
+fn push_cli_flag_val(cmd: &mut String, flag: &str, val: &str) {
+    cmd.push(' ');
+    if needs_hex_transport(val) {
+        cmd.push_str(flag);
+        cmd.push_str("-hex '");
+        cmd.push_str(&encode_utf8_hex(val));
+        cmd.push('\'');
+        return;
+    }
+    cmd.push_str(flag);
+    if val.starts_with('-') {
+        cmd.push('=');
+    } else {
+        cmd.push(' ');
+    }
+    cmd.push_str(&quote_cli_arg(val));
+}
+
+pub struct RetryCmdSpec<'a> {
+    pub model: &'a str,
+    pub xhigh: bool,
+    pub closure: bool,
+    pub session: &'a str,
+    pub cwd: &'a str,
+    pub diff_file: &'a str,
+    pub summary: &'a str,
+    pub pretty: bool,
+}
+
+pub fn format_review_retry_cmd_with_spec(spec: &RetryCmdSpec<'_>) -> String {
+    let mut cmd = String::from("carbon-stack codex-lane review");
+    if spec.xhigh {
+        cmd.push_str(" --xhigh");
+    }
+    if spec.closure {
+        cmd.push_str(" --closure");
+    }
+    let m = spec.model.trim();
+    let default_mdl = resolve_review_model("", spec.xhigh);
+    if !m.is_empty() && !m.eq_ignore_ascii_case(&default_mdl) {
+        push_cli_flag_val(&mut cmd, "--model", m);
+    }
+    if !spec.session.is_empty() {
+        push_cli_flag_val(&mut cmd, "--session", spec.session);
+    }
+    if !spec.cwd.is_empty() {
+        push_cli_flag_val(&mut cmd, "--cwd", spec.cwd);
+    }
+    if !spec.diff_file.is_empty() {
+        push_cli_flag_val(&mut cmd, "--diff-file", spec.diff_file);
+    }
+    if !spec.summary.is_empty() {
+        push_cli_flag_val(&mut cmd, "--summary", spec.summary);
+    }
+    if spec.pretty {
+        cmd.push_str(" --pretty");
+    }
+    cmd
+}
+
+pub fn format_review_retry_cmd_phase(model: &str, xhigh: bool, closure: bool) -> String {
+    format_review_retry_cmd_with_spec(&RetryCmdSpec {
+        model,
+        xhigh,
+        closure,
+        session: "",
+        cwd: "",
+        diff_file: "",
+        summary: "",
+        pretty: false,
+    })
+}
+
+pub fn format_review_retry_cmd(model: &str, xhigh: bool) -> String {
+    format_review_retry_cmd_phase(model, xhigh, false)
+}
+
 pub fn next_timeout_after(timeout_sec: i64) -> i64 {
     MAX_REVIEW_TIMEOUT_SECONDS
         .min((timeout_sec + TIMEOUT_STEP_SECONDS).max(DEFAULT_XHIGH_REVIEW_TIMEOUT_SECONDS))
@@ -361,6 +485,10 @@ pub fn required_review_timeout(xhigh: bool, saved_next_sec: i64) -> i64 {
 
 fn breaker_path() -> PathBuf {
     cwg_common::gate_dir().join("codex_lane.json")
+}
+
+fn breaker_lock_path() -> PathBuf {
+    cwg_common::gate_dir().join("codex_lane.lock")
 }
 
 fn packets_dir() -> PathBuf {
@@ -422,13 +550,21 @@ pub fn find_codex_binary() -> Option<String> {
     None
 }
 
+pub fn breaker_history_slice(v: &Value) -> &[Value] {
+    v.get("history")
+        .and_then(|h| h.as_array())
+        .map(|a| a.as_slice())
+        .unwrap_or(&[])
+}
+
 pub fn breaker_status() -> Value {
-    let Some(Value::Object(data)) = rio::read_json(&breaker_path()) else {
-        return json!({ "tripped": false });
+    let Some(data) = rio::read_json(&breaker_path()).filter(|v| v.is_object()) else {
+        return json!({ "tripped": false, "history": [] });
     };
+    let history = breaker_history_slice(&data).to_vec();
     let until = val_to_f64(data.get("tripped_until"));
     let now = now_sec();
-    if until > now {
+    if json_truthy(data.get("tripped")) && until > now {
         let raw_reason = val_to_str(data.get("reason"));
         let reason = if raw_reason.is_empty() {
             "codex_outage".to_string()
@@ -441,39 +577,243 @@ pub fn breaker_status() -> Value {
             "reason": reason,
             "remaining_seconds": (until - now) as i64,
             "tripped_at": tripped_at,
+            "tripped_until": until,
+            "history": history,
         });
     }
-    json!({ "tripped": false })
+    json!({ "tripped": false, "history": history })
+}
+
+fn clamp_until_ts(h_until: f64, h_at: f64, clamp_at: f64) -> f64 {
+    if h_until <= 0.0 || h_until > clamp_at {
+        clamp_at.max(h_at)
+    } else {
+        h_until.max(h_at)
+    }
+}
+
+fn clamp_breaker_history_for_probe(
+    raw_history: &[Value],
+    max_tripped_at: f64,
+    recovery_ts: f64,
+) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(raw_history.len());
+    for item in raw_history {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        let h_at = val_to_f64(obj.get("tripped_at"));
+        if h_at <= 0.0 {
+            continue;
+        }
+        let h_until = val_to_f64(obj.get("until_ts"));
+        let eff_until = if h_at <= max_tripped_at {
+            clamp_until_ts(h_until, h_at, recovery_ts)
+        } else if h_until > 0.0 {
+            h_until.max(h_at)
+        } else {
+            0.0
+        };
+        let mut next_obj = obj.clone();
+        next_obj.insert("until_ts".to_string(), json!(eff_until));
+        out.push(Value::Object(next_obj));
+    }
+    out
+}
+
+fn trip_breaker_locked(reason: &str, ttl: i64, explicit_now: Option<f64>) {
+    // SAFETY: Serialize `codex_lane.json` Read-Modify-Write under `codex_lane.lock` so concurrent trips and recoveries never lose outage windows or regress monotonic `tripped_at`/`tripped_until`.
+    let bp = breaker_path();
+    let r_trunc: String = reason.chars().take(300).collect();
+    let r_log: String = reason.chars().take(200).collect();
+    let wrote = rio::with_file_lock(&breaker_lock_path(), 5.0, 30.0, |locked| {
+        if !locked {
+            return false;
+        }
+        let now = explicit_now.unwrap_or_else(now_sec);
+        let until_ts = now + (ttl.max(1) as f64);
+        let existing = rio::read_json(&bp).filter(|v| v.is_object());
+        let raw_history = existing.as_ref().map(breaker_history_slice).unwrap_or(&[]);
+        let mut history: Vec<Value> = raw_history
+            .iter()
+            .filter(|item| item.is_object() && val_to_f64(item.get("tripped_at")) > 0.0)
+            .cloned()
+            .collect();
+        let was_tripped = existing
+            .as_ref()
+            .map_or(false, |d| json_truthy(d.get("tripped")));
+        let prev_at = existing
+            .as_ref()
+            .map_or(0.0, |d| val_to_f64(d.get("tripped_at")));
+        let prev_until = existing
+            .as_ref()
+            .map_or(0.0, |d| val_to_f64(d.get("tripped_until")));
+        if raw_history.is_empty() && prev_at > 0.0 && (was_tripped || prev_until > prev_at) {
+            history.push(json!({
+                "tripped_at": prev_at,
+                "until_ts": prev_until.max(prev_at),
+            }));
+        }
+        history.push(json!({
+            "tripped_at": now,
+            "until_ts": until_ts,
+        }));
+        history.sort_by(|a, b| {
+            val_to_f64(a.get("tripped_at")).total_cmp(&val_to_f64(b.get("tripped_at")))
+        });
+        if history.len() > 32 {
+            let drain_n = history.len() - 32;
+            history.drain(0..drain_n);
+        }
+        let prev_active = was_tripped && prev_until > now;
+        let (eff_at, eff_reason) = if prev_active && prev_at > now {
+            let pr = existing
+                .as_ref()
+                .map(|d| val_to_str(d.get("reason")))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| r_trunc.clone());
+            (prev_at, pr)
+        } else {
+            (now, r_trunc.clone())
+        };
+        let eff_until = if prev_active {
+            prev_until.max(until_ts)
+        } else {
+            until_ts
+        };
+        rio::write_json(
+            &bp,
+            &json!({
+                "tripped": true,
+                "reason": eff_reason,
+                "tripped_at": eff_at,
+                "tripped_until": eff_until,
+                "history": history,
+            }),
+        )
+        .is_ok()
+    });
+    if wrote {
+        rio::log_hook_event(
+            "gate-events",
+            "codex_breaker_tripped",
+            json!({
+                "reason": r_log,
+                "ttl": ttl,
+            }),
+        );
+    }
+}
+
+pub fn trip_breaker_at(reason: &str, ttl: i64, now: f64) {
+    trip_breaker_locked(reason, ttl, Some(now));
 }
 
 pub fn trip_breaker(reason: &str, ttl: i64) {
-    let now = now_sec();
-    let r_trunc: String = reason.chars().take(300).collect();
-    let r_log: String = reason.chars().take(200).collect();
-    let _ = rio::write_json(
-        &breaker_path(),
-        &json!({
-            "tripped": true,
-            "reason": r_trunc,
-            "tripped_at": now,
-            "tripped_until": now + (ttl as f64),
-        }),
-    );
-    rio::log_hook_event(
-        "gate-events",
-        "codex_breaker_tripped",
-        json!({
-            "reason": r_log,
-            "ttl": ttl,
-        }),
-    );
+    trip_breaker_locked(reason, ttl, None);
+}
+
+fn reset_breaker_locked(probe_bounds: Option<(f64, f64)>) {
+    // SAFETY: Serialize under `codex_lane.lock` and clamp only outage windows whose `tripped_at <= max_tripped_at` so a slow or concurrent probe started before a newer outage cannot clear that newer outage or resurrect a closed breaker.
+    let bp = breaker_path();
+    if !bp.exists() {
+        return;
+    }
+    let _ = rio::with_file_lock(&breaker_lock_path(), 5.0, 30.0, |locked| {
+        if !locked {
+            return false;
+        }
+        let (max_tripped_at, eff_rec_ts) = match probe_bounds {
+            Some((m_at, r_ts)) => (m_at, r_ts.max(m_at)),
+            None => {
+                let now = now_sec();
+                (now, now)
+            }
+        };
+        let Some(mut doc) = rio::read_json(&bp).filter(|v| v.is_object()) else {
+            if bp.exists() {
+                let _ = fs::remove_file(&bp);
+            }
+            return false;
+        };
+        let was_tripped = json_truthy(doc.get("tripped"));
+        let prev_at = val_to_f64(doc.get("tripped_at"));
+        let prev_until = val_to_f64(doc.get("tripped_until"));
+        let raw_history = breaker_history_slice(&doc);
+        let mut history =
+            clamp_breaker_history_for_probe(raw_history, max_tripped_at, eff_rec_ts);
+        if prev_at > 0.0
+            && (was_tripped || prev_until > prev_at)
+            && !history
+                .iter()
+                .any(|w| (val_to_f64(w.get("tripped_at")) - prev_at).abs() < 1e-6)
+        {
+            let eff_prev_until = if prev_at <= max_tripped_at {
+                clamp_until_ts(prev_until, prev_at, eff_rec_ts)
+            } else {
+                prev_until.max(prev_at)
+            };
+            history.push(json!({
+                "tripped_at": prev_at,
+                "until_ts": eff_prev_until,
+            }));
+        }
+        if was_tripped {
+            // SAFETY: Recompute `newer_at` and `newer_until` strictly from surviving unclosed windows (`h_at > max_tripped_at && h_until > eff_rec_ts`), never carrying forward an older closed window's longer TTL.
+            let mut newer_at = 0.0f64;
+            let mut newer_until = 0.0f64;
+            for item in &history {
+                let h_at = val_to_f64(item.get("tripped_at"));
+                let h_until = val_to_f64(item.get("until_ts"));
+                if h_at > max_tripped_at && h_until > eff_rec_ts {
+                    newer_at = newer_at.max(h_at);
+                    newer_until = newer_until.max(h_until);
+                }
+            }
+            if newer_at > 0.0 && newer_until > 0.0 {
+                if let Some(data) = doc.as_object_mut() {
+                    data.insert("tripped".to_string(), Value::Bool(true));
+                    data.insert("tripped_at".to_string(), json!(newer_at));
+                    data.insert("tripped_until".to_string(), json!(newer_until));
+                    data.insert("history".to_string(), Value::Array(history));
+                }
+                return rio::write_json(&bp, &doc).is_ok();
+            }
+        } else if prev_until == 0.0 && history.as_slice() == raw_history {
+            return true;
+        }
+        if let Some(data) = doc.as_object_mut() {
+            data.insert("tripped".to_string(), Value::Bool(false));
+            data.insert("tripped_until".to_string(), json!(0.0));
+            data.insert("history".to_string(), Value::Array(history));
+        }
+        rio::write_json(&bp, &doc).is_ok()
+    });
+}
+
+pub fn reset_breaker_for_probe(max_tripped_at: f64, recovery_ts: f64) {
+    if max_tripped_at > 0.0 {
+        reset_breaker_locked(Some((max_tripped_at, recovery_ts.max(max_tripped_at))));
+    }
+}
+
+pub fn reset_breaker_at(now: f64) {
+    reset_breaker_locked(Some((now, now)));
 }
 
 pub fn reset_breaker() {
+    reset_breaker_locked(None);
+}
+
+#[cfg(test)]
+pub fn wipe_breaker_for_test() {
     let bp = breaker_path();
-    if bp.exists() && fs::remove_file(&bp).is_err() {
-        let _ = rio::write_json(&bp, &json!({ "tripped": false }));
-    }
+    let _ = rio::with_file_lock(&breaker_lock_path(), 5.0, 30.0, |locked| {
+        if locked && bp.exists() {
+            let _ = fs::remove_file(&bp);
+        }
+        locked
+    });
 }
 
 fn infer_single_open_session(cwd: &str) -> String {
@@ -487,13 +827,21 @@ fn infer_single_open_session(cwd: &str) -> String {
     let Ok(entries) = fs::read_dir(&markers_dir) else {
         return String::new();
     };
+    let mut seen_stems: HashSet<String> = HashSet::new();
     let mut matched: Vec<String> = Vec::new();
     for ent in entries.flatten() {
-        let p = ent.path();
-        if p.extension().and_then(|e| e.to_str()) != Some("json") {
+        let fname = ent.file_name().to_string_lossy().into_owned();
+        let stem = if let Some(s) = fname.strip_suffix(".json") {
+            s
+        } else if let Some(s) = fname.strip_suffix(".pending.d") {
+            s
+        } else {
+            continue;
+        };
+        if stem.is_empty() || !seen_stems.insert(stem.to_string()) {
             continue;
         }
-        let Some(Value::Object(mdata)) = rio::read_json(&p) else {
+        let Some(Value::Object(mdata)) = cwg_common::read_marker_with_pending(stem) else {
             continue;
         };
         if json_truthy(mdata.get("closed")) {
@@ -535,11 +883,11 @@ fn infer_single_open_session(cwd: &str) -> String {
     }
 }
 
-fn candidate_first_ts(session: &str) -> f64 {
+pub fn candidate_first_ts(session: &str) -> f64 {
     if session.is_empty() {
         return 0.0;
     }
-    let Some(Value::Object(mdata)) = rio::read_json(&cwg_common::marker_path(session)) else {
+    let Some(Value::Object(mdata)) = cwg_common::read_marker_with_pending(session) else {
         return 0.0;
     };
     if json_truthy(mdata.get("closed")) {
@@ -548,15 +896,374 @@ fn candidate_first_ts(session: &str) -> f64 {
     val_to_f64(mdata.get("first_ts"))
 }
 
-fn thread_state_path(session: &str, git_root: &str) -> PathBuf {
+fn session_root_digest(session: &str, git_root: &str) -> String {
     let sess_part = if session.is_empty() {
         "nosession"
     } else {
         session
     };
     let raw_key = format!("{}|{}", sess_part, rio::fold_path(git_root));
-    let digest = sha256_hex(raw_key.as_bytes());
-    threads_dir().join(format!("{}.json", &digest[..20]))
+    sha256_hex(raw_key.as_bytes())[..20].to_string()
+}
+
+fn thread_state_path(session: &str, git_root: &str) -> PathBuf {
+    threads_dir().join(format!("{}.json", session_root_digest(session, git_root)))
+}
+
+fn is_default_high_lane(model: &str, effort: &str) -> bool {
+    let m = model.trim();
+    let e = effort.trim();
+    (m.is_empty() || m.eq_ignore_ascii_case(cwg_common::CODEX_SOL_MODEL))
+        && (e.is_empty() || e.eq_ignore_ascii_case("high"))
+}
+
+fn thread_state_path_for_lane(
+    session: &str,
+    git_root: &str,
+    model: &str,
+    effort: &str,
+) -> PathBuf {
+    if is_default_high_lane(model, effort) {
+        return thread_state_path(session, git_root);
+    }
+    let root_dig = session_root_digest(session, git_root);
+    let lane_dig = &sha256_hex(review_lane_key(model, effort).as_bytes())[..12];
+    threads_dir().join(format!("{}-{}.json", root_dig, lane_dig))
+}
+
+fn thread_entry_matches_candidate(entry: &Map<String, Value>, cand_ts: f64, now: f64) -> bool {
+    let saved_cand_ts = val_to_f64(entry.get("candidate_first_ts"));
+    // INVARIANT: Bind thread continuity & timeout escalation strictly to the active candidate (`1h` TTL when no marker is open).
+    if cand_ts > 0.0 {
+        (saved_cand_ts - cand_ts).abs() < 1.0
+    } else {
+        saved_cand_ts <= 0.0 && (now - val_to_f64(entry.get("updated_ts"))) < 3600.0
+    }
+}
+
+fn is_legacy_untyped_thread(saved: &Map<String, Value>) -> bool {
+    !saved.contains_key("model") && !saved.contains_key("effort") && !saved.contains_key("xhigh")
+}
+
+fn thread_lock_path(session: &str, git_root: &str) -> PathBuf {
+    threads_dir().join(format!("{}.lock", session_root_digest(session, git_root)))
+}
+
+fn find_rollout_lane_for_session(sid: &str, last_rid: &str, since_ts: f64) -> Option<(String, String)> {
+    let clean_sid = sid.trim();
+    let clean_rid = last_rid.trim();
+    if clean_sid.is_empty() {
+        return None;
+    }
+    let recent = recent_rollout_files((since_ts - 60.0).max(0.0), 40, true);
+    let mut ordered: Vec<&PathBuf> = recent
+        .iter()
+        .filter(|rf| {
+            rf.file_name()
+                .and_then(|n| n.to_str())
+                .map_or(false, |n| n.contains(clean_sid))
+        })
+        .collect();
+    for rf in &recent {
+        if !ordered.contains(&rf) {
+            ordered.push(rf);
+        }
+    }
+    for rf in ordered {
+        if is_subagent_rollout_meta(&read_rollout_session_meta(rf)) {
+            continue;
+        }
+        let Some(parsed) = extract_rollout_texts_and_meta(rf) else {
+            continue;
+        };
+        if parsed.session_id != clean_sid || parsed.is_subagent {
+            continue;
+        }
+        if !clean_rid.is_empty() {
+            // INVARIANT: Match strictly the turn carrying `last_review_id` so an XHIGH turn that timed out before emitting `turn_context` never inherits an earlier HIGH turn's metadata.
+            for turn in parsed.turns.iter().rev() {
+                if turn.review_ids.iter().any(|r| r == clean_rid) {
+                    if !turn.model.trim().is_empty() || !turn.effort.trim().is_empty() {
+                        return Some((turn.model.trim().to_string(), turn.effort.trim().to_string()));
+                    }
+                    return None;
+                }
+            }
+            return None;
+        }
+        let Some(last_turn) = parsed.turns.last() else {
+            return None;
+        };
+        if last_turn.model.trim().is_empty() && last_turn.effort.trim().is_empty() {
+            return None;
+        }
+        let last_key = review_lane_key(&last_turn.model, &last_turn.effort);
+        let all_same = parsed.turns.iter().all(|t| {
+            !t.model.trim().is_empty()
+                && !t.effort.trim().is_empty()
+                && review_lane_key(&t.model, &t.effort) == last_key
+        });
+        if all_same {
+            return Some((
+                last_turn.model.trim().to_string(),
+                last_turn.effort.trim().to_string(),
+            ));
+        }
+        return None;
+    }
+    None
+}
+
+enum LegacyThreadResolution {
+    None,
+    Typed(Map<String, Value>),
+    UnknownPending(Map<String, Value>),
+}
+
+fn classify_legacy_default_from_raw(
+    mut saved: Map<String, Value>,
+    session: &str,
+    git_root: &str,
+    cand_ts: f64,
+) -> LegacyThreadResolution {
+    // INVARIANT: Pure read-only classification of pre-upgrade untyped records (zero disk writes/deletes during reads, preventing write-failure data loss and concurrent TOCTOU clobbers).
+    if !is_legacy_untyped_thread(&saved) {
+        return LegacyThreadResolution::None;
+    }
+    if !thread_entry_matches_candidate(&saved, cand_ts, now_sec()) {
+        return LegacyThreadResolution::None;
+    }
+    let sid = val_to_str(saved.get("session_id")).trim().to_string();
+    let last_rid = val_to_str(saved.get("last_review_id")).trim().to_string();
+    let last_to = val_to_f64(saved.get("last_timeout_seconds")) as i64;
+    let pending = json_truthy(saved.get("pending_timeout_resume"));
+
+    let pkt_eff = if !last_rid.is_empty() {
+        rio::read_json(&packet_path(&last_rid))
+            .and_then(|v| {
+                v.get("effort")
+                    .and_then(|e| e.as_str())
+                    .map(|s| s.trim().to_ascii_lowercase())
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let (m_trim, e_low) = match find_rollout_lane_for_session(&sid, &last_rid, cand_ts) {
+        Some((r_mdl, r_eff)) => (r_mdl.trim().to_string(), r_eff.trim().to_ascii_lowercase()),
+        None => (String::new(), String::new()),
+    };
+    // INVARIANT: Resolve effort tier strictly from `turn_context.effort`, `packet.effort`, or timeout/candidate bounds — never assume XHIGH from an Astra model name alone, because `--model gpt-6.2-astra` is valid at HIGH (600s).
+    let eff_hint = if !e_low.is_empty() {
+        e_low.as_str()
+    } else {
+        pkt_eff.as_str()
+    };
+    let tier: Option<&str> = if !eff_hint.is_empty() {
+        if cwg_common::is_codex_xhigh_effort(eff_hint) {
+            Some("xhigh")
+        } else {
+            Some("high")
+        }
+    } else if pending && last_to > 0 && last_to < DEFAULT_XHIGH_REVIEW_TIMEOUT_SECONDS {
+        Some("high")
+    } else if pending && last_to >= DEFAULT_XHIGH_REVIEW_TIMEOUT_SECONDS && !session.is_empty() {
+        let is_xhigh_cand = cwg_common::read_marker_with_pending(session)
+            .filter(|m| !json_truthy(m.get("closed")))
+            .map(|m| {
+                let cctx = cwg_common::resolve_candidate_context(&m, false);
+                val_to_str(cctx.get("floor")) == "XHIGH"
+            })
+            .unwrap_or(false);
+        if is_xhigh_cand {
+            Some("xhigh")
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let inferred: Option<(String, String, bool, bool)> = match tier {
+        Some("xhigh") => {
+            let is_astra = cwg_common::is_codex_astra_model(&m_trim);
+            let verified_astra_turn = is_astra && !eff_hint.is_empty();
+            let tgt_m = if is_astra {
+                m_trim.clone()
+            } else {
+                cwg_common::CODEX_ASTRA_MODEL.to_string()
+            };
+            // INVARIANT: Normalize `max`/`ultra` to `"xhigh"` so `codex_lane.py review --xhigh` matches and clears the migrated lane.
+            Some((tgt_m, "xhigh".to_string(), true, verified_astra_turn))
+        }
+        Some("high") => {
+            let is_legacy_sol = m_trim.is_empty()
+                || m_trim.eq_ignore_ascii_case("gpt-6.1-sol")
+                || m_trim.eq_ignore_ascii_case("gpt-6-sol");
+            let is_legacy_astra = m_trim.to_ascii_lowercase().contains("astra")
+                && !cwg_common::is_codex_astra_model(&m_trim);
+            let tgt_m = if is_legacy_sol {
+                cwg_common::CODEX_SOL_MODEL.to_string()
+            } else if is_legacy_astra {
+                cwg_common::CODEX_ASTRA_MODEL.to_string()
+            } else {
+                m_trim.clone()
+            };
+            Some((tgt_m, "high".to_string(), false, !is_legacy_astra))
+        }
+        _ => None,
+    };
+
+    if let Some((tgt_m, tgt_e, tgt_xh, keep_sid)) = inferred {
+        if !keep_sid {
+            saved.insert("session_id".to_string(), Value::String(String::new()));
+        }
+        saved.insert("model".to_string(), Value::String(tgt_m));
+        saved.insert("effort".to_string(), Value::String(tgt_e));
+        saved.insert("xhigh".to_string(), Value::Bool(tgt_xh));
+        saved
+            .entry("session".to_string())
+            .or_insert_with(|| Value::String(session.to_string()));
+        saved
+            .entry("git_root".to_string())
+            .or_insert_with(|| Value::String(rio::normalize_path(git_root)));
+        return LegacyThreadResolution::Typed(saved);
+    }
+
+    if !pending {
+        return LegacyThreadResolution::None;
+    }
+
+    saved.insert("session_id".to_string(), Value::String(String::new()));
+    saved.insert("legacy_unknown_tier".to_string(), Value::Bool(true));
+    LegacyThreadResolution::UnknownPending(saved)
+}
+
+fn classify_legacy_default_thread_state(
+    session: &str,
+    git_root: &str,
+    cand_ts: f64,
+) -> LegacyThreadResolution {
+    let default_p = thread_state_path(session, git_root);
+    let Some(Value::Object(saved)) = rio::read_json(&default_p) else {
+        return LegacyThreadResolution::None;
+    };
+    classify_legacy_default_from_raw(saved, session, git_root, cand_ts)
+}
+
+fn match_typed_lane_map(
+    saved: Map<String, Value>,
+    cand_ts: f64,
+    req_mdl: &str,
+    req_eff: &str,
+) -> Option<Map<String, Value>> {
+    if is_legacy_untyped_thread(&saved) || !thread_entry_matches_candidate(&saved, cand_ts, now_sec()) {
+        return None;
+    }
+    let is_xh = json_truthy(saved.get("xhigh"));
+    let saved_mdl = {
+        let s = val_to_str(saved.get("model"));
+        if s.trim().is_empty() {
+            if is_xh {
+                cwg_common::CODEX_ASTRA_MODEL.to_string()
+            } else {
+                cwg_common::CODEX_SOL_MODEL.to_string()
+            }
+        } else {
+            s
+        }
+    };
+    let saved_eff = {
+        let s = val_to_str(saved.get("effort"));
+        if s.trim().is_empty() {
+            if is_xh {
+                "xhigh".to_string()
+            } else {
+                "high".to_string()
+            }
+        } else {
+            s
+        }
+    };
+    if review_lane_key(&saved_mdl, &saved_eff) == review_lane_key(req_mdl, req_eff) {
+        Some(saved)
+    } else {
+        None
+    }
+}
+
+fn session_last_research_reset_ts(session: &str) -> f64 {
+    if session.is_empty() {
+        return 0.0;
+    }
+    cwg_common::read_marker_with_pending(session)
+        .filter(|m| !json_truthy(m.get("closed")))
+        .map(|m| cwg_common::last_research_reset_ts(&m))
+        .unwrap_or(0.0)
+}
+
+pub fn active_thread_state_for_lane(
+    session: &str,
+    git_root: &str,
+    candidate_first_ts_opt: Option<f64>,
+    model: &str,
+    effort: &str,
+) -> Option<Map<String, Value>> {
+    let cand_ts = candidate_first_ts_opt.unwrap_or_else(|| candidate_first_ts(session));
+    let rr_ts = session_last_research_reset_ts(session);
+    let req_mdl = if model.trim().is_empty() {
+        cwg_common::CODEX_SOL_MODEL
+    } else {
+        model.trim()
+    };
+    let req_eff = if effort.trim().is_empty() {
+        "high"
+    } else {
+        effort.trim()
+    };
+    let default_p = thread_state_path(session, git_root);
+    let tpath = thread_state_path_for_lane(session, git_root, req_mdl, req_eff);
+    let raw_def = rio::read_json(&default_p).and_then(|v| match v {
+        Value::Object(m) => Some(m),
+        _ => None,
+    });
+    let (legacy_def, typed_def) = match raw_def {
+        Some(m) if is_legacy_untyped_thread(&m) => (Some(m), None),
+        Some(m) => (None, Some(m)),
+        None => (None, None),
+    };
+    let typed_hit = if tpath == default_p {
+        typed_def.and_then(|m| match_typed_lane_map(m, cand_ts, req_mdl, req_eff))
+    } else {
+        rio::read_json(&tpath).and_then(|v| match v {
+            Value::Object(m) => match_typed_lane_map(m, cand_ts, req_mdl, req_eff),
+            _ => None,
+        })
+    }
+    .filter(|m| rr_ts <= 0.0 || val_to_f64(m.get("updated_ts")) >= rr_ts);
+    let Some(def_map) = legacy_def else {
+        return typed_hit;
+    };
+    if rr_ts > 0.0 && val_to_f64(def_map.get("updated_ts")) < rr_ts {
+        return typed_hit;
+    }
+    match classify_legacy_default_from_raw(def_map, session, git_root, cand_ts) {
+        LegacyThreadResolution::Typed(leg) => {
+            let leg_key = review_lane_key(&val_to_str(leg.get("model")), &val_to_str(leg.get("effort")));
+            if leg_key == review_lane_key(req_mdl, req_eff) {
+                if let Some(ref th) = typed_hit {
+                    if val_to_f64(th.get("updated_ts")) >= val_to_f64(leg.get("updated_ts")) {
+                        return typed_hit;
+                    }
+                }
+                return Some(leg);
+            }
+            typed_hit
+        }
+        LegacyThreadResolution::UnknownPending(unk) => typed_hit.or(Some(unk)),
+        LegacyThreadResolution::None => typed_hit,
+    }
 }
 
 pub fn active_thread_state(
@@ -564,44 +1271,320 @@ pub fn active_thread_state(
     git_root: &str,
     candidate_first_ts_opt: Option<f64>,
 ) -> Option<Map<String, Value>> {
-    let Some(Value::Object(saved)) = rio::read_json(&thread_state_path(session, git_root)) else {
-        return None;
-    };
     let cand_ts = candidate_first_ts_opt.unwrap_or_else(|| candidate_first_ts(session));
-    let saved_cand_ts = val_to_f64(saved.get("candidate_first_ts"));
-    // INVARIANT: Bind thread continuity & timeout escalation strictly to the active candidate (`1h` TTL when no marker is open).
-    let matched = if cand_ts > 0.0 {
-        (saved_cand_ts - cand_ts).abs() < 1.0
-    } else {
-        saved_cand_ts <= 0.0 && (now_sec() - val_to_f64(saved.get("updated_ts"))) < 3600.0
+    let rr_ts = session_last_research_reset_ts(session);
+    let now = now_sec();
+    let fold_root = rio::fold_path(git_root);
+    let root_dig = session_root_digest(session, git_root);
+    let default_name = format!("{}.json", root_dig);
+    let lane_prefix = format!("{}-", root_dig);
+    let mut matched: Vec<Map<String, Value>> = Vec::new();
+    let mut legacy_raw: Option<Map<String, Value>> = None;
+    if let Ok(entries) = fs::read_dir(threads_dir()) {
+        for ent_res in entries.flatten() {
+            let fname_os = ent_res.file_name();
+            let Some(fname) = fname_os.to_str() else {
+                continue;
+            };
+            let is_default = fname == default_name;
+            // INVARIANT: Filter by `<session_root_digest>` filename prefix before JSON parsing so `PreToolUse` stays O(lanes of active session) instead of scanning stale files of unrelated sessions/repos.
+            if !is_default && !(fname.starts_with(&lane_prefix) && fname.ends_with(".json")) {
+                continue;
+            }
+            let Some(Value::Object(saved)) = rio::read_json(&ent_res.path()) else {
+                continue;
+            };
+            if rr_ts > 0.0 && val_to_f64(saved.get("updated_ts")) < rr_ts {
+                continue;
+            }
+            if is_default && is_legacy_untyped_thread(&saved) {
+                legacy_raw = Some(saved);
+                continue;
+            }
+            if !is_default {
+                if val_to_str(saved.get("session")) != session {
+                    continue;
+                }
+                if rio::fold_path(&val_to_str(saved.get("git_root"))) != fold_root {
+                    continue;
+                }
+            }
+            if thread_entry_matches_candidate(&saved, cand_ts, now) {
+                matched.push(saved);
+            }
+        }
+    }
+    if let Some(def_map) = legacy_raw {
+        match classify_legacy_default_from_raw(def_map, session, git_root, cand_ts) {
+            LegacyThreadResolution::Typed(leg) => {
+                let leg_key = review_lane_key(&val_to_str(leg.get("model")), &val_to_str(leg.get("effort")));
+                let superseded = matched.iter().any(|m| {
+                    review_lane_key(&val_to_str(m.get("model")), &val_to_str(m.get("effort"))) == leg_key
+                        && val_to_f64(m.get("updated_ts")) >= val_to_f64(leg.get("updated_ts"))
+                });
+                if !superseded {
+                    matched.push(leg);
+                }
+            }
+            LegacyThreadResolution::UnknownPending(unk) => {
+                let superseded = matched
+                    .iter()
+                    .any(|m| val_to_f64(m.get("updated_ts")) >= val_to_f64(unk.get("updated_ts")));
+                if !superseded {
+                    matched.push(unk);
+                }
+            }
+            LegacyThreadResolution::None => {}
+        }
+    }
+    let mut best_pending: Option<Map<String, Value>> = None;
+    let mut best_any: Option<Map<String, Value>> = None;
+    for saved in matched {
+        let ts = val_to_f64(saved.get("updated_ts"));
+        if json_truthy(saved.get("pending_timeout_resume")) {
+            if best_pending
+                .as_ref()
+                .map_or(true, |b| ts >= val_to_f64(b.get("updated_ts")))
+            {
+                best_pending = Some(saved.clone());
+            }
+        }
+        if best_any
+            .as_ref()
+            .map_or(true, |b| ts >= val_to_f64(b.get("updated_ts")))
+        {
+            best_any = Some(saved);
+        }
+    }
+    best_pending.or(best_any)
+}
+
+fn preserve_or_retire_legacy_on_mutation(
+    session: &str,
+    git_root: &str,
+    cand_ts: f64,
+    mutating_lane_key: &str,
+    about_to_overwrite_default: bool,
+) -> bool {
+    let default_p = thread_state_path(session, git_root);
+    let Some(Value::Object(raw_def)) = rio::read_json(&default_p) else {
+        return true;
     };
-    if matched {
-        Some(saved)
-    } else {
-        None
+    if !is_legacy_untyped_thread(&raw_def) {
+        return true;
+    }
+    match classify_legacy_default_from_raw(raw_def, session, git_root, cand_ts) {
+        LegacyThreadResolution::None | LegacyThreadResolution::UnknownPending(_) => {
+            if !about_to_overwrite_default {
+                unlink_quiet(&default_p);
+            }
+            true
+        }
+        LegacyThreadResolution::Typed(leg) => {
+            let leg_m = val_to_str(leg.get("model"));
+            let leg_e = val_to_str(leg.get("effort"));
+            let leg_key = review_lane_key(&leg_m, &leg_e);
+            if leg_key == mutating_lane_key {
+                if !about_to_overwrite_default {
+                    unlink_quiet(&default_p);
+                }
+                return true;
+            }
+            if about_to_overwrite_default {
+                let dest_p = thread_state_path_for_lane(session, git_root, &leg_m, &leg_e);
+                let has_newer = rio::read_json(&dest_p)
+                    .and_then(|v| v.as_object().cloned())
+                    .map_or(false, |d| {
+                        !is_legacy_untyped_thread(&d)
+                            && thread_entry_matches_candidate(&d, cand_ts, now_sec())
+                            && val_to_f64(d.get("updated_ts")) >= val_to_f64(leg.get("updated_ts"))
+                    });
+                if !has_newer && rio::write_json(&dest_p, &Value::Object(leg)).is_err() {
+                    // SAFETY: Abort overwriting `default_p` if evacuating a non-default legacy record to `dest_p` fails.
+                    return false;
+                }
+            }
+            true
+        }
     }
 }
 
-fn clear_pending_timeout_resume(session: &str, git_root: &str) {
-    let tpath = thread_state_path(session, git_root);
-    let Some(Value::Object(mut saved)) = rio::read_json(&tpath) else {
-        return;
-    };
-    if !json_truthy(saved.get("pending_timeout_resume")) {
-        return;
+fn save_lane_thread_state(
+    session: &str,
+    git_root: &str,
+    cand_first_ts: f64,
+    model: &str,
+    effort: &str,
+    mut entry: Value,
+) -> bool {
+    let norm_eff = canonical_lane_effort(effort);
+    if let Some(obj) = entry.as_object_mut() {
+        obj.entry("session".to_string())
+            .or_insert_with(|| Value::String(session.to_string()));
+        obj.entry("git_root".to_string())
+            .or_insert_with(|| Value::String(rio::normalize_path(git_root)));
+        obj.entry("candidate_first_ts".to_string())
+            .or_insert_with(|| json!(cand_first_ts));
+        obj.entry("model".to_string())
+            .or_insert_with(|| Value::String(model.to_string()));
+        obj.insert("effort".to_string(), Value::String(norm_eff.clone()));
     }
-    if json_truthy(saved.get("session_id")) {
-        saved.insert("pending_timeout_resume".to_string(), Value::Bool(false));
-        saved.remove("next_timeout_seconds");
-        saved.insert("updated_ts".to_string(), json!(now_sec()));
-        let _ = rio::write_json(&tpath, &Value::Object(saved));
-    } else {
-        unlink_quiet(&tpath);
-    }
+    let lkey = review_lane_key(model, &norm_eff);
+    let tpath = thread_state_path_for_lane(session, git_root, model, &norm_eff);
+    let default_p = thread_state_path(session, git_root);
+    let new_ts = val_to_f64(entry.get("updated_ts"));
+    let mut persisted = false;
+    rio::with_file_lock(&thread_lock_path(session, git_root), 5.0, 30.0, |locked| {
+        // SAFETY: Fail closed without mutating thread state if the per-session lock could not be acquired.
+        if !locked {
+            return;
+        }
+        let has_newer = rio::read_json(&tpath)
+            .and_then(|v| v.as_object().cloned())
+            .map_or(false, |d| {
+                !is_legacy_untyped_thread(&d)
+                    && thread_entry_matches_candidate(&d, cand_first_ts, now_sec())
+                    && val_to_f64(d.get("updated_ts")) > new_ts
+            });
+        if has_newer {
+            return;
+        }
+        if tpath == default_p {
+            if !preserve_or_retire_legacy_on_mutation(session, git_root, cand_first_ts, &lkey, true) {
+                return;
+            }
+            persisted = rio::write_json(&tpath, &entry).is_ok();
+        } else if rio::write_json(&tpath, &entry).is_ok() {
+            let _ = preserve_or_retire_legacy_on_mutation(session, git_root, cand_first_ts, &lkey, false);
+            persisted = true;
+        }
+    });
+    persisted
+}
+
+fn remove_lane_thread_state(
+    session: &str,
+    git_root: &str,
+    cand_first_ts: f64,
+    model: &str,
+    effort: &str,
+) {
+    let norm_eff = canonical_lane_effort(effort);
+    let lkey = review_lane_key(model, &norm_eff);
+    let tpath = thread_state_path_for_lane(session, git_root, model, &norm_eff);
+    let default_p = thread_state_path(session, git_root);
+    rio::with_file_lock(&thread_lock_path(session, git_root), 5.0, 30.0, |locked| {
+        if !locked {
+            return;
+        }
+        if tpath == default_p {
+            if !preserve_or_retire_legacy_on_mutation(session, git_root, cand_first_ts, &lkey, true) {
+                return;
+            }
+            unlink_quiet(&tpath);
+        } else {
+            unlink_quiet(&tpath);
+            let _ = preserve_or_retire_legacy_on_mutation(session, git_root, cand_first_ts, &lkey, false);
+        }
+    });
+}
+
+fn clear_pending_timeout_resume(
+    session: &str,
+    git_root: &str,
+    cand_first_ts: f64,
+    model: &str,
+    effort: &str,
+) {
+    let norm_eff = canonical_lane_effort(effort);
+    let lkey = review_lane_key(model, &norm_eff);
+    let tpath = thread_state_path_for_lane(session, git_root, model, &norm_eff);
+    let default_p = thread_state_path(session, git_root);
+    rio::with_file_lock(&thread_lock_path(session, git_root), 5.0, 30.0, |locked| {
+        if !locked {
+            return;
+        }
+        let mut base = rio::read_json(&tpath).and_then(|v| v.as_object().cloned()).filter(|d| !is_legacy_untyped_thread(d));
+        if base.is_none() {
+            if let LegacyThreadResolution::Typed(leg) =
+                classify_legacy_default_thread_state(session, git_root, cand_first_ts)
+            {
+                if review_lane_key(&val_to_str(leg.get("model")), &val_to_str(leg.get("effort"))) == lkey {
+                    base = Some(leg);
+                }
+            }
+        }
+        let Some(mut saved) = base else {
+            let _ = preserve_or_retire_legacy_on_mutation(session, git_root, cand_first_ts, &lkey, false);
+            return;
+        };
+        if !json_truthy(saved.get("pending_timeout_resume")) {
+            return;
+        }
+        if json_truthy(saved.get("session_id")) {
+            saved.insert("pending_timeout_resume".to_string(), Value::Bool(false));
+            saved.remove("next_timeout_seconds");
+            saved.insert("updated_ts".to_string(), json!(now_sec()));
+            if tpath == default_p {
+                if !preserve_or_retire_legacy_on_mutation(session, git_root, cand_first_ts, &lkey, true) {
+                    return;
+                }
+                let _ = rio::write_json(&tpath, &Value::Object(saved));
+            } else if rio::write_json(&tpath, &Value::Object(saved)).is_ok() {
+                let _ = preserve_or_retire_legacy_on_mutation(session, git_root, cand_first_ts, &lkey, false);
+            }
+        } else {
+            if tpath == default_p && !preserve_or_retire_legacy_on_mutation(session, git_root, cand_first_ts, &lkey, true) {
+                return;
+            }
+            unlink_quiet(&tpath);
+            if tpath != default_p {
+                let _ = preserve_or_retire_legacy_on_mutation(session, git_root, cand_first_ts, &lkey, false);
+            }
+        }
+    });
 }
 
 fn packet_path(review_id: &str) -> PathBuf {
     packets_dir().join(format!("{}.json", rio::safe_key(review_id, "default")))
+}
+
+pub fn has_recorded_packet(review_id: &str) -> bool {
+    !review_id.is_empty() && packet_path(review_id).exists()
+}
+
+fn build_packet_doc(
+    review_id: &str,
+    prompt_text: &str,
+    cwd: &str,
+    effort: &str,
+    phase: &str,
+    session: &str,
+    committed: bool,
+) -> Value {
+    let now = now_sec();
+    let eff_session = if session.is_empty() {
+        infer_single_open_session(cwd)
+    } else {
+        session.to_string()
+    };
+    let digest = sha256_hex(prompt_text.as_bytes())[..24].to_string();
+    let pkt_nonce = packet_nonce_re()
+        .captures(prompt_text)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_lowercase())
+        .unwrap_or_default();
+    json!({
+        "review_id": review_id,
+        "packet_nonce": pkt_nonce,
+        "prompt_sha256": digest,
+        "cwd": rio::normalize_path(cwd),
+        "effort": effort.to_lowercase(),
+        "phase": phase,
+        "session": eff_session,
+        "created_ts": now,
+        "committed": committed,
+    })
 }
 
 pub fn record_packet(
@@ -612,36 +1595,129 @@ pub fn record_packet(
     phase: &str,
     session: &str,
 ) -> Value {
-    let now = now_sec();
-    let eff_session = if session.is_empty() {
-        infer_single_open_session(cwd)
-    } else {
-        session.to_string()
-    };
-    let digest = sha256_hex(prompt_text.as_bytes())[..24].to_string();
-    let pkt = json!({
-        "review_id": review_id,
-        "prompt_sha256": digest,
-        "cwd": rio::normalize_path(cwd),
-        "effort": effort.to_lowercase(),
-        "phase": phase,
-        "session": eff_session,
-        "created_ts": now,
-    });
+    let pkt = build_packet_doc(review_id, prompt_text, cwd, effort, phase, session, true);
     let _ = rio::write_json(&packet_path(review_id), &pkt);
     sweep_expired_gate_files();
     pkt
 }
 
-fn unlink_packet(review_id: &str) {
+pub fn record_packet_if_absent(
+    review_id: &str,
+    prompt_text: &str,
+    cwd: &str,
+    effort: &str,
+    phase: &str,
+    session: &str,
+) -> bool {
+    // SAFETY: Atomically create `packets/<review_id>.json` with `create_new(true)` so `PostToolUse` direct-`codex` fallback can never overwrite an in-flight or committed `codex-lane review` packet.
     if review_id.is_empty() {
+        return false;
+    }
+    sweep_expired_gate_files();
+    let pdir = packets_dir();
+    if fs::create_dir_all(&pdir).is_err() {
+        return false;
+    }
+    let pkt = build_packet_doc(review_id, prompt_text, cwd, effort, phase, session, true);
+    let Ok(encoded) = serde_json::to_vec_pretty(&pkt) else {
+        return false;
+    };
+    let Ok(mut fh) = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(packet_path(review_id))
+    else {
+        return false;
+    };
+    if fh.write_all(&encoded).and_then(|()| fh.flush()).is_err() {
+        let _ = fs::remove_file(packet_path(review_id));
+        return false;
+    }
+    true
+}
+
+enum PacketReserveError {
+    Duplicate,
+    Io(String),
+}
+
+fn reserve_packet_exclusive(
+    review_id: &str,
+    prompt_text: &str,
+    cwd: &str,
+    effort: &str,
+    phase: &str,
+    session: &str,
+) -> Result<Value, PacketReserveError> {
+    // SAFETY: Reserve `packets/<review_id>.json` atomically via OS `create_new(true)` (`CREATE_NEW` / `O_CREAT|O_EXCL`) so concurrent duplicate `--review-id` invocations never overwrite or clobber an existing packet.
+    sweep_expired_gate_files();
+    let pdir = packets_dir();
+    fs::create_dir_all(&pdir).map_err(|e| PacketReserveError::Io(e.to_string()))?;
+    let pkt = build_packet_doc(review_id, prompt_text, cwd, effort, phase, session, false);
+    let encoded = serde_json::to_vec_pretty(&pkt)
+        .map_err(|e| PacketReserveError::Io(e.to_string()))?;
+    let mut fh = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(packet_path(review_id))
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                PacketReserveError::Duplicate
+            } else {
+                PacketReserveError::Io(e.to_string())
+            }
+        })?;
+    fh.write_all(&encoded)
+        .and_then(|()| fh.flush())
+        .map_err(|e| {
+            let _ = fs::remove_file(packet_path(review_id));
+            PacketReserveError::Io(e.to_string())
+        })?;
+    Ok(pkt)
+}
+
+fn commit_packet_owned(review_id: &str, owner_nonce: &str) -> bool {
+    if review_id.is_empty() || owner_nonce.is_empty() {
+        return false;
+    }
+    let p = packet_path(review_id);
+    rio::with_file_lock(&breaker_lock_path(), 3.0, 15.0, |locked| {
+        if !locked {
+            return false;
+        }
+        let Some(mut doc) = rio::read_json(&p) else {
+            return false;
+        };
+        if !val_to_str(doc.get("packet_nonce")).eq_ignore_ascii_case(owner_nonce) {
+            return false;
+        }
+        if let Some(obj) = doc.as_object_mut() {
+            obj.insert("committed".to_string(), Value::Bool(true));
+        }
+        rio::write_json(&p, &doc).is_ok()
+    })
+}
+
+fn unlink_packet_if_owned(review_id: &str, owner_nonce: &str) {
+    if review_id.is_empty() || owner_nonce.is_empty() {
         return;
     }
-    unlink_quiet(&packet_path(review_id));
+    let p = packet_path(review_id);
+    rio::with_file_lock(&breaker_lock_path(), 3.0, 15.0, |locked| {
+        if !locked {
+            return;
+        }
+        if let Some(doc) = rio::read_json(&p) {
+            if val_to_str(doc.get("packet_nonce")).eq_ignore_ascii_case(owner_nonce) {
+                unlink_quiet(&p);
+            }
+        }
+    });
 }
 
 fn sweep_expired_gate_files() {
     let cutoff = now_sec() - PACKET_TTL_SECONDS;
+    let mut open_session_cache: HashMap<String, bool> = HashMap::new();
     for base_dir in [packets_dir(), threads_dir()] {
         let Ok(entries) = fs::read_dir(&base_dir) else {
             continue;
@@ -651,70 +1727,28 @@ fn sweep_expired_gate_files() {
             if p.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let mt = file_mtime_sec(&p);
+            let mt = rio::file_mtime_sec(&p).unwrap_or(0.0);
             if mt > 0.0 && mt < cutoff {
+                // SAFETY: Retain committed packets and thread state for any session whose candidate marker is still open so multi-day candidates never lose review history or 2-BLOCKED accounting.
+                if let Some(doc) = rio::read_json(&p) {
+                    if doc.get("committed").and_then(|v| v.as_bool()) != Some(false) {
+                        let sess = val_to_str(doc.get("session")).trim().to_string();
+                        if !sess.is_empty() {
+                            let is_open = *open_session_cache.entry(sess.clone()).or_insert_with(|| {
+                                let skey = rio::safe_key(&sess, "default");
+                                cwg_common::read_marker_with_pending(&skey)
+                                    .map_or(false, |m| m.is_object() && !json_truthy(m.get("closed")))
+                            });
+                            if is_open {
+                                continue;
+                            }
+                        }
+                    }
+                }
                 let _ = fs::remove_file(&p);
             }
         }
     }
-}
-
-fn fold_ps_line_continuations(cmd_str: &str) -> String {
-    // INVARIANT: Fold only PowerShell backtick line-continuations (`` ` `` + optional horizontal space + newline) outside quotes; bare newlines and arbitrary backticks remain untouched and rejected as multi-statement / escape hazards.
-    if !cmd_str.contains('`') || (!cmd_str.contains('\n') && !cmd_str.contains('\r')) {
-        return cmd_str.to_string();
-    }
-    let bytes = cmd_str.as_bytes();
-    let n = bytes.len();
-    let mut out = String::with_capacity(n);
-    let mut quote: Option<u8> = None;
-    let mut i = 0usize;
-    while i < n {
-        let ch = bytes[i];
-        if let Some(q) = quote {
-            if ch == q {
-                out.push(q as char);
-                if i + 1 < n && bytes[i + 1] == q {
-                    out.push(q as char);
-                    i += 2;
-                    continue;
-                }
-                quote = None;
-                i += 1;
-                continue;
-            }
-            let step = cmd_str[i..].chars().next().map_or(1, char::len_utf8);
-            out.push_str(&cmd_str[i..i + step]);
-            i += step;
-            continue;
-        }
-        if ch == b'\'' || ch == b'"' {
-            quote = Some(ch);
-            out.push(ch as char);
-            i += 1;
-            continue;
-        }
-        if ch == b'`' {
-            let mut k = i + 1;
-            while k < n && (bytes[k] == b' ' || bytes[k] == b'\t') {
-                k += 1;
-            }
-            if k < n && bytes[k] == b'\r' && k + 1 < n && bytes[k + 1] == b'\n' {
-                out.push(' ');
-                i = k + 2;
-                continue;
-            }
-            if k < n && bytes[k] == b'\n' {
-                out.push(' ');
-                i = k + 1;
-                continue;
-            }
-        }
-        let step = cmd_str[i..].chars().next().map_or(1, char::len_utf8);
-        out.push_str(&cmd_str[i..i + step]);
-        i += step;
-    }
-    out
 }
 
 fn validate_codex_lane_subcmd_tokens(subcmd: &str, rem: &[String]) -> bool {
@@ -755,7 +1789,7 @@ fn validate_codex_lane_subcmd_tokens(subcmd: &str, rem: &[String]) -> bool {
 }
 
 fn is_direct_codex_invocation(cmd_str: &str) -> bool {
-    let folded = fold_ps_line_continuations(cmd_str.trim());
+    let folded = crate::cwg_mark::fold_ps_line_continuations(cmd_str.trim());
     let mut s = folded.trim();
     if s.is_empty()
         || s.contains('\r')
@@ -1264,10 +2298,14 @@ fn is_subagent_rollout_meta(payload: &Map<String, Value>) -> bool {
 }
 
 fn read_rollout_session_meta(rollout_file: &Path) -> Map<String, Value> {
-    let Ok(raw) = fs::read_to_string(rollout_file) else {
+    let Ok(f) = fs::File::open(rollout_file) else {
         return Map::new();
     };
-    for raw_line in raw.lines().take(8) {
+    let reader = BufReader::new(f);
+    for line_res in reader.lines().take(8) {
+        let Ok(raw_line) = line_res else {
+            break;
+        };
         let line = raw_line.trim();
         if line.is_empty() {
             continue;
@@ -1312,13 +2350,20 @@ fn extract_review_ids(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn rollout_user_review_ids(rtype: &str, payload: &Map<String, Value>) -> Vec<String> {
+fn extract_packet_nonces(text: &str) -> Vec<String> {
+    packet_nonce_re()
+        .captures_iter(text)
+        .filter_map(|c| c.get(1).map(|m| m.as_str().to_lowercase()))
+        .collect()
+}
+
+fn rollout_user_prompt_text(rtype: &str, payload: &Map<String, Value>) -> Option<String> {
     let ptype = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
     if rtype == "event_msg" && ptype == "user_message" {
         let umsg = val_to_str(payload.get("message"));
         let trimmed = umsg.trim();
         if !trimmed.is_empty() {
-            return extract_review_ids(trimmed);
+            return Some(trimmed.to_string());
         }
     } else if rtype == "response_item"
         && ptype == "message"
@@ -1326,14 +2371,19 @@ fn rollout_user_review_ids(rtype: &str, payload: &Map<String, Value>) -> Vec<Str
     {
         let txt = rollout_message_text(payload.get("content"));
         if !txt.is_empty() {
-            return extract_review_ids(&txt);
+            return Some(txt);
         }
     }
-    Vec::new()
+    None
+}
+
+fn rollout_user_review_ids(rtype: &str, payload: &Map<String, Value>) -> Vec<String> {
+    rollout_user_prompt_text(rtype, payload).map_or_else(Vec::new, |t| extract_review_ids(&t))
 }
 
 struct RolloutTurn {
     review_ids: Vec<String>,
+    packet_nonces: Vec<String>,
     started_ts: f64,
     completed_ts: f64,
     effort: String,
@@ -1344,10 +2394,9 @@ struct RolloutTurn {
 
 struct RolloutMetaExtracted {
     path: String,
+    file_mtime: f64,
     session_id: String,
     is_subagent: bool,
-    effort: String,
-    model: String,
     started_ts: f64,
     completed_ts: f64,
     turns: Vec<RolloutTurn>,
@@ -1358,11 +2407,11 @@ fn extract_rollout_texts_and_meta(rollout_file: &Path) -> Option<RolloutMetaExtr
     if records.is_empty() {
         return None;
     }
-    let file_mtime = file_mtime_sec(rollout_file);
+    let file_mtime = rio::file_mtime_sec(rollout_file).unwrap_or(0.0);
     let mut turns: Vec<RolloutTurn> = Vec::new();
     let mut current_idx: Option<usize> = None;
-    let mut cur_effort = String::new();
-    let mut cur_model = String::new();
+    let mut pending_effort = String::new();
+    let mut pending_model = String::new();
     let mut session_id = String::new();
     let mut is_subagent = false;
     let mut started_ts = 0.0f64;
@@ -1402,35 +2451,44 @@ fn extract_rollout_texts_and_meta(rollout_file: &Path) -> Option<RolloutMetaExtr
                 };
             }
         } else if rtype == "turn_context" {
-            let eff_s = val_to_str(payload.get("effort")).to_lowercase();
-            if !eff_s.is_empty() {
-                cur_effort = eff_s;
-            }
-            let mdl_s = val_to_str(payload.get("model"));
-            if !mdl_s.is_empty() {
-                cur_model = mdl_s;
-            }
-            if let Some(idx) = current_idx {
-                let t = &mut turns[idx];
-                if !t.closed && t.assistant_messages.is_empty() {
-                    if !cur_effort.is_empty() {
-                        t.effort = cur_effort.clone();
-                    }
-                    if !cur_model.is_empty() {
-                        t.model = cur_model.clone();
+            // INVARIANT: Bind `(model, effort)` strictly to the turn that emitted this `turn_context`; never carry missing fields across turns.
+            let tc_eff = val_to_str(payload.get("effort")).trim().to_lowercase();
+            let tc_mdl = val_to_str(payload.get("model")).trim().to_string();
+            let applied_to_open_turn = match current_idx {
+                Some(idx) => {
+                    let t = &mut turns[idx];
+                    if !t.closed && t.assistant_messages.is_empty() {
+                        t.effort = tc_eff.clone();
+                        t.model = tc_mdl.clone();
+                        true
+                    } else {
+                        false
                     }
                 }
+                None => false,
+            };
+            if applied_to_open_turn {
+                pending_effort.clear();
+                pending_model.clear();
+            } else {
+                pending_effort = tc_eff;
+                pending_model = tc_mdl;
             }
         } else if rtype == "event_msg" && ptype == "task_started" {
             if let Some(idx) = current_idx {
                 turns[idx].closed = true;
             }
+            pending_effort.clear();
+            pending_model.clear();
         } else if (rtype == "event_msg" && ptype == "user_message")
             || (rtype == "response_item"
                 && ptype == "message"
                 && payload.get("role").and_then(|v| v.as_str()) == Some("user"))
         {
-            let m_ids = rollout_user_review_ids(rtype, payload);
+            let (m_ids, m_nonces) = match rollout_user_prompt_text(rtype, payload) {
+                Some(txt) => (extract_review_ids(&txt), extract_packet_nonces(&txt)),
+                None => (Vec::new(), Vec::new()),
+            };
             let same_open_turn = current_idx.map_or(false, |idx| {
                 let t = &turns[idx];
                 !t.closed && t.review_ids == m_ids && t.assistant_messages.is_empty()
@@ -1441,14 +2499,23 @@ fn extract_rollout_texts_and_meta(rollout_file: &Path) -> Option<RolloutMetaExtr
                 }
                 turns.push(RolloutTurn {
                     review_ids: m_ids,
+                    packet_nonces: m_nonces,
                     started_ts: if rec_ts > 0.0 { rec_ts } else { started_ts },
                     completed_ts: 0.0,
-                    effort: cur_effort.clone(),
-                    model: cur_model.clone(),
+                    effort: std::mem::take(&mut pending_effort),
+                    model: std::mem::take(&mut pending_model),
                     assistant_messages: Vec::new(),
                     closed: false,
                 });
                 current_idx = Some(turns.len() - 1);
+            } else if same_open_turn {
+                if let Some(idx) = current_idx {
+                    for nc in m_nonces {
+                        if !turns[idx].packet_nonces.contains(&nc) {
+                            turns[idx].packet_nonces.push(nc);
+                        }
+                    }
+                }
             }
         } else if rtype == "response_item"
             && ptype == "message"
@@ -1493,6 +2560,8 @@ fn extract_rollout_texts_and_meta(rollout_file: &Path) -> Option<RolloutMetaExtr
                 turns[idx].completed_ts = ts_done;
                 turns[idx].closed = true;
             }
+            pending_effort.clear();
+            pending_model.clear();
         }
     }
 
@@ -1509,10 +2578,9 @@ fn extract_rollout_texts_and_meta(rollout_file: &Path) -> Option<RolloutMetaExtr
 
     Some(RolloutMetaExtracted {
         path: rollout_file.to_string_lossy().into_owned(),
+        file_mtime,
         session_id,
         is_subagent,
-        effort: cur_effort,
-        model: cur_model,
         started_ts,
         completed_ts: eff_completed,
         turns,
@@ -1561,21 +2629,53 @@ fn collect_jsonl_files_rec(
     }
 }
 
+fn collect_recent_rollout_files_rec(
+    dir: &Path,
+    min_mtime: f64,
+    depth: usize,
+    out: &mut Vec<(f64, PathBuf)>,
+) {
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for ent in entries.flatten() {
+        let Ok(ft) = ent.file_type() else {
+            continue;
+        };
+        let p = ent.path();
+        if ft.is_dir() {
+            collect_recent_rollout_files_rec(&p, min_mtime, depth - 1, out);
+        } else if ft.is_file() {
+            let fname = ent.file_name();
+            let Some(fname_s) = fname.to_str() else {
+                continue;
+            };
+            if !fname_s.starts_with("rollout-") || !fname_s.ends_with(".jsonl") {
+                continue;
+            }
+            let mt = ent
+                .metadata()
+                .ok()
+                .and_then(|m| rio::meta_mtime_sec(&m))
+                .unwrap_or(0.0);
+            if mt >= min_mtime {
+                out.push((mt, p));
+            }
+        }
+    }
+}
+
 fn recent_rollout_files(since_ts: f64, limit: usize, newest_first: bool) -> Vec<PathBuf> {
     let root = codex_sessions_dir();
     if !root.is_dir() {
         return Vec::new();
     }
     let min_mtime = (since_ts - 5.0).max(0.0);
-    let mut files = Vec::new();
-    collect_jsonl_files_rec(&root, Some("rollout-"), None, 8, &mut files);
     let mut candidates: Vec<(f64, PathBuf)> = Vec::new();
-    for rf in files {
-        let mt = file_mtime_sec(&rf);
-        if mt >= min_mtime {
-            candidates.push((mt, rf));
-        }
-    }
+    collect_recent_rollout_files_rec(&root, min_mtime, 8, &mut candidates);
     if newest_first {
         candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
         candidates.truncate(limit);
@@ -1597,6 +2697,7 @@ pub fn scan_verified_codex_reviews(since_ts: f64, session: &str, git_root: &str)
     };
     let mut cwd_root_cache: HashMap<String, String> = HashMap::new();
     let mut known_packets: HashMap<String, Map<String, Value>> = HashMap::new();
+    let min_pkt_mtime = (since_ts - 86_400.0).max(0.0);
 
     if let Ok(entries) = fs::read_dir(packets_dir()) {
         for ent in entries.flatten() {
@@ -1604,9 +2705,22 @@ pub fn scan_verified_codex_reviews(since_ts: f64, session: &str, git_root: &str)
             if pf.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
+            if min_pkt_mtime > 0.0 {
+                let pkt_mt = ent
+                    .metadata()
+                    .ok()
+                    .and_then(|m| rio::meta_mtime_sec(&m))
+                    .unwrap_or(0.0);
+                if pkt_mt > 0.0 && pkt_mt < min_pkt_mtime {
+                    continue;
+                }
+            }
             let Some(Value::Object(pdata)) = rio::read_json(&pf) else {
                 continue;
             };
+            if pdata.get("committed").and_then(|v| v.as_bool()) == Some(false) {
+                continue;
+            }
             let rid = val_to_str(pdata.get("review_id"));
             if rid.is_empty() {
                 continue;
@@ -1640,17 +2754,15 @@ pub fn scan_verified_codex_reviews(since_ts: f64, session: &str, git_root: &str)
         return Vec::new();
     }
 
-    let mut by_review_id: HashMap<String, Value> = HashMap::new();
-    for rf in recent_rollout_files(since_ts, 40, false) {
-        // INVARIANT: Subagent/guardian rollouts are never eligible sources of gate review verdicts.
-        if is_subagent_rollout_meta(&read_rollout_session_meta(&rf)) {
-            continue;
-        }
-        let Some(parsed) = extract_rollout_texts_and_meta(&rf) else {
-            continue;
+    const PRIMARY_ROLLOUT_SCAN_WINDOW: usize = 40;
+    let mut by_review_id: HashMap<String, (f64, Value)> = HashMap::new();
+    let scan_rollout_file = |rf: &Path, out_map: &mut HashMap<String, (f64, Value)>| {
+        // INVARIANT: Subagent/guardian rollouts are never eligible sources of gate review verdicts (`parsed.is_subagent` inspects `session_meta`).
+        let Some(parsed) = extract_rollout_texts_and_meta(rf) else {
+            return;
         };
         if parsed.is_subagent {
-            continue;
+            return;
         }
         for turn in &parsed.turns {
             let Some(bound_packet) = turn
@@ -1660,7 +2772,26 @@ pub fn scan_verified_codex_reviews(since_ts: f64, session: &str, git_root: &str)
             else {
                 continue;
             };
+            // SAFETY: Bind rollout turns to the exact packet attempt via `packet_nonce` (when recorded) and reject rollout files predating `created_ts` so an older review's verdict can never bind to a newer packet.
+            let pkt_nonce = val_to_str(bound_packet.get("packet_nonce"))
+                .trim()
+                .to_lowercase();
+            if !pkt_nonce.is_empty()
+                && !turn
+                    .packet_nonces
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(&pkt_nonce))
+            {
+                continue;
+            }
+            let pkt_cts = val_to_f64(bound_packet.get("created_ts"));
+            if pkt_cts > 0.0 && parsed.file_mtime > 0.0 && parsed.file_mtime < pkt_cts - 2.0 {
+                continue;
+            }
 
+            let pkt_phase = val_to_str(bound_packet.get("phase"))
+                .trim()
+                .to_lowercase();
             let mut verdict: Option<String> = None;
             let mut kind: Option<String> = None;
             let mut verdict_ts = if turn.completed_ts > 0.0 {
@@ -1671,6 +2802,10 @@ pub fn scan_verified_codex_reviews(since_ts: f64, session: &str, git_root: &str)
             for (msg_ts, msg) in turn.assistant_messages.iter().rev() {
                 let (dec_kind, dec_verdict) = cwg_common::extract_review_decision(msg);
                 if let (Some(dk), Some(dv)) = (dec_kind, dec_verdict) {
+                    // SAFETY: Reject rollout verdicts whose phase (`ordinary` vs `closure`) diverges from the recorded packet `phase`.
+                    if !pkt_phase.is_empty() && dk != pkt_phase {
+                        continue;
+                    }
                     kind = Some(dk);
                     verdict = Some(dv);
                     if *msg_ts > 0.0 {
@@ -1691,10 +2826,10 @@ pub fn scan_verified_codex_reviews(since_ts: f64, session: &str, git_root: &str)
                         parsed.started_ts
                     }
                 };
-                let eff = if !turn.effort.is_empty() {
-                    turn.effort.clone()
-                } else if !parsed.effort.is_empty() {
-                    parsed.effort.clone()
+                let turn_eff = turn.effort.trim();
+                let turn_mdl = turn.model.trim();
+                let eff = if !turn_eff.is_empty() {
+                    turn_eff.to_string()
                 } else {
                     let pkt_eff = val_to_str(bound_packet.get("effort"));
                     if pkt_eff.is_empty() {
@@ -1703,11 +2838,7 @@ pub fn scan_verified_codex_reviews(since_ts: f64, session: &str, git_root: &str)
                         pkt_eff
                     }
                 };
-                let mdl = if !turn.model.is_empty() {
-                    turn.model.clone()
-                } else {
-                    parsed.model.clone()
-                };
+                let raw_rank_ts = if verdict_ts > 0.0 { verdict_ts } else { turn.started_ts.max(parsed.started_ts) };
                 let eff_verdict_ts = pkt_ts.max(if verdict_ts > 0.0 { verdict_ts } else { pkt_ts });
                 let rid_key = val_to_str(bound_packet.get("review_id"));
                 let rec = json!({
@@ -1718,23 +2849,59 @@ pub fn scan_verified_codex_reviews(since_ts: f64, session: &str, git_root: &str)
                     "verdict": v,
                     "launch_ts": pkt_ts,
                     "verdict_ts": eff_verdict_ts,
-                    "xhigh": eff == "xhigh",
-                    "model": mdl,
+                    "xhigh": cwg_common::is_codex_xhigh_turn(turn_mdl, turn_eff),
+                    "model": turn_mdl,
                     "effort": eff,
                     "rollout_path": parsed.path,
                 });
-                let replace = match by_review_id.get(&rid_key) {
+                // SAFETY: Candidates are scanned newest-mtime-first; replace an existing match only when `raw_rank_ts` is strictly newer (or same rollout turn later in the same file).
+                let replace = match out_map.get(&rid_key) {
                     None => true,
-                    Some(prev) => eff_verdict_ts >= val_to_f64(prev.get("verdict_ts")),
+                    Some((prev_raw_ts, prev_rec)) => {
+                        if raw_rank_ts > 0.0 && *prev_raw_ts > 0.0 {
+                            raw_rank_ts > *prev_raw_ts
+                                || ((raw_rank_ts - *prev_raw_ts).abs() <= 1e-6
+                                    && val_to_str(prev_rec.get("rollout_path")) == parsed.path)
+                        } else {
+                            val_to_str(prev_rec.get("rollout_path")) == parsed.path
+                        }
+                    }
                 };
                 if replace {
-                    by_review_id.insert(rid_key, rec);
+                    out_map.insert(rid_key, (raw_rank_ts, rec));
+                }
+            }
+        }
+    };
+
+    // SAFETY: Sort rollout candidates newest-mtime-first so `[..first_n]` always inspects the 40 freshest rollouts before considering older displaced files.
+    const FALLBACK_ROLLOUT_SCAN_CAP: usize = 160;
+    let all_candidates = recent_rollout_files(since_ts, FALLBACK_ROLLOUT_SCAN_CAP, true);
+    let first_n = all_candidates.len().min(PRIMARY_ROLLOUT_SCAN_WINDOW);
+    for rf in &all_candidates[..first_n] {
+        scan_rollout_file(rf, &mut by_review_id);
+    }
+    if all_candidates.len() > first_n && by_review_id.len() < known_packets.len() {
+        for rf in &all_candidates[first_n..] {
+            // INVARIANT: Prefilter older/sibling rollout files by raw byte substring match against still-unresolved `review_id`s before JSONL parsing so in-flight or timed-out packets never trigger full-file JSON deserialization across unrelated Codex sessions.
+            let raw_has_missing_rid = fs::read(rf).map_or(false, |bytes| {
+                known_packets.keys().any(|rid| {
+                    !by_review_id.contains_key(rid)
+                        && bytes
+                            .windows(rid.len())
+                            .any(|w| w == rid.as_bytes())
+                })
+            });
+            if raw_has_missing_rid {
+                scan_rollout_file(rf, &mut by_review_id);
+                if by_review_id.len() >= known_packets.len() {
+                    break;
                 }
             }
         }
     }
 
-    let mut results: Vec<Value> = by_review_id.into_values().collect();
+    let mut results: Vec<Value> = by_review_id.into_values().map(|(_, rec)| rec).collect();
     results.sort_by(|a, b| {
         let la = val_to_f64(a.get("launch_ts"));
         let lb = val_to_f64(b.get("launch_ts"));
@@ -1820,6 +2987,28 @@ fn find_rollout_meta_by_sid(
     Map::new()
 }
 
+fn extract_subagent_parent_id(payload: &Map<String, Value>) -> String {
+    let direct = val_to_str(payload.get("parent_thread_id")).trim().to_string();
+    if !direct.is_empty() {
+        return direct;
+    }
+    if let Some(Value::Object(src)) = payload.get("source") {
+        if let Some(Value::Object(sub)) = src.get("subagent") {
+            let nested = val_to_str(sub.get("parent_thread_id")).trim().to_string();
+            if !nested.is_empty() {
+                return nested;
+            }
+            if let Some(Value::Object(tspawn)) = sub.get("thread_spawn") {
+                let spawn_parent = val_to_str(tspawn.get("parent_thread_id")).trim().to_string();
+                if !spawn_parent.is_empty() {
+                    return spawn_parent;
+                }
+            }
+        }
+    }
+    String::new()
+}
+
 fn unwrap_primary_session_id(sid: &str, since_ts: f64) -> String {
     // INVARIANT: Codex 0.159+ spawns guardian/subagent rollouts sharing the user prompt; always unwrap to parent thread.
     let mut cur = sid.trim().to_string();
@@ -1837,47 +3026,337 @@ fn unwrap_primary_session_id(sid: &str, since_ts: f64) -> String {
         if meta.is_empty() || !is_subagent_rollout_meta(&meta) {
             return cur;
         }
-        cur = val_to_str(meta.get("parent_thread_id")).trim().to_string();
+        cur = extract_subagent_parent_id(&meta);
     }
     String::new()
 }
 
-fn resolve_resume_session(
-    git_root: &str,
-    session: &str,
-    candidate_first_ts: f64,
-    explicit_resume: &str,
-    force_new: bool,
-) -> String {
-    if force_new {
-        return String::new();
-    }
-    let exp = explicit_resume.trim();
-    if !exp.is_empty() {
-        return unwrap_primary_session_id(exp, candidate_first_ts);
-    }
-    if let Some(saved) = active_thread_state(session, git_root, Some(candidate_first_ts)) {
-        let raw_sid = val_to_str(saved.get("session_id"));
-        if !raw_sid.is_empty() {
-            let unwrapped = unwrap_primary_session_id(&raw_sid, candidate_first_ts);
-            if !unwrapped.is_empty() {
-                return unwrapped;
+pub fn rollout_session_origin_ts(session_id: &str, rollout_path: &str, since_hint_ts: f64) -> f64 {
+    let probe_file = |p: &Path| -> f64 {
+        let Ok(f) = fs::File::open(p) else {
+            return 0.0;
+        };
+        let reader = BufReader::new(f);
+        for line_res in reader.lines().take(12) {
+            let Ok(line) = line_res else {
+                break;
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+                let ts = v
+                    .get("timestamp")
+                    .and_then(|x| x.as_str())
+                    .map(rio::parse_iso_ts)
+                    .unwrap_or(0.0);
+                if ts > 0.0 {
+                    return ts;
+                }
+            }
+        }
+        0.0
+    };
+
+    if !rollout_path.trim().is_empty() {
+        let p = Path::new(rollout_path.trim());
+        if p.is_file() {
+            let ts = probe_file(p);
+            if ts > 0.0 {
+                return ts;
             }
         }
     }
-    if !session.is_empty() && candidate_first_ts > 0.0 {
-        let prior = scan_verified_codex_reviews(candidate_first_ts, session, git_root);
-        for prev in prior.iter().rev() {
-            let raw_sid = val_to_str(prev.get("session_id")).trim().to_string();
+    let clean_sid = session_id.trim();
+    if clean_sid.is_empty() {
+        return 0.0;
+    }
+    let mut checked: HashSet<PathBuf> = HashSet::new();
+    for rf in recent_rollout_files((since_hint_ts - 86400.0).max(0.0), 80, true) {
+        checked.insert(rf.clone());
+        let meta = read_rollout_session_meta(&rf);
+        let mid = val_to_str(meta.get("id").or_else(|| meta.get("session_id")));
+        if mid.trim() == clean_sid {
+            let ts = probe_file(&rf);
+            if ts > 0.0 {
+                return ts;
+            }
+        }
+    }
+    let root = codex_sessions_dir();
+    if safe_sid_re().is_match(clean_sid) && root.is_dir() {
+        let mut sid_files = Vec::new();
+        collect_jsonl_files_rec(&root, None, Some(clean_sid), 8, &mut sid_files);
+        for rf in sid_files {
+            if checked.contains(&rf) {
+                continue;
+            }
+            let meta = read_rollout_session_meta(&rf);
+            let mid = val_to_str(meta.get("id").or_else(|| meta.get("session_id")));
+            if mid.trim() == clean_sid {
+                let ts = probe_file(&rf);
+                if ts > 0.0 {
+                    return ts;
+                }
+            }
+        }
+    }
+    0.0
+}
+
+pub fn is_post_reset_codex_session_proven(
+    session_id: &str,
+    rollout_path: &str,
+    cutoff_ts: f64,
+    since_hint_ts: f64,
+) -> bool {
+    if cutoff_ts <= 0.0 {
+        return true;
+    }
+    // SAFETY: Fail closed after `research-reset` unless the unwrapped primary Codex session has a verified rollout origin strictly at/after `cutoff_ts`.
+    let clean_raw = session_id.trim();
+    let mut seed_sid = clean_raw.to_string();
+    if !rollout_path.trim().is_empty() {
+        let rp = Path::new(rollout_path.trim());
+        if rp.is_file() {
+            let rp_meta = read_rollout_session_meta(rp);
+            if is_subagent_rollout_meta(&rp_meta) {
+                let parent_sid = extract_subagent_parent_id(&rp_meta);
+                if parent_sid.is_empty() {
+                    return false;
+                }
+                seed_sid = parent_sid;
+            }
+        }
+    }
+    if seed_sid.is_empty() {
+        return false;
+    }
+    let unwrapped = unwrap_primary_session_id(&seed_sid, 0.0);
+    if unwrapped.is_empty() {
+        return false;
+    }
+    let eff_rpath = if !clean_raw.is_empty() && unwrapped == clean_raw {
+        rollout_path
+    } else {
+        ""
+    };
+    let origin = rollout_session_origin_ts(&unwrapped, eff_rpath, since_hint_ts);
+    origin > 0.0 && origin >= cutoff_ts - 0.001
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ClosureCycleSummary {
+    pub blocked_count: usize,
+    pub last_blocked_ts: f64,
+    pub blocked_ids: Vec<String>,
+    pub effective_pass_count: usize,
+    pub last_closure_ts: f64,
+    pub has_fresh_ready: bool,
+    pub counted_ordinary_rounds: usize,
+    pub raw_ordinary_rounds: usize,
+    pub ordinary_cap_reached: bool,
+    pub has_fresh_ordinary_approved: bool,
+    pub needs_simplify: bool,
+    pub simplify_started_in_cycle: bool,
+}
+
+pub fn active_cycle_closure_summary_for_marker(
+    marker: &Value,
+    session: &str,
+    git_root: &str,
+    transcript_path: &str,
+) -> ClosureCycleSummary {
+    crate::cwg_stop::evaluate_closure_cycle_for_marker(
+        marker,
+        session,
+        git_root,
+        transcript_path,
+        "",
+    )
+}
+
+pub fn active_cycle_closure_summary_with_risk(
+    session: &str,
+    git_root: &str,
+    transcript_path: &str,
+    min_risk_override: &str,
+) -> ClosureCycleSummary {
+    if session.trim().is_empty() {
+        return ClosureCycleSummary::default();
+    }
+    let skey = rio::safe_key(session, "default");
+    let raw_marker = rio::read_json(&cwg_common::marker_path(&skey));
+    let (merged_opt, _) = cwg_common::apply_pending_marker_deltas(&skey, raw_marker.as_ref());
+    let Some(marker) = merged_opt else {
+        return ClosureCycleSummary::default();
+    };
+    let summary = crate::cwg_stop::evaluate_closure_cycle_for_marker(
+        &marker,
+        session,
+        git_root,
+        transcript_path,
+        min_risk_override,
+    );
+    if summary.blocked_count >= cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE {
+        cwg_common::latch_marker_closure_halt_for_marker(
+            session,
+            &marker,
+            summary.blocked_count,
+            summary.last_blocked_ts,
+            &summary.blocked_ids,
+        );
+    }
+    summary
+}
+
+pub fn active_cycle_closure_summary(
+    session: &str,
+    git_root: &str,
+    transcript_path: &str,
+) -> ClosureCycleSummary {
+    active_cycle_closure_summary_with_risk(session, git_root, transcript_path, "")
+}
+
+pub fn active_cycle_closure_blocks_for_marker(
+    marker: &Value,
+    session: &str,
+    git_root: &str,
+    transcript_path: &str,
+) -> (usize, f64, Vec<String>) {
+    let s = active_cycle_closure_summary_for_marker(marker, session, git_root, transcript_path);
+    (s.blocked_count, s.last_blocked_ts, s.blocked_ids)
+}
+
+pub fn active_cycle_closure_blocks(
+    session: &str,
+    git_root: &str,
+    transcript_path: &str,
+) -> (usize, f64, Vec<String>) {
+    let s = active_cycle_closure_summary(session, git_root, transcript_path);
+    (s.blocked_count, s.last_blocked_ts, s.blocked_ids)
+}
+
+#[derive(Copy, Clone)]
+struct ResumeSessionQuery<'a> {
+    git_root: &'a str,
+    session: &'a str,
+    candidate_first_ts: f64,
+    explicit_resume: &'a str,
+    force_new: bool,
+    model: &'a str,
+    effort: &'a str,
+}
+
+fn resolve_resume_session_with_saved(
+    query: ResumeSessionQuery<'_>,
+    preloaded_saved: Option<Option<&Map<String, Value>>>,
+) -> String {
+    let ResumeSessionQuery {
+        git_root,
+        session,
+        candidate_first_ts,
+        explicit_resume,
+        force_new,
+        model,
+        effort,
+    } = query;
+    if force_new {
+        return String::new();
+    }
+    let rr_ts = if !session.is_empty() {
+        cwg_common::read_marker_with_pending(session)
+            .map(|m| cwg_common::last_research_reset_ts(&m))
+            .unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    let min_since_ts = candidate_first_ts.max(rr_ts);
+    let exp = explicit_resume.trim();
+    if !exp.is_empty() {
+        let unwrapped = unwrap_primary_session_id(exp, min_since_ts);
+        if unwrapped.is_empty() {
+            return String::new();
+        }
+        if rr_ts > 0.0
+            && !is_post_reset_codex_session_proven(&unwrapped, "", rr_ts, candidate_first_ts)
+        {
+            return String::new();
+        }
+        return unwrapped;
+    }
+    let owned_saved = if preloaded_saved.is_none() {
+        active_thread_state_for_lane(session, git_root, Some(candidate_first_ts), model, effort)
+    } else {
+        None
+    };
+    let saved_ref = match preloaded_saved {
+        Some(s) => s,
+        None => owned_saved.as_ref(),
+    };
+    if let Some(saved) = saved_ref {
+        if rr_ts <= 0.0 || val_to_f64(saved.get("updated_ts")) >= rr_ts {
+            let raw_sid = val_to_str(saved.get("session_id"));
             if !raw_sid.is_empty() {
-                let sid = unwrap_primary_session_id(&raw_sid, candidate_first_ts);
-                if !sid.is_empty() {
+                let unwrapped = unwrap_primary_session_id(&raw_sid, min_since_ts);
+                if !unwrapped.is_empty()
+                    && is_post_reset_codex_session_proven(&unwrapped, "", rr_ts, candidate_first_ts)
+                {
+                    return unwrapped;
+                }
+            }
+        }
+    }
+    let target_key = review_lane_key(model, effort);
+    if !session.is_empty() && min_since_ts > 0.0 {
+        let prior = scan_verified_codex_reviews(min_since_ts, session, git_root);
+        for prev in prior.iter().rev() {
+            let prev_mdl = val_to_str(prev.get("model"));
+            let prev_eff = val_to_str(prev.get("effort"));
+            if review_lane_key(&prev_mdl, &prev_eff) != target_key {
+                continue;
+            }
+            let raw_sid = val_to_str(prev.get("session_id")).trim().to_string();
+            let rpath = val_to_str(prev.get("rollout_path"));
+            if !is_post_reset_codex_session_proven(&raw_sid, &rpath, rr_ts, candidate_first_ts) {
+                continue;
+            }
+            if !raw_sid.is_empty() {
+                let sid = unwrap_primary_session_id(&raw_sid, min_since_ts);
+                if !sid.is_empty()
+                    && is_post_reset_codex_session_proven(&sid, "", rr_ts, candidate_first_ts)
+                {
                     return sid;
                 }
             }
         }
     }
     String::new()
+}
+
+#[cfg(test)]
+fn resolve_resume_session(
+    git_root: &str,
+    session: &str,
+    candidate_first_ts: f64,
+    explicit_resume: &str,
+    force_new: bool,
+    model: &str,
+    effort: &str,
+) -> String {
+    resolve_resume_session_with_saved(
+        ResumeSessionQuery {
+            git_root,
+            session,
+            candidate_first_ts,
+            explicit_resume,
+            force_new,
+            model,
+            effort,
+        },
+        None,
+    )
 }
 
 fn find_session_id_for_review(review_id: &str, since_ts: f64) -> String {
@@ -2121,6 +3600,7 @@ fn build_codex_exec_args(
 
 fn build_adversarial_prompt(
     review_id: &str,
+    packet_nonce: &str,
     scope_summary: &str,
     diff_text: &str,
     phase: &str,
@@ -2162,6 +3642,7 @@ check remediation delta for regressions, and do not invent nitpicks on unchanged
 
     format!(
         "REVIEW_ID: {}\n\
+PACKET_NONCE: {}\n\
 ROLE: Independent Adversarial Code Reviewer (Read-Only).\n\
 {}\
 RULES:\n\
@@ -2171,7 +3652,7 @@ RULES:\n\
 4. {}\n\n\
 CANDIDATE SUMMARY:\n{}\n\n\
 GIT DIFF SNAPSHOT:\n{}\n",
-        review_id, round_mode, verdict_rule, scope_summary, diff_snapshot
+        review_id, packet_nonce, round_mode, verdict_rule, scope_summary, diff_snapshot
     )
 }
 
@@ -2194,15 +3675,99 @@ fn is_permission_spawn_err(err: &str) -> bool {
         || low.contains("os error 13")
 }
 
-fn exec_codex_once(
-    binary: &str,
-    args: &[String],
-    prompt: &str,
-    cwd: &str,
-    timeout: f64,
+fn build_thinking_timeout_payload(
     review_id: &str,
+    timeout_sec: i64,
+    recommended_timeout: i64,
+    retry_cmd: &str,
+    timeout_sid: &str,
+    state_persisted: bool,
+) -> Value {
+    let mut payload_to = Map::new();
+    payload_to.insert("ok".to_string(), Value::Bool(false));
+    payload_to.insert("review_id".to_string(), Value::String(review_id.to_string()));
+    payload_to.insert("timed_out".to_string(), Value::Bool(true));
+    payload_to.insert("state_persisted".to_string(), Value::Bool(state_persisted));
+    payload_to.insert(
+        "session_continuation_saved".to_string(),
+        Value::Bool(state_persisted && !timeout_sid.is_empty()),
+    );
+    payload_to.insert("retry_in_same_lane".to_string(), Value::Bool(true));
+    payload_to.insert("round_consumed".to_string(), Value::Bool(false));
+    payload_to.insert("recommended_timeout".to_string(), json!(recommended_timeout));
+    payload_to.insert(
+        "error".to_string(),
+        Value::String(format!("timeout_after_{}s", timeout_sec)),
+    );
+    let effective_retry_cmd = if !state_persisted && !timeout_sid.is_empty() {
+        let mut s = retry_cmd.to_string();
+        push_cli_flag_val(&mut s, "--resume", timeout_sid);
+        s
+    } else {
+        retry_cmd.to_string()
+    };
+    payload_to.insert(
+        "retry_command".to_string(),
+        Value::String(effective_retry_cmd.clone()),
+    );
+    if !state_persisted {
+        payload_to.insert(
+            "persistence_error".to_string(),
+            Value::String("thread_state_not_saved".to_string()),
+        );
+    }
+    let hint = if state_persisted {
+        if !timeout_sid.is_empty() {
+            format!(
+                "Codex did not finish within {}s (thinking timeout, NOT an outage; review round NOT consumed). Re-run {} without --timeout to continue the same Codex session with {}s timeout; escalating to internal review on a thinking timeout is forbidden.",
+                timeout_sec, effective_retry_cmd, recommended_timeout
+            )
+        } else {
+            format!(
+                "Codex did not finish within {}s (thinking timeout, NOT an outage; review round NOT consumed). Re-run {} without --timeout to retry in the same Codex lane with {}s escalated timeout; escalating to internal review on a thinking timeout is forbidden.",
+                timeout_sec, effective_retry_cmd, recommended_timeout
+            )
+        }
+    } else if !timeout_sid.is_empty() {
+        format!(
+            "Codex did not finish within {}s (thinking timeout, NOT an outage; review round NOT consumed), and timeout continuation state could NOT be saved (`state_persisted=false`). Re-run {} without --timeout (uses {}s timeout because escalated state was not persisted); escalating to internal review on a thinking timeout is forbidden.",
+            timeout_sec, effective_retry_cmd, recommended_timeout
+        )
+    } else {
+        format!(
+            "Codex did not finish within {}s (thinking timeout, NOT an outage; review round NOT consumed), and timeout continuation state could NOT be saved (`state_persisted=false`). Re-run {} without --timeout (opens a new session in the same Codex lane with {}s timeout); escalating to internal review on a thinking timeout is forbidden.",
+            timeout_sec, effective_retry_cmd, recommended_timeout
+        )
+    };
+    payload_to.insert("hint".to_string(), Value::String(hint));
+    if !timeout_sid.is_empty() {
+        payload_to.insert("session_id".to_string(), Value::String(timeout_sid.to_string()));
+    }
+    Value::Object(payload_to)
+}
+
+struct CodexExecSpec<'a> {
+    binary: &'a str,
+    args: &'a [String],
+    prompt: &'a str,
+    cwd: &'a str,
+    timeout: f64,
+    review_id: &'a str,
+    expected_phase: &'a str,
     xhigh: bool,
-) -> Option<CodexExecResult> {
+}
+
+fn exec_codex_once(spec: CodexExecSpec<'_>) -> Option<CodexExecResult> {
+    let CodexExecSpec {
+        binary,
+        args,
+        prompt,
+        cwd,
+        timeout,
+        review_id,
+        expected_phase,
+        xhigh,
+    } = spec;
     let t_start = now_sec();
     let timeout_ms = ((timeout.max(0.1)) * 1000.0).round() as u64;
     let res = match run_command_with_job(
@@ -2270,7 +3835,7 @@ fn exec_codex_once(
                     "review_id": review_id,
                     "sandbox_blocked": true,
                     "round_consumed": false,
-                    "error": format!("sandbox_restricted ({}); re-run codex_lane.py review with BypassSandbox=true", sb),
+                    "error": format!("sandbox_restricted ({}); re-run `carbon-stack codex-lane review` with BypassSandbox=true", sb),
                 }),
                 false,
             );
@@ -2328,28 +3893,25 @@ fn exec_codex_once(
             timeout_sid = find_session_id_for_review(review_id, t_start - 1.0);
         }
         set_last_timeout_outage(review_id, "thinking", &timeout_sid);
-        let mut payload_to = Map::new();
-        payload_to.insert("ok".to_string(), Value::Bool(false));
-        payload_to.insert("review_id".to_string(), Value::String(review_id.to_string()));
-        payload_to.insert("timed_out".to_string(), Value::Bool(true));
-        payload_to.insert("retry_in_same_lane".to_string(), Value::Bool(true));
-        payload_to.insert("round_consumed".to_string(), Value::Bool(false));
-        payload_to.insert("recommended_timeout".to_string(), json!(recommended_timeout));
-        payload_to.insert(
-            "error".to_string(),
-            Value::String(format!("timeout_after_{}s", timeout as i64)),
-        );
-        payload_to.insert(
-            "hint".to_string(),
-            Value::String(format!(
-                "Codex did not finish within {}s (thinking timeout, NOT an outage; review round NOT consumed). Re-run codex_lane.py review without --timeout to continue the same Codex session with {}s timeout; escalating to internal review on a thinking timeout is forbidden.",
-                timeout as i64, recommended_timeout
-            )),
-        );
-        if !timeout_sid.is_empty() {
-            payload_to.insert("session_id".to_string(), Value::String(timeout_sid));
+        if take_defer_timeout_print(review_id) {
+            return None;
         }
-        rio::print_cli_json(&Value::Object(payload_to), false);
+        let mut arg_model = String::new();
+        for (idx, a) in args.iter().enumerate() {
+            if a == "-m" && idx + 1 < args.len() {
+                arg_model = args[idx + 1].clone();
+                break;
+            }
+        }
+        let payload_to = build_thinking_timeout_payload(
+            review_id,
+            timeout as i64,
+            recommended_timeout,
+            &format_review_retry_cmd(&arg_model, xhigh),
+            &timeout_sid,
+            true,
+        );
+        rio::print_cli_json(&payload_to, false);
         return None;
     }
 
@@ -2362,7 +3924,10 @@ fn exec_codex_once(
     } else {
         raw_stdout_text.clone()
     };
-    let has_structured_verdict = cwg_common::extract_review_decision(&stdout_text) != (None, None);
+    let has_structured_verdict = matches!(
+        cwg_common::extract_review_decision(&stdout_text),
+        (Some(ref dk), Some(_)) if expected_phase.is_empty() || dk == expected_phase
+    );
     if res.code == 0 && has_structured_verdict {
         return Some(CodexExecResult {
             rc: 0,
@@ -2422,16 +3987,400 @@ fn exec_codex_once(
     })
 }
 
+fn purge_session_lane_threads_unlocked(session: &str, git_root: &str) {
+    let root_dig = session_root_digest(session, git_root);
+    let default_name = format!("{}.json", root_dig);
+    let lane_prefix = format!("{}-", root_dig);
+    if let Ok(entries) = fs::read_dir(threads_dir()) {
+        for ent in entries.flatten() {
+            let fname_os = ent.file_name();
+            let Some(fname) = fname_os.to_str() else {
+                continue;
+            };
+            if fname == default_name || (fname.starts_with(&lane_prefix) && fname.ends_with(".json")) {
+                unlink_quiet(&ent.path());
+            }
+        }
+    }
+}
+
+struct ResearchResetArgs {
+    cwd: String,
+    session: String,
+    decision: String,
+    findings: String,
+    transcript: String,
+    pretty: bool,
+}
+
+fn cmd_research_reset(args: &ResearchResetArgs) -> i32 {
+    let dec = args.decision.trim().to_ascii_lowercase();
+    if !cwg_common::RESEARCH_RESET_DECISIONS.contains(&dec.as_str()) {
+        rio::print_cli_json(
+            &json!({
+                "ok": false,
+                "error": "invalid_decision",
+                "hint": "Specify --decision refactor (redesign/refactor from scratch) or --decision refine (targeted refinement grounded in researched docs).",
+            }),
+            args.pretty,
+        );
+        return 2;
+    }
+    let clean_findings = args.findings.trim();
+    if clean_findings.chars().count() < 15 {
+        rio::print_cli_json(
+            &json!({
+                "ok": false,
+                "error": "insufficient_findings",
+                "hint": "Provide a concrete --findings summary (>= 15 chars) of the researched documentation/best practices and architectural decision.",
+            }),
+            args.pretty,
+        );
+        return 2;
+    }
+    let cwd_raw = if args.cwd.trim().is_empty() {
+        env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        args.cwd.clone()
+    };
+    let cwd = abs_path_from_str(&cwd_raw).to_string_lossy().into_owned();
+    let git_root = rio::git_toplevel(&cwd, false).unwrap_or_else(|| cwd.clone());
+    let eff_session = if args.session.trim().is_empty() {
+        infer_single_open_session(&cwd)
+    } else {
+        args.session.trim().to_string()
+    };
+    if eff_session.is_empty() {
+        rio::print_cli_json(
+            &json!({
+                "ok": false,
+                "error": "missing_session",
+                "hint": "Pass --session <conversation-id> explicitly.",
+            }),
+            args.pretty,
+        );
+        return 2;
+    }
+    let _flight_lock = match try_acquire_review_flight_lock(&eff_session, &git_root) {
+        FlightLockResult::Acquired(fh) => fh,
+        FlightLockResult::Busy => {
+            rio::print_cli_json(
+                &json!({
+                    "ok": false,
+                    "review_in_progress": true,
+                    "error": "concurrent_review_in_flight",
+                    "hint": "Wait for the running `carbon-stack codex-lane review` to finish before running `research-reset`.",
+                }),
+                args.pretty,
+            );
+            return 2;
+        }
+        FlightLockResult::Io(detail) => {
+            rio::print_cli_json(
+                &json!({
+                    "ok": false,
+                    "sandbox_blocked": true,
+                    "detail": detail,
+                    "error": "CARBON_STACK_HOME is not writable in sandbox; re-run `carbon-stack codex-lane research-reset` with BypassSandbox=true",
+                }),
+                args.pretty,
+            );
+            return 2;
+        }
+    };
+    let skey = rio::safe_key(&eff_session, "default");
+    let mpath = cwg_common::marker_path(&skey);
+    let raw_marker = rio::read_json(&mpath);
+    let (merged_m_opt, _) = cwg_common::apply_pending_marker_deltas(&skey, raw_marker.as_ref());
+    let Some(marker) = merged_m_opt else {
+        rio::print_cli_json(
+            &json!({
+                "ok": false,
+                "error": "no_open_candidate",
+                "session": eff_session,
+            }),
+            args.pretty,
+        );
+        return 2;
+    };
+    if !marker.is_object() || json_truthy(marker.get("closed")) {
+        rio::print_cli_json(
+            &json!({
+                "ok": false,
+                "error": "no_open_candidate",
+                "session": eff_session,
+            }),
+            args.pretty,
+        );
+        return 2;
+    }
+    let pre_lock_rr_ts = cwg_common::last_research_reset_ts(&marker);
+    let pre_lock_rr_seq = cwg_common::last_research_reset_board_seq(&marker);
+
+    let tp_buf = if !args.transcript.trim().is_empty() {
+        PathBuf::from(args.transcript.trim())
+    } else {
+        rio::member_transcript_path(&rio::resolve_brain_root(""), &eff_session)
+    };
+    let tp_str = tp_buf.to_string_lossy().into_owned();
+    let cls_summary = active_cycle_closure_summary(&eff_session, &git_root, &tp_str);
+    let blocked_n = cls_summary.blocked_count;
+    let blocked_ids = cls_summary.blocked_ids;
+    let cycle_exhausted_unready = cls_summary.effective_pass_count
+        >= cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE
+        && !cls_summary.has_fresh_ready;
+    let halt_floor_ts = if blocked_n >= cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE {
+        cls_summary.last_blocked_ts
+    } else {
+        cls_summary.last_closure_ts.max(cls_summary.last_blocked_ts)
+    };
+    if blocked_n < cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE && !cycle_exhausted_unready {
+        rio::print_cli_json(
+            &json!({
+                "ok": false,
+                "error": "closure_blocks_below_threshold",
+                "blocked_closure_passes": blocked_n,
+                "effective_closure_passes": cls_summary.effective_pass_count,
+                "required": cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE,
+                "hint": "research-reset is reserved for cycles halted after 2 closure passes without a valid CLOSURE_VALIDATION: READY.",
+            }),
+            args.pretty,
+        );
+        return 2;
+    }
+
+    let steps = rio::read_transcript_steps(&tp_str, 4000);
+    let research_tools =
+        cwg_common::find_research_evidence_since(&steps, halt_floor_ts, None);
+    if research_tools.is_empty() {
+        rio::print_cli_json(
+            &json!({
+                "ok": false,
+                "error": "missing_post_block_research",
+                "last_blocked_ts": halt_floor_ts,
+                "hint": "Execute external documentation/web research AFTER the closure halt (search_web, tokenade search/web, Context7, Gemini/Developer Knowledge MCP docs, or the research subagent) before running research-reset.",
+            }),
+            args.pretty,
+        );
+        return 2;
+    }
+
+    let brain_root = rio::swarm_brain_and_cid(&tp_str, &eff_session)
+        .0
+        .unwrap_or_else(|| rio::resolve_brain_root(""));
+    let alive_workers = cwg_common::active_simplify_or_review_workers(&brain_root, &eff_session);
+    if !alive_workers.is_empty() {
+        rio::print_cli_json(
+            &json!({
+                "ok": false,
+                "error": "active_swarm_workers_present",
+                "workers": alive_workers,
+                "hint": "Kill all waiting/active simplify and review swarm workers via swarm(action='kill', ...) before research-reset so the new cycle starts in fresh worker sessions.",
+            }),
+            args.pretty,
+        );
+        return 2;
+    }
+
+    let pre_members = rio::load_swarm_members(&brain_root, &eff_session);
+    let mut pre_cids: Vec<String> = pre_members
+        .values()
+        .filter_map(|m| m.get("conversation_id").or_else(|| m.get("conversationId")))
+        .map(|v| val_to_str(Some(v)).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    pre_cids.sort();
+    pre_cids.dedup();
+    let board_head_live = cwg_common::swarm_board_head_seq(&eff_session, &git_root, &tp_str, None);
+    let now = now_sec().max(halt_floor_ts + 0.002);
+
+    // SAFETY: Lock `marker_lock_path` (backed by OS kernel `File::try_lock`), fold pending `PostToolUse` deltas, re-scan rollouts ONLY if `marker` changed since pre-check, verify unchanged `mpath` snapshot before writing, and persist `research_resets` BEFORE purging lane threads.
+    let commit_res: Result<(i64, Value), &'static str> =
+        rio::with_file_lock(&cwg_common::marker_lock_path(&skey), 5.0, 30.0, |m_locked| {
+            if !m_locked {
+                return Err("marker_lock_failed");
+            }
+            let raw_fresh = rio::read_json(&mpath);
+            let (fresh_opt, consumed_ids) =
+                cwg_common::apply_pending_marker_deltas(&skey, raw_fresh.as_ref());
+            let Some(mut fresh_marker) = fresh_opt else {
+                return Err("no_open_candidate");
+            };
+            if !fresh_marker.is_object() || json_truthy(fresh_marker.get("closed")) {
+                return Err("no_open_candidate");
+            }
+            if cwg_common::last_research_reset_ts(&fresh_marker) != pre_lock_rr_ts
+                || cwg_common::last_research_reset_board_seq(&fresh_marker) != pre_lock_rr_seq
+            {
+                return Err("closure_blocks_below_threshold");
+            }
+            let (live_halt_ts, live_blocked_ids, eff_res_tools) = if fresh_marker == marker {
+                (halt_floor_ts, blocked_ids.clone(), research_tools.clone())
+            } else {
+                let live_sum = active_cycle_closure_summary_for_marker(
+                    &fresh_marker,
+                    &eff_session,
+                    &git_root,
+                    &tp_str,
+                );
+                let live_exhausted_unready = live_sum.effective_pass_count
+                    >= cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE
+                    && !live_sum.has_fresh_ready;
+                if live_sum.blocked_count < cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE
+                    && !live_exhausted_unready
+                {
+                    return Err("closure_blocks_below_threshold");
+                }
+                let h_ts = if live_sum.blocked_count >= cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE {
+                    live_sum.last_blocked_ts
+                } else {
+                    live_sum.last_closure_ts.max(live_sum.last_blocked_ts)
+                };
+                let mut r_tools = research_tools.clone();
+                if h_ts > halt_floor_ts {
+                    let fresh_steps = rio::read_transcript_steps(&tp_str, 4000);
+                    r_tools = cwg_common::find_research_evidence_since(&fresh_steps, h_ts, None);
+                    if r_tools.is_empty() {
+                        return Err("missing_post_block_research");
+                    }
+                }
+                (h_ts, live_sum.blocked_ids, r_tools)
+            };
+            if !cwg_common::active_simplify_or_review_workers(&brain_root, &eff_session).is_empty()
+            {
+                return Err("active_swarm_workers_present");
+            }
+            let eff_now = now.max(live_halt_ts + 0.002);
+            let board_head_seq = fresh_marker
+                .get("round_start_msg_id")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                .max(board_head_live);
+            let reset_entry = json!({
+                "reset_ts": eff_now,
+                "last_blocked_ts": live_halt_ts,
+                "blocked_review_ids": live_blocked_ids,
+                "decision": dec,
+                "findings": clean_findings,
+                "research_tools": eff_res_tools,
+                "board_head_seq": board_head_seq,
+                "pre_reset_worker_cids": pre_cids,
+            });
+            if let Some(mobj) = fresh_marker.as_object_mut() {
+                let arr_val = mobj
+                    .entry("research_resets".to_string())
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                if !arr_val.is_array() {
+                    *arr_val = Value::Array(Vec::new());
+                }
+                if let Some(arr) = arr_val.as_array_mut() {
+                    arr.push(reset_entry.clone());
+                }
+                mobj.insert("round_start_msg_id".to_string(), json!(board_head_seq));
+                mobj.remove("closure_halt");
+                mobj.remove("cycle_declared_risk");
+            }
+            rio::with_file_lock(&thread_lock_path(&eff_session, &git_root), 5.0, 30.0, |t_locked| {
+                if !t_locked {
+                    return Err("thread_purge_lock_failed");
+                }
+                if rio::read_json(&mpath) != raw_fresh {
+                    return Err("concurrent_marker_mutation");
+                }
+                if rio::write_json(&mpath, &fresh_marker).is_err() {
+                    return Err("marker_write_failed");
+                }
+                if !consumed_ids.is_empty() {
+                    cwg_common::ack_pending_marker_deltas(&skey, &consumed_ids);
+                }
+                purge_session_lane_threads_unlocked(&eff_session, &git_root);
+                unlink_quiet(&cwg_common::swarm_rounds_path(&skey));
+                Ok((board_head_seq, reset_entry))
+            })
+        });
+
+    let (board_head_seq, reset_entry) = match commit_res {
+        Ok(pair) => pair,
+        Err(err_code) => {
+            rio::print_cli_json(
+                &json!({
+                    "ok": false,
+                    "error": err_code,
+                    "session": eff_session,
+                }),
+                args.pretty,
+            );
+            return 2;
+        }
+    };
+
+    rio::log_hook_event("gate-events", "research_cycle_reset", reset_entry.clone());
+    rio::print_cli_json(
+        &json!({
+            "ok": true,
+            "session": eff_session,
+            "decision": dec,
+            "research_tools": reset_entry.get("research_tools").cloned().unwrap_or_else(|| json!(research_tools)),
+            "blocked_review_ids": reset_entry.get("blocked_review_ids").cloned().unwrap_or_else(|| json!(blocked_ids)),
+            "reset_ts": reset_entry.get("reset_ts").cloned().unwrap_or_else(|| json!(now)),
+            "board_head_seq": board_head_seq,
+            "round_counters_reset": true,
+            "fresh_sessions_enforced": true,
+        }),
+        args.pretty,
+    );
+    0
+}
+
 struct PacketCleanupGuard {
     review_id: String,
+    owner_nonce: String,
     committed: bool,
 }
 
 impl Drop for PacketCleanupGuard {
     fn drop(&mut self) {
         if !self.committed {
-            unlink_packet(&self.review_id);
+            unlink_packet_if_owned(&self.review_id, &self.owner_nonce);
         }
+    }
+}
+
+enum FlightLockResult {
+    Acquired(fs::File),
+    Busy,
+    Io(String),
+}
+
+fn try_acquire_review_flight_lock(session: &str, git_root: &str) -> FlightLockResult {
+    // SAFETY: Serialize in-flight `codex-lane review` runs per `(session, git_root)` via kernel `LockFileEx`/`flock` (`File::try_lock`) so parallel launches cannot bypass pre-launch `--closure` pass limits and crashes release the lock automatically.
+    let tdir = threads_dir();
+    if let Err(e) = fs::create_dir_all(&tdir) {
+        return FlightLockResult::Io(e.to_string());
+    }
+    let key_sess = if session.trim().is_empty() {
+        "default"
+    } else {
+        session.trim()
+    };
+    let lock_path = tdir.join(format!("{}.flight.lock", session_root_digest(key_sess, git_root)));
+    let fh = match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(e) => return FlightLockResult::Io(e.to_string()),
+    };
+    match fh.try_lock() {
+        Ok(()) => FlightLockResult::Acquired(fh),
+        Err(std::fs::TryLockError::WouldBlock) => FlightLockResult::Busy,
+        Err(std::fs::TryLockError::Error(e)) => FlightLockResult::Io(e.to_string()),
     }
 }
 
@@ -2452,23 +4401,30 @@ struct ReviewArgs {
 }
 
 fn cmd_review(args: &ReviewArgs) -> i32 {
-    if !args.review_id.is_empty() && packet_path(&args.review_id).exists() {
-        rio::print_cli_json(
-            &json!({
-                "ok": false,
-                "error": format!("duplicate_review_id:{}", args.review_id),
-            }),
-            args.pretty,
-        );
-        return 2;
+    if !args.review_id.is_empty() {
+        if !aborted_rid_re().is_match(&args.review_id) {
+            rio::print_cli_json(
+                &json!({
+                    "ok": false,
+                    "error": "invalid_review_id",
+                    "review_id": args.review_id,
+                    "hint": "Custom --review-id must match ^[A-Za-z0-9_-]{6,64}$; omit --review-id so carbon-stack generates one automatically.",
+                }),
+                args.pretty,
+            );
+            return 2;
+        }
+        if has_recorded_packet(&args.review_id) {
+            rio::print_cli_json(
+                &json!({
+                    "ok": false,
+                    "error": format!("duplicate_review_id:{}", args.review_id),
+                }),
+                args.pretty,
+            );
+            return 2;
+        }
     }
-
-    let health = check_health();
-    if !json_truthy(health.get("available")) {
-        rio::print_cli_json(&health, args.pretty);
-        return 2;
-    }
-    let binary = val_to_str(health.get("binary"));
 
     let cwd_raw = if args.cwd.trim().is_empty() {
         env::current_dir()
@@ -2481,6 +4437,7 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
     let cwd = abs_path_from_str(&cwd_raw).to_string_lossy().into_owned();
     let git_root = rio::git_toplevel(&cwd, false).unwrap_or_else(|| cwd.clone());
     let effort = if args.xhigh { "xhigh" } else { "high" };
+    let eff_model = resolve_review_model(&args.model, args.xhigh);
     let phase = if args.closure || args.phase == "closure" {
         "closure"
     } else {
@@ -2496,14 +4453,332 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
     } else {
         args.session.clone()
     };
+    let _flight_lock = match try_acquire_review_flight_lock(&eff_session, &git_root) {
+        FlightLockResult::Acquired(fh) => fh,
+        FlightLockResult::Busy => {
+            rio::print_cli_json(
+                &json!({
+                    "ok": false,
+                    "review_in_progress": true,
+                    "round_consumed": false,
+                    "error": "concurrent_review_in_flight",
+                    "hint": "Another `carbon-stack codex-lane review` is already running for this session and repository; wait for it to finish instead of running parallel reviews.",
+                }),
+                args.pretty,
+            );
+            return 2;
+        }
+        FlightLockResult::Io(detail) => {
+            rio::print_cli_json(
+                &json!({
+                    "ok": false,
+                    "sandbox_blocked": true,
+                    "detail": detail,
+                    "error": "CARBON_STACK_HOME is not writable in sandbox; re-run `carbon-stack codex-lane review` with BypassSandbox=true",
+                }),
+                args.pretty,
+            );
+            return 2;
+        }
+    };
+    if !eff_session.is_empty() {
+        let skey_fold = rio::safe_key(&eff_session, "default");
+        let mfile_fold = cwg_common::marker_path(&skey_fold);
+        if mfile_fold.is_file() || cwg_common::has_pending_marker_deltas(&skey_fold) {
+            // SAFETY: Fold pending journaled edits AND persist external editor `catch_up_unmeasured_changes` BEFORE pre-launch cycle summary and `launch_ts`, failing closed (`rc == 2`) if marker lock or write fails so a later `Stop` never stamps an edit after `launch_ts`.
+            let sync_res: Result<(), &'static str> =
+                rio::with_file_lock(&cwg_common::marker_lock_path(&skey_fold), 5.0, 30.0, |locked| {
+                    if !locked {
+                        return Err("marker_lock_failed");
+                    }
+                    let raw_m = rio::read_json(&mfile_fold);
+                    let (merged_opt, cids) =
+                        cwg_common::apply_pending_marker_deltas(&skey_fold, raw_m.as_ref());
+                    if let Some(merged) = merged_opt {
+                        if merged.is_object() && !json_truthy(merged.get("closed")) {
+                            let caught = crate::cwg_stop::catch_up_unmeasured_changes(&merged);
+                            if !cids.is_empty() || Some(&caught) != raw_m.as_ref() {
+                                if rio::write_json(&mfile_fold, &caught).is_err() {
+                                    return Err("marker_sync_write_failed");
+                                }
+                                if !cids.is_empty() {
+                                    cwg_common::ack_pending_marker_deltas(&skey_fold, &cids);
+                                }
+                            }
+                        }
+                    }
+                    Ok(())
+                });
+            if let Err(sync_err) = sync_res {
+                rio::print_cli_json(
+                    &json!({
+                        "ok": false,
+                        "round_consumed": false,
+                        "error": sync_err,
+                        "hint": "Failed to synchronize candidate marker fingerprint before review; retry `carbon-stack codex-lane review` once marker lock/storage is available.",
+                    }),
+                    args.pretty,
+                );
+                return 2;
+            }
+        }
+    }
+    let req_risk_override = if args.xhigh { "XHIGH" } else { "" };
+    // SAFETY: Latch `XHIGH` BEFORE `check_health()` so breaker-open / missing-binary / auth-failure fallbacks preserve escalated cycle risk in `Stop`.
+    if args.xhigh
+        && !eff_session.is_empty()
+        && candidate_first_ts(&eff_session) > 0.0
+        && !cwg_common::latch_marker_declared_risk(&eff_session, None, None, "XHIGH")
+    {
+        rio::print_cli_json(
+            &json!({
+                "ok": false,
+                "round_consumed": false,
+                "error": "marker_risk_latch_failed",
+                "hint": "Failed to persist cycle XHIGH risk under marker lock; retry `carbon-stack codex-lane review --xhigh`.",
+            }),
+            args.pretty,
+        );
+        return 2;
+    }
+
+    let health = check_health();
+    if !json_truthy(health.get("available")) {
+        rio::print_cli_json(&health, args.pretty);
+        return 2;
+    }
+    let binary = val_to_str(health.get("binary"));
+
+    let cls_summary =
+        active_cycle_closure_summary_with_risk(&eff_session, &git_root, "", req_risk_override);
+    let blocked_cls_n = cls_summary.blocked_count;
+    let last_cls_blk_ts = cls_summary.last_blocked_ts;
+    let blocked_cls_ids = cls_summary.blocked_ids;
+    if blocked_cls_n >= cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE {
+        // INVARIANT: Halt review continuation after 2 `CLOSURE_VALIDATION: BLOCKED` passes until Research Mode + `research-reset` runs.
+        rio::print_cli_json(
+            &json!({
+                "ok": false,
+                "research_mode_required": true,
+                "blocked_closure_passes": blocked_cls_n,
+                "blocked_review_ids": blocked_cls_ids,
+                "error": "max_closure_blocks_reached",
+                "hint": format!(
+                    "After {} CLOSURE_VALIDATION: BLOCKED passes, continuing the current cycle is forbidden. Enter Research Mode: study relevant documentation and best practices via plugins/web (search_web, tokenade search/web, Context7, Developer Knowledge / Gemini Docs), choose `refactor` or `refine`, kill any waiting simplify/review swarm workers, and run `carbon-stack codex-lane research-reset --cwd {} --session {} --decision <refactor|refine> --findings '...'` to reset round counters and start fresh simplify & review sessions.",
+                    blocked_cls_n,
+                    quote_cli_arg(&cwd),
+                    quote_cli_arg(&eff_session),
+                ),
+            }),
+            args.pretty,
+        );
+        return 2;
+    }
+    if cls_summary.effective_pass_count >= cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE
+        && (phase == "closure" || !cls_summary.has_fresh_ready)
+    {
+        rio::print_cli_json(
+            &json!({
+                "ok": false,
+                "research_mode_required": !cls_summary.has_fresh_ready,
+                "already_closure_ready": cls_summary.has_fresh_ready,
+                "round_consumed": false,
+                "effective_closure_passes": cls_summary.effective_pass_count,
+                "error": "max_closure_passes_reached",
+                "hint": if cls_summary.has_fresh_ready {
+                    "Current candidate already completed 2/2 closure passes ending in CLOSURE_VALIDATION: READY; close the gate instead of launching a 3rd --closure pass.".to_string()
+                } else {
+                    format!(
+                        "Current cycle already consumed MAX_CLOSURE_PASSES={} closure passes; enter Research Mode and run `carbon-stack codex-lane research-reset --cwd {} --session {} --decision <refactor|refine> --findings '...'` to start a fresh cycle.",
+                        cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE,
+                        quote_cli_arg(&cwd),
+                        quote_cli_arg(&eff_session),
+                    )
+                },
+            }),
+            args.pretty,
+        );
+        return 2;
+    }
+    if phase == "ordinary" {
+        if cls_summary.ordinary_cap_reached {
+            rio::print_cli_json(
+                &json!({
+                    "ok": false,
+                    "round_consumed": false,
+                    "counted_ordinary_rounds": cls_summary.counted_ordinary_rounds,
+                    "raw_ordinary_rounds": cls_summary.raw_ordinary_rounds,
+                    "error": "max_ordinary_rounds_reached",
+                    "hint": if cls_summary.needs_simplify {
+                        format!(
+                            "All {}/{} ordinary review rounds in this cycle have been used: run `simplify` on the current diff, kill waiting simplify workers, and then run `carbon-stack codex-lane review --closure` instead of launching another ordinary round.",
+                            crate::cwg_stop::MAX_REVIEW_ROUNDS,
+                            crate::cwg_stop::MAX_REVIEW_ROUNDS,
+                        )
+                    } else {
+                        format!(
+                            "All {}/{} ordinary review rounds in this cycle have been used: run `carbon-stack codex-lane review --closure` instead of launching another ordinary round.",
+                            crate::cwg_stop::MAX_REVIEW_ROUNDS,
+                            crate::cwg_stop::MAX_REVIEW_ROUNDS,
+                        )
+                    },
+                }),
+                args.pretty,
+            );
+            return 2;
+        }
+        if cls_summary.has_fresh_ordinary_approved {
+            rio::print_cli_json(
+                &json!({
+                    "ok": false,
+                    "round_consumed": false,
+                    "already_approved": true,
+                    "error": "already_ordinary_approved",
+                    "hint": if cls_summary.needs_simplify {
+                        "Current candidate already has a fresh valid `VERDICT: APPROVED`: run `simplify`, kill waiting simplify workers, and run `carbon-stack codex-lane review --closure` instead of another ordinary round."
+                    } else {
+                        "Current candidate already has a fresh valid `VERDICT: APPROVED`: close the gate instead of launching another ordinary round."
+                    },
+                }),
+                args.pretty,
+            );
+            return 2;
+        }
+        if blocked_cls_n >= 1 {
+            rio::print_cli_json(
+                &json!({
+                    "ok": false,
+                    "round_consumed": false,
+                    "blocked_closure_passes": blocked_cls_n,
+                    "error": "closure_phase_active",
+                    "hint": "Cycle is already in `--closure` escalation after Pass 1/2 BLOCKED: run tests, run `simplify`, kill simplify workers, and run `carbon-stack codex-lane review --closure` (Pass 2/2) instead of an ordinary review.",
+                }),
+                args.pretty,
+            );
+            return 2;
+        }
+        if cls_summary.simplify_started_in_cycle && cls_summary.raw_ordinary_rounds > 0 {
+            rio::print_cli_json(
+                &json!({
+                    "ok": false,
+                    "round_consumed": false,
+                    "error": "simplify_phase_already_started",
+                    "hint": "Cycle has already entered `simplify`: complete `simplify` on the current diff, kill waiting simplify workers, and run `carbon-stack codex-lane review --closure` instead of launching another ordinary review.",
+                }),
+                args.pretty,
+            );
+            return 2;
+        }
+    }
+    if phase == "closure" && !eff_session.is_empty() {
+        let brain_root = rio::resolve_brain_root("");
+        let alive_workers = cwg_common::active_simplify_or_review_workers(&brain_root, &eff_session);
+        if !alive_workers.is_empty() {
+            rio::print_cli_json(
+                &json!({
+                    "ok": false,
+                    "round_consumed": false,
+                    "error": "active_swarm_workers_present",
+                    "workers": alive_workers,
+                    "hint": "Kill all waiting/active simplify and review swarm workers via swarm(action='kill', ...) BEFORE launching `carbon-stack codex-lane review --closure`.",
+                }),
+                args.pretty,
+            );
+            return 2;
+        }
+    }
+    if phase == "closure" && blocked_cls_n >= 1 && !eff_session.is_empty() {
+        let skey_cls = rio::safe_key(&eff_session, "default");
+        if let Some(m_cls) = cwg_common::read_marker_with_pending(&skey_cls) {
+            if m_cls.is_object()
+                && !json_truthy(m_cls.get("closed"))
+                && !crate::cwg_stop::has_completed_simplify_after(
+                    &eff_session,
+                    &m_cls,
+                    "",
+                    last_cls_blk_ts,
+                )
+            {
+                rio::print_cli_json(
+                    &json!({
+                        "ok": false,
+                        "error": "missing_post_block_simplify",
+                        "blocked_closure_passes": blocked_cls_n,
+                        "last_blocked_ts": last_cls_blk_ts,
+                        "hint": format!(
+                            "Closure pass {}/{} returned BLOCKED: run a fresh `simplify` pass on the candidate BEFORE launching final `--closure` pass 2/2.",
+                            blocked_cls_n,
+                            cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE,
+                        ),
+                    }),
+                    args.pretty,
+                );
+                return 2;
+            }
+        }
+    }
     let cand_first_ts = candidate_first_ts(&eff_session);
-    let resume_sid = resolve_resume_session(
-        &git_root,
-        &eff_session,
-        cand_first_ts,
-        &args.resume,
-        args.new_session,
+    let last_rr_ts = if !eff_session.is_empty() {
+        cwg_common::read_marker_with_pending(&eff_session)
+            .map(|m| cwg_common::last_research_reset_ts(&m))
+            .unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    if !args.resume.trim().is_empty()
+        && last_rr_ts > 0.0
+        && !is_post_reset_codex_session_proven(args.resume.trim(), "", last_rr_ts, cand_first_ts)
+    {
+        rio::print_cli_json(
+            &json!({
+                "ok": false,
+                "error": "pre_research_reset_session_forbidden",
+                "hint": "Resuming a pre-research-reset or unverified Codex session after research-reset is forbidden; omit --resume so the new cycle starts in a fresh review session.",
+            }),
+            args.pretty,
+        );
+        return 2;
+    }
+    let saved_thread = if args.new_session {
+        None
+    } else {
+        active_thread_state_for_lane(
+            &eff_session,
+            &git_root,
+            Some(cand_first_ts),
+            &eff_model,
+            effort,
+        )
+    };
+    let mut resume_sid = resolve_resume_session_with_saved(
+        ResumeSessionQuery {
+            git_root: &git_root,
+            session: &eff_session,
+            candidate_first_ts: cand_first_ts,
+            explicit_resume: &args.resume,
+            force_new: args.new_session,
+            model: &eff_model,
+            effort,
+        },
+        Some(saved_thread.as_ref()),
     );
+    if !resume_sid.is_empty()
+        && last_rr_ts > 0.0
+        && !is_post_reset_codex_session_proven(&resume_sid, "", last_rr_ts, cand_first_ts)
+    {
+        if !args.resume.trim().is_empty() {
+            rio::print_cli_json(
+                &json!({
+                    "ok": false,
+                    "error": "pre_research_reset_session_forbidden",
+                    "hint": "Resuming a pre-research-reset or unverified Codex session after research-reset is forbidden; omit --resume so the new cycle starts in a fresh review session.",
+                }),
+                args.pretty,
+            );
+            return 2;
+        }
+        resume_sid.clear();
+    }
 
     let diff_text = if !args.diff_file.is_empty() && Path::new(&args.diff_file).is_file() {
         read_diff_file(&args.diff_file)
@@ -2523,11 +4798,6 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
         args.summary.clone()
     };
 
-    let saved_thread = if args.new_session {
-        None
-    } else {
-        active_thread_state(&eff_session, &git_root, Some(cand_first_ts))
-    };
     let is_timeout_continuation = saved_thread
         .as_ref()
         .map_or(false, |st| json_truthy(st.get("pending_timeout_resume")));
@@ -2553,7 +4823,7 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
                         "ok": false,
                         "invalid_timeout": true,
                         "error": format!(
-                            "Upfront custom --timeout is forbidden; omit --timeout so codex_lane.py uses the standard {}s (HIGH) / {}s (--xhigh) timeout.",
+                            "Upfront custom --timeout is forbidden; omit --timeout so `carbon-stack codex-lane review` uses the standard {}s (HIGH) / {}s (--xhigh) timeout.",
                             DEFAULT_REVIEW_TIMEOUT_SECONDS, DEFAULT_XHIGH_REVIEW_TIMEOUT_SECONDS
                         ),
                     }),
@@ -2586,7 +4856,9 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
     };
 
     let mut final_exec_res: Option<CodexExecResult> = None;
+    let mut packet_committed = false;
     let mut launch_wall_ts = 0.0f64;
+    let mut verdict_wall_ts = 0.0f64;
     let mut used_resume_sid = String::new();
     let mut active_review_id = review_id.clone();
 
@@ -2596,54 +4868,74 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
         } else {
             format!("cwg-{}", random_hex_12())
         };
+        let packet_nonce = random_hex_12();
         let prompt = build_adversarial_prompt(
             &active_review_id,
+            &packet_nonce,
             &scope_summary,
             &diff_text,
             phase,
             !cur_resume_sid.is_empty(),
             !cur_resume_sid.is_empty() && is_timeout_continuation,
         );
-        record_packet(
+        match reserve_packet_exclusive(
             &active_review_id,
             &prompt,
             &cwd,
             effort,
             phase,
             &eff_session,
-        );
-        if !packet_path(&active_review_id).is_file() {
-            // SAFETY: Inside Standard Sandbox (`BypassSandbox=false`), `CARBON_STACK_HOME` is read-only; fail fast without hanging on blocked network sockets, without tripping the global breaker, and without granting fallback.
-            rio::print_cli_json(
-                &json!({
-                    "ok": false,
-                    "sandbox_blocked": true,
-                    "error": "CARBON_STACK_HOME is not writable in sandbox; re-run codex_lane.py review with BypassSandbox=true",
-                }),
-                args.pretty,
-            );
-            return 2;
+        ) {
+            Ok(_) => {}
+            Err(PacketReserveError::Duplicate) => {
+                rio::print_cli_json(
+                    &json!({
+                        "ok": false,
+                        "error": format!("duplicate_review_id:{}", active_review_id),
+                    }),
+                    args.pretty,
+                );
+                return 2;
+            }
+            Err(PacketReserveError::Io(detail)) => {
+                // SAFETY: Inside Standard Sandbox (`BypassSandbox=false`), `CARBON_STACK_HOME` is read-only; fail fast without hanging on blocked network sockets, without tripping the global breaker, and without granting fallback.
+                rio::print_cli_json(
+                    &json!({
+                        "ok": false,
+                        "sandbox_blocked": true,
+                        "detail": detail,
+                        "error": "CARBON_STACK_HOME is not writable in sandbox; re-run `carbon-stack codex-lane review` with BypassSandbox=true",
+                    }),
+                    args.pretty,
+                );
+                return 2;
+            }
         }
 
         let mut pkt_guard = PacketCleanupGuard {
             review_id: active_review_id.clone(),
+            owner_nonce: packet_nonce.clone(),
             committed: false,
         };
         launch_wall_ts = now_sec();
-        let cmd_args = build_codex_exec_args(&cwd, effort, &args.model, cur_resume_sid);
-        let exec_opt = exec_codex_once(
-            &binary,
-            &cmd_args,
-            &prompt,
-            &cwd,
-            eff_timeout,
-            &active_review_id,
-            args.xhigh,
-        );
+        let cmd_args = build_codex_exec_args(&cwd, effort, &eff_model, cur_resume_sid);
+        set_defer_timeout_print(&active_review_id, true);
+        let exec_opt = exec_codex_once(CodexExecSpec {
+            binary: &binary,
+            args: &cmd_args,
+            prompt: &prompt,
+            cwd: &cwd,
+            timeout: eff_timeout,
+            review_id: &active_review_id,
+            expected_phase: phase,
+            xhigh: args.xhigh,
+        });
+        set_defer_timeout_print(&active_review_id, false);
+        verdict_wall_ts = now_sec();
         let Some(exec_res) = exec_opt else {
             let (timeout_kind, stream_sid) = pop_last_timeout_outage(&active_review_id);
             if timeout_kind == "thinking" {
-                // INVARIANT: Persist timed-out Codex thread + elevated timeout so retry resumes the same lane without losing a round.
+                // INVARIANT: Persist timed-out Codex thread + elevated timeout before emitting CLI JSON so `state_persisted` and `recommended_timeout` reflect whether saving actually succeeded.
                 let mut timeout_sid = stream_sid;
                 if timeout_sid.is_empty() {
                     timeout_sid =
@@ -2658,22 +4950,70 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
                     }
                 }
                 let next_to = next_timeout_after(eff_timeout as i64);
-                let _ = rio::write_json(
-                    &thread_state_path(&eff_session, &git_root),
-                    &json!({
+                let persisted = save_lane_thread_state(
+                    &eff_session,
+                    &git_root,
+                    cand_first_ts,
+                    &eff_model,
+                    effort,
+                    json!({
                         "session_id": timeout_sid,
                         "last_review_id": active_review_id,
                         "session": eff_session,
                         "git_root": rio::normalize_path(&git_root),
                         "candidate_first_ts": cand_first_ts,
+                        "model": eff_model,
+                        "effort": effort,
+                        "phase": phase,
+                        "xhigh": args.xhigh,
                         "pending_timeout_resume": true,
                         "last_timeout_seconds": eff_timeout as i64,
                         "next_timeout_seconds": next_to,
                         "updated_ts": now_sec(),
                     }),
                 );
+                let effective_rec_to = if persisted {
+                    next_to
+                } else {
+                    let existing_next = active_thread_state_for_lane(
+                        &eff_session,
+                        &git_root,
+                        Some(cand_first_ts),
+                        &eff_model,
+                        effort,
+                    )
+                    .filter(|st| json_truthy(st.get("pending_timeout_resume")))
+                    .map(|st| val_to_f64(st.get("next_timeout_seconds")) as i64)
+                    .unwrap_or(0);
+                    required_review_timeout(args.xhigh, existing_next)
+                };
+                let retry_base_cmd = format_review_retry_cmd_with_spec(&RetryCmdSpec {
+                    model: &eff_model,
+                    xhigh: args.xhigh,
+                    closure: phase == "closure",
+                    session: &eff_session,
+                    cwd: &args.cwd,
+                    diff_file: &args.diff_file,
+                    summary: &args.summary,
+                    pretty: args.pretty,
+                });
+                let payload_to = build_thinking_timeout_payload(
+                    &active_review_id,
+                    eff_timeout as i64,
+                    effective_rec_to,
+                    &retry_base_cmd,
+                    &timeout_sid,
+                    persisted,
+                );
+                rio::print_cli_json(&payload_to, args.pretty);
             } else if timeout_kind == "network" {
-                clear_pending_timeout_resume(&eff_session, &git_root);
+                clear_pending_timeout_resume(
+                    &eff_session,
+                    &git_root,
+                    cand_first_ts,
+                    &eff_model,
+                    effort,
+                );
             }
             return 3;
         };
@@ -2689,11 +5029,24 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
             && exec_res.network_outage.is_none()
             && exec_res.sandbox_blocked.is_none()
         {
-            unlink_quiet(&thread_state_path(&eff_session, &git_root));
+            remove_lane_thread_state(
+                &eff_session,
+                &git_root,
+                cand_first_ts,
+                &eff_model,
+                effort,
+            );
             continue;
         }
-        if exec_res.outage.is_none() && exec_res.network_outage.is_none() && exec_res.rc == 0 {
+        // SAFETY: Commit the packet only when Codex exited 0 without outage AND emitted a recognized standalone verdict line matching `phase`; if disk commit fails, fail closed with non-zero exit code below.
+        if exec_res.has_verdict
+            && exec_res.outage.is_none()
+            && exec_res.network_outage.is_none()
+            && exec_res.rc == 0
+            && commit_packet_owned(&active_review_id, &packet_nonce)
+        {
             pkt_guard.committed = true;
+            packet_committed = true;
         }
         final_exec_res = Some(exec_res);
         break;
@@ -2711,7 +5064,7 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
                     "review_id": active_review_id,
                     "exit_code": exec_res.rc,
                     "sandbox_blocked": true,
-                    "error": format!("sandbox_restricted ({}); re-run codex_lane.py review with BypassSandbox=true", sb),
+                    "error": format!("sandbox_restricted ({}); re-run `carbon-stack codex-lane review` with BypassSandbox=true", sb),
                 }),
                 args.pretty,
             );
@@ -2726,7 +5079,13 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
             trip_breaker(o, BREAKER_TTL_SECONDS);
         }
         if !eff_outage.is_empty() {
-            clear_pending_timeout_resume(&eff_session, &git_root);
+            clear_pending_timeout_resume(
+                &eff_session,
+                &git_root,
+                cand_first_ts,
+                &eff_model,
+                effort,
+            );
         }
         let err_detail = {
             let se = exec_res.stderr.trim();
@@ -2762,6 +5121,33 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
         return 2;
     }
 
+    if !exec_res.has_verdict {
+        rio::print_cli_json(
+            &json!({
+                "ok": false,
+                "review_id": active_review_id,
+                "exit_code": exec_res.rc,
+                "error": "missing_review_verdict",
+                "hint": "Codex exited 0 without emitting a recognized standalone review verdict line; re-run `carbon-stack codex-lane review`.",
+            }),
+            args.pretty,
+        );
+        return 2;
+    }
+    if !packet_committed {
+        rio::print_cli_json(
+            &json!({
+                "ok": false,
+                "review_id": active_review_id,
+                "round_consumed": false,
+                "error": "packet_commit_failed",
+                "hint": "Failed to persist committed review packet on disk; re-run `carbon-stack codex-lane review`.",
+            }),
+            args.pretty,
+        );
+        return 2;
+    }
+
     let mut actual_sid = if !exec_res.thread_id.is_empty() {
         unwrap_primary_session_id(&exec_res.thread_id, cand_first_ts)
     } else {
@@ -2775,20 +5161,37 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
     }
 
     if exec_res.has_verdict {
+        reset_breaker_for_probe(launch_wall_ts, verdict_wall_ts);
         if !actual_sid.is_empty() {
-            let _ = rio::write_json(
-                &thread_state_path(&eff_session, &git_root),
-                &json!({
+            save_lane_thread_state(
+                &eff_session,
+                &git_root,
+                cand_first_ts,
+                &eff_model,
+                effort,
+                json!({
                     "session_id": actual_sid,
                     "last_review_id": active_review_id,
                     "session": eff_session,
                     "git_root": rio::normalize_path(&git_root),
                     "candidate_first_ts": cand_first_ts,
+                    "model": eff_model,
+                    "effort": effort,
+                    "xhigh": args.xhigh,
                     "updated_ts": now_sec(),
                 }),
             );
         } else if is_timeout_continuation {
-            unlink_quiet(&thread_state_path(&eff_session, &git_root));
+            remove_lane_thread_state(
+                &eff_session,
+                &git_root,
+                cand_first_ts,
+                &eff_model,
+                effort,
+            );
+        }
+        if phase == "closure" && !eff_session.is_empty() {
+            let _ = active_cycle_closure_blocks(&eff_session, &git_root, "");
         }
     }
 
@@ -2798,10 +5201,11 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
         "new"
     };
     let output_block = format!(
-        "REVIEW_ID: {}\nSESSION_ID: {}\nSESSION_MODE: {}\nENGINE: codex ({})\n{}\n{}\n",
+        "REVIEW_ID: {}\nSESSION_ID: {}\nSESSION_MODE: {}\nENGINE: codex ({}, {})\n{}\n{}\n",
         active_review_id,
         actual_sid,
         session_mode,
+        eff_model,
         effort,
         cwg_common::CODEX_REVIEW_OUTPUT_BANNER,
         exec_res.stdout.trim()
@@ -2839,11 +5243,47 @@ fn count_active_threads() -> usize {
         .count()
 }
 
+fn parse_str_flag_table(
+    rest: &[String],
+    idx: &mut usize,
+    tok: &str,
+    table: &mut [(&str, &mut String)],
+) -> Result<bool, String> {
+    for (flag, slot) in table.iter_mut() {
+        if *flag == tok || tok.starts_with(&format!("{}=", flag)) {
+            if let Some(v) = parse_flag_value(rest, idx, flag)? {
+                **slot = v;
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn parse_hex_flag_table(
+    rest: &[String],
+    idx: &mut usize,
+    tok: &str,
+    table: &mut [(&str, &mut String)],
+) -> Result<bool, String> {
+    for (flag, slot) in table.iter_mut() {
+        if *flag == tok || tok.starts_with(&format!("{}=", flag)) {
+            if let Some(v) = parse_flag_value(rest, idx, flag)? {
+                let decoded = decode_utf8_hex(&v)
+                    .map_err(|err_msg| format!("error: argument {}: invalid utf-8 hex ({})", flag, err_msg))?;
+                **slot = decoded;
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 pub fn run_cli(args: &[String]) -> i32 {
     if args.is_empty() {
         let _ = writeln!(
             std::io::stderr(),
-            "usage: codex_lane <check|status|reset|breaker|scan|review> [args...]"
+            "usage: codex_lane <check|status|reset|breaker|scan|review|research-reset> [args...]"
         );
         return 2;
     }
@@ -3052,25 +5492,30 @@ pub fn run_cli(args: &[String]) -> i32 {
                     ("--model", &mut rargs.model),
                     ("--resume", &mut rargs.resume),
                 ];
-                let mut matched_str = false;
-                for (flag, slot) in str_flags.iter_mut() {
-                    if *flag == tok.as_str() || tok.starts_with(&format!("{}=", flag)) {
-                        match parse_flag_value(rest, &mut i, flag) {
-                            Ok(Some(v)) => {
-                                **slot = v;
-                                matched_str = true;
-                                break;
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                let _ = writeln!(std::io::stderr(), "{}", e);
-                                return 2;
-                            }
-                        }
+                match parse_str_flag_table(rest, &mut i, tok, &mut str_flags) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(e) => {
+                        let _ = writeln!(std::io::stderr(), "{}", e);
+                        return 2;
                     }
                 }
-                if matched_str {
-                    continue;
+
+                let mut hex_flags = [
+                    ("--cwd-hex", &mut rargs.cwd),
+                    ("--summary-hex", &mut rargs.summary),
+                    ("--diff-file-hex", &mut rargs.diff_file),
+                    ("--session-hex", &mut rargs.session),
+                    ("--model-hex", &mut rargs.model),
+                    ("--resume-hex", &mut rargs.resume),
+                ];
+                match parse_hex_flag_table(rest, &mut i, tok, &mut hex_flags) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(e) => {
+                        let _ = writeln!(std::io::stderr(), "{}", e);
+                        return 2;
+                    }
                 }
 
                 match parse_flag_value(rest, &mut i, "--phase") {
@@ -3118,10 +5563,61 @@ pub fn run_cli(args: &[String]) -> i32 {
             }
             cmd_review(&rargs)
         }
+        "research-reset" => {
+            let mut rr = ResearchResetArgs {
+                cwd: String::new(),
+                session: String::new(),
+                decision: String::new(),
+                findings: String::new(),
+                transcript: String::new(),
+                pretty: false,
+            };
+            let mut i = 0usize;
+            while i < rest.len() {
+                let tok = &rest[i];
+                if tok == "--pretty" {
+                    rr.pretty = true;
+                    i += 1;
+                    continue;
+                }
+                let mut str_flags = [
+                    ("--cwd", &mut rr.cwd),
+                    ("--session", &mut rr.session),
+                    ("--decision", &mut rr.decision),
+                    ("--findings", &mut rr.findings),
+                    ("--transcript", &mut rr.transcript),
+                ];
+                match parse_str_flag_table(rest, &mut i, tok, &mut str_flags) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(e) => {
+                        let _ = writeln!(std::io::stderr(), "{}", e);
+                        return 2;
+                    }
+                }
+                let mut hex_flags = [
+                    ("--cwd-hex", &mut rr.cwd),
+                    ("--session-hex", &mut rr.session),
+                    ("--findings-hex", &mut rr.findings),
+                    ("--transcript-hex", &mut rr.transcript),
+                ];
+                match parse_hex_flag_table(rest, &mut i, tok, &mut hex_flags) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(e) => {
+                        let _ = writeln!(std::io::stderr(), "{}", e);
+                        return 2;
+                    }
+                }
+                let _ = writeln!(std::io::stderr(), "error: unrecognized arguments: {}", tok);
+                return 2;
+            }
+            cmd_research_reset(&rr)
+        }
         other => {
             let _ = writeln!(
                 std::io::stderr(),
-                "usage: codex_lane <check|status|reset|breaker|scan|review> (invalid choice: '{}')",
+                "usage: codex_lane <check|status|reset|breaker|scan|review|research-reset> (invalid choice: '{}')",
                 other
             );
             2
@@ -3233,6 +5729,51 @@ mod tests {
         assert_eq!(st["reason"], Value::String("quota exceeded".to_string()));
         reset_breaker();
         assert_eq!(breaker_status()["tripped"], Value::Bool(false));
+
+        // SAFETY: A probe started before a newer outage clamps only older windows and never closes the newer outage or resurrects an already-closed breaker.
+        wipe_breaker_for_test();
+        let base_now = now_sec();
+        trip_breaker_at("older_outage", 900, base_now - 100.0);
+        trip_breaker_at("newer_quota", 600, base_now - 20.0);
+        reset_breaker_for_probe(base_now - 50.0, base_now - 30.0);
+        let st_concurrent = breaker_status();
+        assert_eq!(st_concurrent["tripped"], Value::Bool(true));
+        assert_eq!(st_concurrent["reason"], Value::String("newer_quota".to_string()));
+        assert!(
+            (val_to_f64(st_concurrent.get("tripped_until")) - (base_now + 580.0)).abs() < 1e-6,
+            "expected tripped_until to drop to newer window end, got: {:?}",
+            st_concurrent.get("tripped_until")
+        );
+        let hist_concurrent = breaker_history_slice(&st_concurrent);
+        assert_eq!(hist_concurrent.len(), 2);
+        assert!(
+            (val_to_f64(hist_concurrent[0].get("until_ts")) - (base_now - 30.0)).abs() < 1e-6
+        );
+        assert!(
+            (val_to_f64(hist_concurrent[1].get("until_ts")) - (base_now + 580.0)).abs() < 1e-6
+        );
+
+        reset_breaker_at(base_now - 10.0);
+        assert_eq!(breaker_status()["tripped"], Value::Bool(false));
+        reset_breaker_for_probe(base_now - 50.0, base_now - 5.0);
+        assert_eq!(breaker_status()["tripped"], Value::Bool(false));
+
+        // SAFETY: Concurrent multi-threaded `trip_breaker_at` + `reset_breaker_for_probe` serialized via `codex_lane.lock` loses zero outage windows.
+        wipe_breaker_for_test();
+        std::thread::scope(|s| {
+            for i in 0..8 {
+                s.spawn(move || {
+                    let t_at = base_now - 200.0 + (i as f64) * 10.0;
+                    trip_breaker_at(&format!("parallel_{}", i), 600, t_at);
+                    if i % 2 == 1 {
+                        reset_breaker_for_probe(t_at - 5.0, t_at - 1.0);
+                    }
+                });
+            }
+        });
+        let st_parallel = breaker_status();
+        assert_eq!(breaker_history_slice(&st_parallel).len(), 8);
+        wipe_breaker_for_test();
     }
 
     #[test]
@@ -3314,7 +5855,7 @@ mod tests {
             json!({
                 "type": "turn_context",
                 "timestamp": "2026-11-17T10:00:01Z",
-                "payload": {"model": "gpt-6.1-sol", "effort": "xhigh"}
+                "payload": {"model": "gpt-6.2-astra", "effort": "xhigh"}
             }),
             json!({
                 "type": "response_item",
@@ -3384,6 +5925,63 @@ mod tests {
         assert_eq!(scanned[0]["kind"], "ordinary");
         assert_eq!(scanned[0]["verdict"], "APPROVED");
         assert_eq!(scanned[0]["xhigh"], true);
+
+        // SAFETY: When >40 rollouts exist and an older rollout carries a stale READY for the same `review_id`, scanning the 40 newest rollouts first selects the latest `BLOCKED` verdict rather than stopping early on the 40 oldest files.
+        let rid_reuse = "cwg-reuse45newest";
+        record_packet(
+            rid_reuse,
+            &format!("REVIEW_ID: {}\nClosure check", rid_reuse),
+            &repo_str,
+            "high",
+            "closure",
+            "sess-cli-01",
+        );
+        let stale_rf = sessions_dir.join("rollout-0000-stale.jsonl");
+        let stale_lines = [
+            json!({"type": "session_meta", "timestamp": "2026-11-17T10:01:00Z", "payload": {"id": "sess-old-ready", "session_id": "sess-old-ready", "source": "exec", "thread_source": "user"}}),
+            json!({"type": "turn_context", "timestamp": "2026-11-17T10:01:01Z", "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
+            json!({"type": "response_item", "timestamp": "2026-11-17T10:01:02Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": format!("REVIEW_ID: {}", rid_reuse)}]}}),
+            json!({"type": "event_msg", "timestamp": "2026-11-17T10:01:05Z", "payload": {"type": "task_complete", "last_agent_message": "CLOSURE_VALIDATION: READY"}}),
+        ];
+        fs::write(
+            &stale_rf,
+            stale_lines.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        for idx in 0..42 {
+            let noise_sid = format!("sess-noise-{:02}", idx);
+            let noise_rf = sessions_dir.join(format!("rollout-01{:02}-{}.jsonl", idx, noise_sid));
+            let noise_lines = [
+                json!({"type": "session_meta", "timestamp": "2026-11-17T10:02:00Z", "payload": {"id": noise_sid, "session_id": noise_sid, "source": "exec", "thread_source": "user"}}),
+                json!({"type": "event_msg", "timestamp": "2026-11-17T10:02:01Z", "payload": {"type": "task_complete", "last_agent_message": "CLOSURE_VALIDATION: READY"}}),
+            ];
+            fs::write(
+                &noise_rf,
+                noise_lines.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+            )
+            .unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        let fresh_rf = sessions_dir.join("rollout-9999-fresh-blocked.jsonl");
+        let fresh_lines = [
+            json!({"type": "session_meta", "timestamp": "2026-11-17T10:05:00Z", "payload": {"id": "sess-fresh-blk", "session_id": "sess-fresh-blk", "source": "exec", "thread_source": "user"}}),
+            json!({"type": "turn_context", "timestamp": "2026-11-17T10:05:01Z", "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
+            json!({"type": "response_item", "timestamp": "2026-11-17T10:05:02Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": format!("REVIEW_ID: {}", rid_reuse)}]}}),
+            json!({"type": "event_msg", "timestamp": "2026-11-17T10:05:10Z", "payload": {"type": "task_complete", "last_agent_message": "CLOSURE_VALIDATION: BLOCKED"}}),
+        ];
+        fs::write(
+            &fresh_rf,
+            fresh_lines.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+
+        let scanned_45 = scan_verified_codex_reviews(now - 60.0, "sess-cli-01", &repo_str);
+        let reuse_hit = scanned_45
+            .iter()
+            .find(|r| r.get("review_id").and_then(|v| v.as_str()) == Some(rid_reuse))
+            .expect("expected rid_reuse verdict");
+        assert_eq!(reuse_hit["verdict"], "BLOCKED");
+        assert_eq!(reuse_hit["session_id"], "sess-fresh-blk");
     }
 
     #[test]
@@ -3413,18 +6011,25 @@ sess_root.mkdir(parents=True, exist_ok=True)
 if len(argv) >= 2 and argv[0] == "exec" and argv[1] == "resume" and "sess-compacted-allow" in argv:
     print('{"outcome":"allow"}')
     sys.exit(0)
+if "FORCE_VERDICTLESS_MOCK" in prompt:
+    print("Completed inspection without standalone verdict")
+    sys.exit(0)
+if "FORCE_WRONG_PHASE_CLOSURE" in prompt:
+    print("CLOSURE_VALIDATION: BLOCKED")
+    sys.exit(0)
 m = re.search(r"REVIEW_ID:\s*([A-Za-z0-9_-]+)", prompt)
 rid = m.group(1) if m else "cwg-unknown0"
 sid = "sess-live-" + uuid.uuid4().hex[:8]
 iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+verdict_line = "VERDICT: APPROVED" if "FORCE_ORDINARY_APPROVED_MOCK" in prompt else "CLOSURE_VALIDATION: READY"
 rows = [
     {"type": "session_meta", "timestamp": iso, "payload": {"id": sid, "session_id": sid, "source": "exec", "thread_source": "user"}},
-    {"type": "turn_context", "timestamp": iso, "payload": {"model": "gpt-6.1-sol", "effort": "high"}},
-    {"type": "response_item", "timestamp": iso, "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: " + rid}]}},
-    {"type": "event_msg", "timestamp": iso, "payload": {"type": "task_complete", "last_agent_message": "CLOSURE_VALIDATION: READY"}},
+    {"type": "turn_context", "timestamp": iso, "payload": {"model": "gpt-6.2-sol", "effort": "high"}},
+    {"type": "response_item", "timestamp": iso, "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": prompt}]}},
+    {"type": "event_msg", "timestamp": iso, "payload": {"type": "task_complete", "last_agent_message": verdict_line}},
 ]
 (sess_root / f"rollout-primary-{sid}.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
-print("CLOSURE_VALIDATION: READY")
+print(verdict_line)
 "#;
             fs::write(&py_path, py_body).unwrap();
             let cmd_path = tmp.0.join("codex.cmd");
@@ -3450,6 +6055,20 @@ echo "$*" >> "$MOCK_CODEX_LOG"
 case " $* " in
   *" sess-compacted-allow "*)
     echo '{"outcome":"allow"}'
+    exit 0
+    ;;
+esac
+case "$prompt" in
+  *FORCE_VERDICTLESS_MOCK*)
+    echo "Completed inspection without standalone verdict"
+    exit 0
+    ;;
+  *FORCE_WRONG_PHASE_CLOSURE*)
+    echo "CLOSURE_VALIDATION: BLOCKED"
+    exit 0
+    ;;
+  *FORCE_ORDINARY_APPROVED_MOCK*)
+    echo "VERDICT: APPROVED"
     exit 0
     ;;
 esac
@@ -3533,9 +6152,1746 @@ exit 0
                 "--session".to_string(),
                 cli_sess.to_string(),
                 "--cwd".to_string(),
-                repo_str,
+                repo_str.clone(),
             ]),
             0
         );
+        assert!(log_lines.iter().all(|l| l.contains("-m gpt-6.2-sol")));
+
+        // SAFETY: Verdict-less `rc == 0` runs fail closed (`rc == 2`) without committing packets, duplicate `--review-id` is rejected without clobbering prior packets, and `scan_verified_codex_reviews` rejects stale rollouts by `packet_nonce` and `mtime`.
+        let rc_vless = run_cli(&[
+            "review".to_string(),
+            "--cwd".to_string(),
+            repo_str.clone(),
+            "--session".to_string(),
+            "cli-mock-sess-vless".to_string(),
+            "--review-id".to_string(),
+            "cwg-verdictless01".to_string(),
+            "--new-session".to_string(),
+            "--diff-file".to_string(),
+            diff_p.to_string_lossy().into_owned(),
+            "--closure".to_string(),
+            "--summary".to_string(),
+            "FORCE_VERDICTLESS_MOCK".to_string(),
+        ]);
+        assert_eq!(rc_vless, 2);
+        assert!(!has_recorded_packet("cwg-verdictless01"));
+
+        let dup_sess = "cli-mock-sess-dup";
+        let rc_dup_ok = run_cli(&[
+            "review".to_string(),
+            "--cwd".to_string(),
+            repo_str.clone(),
+            "--session".to_string(),
+            dup_sess.to_string(),
+            "--review-id".to_string(),
+            "cwg-dupcheck01".to_string(),
+            "--new-session".to_string(),
+            "--diff-file".to_string(),
+            diff_p.to_string_lossy().into_owned(),
+            "--closure".to_string(),
+            "--summary".to_string(),
+            "Valid explicit review_id".to_string(),
+        ]);
+        assert_eq!(rc_dup_ok, 0);
+        let orig_pkt = rio::read_json(&packet_path("cwg-dupcheck01")).unwrap();
+        let rc_dup_re = run_cli(&[
+            "review".to_string(),
+            "--cwd".to_string(),
+            repo_str.clone(),
+            "--session".to_string(),
+            dup_sess.to_string(),
+            "--review-id".to_string(),
+            "cwg-dupcheck01".to_string(),
+            "--new-session".to_string(),
+            "--diff-file".to_string(),
+            diff_p.to_string_lossy().into_owned(),
+            "--closure".to_string(),
+            "--summary".to_string(),
+            "FORCE_VERDICTLESS_MOCK".to_string(),
+        ]);
+        assert_eq!(rc_dup_re, 2);
+        assert_eq!(rio::read_json(&packet_path("cwg-dupcheck01")).unwrap(), orig_pkt);
+
+        let stale_nonce_rf = sessions_dir.join("rollout-stale-nonce.jsonl");
+        let stale_nonce_rows = [
+            json!({"type": "session_meta", "timestamp": "2026-11-18T10:00:00Z", "payload": {"id": "sess-stale-nc", "session_id": "sess-stale-nc", "source": "exec", "thread_source": "user"}}),
+            json!({"type": "turn_context", "timestamp": "2026-11-18T10:00:01Z", "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
+            json!({"type": "response_item", "timestamp": "2026-11-18T10:00:02Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-nonce-mismatch01\nPACKET_NONCE: 111111111111"}]}}),
+            json!({"type": "event_msg", "timestamp": "2026-11-18T10:00:03Z", "payload": {"type": "task_complete", "last_agent_message": "CLOSURE_VALIDATION: READY"}}),
+        ];
+        fs::write(
+            &stale_nonce_rf,
+            stale_nonce_rows.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        record_packet(
+            "cwg-nonce-mismatch01",
+            "REVIEW_ID: cwg-nonce-mismatch01\nPACKET_NONCE: 222222222222",
+            &repo_str,
+            "high",
+            "closure",
+            cli_sess,
+        );
+        let stale_mt_rf = sessions_dir.join("rollout-stale-mtime.jsonl");
+        let stale_mt_rows = [
+            json!({"type": "session_meta", "timestamp": "2026-11-18T10:00:00Z", "payload": {"id": "sess-stale-mt", "session_id": "sess-stale-mt", "source": "exec", "thread_source": "user"}}),
+            json!({"type": "turn_context", "timestamp": "2026-11-18T10:00:01Z", "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
+            json!({"type": "response_item", "timestamp": "2026-11-18T10:00:02Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-mtime-guard01"}]}}),
+            json!({"type": "event_msg", "timestamp": "2026-11-18T10:00:03Z", "payload": {"type": "task_complete", "last_agent_message": "CLOSURE_VALIDATION: READY"}}),
+        ];
+        fs::write(
+            &stale_mt_rf,
+            stale_mt_rows.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        let old_ft = fs::FileTimes::new()
+            .set_modified(SystemTime::now() - std::time::Duration::from_secs(30));
+        fs::File::options()
+            .write(true)
+            .open(&stale_mt_rf)
+            .unwrap()
+            .set_times(old_ft)
+            .unwrap();
+        record_packet(
+            "cwg-mtime-guard01",
+            "REVIEW_ID: cwg-mtime-guard01",
+            &repo_str,
+            "high",
+            "closure",
+            cli_sess,
+        );
+        let scanned_guards = scan_verified_codex_reviews(now_sec() - 60.0, cli_sess, &repo_str);
+        assert!(scanned_guards.iter().all(|r| r["review_id"] != "cwg-nonce-mismatch01"));
+        assert!(scanned_guards.iter().all(|r| r["review_id"] != "cwg-mtime-guard01"));
+
+        // SAFETY: Reject cross-phase verdicts (`CLOSURE_VALIDATION` in an ordinary review) in both CLI execution and rollout scanning.
+        let rc_wrong_phase = run_cli(&[
+            "review".to_string(),
+            "--cwd".to_string(),
+            repo_str.clone(),
+            "--session".to_string(),
+            cli_sess.to_string(),
+            "--review-id".to_string(),
+            "cwg-wrongphase01".to_string(),
+            "--new-session".to_string(),
+            "--diff-file".to_string(),
+            diff_p.to_string_lossy().into_owned(),
+            "--summary".to_string(),
+            "FORCE_WRONG_PHASE_CLOSURE".to_string(),
+        ]);
+        assert_eq!(rc_wrong_phase, 2);
+        assert!(!has_recorded_packet("cwg-wrongphase01"));
+
+        let wrong_phase_rf = sessions_dir.join("rollout-wrong-phase.jsonl");
+        let wrong_phase_rows = [
+            json!({"type": "session_meta", "timestamp": "2026-11-18T10:05:00Z", "payload": {"id": "sess-wrong-ph", "session_id": "sess-wrong-ph", "source": "exec", "thread_source": "user"}}),
+            json!({"type": "turn_context", "timestamp": "2026-11-18T10:05:01Z", "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
+            json!({"type": "response_item", "timestamp": "2026-11-18T10:05:02Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-ord-spoof-cls01"}]}}),
+            json!({"type": "event_msg", "timestamp": "2026-11-18T10:05:03Z", "payload": {"type": "task_complete", "last_agent_message": "CLOSURE_VALIDATION: BLOCKED"}}),
+        ];
+        record_packet(
+            "cwg-ord-spoof-cls01",
+            "REVIEW_ID: cwg-ord-spoof-cls01",
+            &repo_str,
+            "high",
+            "ordinary",
+            cli_sess,
+        );
+        fs::write(
+            &wrong_phase_rf,
+            wrong_phase_rows.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        let scanned_phase = scan_verified_codex_reviews(now_sec() - 60.0, cli_sess, &repo_str);
+        assert!(scanned_phase.iter().all(|r| r["review_id"] != "cwg-ord-spoof-cls01"));
+
+        // SAFETY: Parallel `reserve_packet_exclusive` + `record_packet_if_absent` calls on the same `review_id` admit strictly 1 creator and never overwrite or delete the winner's packet.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for tidx in 0..8usize {
+            let b = std::sync::Arc::clone(&barrier);
+            let rdir = repo_str.clone();
+            handles.push(std::thread::spawn(move || {
+                let nonce = format!("{:012x}", tidx + 1);
+                let pr = format!("REVIEW_ID: cwg-race-dup01\nPACKET_NONCE: {}", nonce);
+                b.wait();
+                if tidx < 4 {
+                    match reserve_packet_exclusive(
+                        "cwg-race-dup01",
+                        &pr,
+                        &rdir,
+                        "high",
+                        "closure",
+                        "cli-mock-sess-01",
+                    ) {
+                        Ok(_) => {
+                            let mut g = PacketCleanupGuard {
+                                review_id: "cwg-race-dup01".to_string(),
+                                owner_nonce: nonce.clone(),
+                                committed: false,
+                            };
+                            assert!(!commit_packet_owned("cwg-race-dup01", "ffffffffffff"));
+                            assert!(commit_packet_owned("cwg-race-dup01", &nonce));
+                            g.committed = true;
+                            true
+                        }
+                        Err(PacketReserveError::Duplicate) => {
+                            let _loser_guard = PacketCleanupGuard {
+                                review_id: "cwg-race-dup01".to_string(),
+                                owner_nonce: nonce,
+                                committed: false,
+                            };
+                            false
+                        }
+                        Err(PacketReserveError::Io(e)) => panic!("unexpected io err: {}", e),
+                    }
+                } else {
+                    record_packet_if_absent(
+                        "cwg-race-dup01",
+                        &pr,
+                        &rdir,
+                        "high",
+                        "ordinary",
+                        "cli-mock-sess-01",
+                    )
+                }
+            }));
+        }
+        let wins: usize = handles.into_iter().map(|h| usize::from(h.join().unwrap())).sum();
+        assert_eq!(wins, 1);
+        assert!(has_recorded_packet("cwg-race-dup01"));
+        assert!(!record_packet_if_absent(
+            "cwg-race-dup01",
+            "REVIEW_ID: cwg-race-dup01\nPACKET_NONCE: 999999999999",
+            &repo_str,
+            "high",
+            "ordinary",
+            "cli-mock-sess-01",
+        ));
+        assert_eq!(
+            rio::read_json(&packet_path("cwg-race-dup01"))
+                .unwrap()
+                .get("committed")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+
+        let fl1 = match try_acquire_review_flight_lock(cli_sess, &repo_str) {
+            FlightLockResult::Acquired(f) => f,
+            _ => panic!("expected first flight lock to succeed"),
+        };
+        assert!(matches!(
+            try_acquire_review_flight_lock(cli_sess, &repo_str),
+            FlightLockResult::Busy
+        ));
+        drop(fl1);
+        assert!(matches!(
+            try_acquire_review_flight_lock(cli_sess, &repo_str),
+            FlightLockResult::Acquired(_)
+        ));
+
+        // SAFETY: Valid `APPROVED -> simplify #1 -> BLOCKED -> simplify #2 -> READY` yields `effective_pass_count == 2, has_fresh_ready == true`, while pre-simplify `BLOCKED` and declared-`XHIGH` wrong-tier `READY` both yield `has_fresh_ready == false` and unlock `research-reset` cleanly.
+        let brain_dir = tmp.0.join("brain");
+        let _benv = EnvVarGuard::set(&[("ANTIGRAVITY_BRAIN_ROOT", Some(&brain_dir.to_string_lossy()))]);
+        let sess_cap = "sess-cls-cap-2";
+        let sw_dir = brain_dir.join(sess_cap).join(".system_generated").join("swarm");
+        fs::create_dir_all(&sw_dir).unwrap();
+        let sim_members = json!({
+            "members": {
+                "sim-r": {"model": "claude-sonnet-5-5-high", "state": "killed", "killed": true},
+                "sim-q": {"model": "claude-sonnet-5-5-high", "state": "killed", "killed": true},
+                "sim-e": {"model": "claude-sonnet-5-5-high", "state": "killed", "killed": true}
+            }
+        });
+        rio::write_json(&sw_dir.join("members.json"), &sim_members).unwrap();
+        let base_t = now_sec() - 30.0;
+        let t_sim1 = crate::win32_sqlite::format_iso_utc(base_t + 2.5);
+        let t_sim2 = crate::win32_sqlite::format_iso_utc(base_t + 8.0);
+        let two_sim_board_rows = [
+            json!({"seq": 1, "agent": "coordinator", "time": t_sim1, "text": "@sim-r @sim-q @sim-e initial simplify"}),
+            json!({"seq": 2, "agent": "sim-r", "time": t_sim1, "text": "SIMPLIFY_LENS: REUSE\nSIMPLIFY_VERDICT: CLEAN"}),
+            json!({"seq": 3, "agent": "sim-q", "time": t_sim1, "text": "SIMPLIFY_LENS: QUALITY\nSIMPLIFY_VERDICT: CLEAN"}),
+            json!({"seq": 4, "agent": "sim-e", "time": t_sim1, "text": "SIMPLIFY_LENS: EFFICIENCY\nSIMPLIFY_VERDICT: CLEAN"}),
+            json!({"seq": 5, "agent": "coordinator", "time": t_sim2, "text": "@sim-r @sim-q @sim-e post-blocked simplify"}),
+            json!({"seq": 6, "agent": "sim-r", "time": t_sim2, "text": "SIMPLIFY_LENS: REUSE\nSIMPLIFY_VERDICT: CLEAN"}),
+            json!({"seq": 7, "agent": "sim-q", "time": t_sim2, "text": "SIMPLIFY_LENS: QUALITY\nSIMPLIFY_VERDICT: CLEAN"}),
+            json!({"seq": 8, "agent": "sim-e", "time": t_sim2, "text": "SIMPLIFY_LENS: EFFICIENCY\nSIMPLIFY_VERDICT: CLEAN"}),
+        ];
+        fs::write(
+            sw_dir.join("board.jsonl"),
+            two_sim_board_rows.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        let cap_auth = repo_dir.join("auth.rs");
+        fs::write(&cap_auth, "pub fn check() {}\n").unwrap();
+        let cap_auth_norm = rio::normalize_path(&cap_auth.to_string_lossy());
+        let cap_fp = cwg_common::content_fingerprint(
+            std::slice::from_ref(&cap_auth_norm),
+            cwg_common::MAX_FINGERPRINT_FILE_BYTES,
+        );
+        rio::write_json(
+            &cwg_common::marker_path(sess_cap),
+            &json!({
+                "session": sess_cap,
+                "first_ts": base_t,
+                "cwd": rio::normalize_path(&repo_str),
+                "git_root": rio::normalize_path(&repo_str),
+                "paths": [cap_auth_norm],
+                "content_marks": [{"ts": base_t, "fp": cap_fp, "unknown": false}],
+                "closed": false,
+            }),
+        )
+        .unwrap();
+        for (rid_c, ph_c, cts_c) in [
+            ("cwg-cap-o0", "ordinary", base_t + 1.0),
+            ("cwg-cap-b1", "closure", base_t + 4.0),
+            ("cwg-cap-r2", "closure", base_t + 10.0),
+        ] {
+            record_packet(rid_c, &format!("REVIEW_ID: {}", rid_c), &repo_str, "high", ph_c, sess_cap);
+            let p_c = packet_path(rid_c);
+            let mut doc_c = rio::read_json(&p_c).unwrap();
+            doc_c["created_ts"] = json!(cts_c);
+            rio::write_json(&p_c, &doc_c).unwrap();
+        }
+        let cap_rf = sessions_dir.join("rollout-cap-2passes.jsonl");
+        let cap_rows = [
+            json!({"type": "session_meta", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.0), "payload": {"id": "sess-cap-2p", "session_id": "sess-cap-2p", "source": "exec", "thread_source": "user"}}),
+            json!({"type": "turn_context", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.1), "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
+            json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.2), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-cap-o0"}]}}),
+            json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 2.0), "payload": {"type": "task_complete", "last_agent_message": "VERDICT: APPROVED"}}),
+            json!({"type": "turn_context", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 4.1), "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
+            json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 4.2), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-cap-b1"}]}}),
+            json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 5.0), "payload": {"type": "task_complete", "last_agent_message": "CLOSURE_VALIDATION: BLOCKED"}}),
+            json!({"type": "turn_context", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 10.1), "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
+            json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 10.2), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-cap-r2"}]}}),
+            json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 11.0), "payload": {"type": "task_complete", "last_agent_message": "CLOSURE_VALIDATION: READY"}}),
+        ];
+        fs::write(
+            &cap_rf,
+            cap_rows.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        let sum_cap = active_cycle_closure_summary(sess_cap, &repo_str, "");
+        assert_eq!(sum_cap.blocked_count, 1);
+        assert_eq!(sum_cap.effective_pass_count, 2);
+        assert!(sum_cap.has_fresh_ready);
+        let rc_3rd_cls = run_cli(&[
+            "review".to_string(),
+            "--cwd".to_string(),
+            repo_str.clone(),
+            "--session".to_string(),
+            sess_cap.to_string(),
+            "--closure".to_string(),
+            "--diff-file".to_string(),
+            diff_p.to_string_lossy().into_owned(),
+            "--summary".to_string(),
+            "Redundant 3rd closure attempt".to_string(),
+        ]);
+        assert_eq!(rc_3rd_cls, 2);
+        let (sg_3rd_dec, _) = crate::safety_guards::guard_shell_command_with_session(
+            &format!("carbon-stack codex-lane review --closure --cwd '{}' --session {}", repo_str, sess_cap),
+            &repo_str,
+            sess_cap,
+        );
+        assert_eq!(sg_3rd_dec, "deny");
+
+        // SAFETY: Sub-case A (`APPROVED -> pre-simplify BLOCKED -> simplify -> READY`) has `has_fresh_ready == false` (matching `Stop`) and is accepted by `research-reset`.
+        let sess_early_blk = "sess-early-blk-nosim";
+        let sw_early = brain_dir.join(sess_early_blk).join(".system_generated").join("swarm");
+        fs::create_dir_all(&sw_early).unwrap();
+        rio::write_json(&sw_early.join("members.json"), &sim_members).unwrap();
+        let one_sim_board_rows = [
+            json!({"seq": 1, "agent": "coordinator", "time": t_sim2, "text": "@sim-r @sim-q @sim-e audit only after blocked pass 1"}),
+            json!({"seq": 2, "agent": "sim-r", "time": t_sim2, "text": "SIMPLIFY_LENS: REUSE\nSIMPLIFY_VERDICT: CLEAN"}),
+            json!({"seq": 3, "agent": "sim-q", "time": t_sim2, "text": "SIMPLIFY_LENS: QUALITY\nSIMPLIFY_VERDICT: CLEAN"}),
+            json!({"seq": 4, "agent": "sim-e", "time": t_sim2, "text": "SIMPLIFY_LENS: EFFICIENCY\nSIMPLIFY_VERDICT: CLEAN"}),
+        ];
+        fs::write(
+            sw_early.join("board.jsonl"),
+            one_sim_board_rows.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        rio::write_json(
+            &cwg_common::marker_path(sess_early_blk),
+            &json!({
+                "session": sess_early_blk,
+                "first_ts": base_t,
+                "cwd": rio::normalize_path(&repo_str),
+                "git_root": rio::normalize_path(&repo_str),
+                "paths": [cap_auth_norm],
+                "content_marks": [{"ts": base_t, "fp": cap_fp, "unknown": false}],
+                "closed": false,
+            }),
+        )
+        .unwrap();
+        for (rid_e, ph_e, cts_e) in [
+            ("cwg-eb-o0", "ordinary", base_t + 1.0),
+            ("cwg-eb-b1", "closure", base_t + 3.0),
+            ("cwg-eb-r2", "closure", base_t + 10.0),
+        ] {
+            record_packet(rid_e, &format!("REVIEW_ID: {}", rid_e), &repo_str, "high", ph_e, sess_early_blk);
+            let p_e = packet_path(rid_e);
+            let mut doc_e = rio::read_json(&p_e).unwrap();
+            doc_e["created_ts"] = json!(cts_e);
+            rio::write_json(&p_e, &doc_e).unwrap();
+        }
+        let eb_rf = sessions_dir.join("rollout-eb-2passes.jsonl");
+        let eb_rows = [
+            json!({"type": "session_meta", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.0), "payload": {"id": "sess-eb-2p", "session_id": "sess-eb-2p", "source": "exec", "thread_source": "user"}}),
+            json!({"type": "turn_context", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.1), "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
+            json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.2), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-eb-o0"}]}}),
+            json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 2.0), "payload": {"type": "task_complete", "last_agent_message": "VERDICT: APPROVED"}}),
+            json!({"type": "turn_context", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 3.1), "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
+            json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 3.2), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-eb-b1"}]}}),
+            json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 4.0), "payload": {"type": "task_complete", "last_agent_message": "CLOSURE_VALIDATION: BLOCKED"}}),
+            json!({"type": "turn_context", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 10.1), "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
+            json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 10.2), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-eb-r2"}]}}),
+            json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 11.0), "payload": {"type": "task_complete", "last_agent_message": "CLOSURE_VALIDATION: READY"}}),
+        ];
+        fs::write(
+            &eb_rf,
+            eb_rows.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        let sum_eb = active_cycle_closure_summary(sess_early_blk, &repo_str, "");
+        assert_eq!(sum_eb.blocked_count, 1);
+        assert_eq!(sum_eb.effective_pass_count, 2);
+        assert!(!sum_eb.has_fresh_ready);
+        // SAFETY: Editing a durable file after the rejected `READY` must NOT trigger automatic cycle turnover or clear the 2/2 closure counter without `research-reset`.
+        fs::write(&cap_auth, "pub fn check() -> bool { false }\n").unwrap();
+        let cap_fp_edited = cwg_common::content_fingerprint(
+            std::slice::from_ref(&cap_auth_norm),
+            cwg_common::MAX_FINGERPRINT_FILE_BYTES,
+        );
+        rio::write_json(
+            &cwg_common::marker_path(sess_early_blk),
+            &json!({
+                "session": sess_early_blk,
+                "first_ts": base_t,
+                "last_durable_ts": base_t + 12.0,
+                "cwd": rio::normalize_path(&repo_str),
+                "git_root": rio::normalize_path(&repo_str),
+                "paths": [cap_auth_norm],
+                "content_marks": [
+                    {"ts": base_t, "fp": cap_fp, "unknown": false},
+                    {"ts": base_t + 12.0, "fp": cap_fp_edited, "unknown": false}
+                ],
+                "closed": false,
+            }),
+        )
+        .unwrap();
+        let sum_eb_post_edit = active_cycle_closure_summary(sess_early_blk, &repo_str, "");
+        assert_eq!(sum_eb_post_edit.blocked_count, 1);
+        assert_eq!(sum_eb_post_edit.effective_pass_count, 2);
+        assert!(!sum_eb_post_edit.has_fresh_ready);
+        assert_eq!(
+            run_cli(&[
+                "review".to_string(),
+                "--cwd".to_string(),
+                repo_str.clone(),
+                "--session".to_string(),
+                sess_early_blk.to_string(),
+                "--closure".to_string(),
+                "--diff-file".to_string(),
+                diff_p.to_string_lossy().into_owned(),
+                "--summary".to_string(),
+                "3rd closure after post-rejected-READY edit must stay blocked".to_string(),
+            ]),
+            2
+        );
+        fs::write(&cap_auth, "pub fn check() {}\n").unwrap();
+        let tp_eb = tmp.0.join("transcript-eb.jsonl");
+        let eb_res_steps = [
+            json!({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": crate::win32_sqlite::format_iso_utc(base_t + 15.0), "tool_calls": [{"name": "search_web", "args": {"query": "sandwich gate order"}}]}),
+            json!({"step_index": 2, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(base_t + 16.0), "content": "ok"}),
+        ];
+        fs::write(
+            &tp_eb,
+            eb_res_steps.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        assert_eq!(
+            run_cli(&[
+                "research-reset".to_string(),
+                "--cwd".to_string(),
+                repo_str.clone(),
+                "--session".to_string(),
+                sess_early_blk.to_string(),
+                "--decision".to_string(),
+                "refine".to_string(),
+                "--findings".to_string(),
+                "Resetting cycle after premature pre-simplify BLOCKED pass.".to_string(),
+                "--transcript".to_string(),
+                tp_eb.to_string_lossy().into_owned(),
+            ]),
+            0
+        );
+
+        // SAFETY: Sub-case B (`HIGH` path floor escalated via `--xhigh` or `XHIGH -> HIGH` receipt transition in same cycle after Sol `READY`) blocks `Stop` (`verified: HIGH` & `pr-ready: HIGH`), keeps `has_fresh_ready == false`, and unlocks `research-reset`.
+        let sess_decl_xh = "sess-decl-xhigh-on-high";
+        let sw_dxh = brain_dir.join(sess_decl_xh).join(".system_generated").join("swarm");
+        let log_dxh = brain_dir.join(sess_decl_xh).join(".system_generated").join("logs");
+        fs::create_dir_all(&sw_dxh).unwrap();
+        fs::create_dir_all(&log_dxh).unwrap();
+        rio::write_json(&sw_dxh.join("members.json"), &sim_members).unwrap();
+        fs::write(
+            sw_dxh.join("board.jsonl"),
+            two_sim_board_rows.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        rio::write_json(
+            &cwg_common::marker_path(sess_decl_xh),
+            &json!({
+                "session": sess_decl_xh,
+                "first_ts": base_t,
+                "last_durable_ts": base_t,
+                "cwd": rio::normalize_path(&repo_str),
+                "git_root": rio::normalize_path(&repo_str),
+                "paths": [cap_auth_norm],
+                "content_marks": [{"ts": base_t, "fp": cap_fp, "unknown": false}],
+                "closed": false,
+            }),
+        )
+        .unwrap();
+        let chk_dxh = cwg_common::checks_ledger_path(sess_decl_xh);
+        if let Some(parent) = chk_dxh.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(
+            &chk_dxh,
+            json!({"kind": "check", "passed": true, "ts": base_t + 6.0}).to_string() + "\n",
+        )
+        .unwrap();
+        for (rid_d, eff_d, ph_d, cts_d) in [
+            ("cwg-dxh-o0", "xhigh", "ordinary", base_t + 1.0),
+            ("cwg-dxh-b1", "xhigh", "closure", base_t + 4.0),
+            ("cwg-dxh-r2", "high", "closure", base_t + 10.0),
+        ] {
+            record_packet(rid_d, &format!("REVIEW_ID: {}", rid_d), &repo_str, eff_d, ph_d, sess_decl_xh);
+            let p_d = packet_path(rid_d);
+            let mut doc_d = rio::read_json(&p_d).unwrap();
+            doc_d["created_ts"] = json!(cts_d);
+            rio::write_json(&p_d, &doc_d).unwrap();
+        }
+        let dxh_rf = sessions_dir.join("rollout-dxh-wrongtier.jsonl");
+        let dxh_rows = [
+            json!({"type": "session_meta", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.0), "payload": {"id": "sess-dxh-wt", "session_id": "sess-dxh-wt", "source": "exec", "thread_source": "user"}}),
+            json!({"type": "turn_context", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.1), "payload": {"model": "gpt-6.2-astra", "effort": "xhigh"}}),
+            json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.2), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-dxh-o0"}]}}),
+            json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 2.0), "payload": {"type": "task_complete", "last_agent_message": "VERDICT: APPROVED"}}),
+            json!({"type": "turn_context", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 4.1), "payload": {"model": "gpt-6.2-astra", "effort": "xhigh"}}),
+            json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 4.2), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-dxh-b1"}]}}),
+            json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 5.0), "payload": {"type": "task_complete", "last_agent_message": "CLOSURE_VALIDATION: BLOCKED"}}),
+            json!({"type": "turn_context", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 10.1), "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
+            json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 10.2), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-dxh-r2"}]}}),
+            json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 11.0), "payload": {"type": "task_complete", "last_agent_message": "CLOSURE_VALIDATION: READY"}}),
+        ];
+        fs::write(
+            &dxh_rf,
+            dxh_rows.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        let tp_dxh = log_dxh.join("transcript.jsonl");
+        fs::write(&tp_dxh, "").unwrap();
+        // SAFETY: First verify `--xhigh` latched inside `marker.json` (`cycle_declared_risk` at `reset_epoch == 0`) blocks `[gate] verified: HIGH` and `[gate] pr-ready: HIGH` in `decide_stop`.
+        assert!(cwg_common::latch_marker_declared_risk(
+            sess_decl_xh,
+            None,
+            None,
+            "XHIGH",
+        ));
+        let stop_from_flag = crate::cwg_stop::decide_stop(&json!({
+            "conversationId": sess_decl_xh,
+            "cwd": repo_str,
+            "transcriptPath": tp_dxh.to_string_lossy(),
+            "lastAssistantMessage": "Done.\n[gate] verified: HIGH; downgrade attempt after --xhigh",
+            "fullyIdle": true,
+        }));
+        assert!(
+            stop_from_flag
+                .as_deref()
+                .is_some_and(|m| m.contains("below active cycle escalated risk")),
+            "unexpected decide_stop result: {:?}",
+            stop_from_flag
+        );
+        let stop_pr_from_flag = crate::cwg_stop::decide_stop(&json!({
+            "conversationId": sess_decl_xh,
+            "cwd": repo_str,
+            "transcriptPath": tp_dxh.to_string_lossy(),
+            "lastAssistantMessage": "Done.\n[gate] pr-ready: HIGH; downgrade attempt after --xhigh",
+            "fullyIdle": true,
+        }));
+        assert!(stop_pr_from_flag.is_some());
+        if let Some(mut m_clr) = rio::read_json(&cwg_common::marker_path(sess_decl_xh)) {
+            if let Some(obj) = m_clr.as_object_mut() {
+                obj.remove("cycle_declared_risk");
+            }
+            rio::write_json(&cwg_common::marker_path(sess_decl_xh), &m_clr).unwrap();
+        }
+        // SAFETY: Next verify `XHIGH -> HIGH` receipt transition in transcript also blocks `decide_stop` and preserves `XHIGH` monotonically inside `marker.json` + CLI.
+        let dxh_steps = [
+            json!({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": crate::win32_sqlite::format_iso_utc(base_t + 12.0), "content": "Done.\n[gate] verified: XHIGH; auth hardened"}),
+            json!({"step_index": 2, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": crate::win32_sqlite::format_iso_utc(base_t + 13.0), "content": "Retrying lower.\n[gate] verified: HIGH; auth hardened"}),
+            json!({"step_index": 3, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": crate::win32_sqlite::format_iso_utc(base_t + 15.0), "tool_calls": [{"name": "search_web", "args": {"query": "declared xhigh recovery"}}]}),
+            json!({"step_index": 4, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(base_t + 16.0), "content": "ok"}),
+        ];
+        fs::write(
+            &tp_dxh,
+            dxh_steps.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        let stop_tx_downgrade = crate::cwg_stop::decide_stop(&json!({
+            "conversationId": sess_decl_xh,
+            "cwd": repo_str,
+            "transcriptPath": tp_dxh.to_string_lossy(),
+            "lastAssistantMessage": "Retrying lower.\n[gate] verified: HIGH; auth hardened",
+            "fullyIdle": true,
+        }));
+        assert!(
+            stop_tx_downgrade
+                .as_deref()
+                .is_some_and(|m| m.contains("below active cycle escalated risk")),
+            "unexpected decide_stop result on XHIGH->HIGH receipt transition: {:?}",
+            stop_tx_downgrade
+        );
+        let m_before_rr = rio::read_json(&cwg_common::marker_path(sess_decl_xh)).unwrap();
+        assert_eq!(cwg_common::active_marker_declared_risk(&m_before_rr), "XHIGH");
+        let sum_dxh = active_cycle_closure_summary(sess_decl_xh, &repo_str, "");
+        assert_eq!(sum_dxh.blocked_count, 1);
+        assert_eq!(sum_dxh.effective_pass_count, 2);
+        assert!(!sum_dxh.has_fresh_ready);
+        // SAFETY: While `review_flight_lock` is held, `research-reset` fails closed (`2`) without mutating `marker.json`; once released, `research-reset` and concurrent new-cycle `--xhigh` latching serialize cleanly on `marker_lock_path` + `reset_epoch`.
+        {
+            let fl_rr = match try_acquire_review_flight_lock(sess_decl_xh, &repo_str) {
+                FlightLockResult::Acquired(fh) => fh,
+                _ => panic!("expected flight lock to be free"),
+            };
+            assert_eq!(
+                run_cli(&[
+                    "research-reset".to_string(),
+                    "--cwd".to_string(),
+                    repo_str.clone(),
+                    "--session".to_string(),
+                    sess_decl_xh.to_string(),
+                    "--decision".to_string(),
+                    "refine".to_string(),
+                    "--findings".to_string(),
+                    "Must reject while review is in flight.".to_string(),
+                    "--transcript".to_string(),
+                    tp_dxh.to_string_lossy().into_owned(),
+                ]),
+                2
+            );
+            drop(fl_rr);
+        }
+        let bar_rr = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let repo_t = repo_str.clone();
+        let tp_dxh_t = tp_dxh.to_string_lossy().into_owned();
+        let bar_rr_c = std::sync::Arc::clone(&bar_rr);
+        let rr_handle = std::thread::spawn(move || {
+            bar_rr_c.wait();
+            run_cli(&[
+                "research-reset".to_string(),
+                "--cwd".to_string(),
+                repo_t,
+                "--session".to_string(),
+                sess_decl_xh.to_string(),
+                "--decision".to_string(),
+                "refine".to_string(),
+                "--findings".to_string(),
+                "Resetting cycle after declared XHIGH receipt rejected Sol READY.".to_string(),
+                "--transcript".to_string(),
+                tp_dxh_t,
+            ])
+        });
+        bar_rr.wait();
+        let rc_rr_done = rr_handle.join().unwrap();
+        assert_eq!(rc_rr_done, 0);
+        let m_after_rr = rio::read_json(&cwg_common::marker_path(sess_decl_xh)).unwrap();
+        assert_eq!(cwg_common::research_reset_epoch(&m_after_rr), 1);
+        assert_eq!(cwg_common::active_marker_declared_risk(&m_after_rr), "");
+        // SAFETY: Stale epoch `0` latch cannot pollute epoch `1`, while new-cycle `--xhigh` (`None` epoch -> live epoch `1`) persists `XHIGH` on epoch `1` and blocks `[gate] verified: HIGH` in `Stop`.
+        assert!(!cwg_common::latch_marker_declared_risk(
+            sess_decl_xh,
+            Some(base_t),
+            Some(0),
+            "XHIGH",
+        ));
+        assert!(cwg_common::latch_marker_declared_risk(
+            sess_decl_xh,
+            None,
+            None,
+            "XHIGH",
+        ));
+        let m_new_cycle_xh = rio::read_json(&cwg_common::marker_path(sess_decl_xh)).unwrap();
+        assert_eq!(cwg_common::active_marker_declared_risk(&m_new_cycle_xh), "XHIGH");
+        let stop_new_cycle_downgrade = crate::cwg_stop::decide_stop(&json!({
+            "conversationId": sess_decl_xh,
+            "cwd": repo_str,
+            "transcriptPath": tp_dxh.to_string_lossy(),
+            "lastAssistantMessage": "New cycle attempt.\n[gate] verified: HIGH; must stay XHIGH in new cycle",
+            "fullyIdle": true,
+        }));
+        assert!(
+            stop_new_cycle_downgrade
+                .as_deref()
+                .is_some_and(|m| m.contains("below active cycle escalated risk")),
+            "expected new cycle XHIGH to block HIGH receipt: {:?}",
+            stop_new_cycle_downgrade
+        );
+
+        // SAFETY: Invoking `review --xhigh` via CLI when `check_health()` returns `available: false` (e.g. open breaker) STILL latches `cycle_declared_risk == "XHIGH"` so an already-valid `HIGH` (`Sol`) `READY` on `sess_cap` cannot close as `HIGH`.
+        rio::write_json(
+            &breaker_path(),
+            &json!({"until_ts": now_sec() + 600.0, "reason": "test_breaker_open"}),
+        )
+        .unwrap();
+        let rc_xh_breaker = run_cli(&[
+            "review".to_string(),
+            "--xhigh".to_string(),
+            "--cwd".to_string(),
+            repo_str.clone(),
+            "--session".to_string(),
+            sess_cap.to_string(),
+            "--diff-file".to_string(),
+            diff_p.to_string_lossy().into_owned(),
+            "--summary".to_string(),
+            "XHIGH attempt while breaker open".to_string(),
+        ]);
+        let _ = fs::remove_file(breaker_path());
+        assert_eq!(rc_xh_breaker, 2);
+        let m_cap_xh = rio::read_json(&cwg_common::marker_path(sess_cap)).unwrap();
+        assert_eq!(cwg_common::active_marker_declared_risk(&m_cap_xh), "XHIGH");
+        let chk_cap = cwg_common::checks_ledger_path(sess_cap);
+        if let Some(parent) = chk_cap.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(
+            &chk_cap,
+            json!({"kind": "check", "passed": true, "ts": base_t + 6.0}).to_string() + "\n",
+        )
+        .unwrap();
+        let tp_cap = tmp.0.join("tp-cap.jsonl");
+        fs::write(&tp_cap, "").unwrap();
+        let stop_cap_high = crate::cwg_stop::decide_stop(&json!({
+            "conversationId": sess_cap,
+            "cwd": repo_str,
+            "transcriptPath": tp_cap.to_string_lossy(),
+            "lastAssistantMessage": "Done.\n[gate] verified: HIGH; must be blocked after review --xhigh fallback",
+            "fullyIdle": true,
+        }));
+        assert!(
+            stop_cap_high
+                .as_deref()
+                .is_some_and(|m| m.contains("below active cycle escalated risk")),
+            "expected breaker-fallback review --xhigh to block HIGH closure: {:?}",
+            stop_cap_high
+        );
+
+        // SAFETY: Pre-launch ordinary review round cap rejects a 4th ordinary `codex-lane review` after 3 `REVISE` rounds without `simplify` (`rc == 2`, `max_ordinary_rounds_reached`).
+        let sess_ord3 = "sess-ord-cap-3";
+        rio::write_json(
+            &cwg_common::marker_path(sess_ord3),
+            &json!({
+                "session": sess_ord3,
+                "first_ts": base_t,
+                "last_durable_ts": base_t,
+                "cwd": rio::normalize_path(&repo_str),
+                "git_root": rio::normalize_path(&repo_str),
+                "paths": [cap_auth_norm],
+                "content_marks": [{"ts": base_t, "fp": cap_fp, "unknown": false}],
+                "closed": false,
+            }),
+        )
+        .unwrap();
+        for (idx_o, rid_o) in ["cwg-ord3-r1", "cwg-ord3-r2", "cwg-ord3-r3"].iter().enumerate() {
+            record_packet(rid_o, &format!("REVIEW_ID: {}", rid_o), &repo_str, "high", "ordinary", sess_ord3);
+            let p_o = packet_path(rid_o);
+            let mut doc_o = rio::read_json(&p_o).unwrap();
+            doc_o["created_ts"] = json!(base_t + 1.0 + (idx_o as f64) * 2.0);
+            rio::write_json(&p_o, &doc_o).unwrap();
+        }
+        let ord3_rf = sessions_dir.join("rollout-ord3-cap.jsonl");
+        let ord3_rows = [
+            json!({"type": "session_meta", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.0), "payload": {"id": "sess-ord3-sid", "session_id": "sess-ord3-sid", "source": "exec", "thread_source": "user"}}),
+            json!({"type": "turn_context", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.1), "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
+            json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.2), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-ord3-r1"}]}}),
+            json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 2.0), "payload": {"type": "task_complete", "last_agent_message": "VERDICT: REVISE"}}),
+            json!({"type": "turn_context", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 3.1), "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
+            json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 3.2), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-ord3-r2"}]}}),
+            json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 4.0), "payload": {"type": "task_complete", "last_agent_message": "VERDICT: REVISE"}}),
+            json!({"type": "turn_context", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 5.1), "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
+            json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 5.2), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-ord3-r3"}]}}),
+            json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 6.0), "payload": {"type": "task_complete", "last_agent_message": "VERDICT: REVISE"}}),
+        ];
+        fs::write(
+            &ord3_rf,
+            ord3_rows.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        let inv_before_4th = fs::read_to_string(&inv_log).unwrap_or_default().lines().count();
+        let rc_4th_ord = run_cli(&[
+            "review".to_string(),
+            "--cwd".to_string(),
+            repo_str.clone(),
+            "--session".to_string(),
+            sess_ord3.to_string(),
+            "--diff-file".to_string(),
+            diff_p.to_string_lossy().into_owned(),
+            "--summary".to_string(),
+            "4th ordinary round must be rejected pre-launch".to_string(),
+        ]);
+        assert_eq!(rc_4th_ord, 2);
+        let inv_after_4th = fs::read_to_string(&inv_log).unwrap_or_default().lines().count();
+        assert_eq!(inv_after_4th, inv_before_4th);
+        // INVARIANT: Completing `simplify` after 3 `REVISE` rounds MUST NOT un-count those 3 ordinary rounds: `cmd_review` still rejects a 4th ordinary round (`rc == 2`), and `validate_candidate_closure` rejects closing on a 4th ordinary `APPROVED` without `--closure`.
+        let ord3_brain = rio::resolve_brain_root("");
+        let ord3_tp = ord3_brain
+            .join(sess_ord3)
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl");
+        let ord3_board = ord3_brain
+            .join(sess_ord3)
+            .join(".system_generated")
+            .join("swarm")
+            .join("board.jsonl");
+        let ord3_members = ord3_brain
+            .join(sess_ord3)
+            .join(".system_generated")
+            .join("swarm")
+            .join("members.json");
+        fs::create_dir_all(ord3_tp.parent().unwrap()).unwrap();
+        fs::create_dir_all(ord3_board.parent().unwrap()).unwrap();
+        fs::write(&ord3_tp, "").unwrap();
+        fs::write(
+            &ord3_members,
+            json!([
+                {"name": "simp-r", "model": cwg_common::SONNET_HIGH_MODEL, "state": "killed", "killed": true},
+                {"name": "simp-q", "model": cwg_common::SONNET_HIGH_MODEL, "state": "killed", "killed": true},
+                {"name": "simp-e", "model": cwg_common::SONNET_HIGH_MODEL, "state": "killed", "killed": true}
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        let sim_t_str = crate::win32_sqlite::format_iso_utc(base_t + 7.0);
+        let sim_end_str = crate::win32_sqlite::format_iso_utc(base_t + 8.0);
+        let ord3_board_lines = [
+            json!({"seq": 1, "agent": "coordinator", "time": sim_t_str, "text": "@simp-r @simp-q @simp-e simplify"}),
+            json!({"seq": 2, "agent": "simp-r", "time": sim_end_str, "text": format!("@coordinator\nDIFF_HASH: {}\nSIMPLIFY_LENS: REUSE\nSIMPLIFY_VERDICT: CLEAN", cap_fp)}),
+            json!({"seq": 3, "agent": "simp-q", "time": sim_end_str, "text": format!("@coordinator\nDIFF_HASH: {}\nSIMPLIFY_LENS: QUALITY\nSIMPLIFY_VERDICT: CLEAN", cap_fp)}),
+            json!({"seq": 4, "agent": "simp-e", "time": sim_end_str, "text": format!("@coordinator\nDIFF_HASH: {}\nSIMPLIFY_LENS: EFFICIENCY\nSIMPLIFY_VERDICT: CLEAN", cap_fp)}),
+        ];
+        fs::write(
+            &ord3_board,
+            ord3_board_lines.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        let mut m_ord3 = rio::read_json(&cwg_common::marker_path(sess_ord3)).unwrap();
+        m_ord3["current_diff_hash"] = json!(cap_fp);
+        rio::write_json(&cwg_common::marker_path(sess_ord3), &m_ord3).unwrap();
+        assert_eq!(
+            run_cli(&[
+                "review".to_string(),
+                "--cwd".to_string(),
+                repo_str.clone(),
+                "--session".to_string(),
+                sess_ord3.to_string(),
+                "--diff-file".to_string(),
+                diff_p.to_string_lossy().into_owned(),
+                "--summary".to_string(),
+                "4th ordinary round AFTER simplify must STILL be rejected".to_string(),
+            ]),
+            2
+        );
+        assert_eq!(
+            fs::read_to_string(&inv_log).unwrap_or_default().lines().count(),
+            inv_before_4th
+        );
+        let ord3_tp_str = ord3_tp.to_string_lossy().into_owned();
+        let sw_ord3 = crate::cwg_stop::scan_swarm_activity_with_reset(crate::cwg_stop::SwarmScanInput {
+            steps: &[],
+            transcript_path: Some(&ord3_tp_str),
+            first_ts: base_t,
+            round_start_msg_id: 0,
+            current_diff_hash: &cap_fp,
+            cwd: &repo_str,
+            research_reset_ts: 0.0,
+            research_reset_seq: 0,
+            marker: Some(&m_ord3),
+        });
+        let mut revs_4th_app = scan_verified_codex_reviews(
+            base_t,
+            sess_ord3,
+            &rio::normalize_path(&repo_str),
+        );
+        revs_4th_app.push(json!({
+            "review_id": "cwg-ord3-r4-app",
+            "engine": "codex",
+            "kind": "ordinary",
+            "verdict": "APPROVED",
+            "launch_ts": base_t + 9.0,
+            "verdict_ts": base_t + 9.5,
+            "xhigh": false,
+        }));
+        let chk_ord3 = crate::cwg_stop::ChecksEvidence {
+            checks_count: 1,
+            passed_count: 1,
+            failed_count: 0,
+            latest_pass_ts: base_t + 0.5,
+            latest_fail_ts: 0.0,
+        };
+        let sub_ord3 = crate::cwg_stop::SubagentEvidence::default();
+        let rcp_high = cwg_common::parse_terminal_receipt("[gate] verified: HIGH; ok").unwrap();
+        let (ok_4th_app, why_4th_app) = crate::cwg_stop::validate_candidate_closure(
+            crate::cwg_stop::CandidateClosureInput {
+                receipt: Some(&rcp_high),
+                marker_in: &m_ord3,
+                checks_ev: &chk_ord3,
+                sub_ev: &sub_ord3,
+                swarm_ev: &sw_ord3,
+                codex_reviews: &revs_4th_app,
+                ctx: None,
+                steps: None,
+                transcript_path: None,
+            },
+        );
+        assert!(!ok_4th_app);
+        assert!(
+            why_4th_app.contains("exceeded MAX_REVIEW_ROUNDS"),
+            "expected 4th ordinary APPROVED after simplify to fail round cap, got: {}",
+            why_4th_app
+        );
+
+        // INVARIANT: Once `simplify` has started after Round 1 `APPROVED`, durable `simplify` edits cannot re-enter `ordinary` review (`simplify_phase_already_started`), AND `--closure` rejects unkilled `waiting` simplify workers (`active_swarm_workers_present`) until they are killed.
+        let sess_sw_guard = "sess-sandwich-cli-guards";
+        rio::write_json(
+            &cwg_common::marker_path(sess_sw_guard),
+            &json!({
+                "session": sess_sw_guard,
+                "first_ts": base_t,
+                "last_durable_ts": base_t + 4.0,
+                "cwd": rio::normalize_path(&repo_str),
+                "git_root": rio::normalize_path(&repo_str),
+                "paths": [cap_auth_norm.clone()],
+                "content_marks": [
+                    {"ts": base_t, "fp": "pre_sim_fp_old", "unknown": false},
+                    {"ts": base_t + 4.0, "fp": cap_fp.clone(), "unknown": false}
+                ],
+                "current_diff_hash": cap_fp.clone(),
+                "closed": false,
+            }),
+        )
+        .unwrap();
+        record_packet("cwg-swg-r1", "REVIEW_ID: cwg-swg-r1", &repo_str, "high", "ordinary", sess_sw_guard);
+        let p_swg = packet_path("cwg-swg-r1");
+        let mut doc_swg = rio::read_json(&p_swg).unwrap();
+        doc_swg["created_ts"] = json!(base_t + 1.0);
+        rio::write_json(&p_swg, &doc_swg).unwrap();
+        let swg_rf = sessions_dir.join("rollout-swg-r1.jsonl");
+        let swg_rows = [
+            json!({"type": "session_meta", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.0), "payload": {"id": "sess-swg-sid", "session_id": "sess-swg-sid", "source": "exec", "thread_source": "user"}}),
+            json!({"type": "turn_context", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.1), "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
+            json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.2), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-swg-r1"}]}}),
+            json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 2.0), "payload": {"type": "task_complete", "last_agent_message": "VERDICT: APPROVED"}}),
+        ];
+        fs::write(
+            &swg_rf,
+            swg_rows.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        let swg_dir = ord3_brain.join(sess_sw_guard).join(".system_generated").join("swarm");
+        let swg_logs = ord3_brain.join(sess_sw_guard).join(".system_generated").join("logs");
+        fs::create_dir_all(&swg_dir).unwrap();
+        fs::create_dir_all(&swg_logs).unwrap();
+        fs::write(swg_logs.join("transcript.jsonl"), "").unwrap();
+        fs::write(
+            swg_dir.join("members.json"),
+            json!([
+                {"name": "simp-r", "model": cwg_common::SONNET_HIGH_MODEL, "state": "waiting", "killed": false},
+                {"name": "simp-q", "model": cwg_common::SONNET_HIGH_MODEL, "state": "killed", "killed": true},
+                {"name": "simp-e", "model": cwg_common::SONNET_HIGH_MODEL, "state": "killed", "killed": true}
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            swg_dir.join("board.jsonl"),
+            ord3_board_lines.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        let inv_before_swg = fs::read_to_string(&inv_log).unwrap_or_default().lines().count();
+        assert_eq!(
+            run_cli(&[
+                "review".to_string(),
+                "--cwd".to_string(),
+                repo_str.clone(),
+                "--session".to_string(),
+                sess_sw_guard.to_string(),
+                "--diff-file".to_string(),
+                diff_p.to_string_lossy().into_owned(),
+                "--summary".to_string(),
+                "Post-simplify edit must not re-enter ordinary review".to_string(),
+            ]),
+            2
+        );
+        assert_eq!(
+            run_cli(&[
+                "review".to_string(),
+                "--closure".to_string(),
+                "--cwd".to_string(),
+                repo_str.clone(),
+                "--session".to_string(),
+                sess_sw_guard.to_string(),
+                "--diff-file".to_string(),
+                diff_p.to_string_lossy().into_owned(),
+                "--summary".to_string(),
+                "Waiting simplify worker must block --closure".to_string(),
+            ]),
+            2
+        );
+        assert_eq!(
+            fs::read_to_string(&inv_log).unwrap_or_default().lines().count(),
+            inv_before_swg
+        );
+        fs::write(
+            swg_dir.join("members.json"),
+            json!([
+                {"name": "simp-r", "model": cwg_common::SONNET_HIGH_MODEL, "state": "killed", "killed": true},
+                {"name": "simp-q", "model": cwg_common::SONNET_HIGH_MODEL, "state": "killed", "killed": true},
+                {"name": "simp-e", "model": cwg_common::SONNET_HIGH_MODEL, "state": "killed", "killed": true}
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            run_cli(&[
+                "review".to_string(),
+                "--closure".to_string(),
+                "--cwd".to_string(),
+                repo_str.clone(),
+                "--session".to_string(),
+                sess_sw_guard.to_string(),
+                "--diff-file".to_string(),
+                diff_p.to_string_lossy().into_owned(),
+                "--summary".to_string(),
+                "All simplify workers killed unlocks --closure".to_string(),
+            ]),
+            0
+        );
+
+        // SAFETY: Fresh `VERDICT: APPROVED` blocks redundant ordinary review (`already_ordinary_approved`), whereas an external editor file modification (no `PostToolUse` delta) is caught via `catch_up_unmeasured_changes` and unlocks a fresh primary review.
+        let sess_ext = "sess-ext-edit-after-app";
+        rio::write_json(
+            &cwg_common::marker_path(sess_ext),
+            &json!({
+                "session": sess_ext,
+                "first_ts": base_t,
+                "last_durable_ts": base_t,
+                "cwd": rio::normalize_path(&repo_str),
+                "git_root": rio::normalize_path(&repo_str),
+                "paths": [cap_auth_norm],
+                "content_marks": [{"ts": base_t, "fp": cap_fp, "unknown": false}],
+                "closed": false,
+            }),
+        )
+        .unwrap();
+        record_packet("cwg-ext-app01", "REVIEW_ID: cwg-ext-app01", &repo_str, "high", "ordinary", sess_ext);
+        let p_ext = packet_path("cwg-ext-app01");
+        let mut doc_ext = rio::read_json(&p_ext).unwrap();
+        doc_ext["created_ts"] = json!(base_t + 1.0);
+        rio::write_json(&p_ext, &doc_ext).unwrap();
+        let ext_rf = sessions_dir.join("rollout-ext-app.jsonl");
+        let ext_rows = [
+            json!({"type": "session_meta", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.0), "payload": {"id": "sess-ext-sid", "session_id": "sess-ext-sid", "source": "exec", "thread_source": "user"}}),
+            json!({"type": "turn_context", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.1), "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
+            json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.2), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-ext-app01"}]}}),
+            json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 2.0), "payload": {"type": "task_complete", "last_agent_message": "VERDICT: APPROVED"}}),
+        ];
+        fs::write(
+            &ext_rf,
+            ext_rows.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        assert_eq!(
+            run_cli(&[
+                "review".to_string(),
+                "--cwd".to_string(),
+                repo_str.clone(),
+                "--session".to_string(),
+                sess_ext.to_string(),
+                "--diff-file".to_string(),
+                diff_p.to_string_lossy().into_owned(),
+                "--summary".to_string(),
+                "Redundant ordinary review on unchanged bytes must fail".to_string(),
+            ]),
+            2
+        );
+        fs::write(&cap_auth, "pub fn check_external_editor_edit() {}\n").unwrap();
+        // SAFETY: If `marker.json` cannot be overwritten to persist the external-editor fingerprint, `cmd_review` fails closed (`rc == 2`, `marker_sync_write_failed`) BEFORE invoking Codex.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let hold_ro = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .open(cwg_common::marker_path(sess_ext))
+                .unwrap();
+            let inv_before_sync_fail =
+                fs::read_to_string(&inv_log).unwrap_or_default().lines().count();
+            assert_eq!(
+                run_cli(&[
+                    "review".to_string(),
+                    "--new-session".to_string(),
+                    "--cwd".to_string(),
+                    repo_str.clone(),
+                    "--session".to_string(),
+                    sess_ext.to_string(),
+                    "--diff-file".to_string(),
+                    diff_p.to_string_lossy().into_owned(),
+                    "--summary".to_string(),
+                    "FORCE_ORDINARY_APPROVED_MOCK".to_string(),
+                ]),
+                2
+            );
+            assert_eq!(
+                fs::read_to_string(&inv_log).unwrap_or_default().lines().count(),
+                inv_before_sync_fail
+            );
+            drop(hold_ro);
+        }
+        assert_eq!(
+            run_cli(&[
+                "review".to_string(),
+                "--new-session".to_string(),
+                "--cwd".to_string(),
+                repo_str.clone(),
+                "--session".to_string(),
+                sess_ext.to_string(),
+                "--diff-file".to_string(),
+                diff_p.to_string_lossy().into_owned(),
+                "--summary".to_string(),
+                "FORCE_ORDINARY_APPROVED_MOCK".to_string(),
+            ]),
+            0
+        );
+        fs::write(&cap_auth, "pub fn check() {}\n").unwrap();
+    }
+
+    #[test]
+    fn test_astra_vs_sol_model_routing_and_xhigh_rollout_verification() {
+        let _lock = crate::win32_sqlite::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(resolve_review_model("", false), "gpt-6.2-sol");
+        assert_eq!(resolve_review_model("", true), "gpt-6.2-astra");
+        assert_eq!(resolve_review_model("custom-model", true), "custom-model");
+
+        assert!(cwg_common::is_codex_xhigh_turn("gpt-6.2-astra", "xhigh"));
+        assert!(cwg_common::is_codex_xhigh_turn("gpt-6.2-astra", "ultra"));
+        assert!(cwg_common::is_codex_xhigh_turn("gpt-6.2-astra-2026-11", "max"));
+        assert!(!cwg_common::is_codex_xhigh_turn("gpt-6.2-sol", "xhigh"));
+        assert!(!cwg_common::is_codex_xhigh_turn("gpt-6-astra", "xhigh"));
+        assert!(!cwg_common::is_codex_xhigh_turn("gpt-6.2-astra", "high"));
+        assert!(!cwg_common::is_codex_xhigh_turn("", "xhigh"));
+
+        let tmp = TempTestDir::new("astra-vs-sol");
+        let stack_home = tmp.0.join("stack");
+        let sessions_dir = tmp.0.join("sessions");
+        let repo_dir = tmp.0.join("repo");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        fs::create_dir_all(&repo_dir).unwrap();
+
+        let _env = EnvVarGuard::set(&[
+            ("CARBON_STACK_HOME", Some(&stack_home.to_string_lossy())),
+            ("CARBON_CODEX_SESSIONS_DIR", Some(&sessions_dir.to_string_lossy())),
+        ]);
+
+        let now = now_sec();
+        let repo_str = repo_dir.to_string_lossy().into_owned();
+        let sess = "sess-astra-sol-01";
+        let rid_sol = "cwg-solxhigh001";
+        let rid_astra = "cwg-astraxhigh1";
+        record_packet(rid_sol, &format!("REVIEW_ID: {}", rid_sol), &repo_str, "xhigh", "ordinary", sess);
+        record_packet(rid_astra, &format!("REVIEW_ID: {}", rid_astra), &repo_str, "xhigh", "ordinary", sess);
+
+        let write_rollout = |sid: &str, model: &str, effort: &str, rid: &str, ts_s: &str| {
+            let lines = [
+                json!({"type": "session_meta", "timestamp": ts_s, "payload": {"id": sid, "session_id": sid, "source": "exec", "thread_source": "user"}}),
+                json!({"type": "turn_context", "timestamp": ts_s, "payload": {"model": model, "effort": effort}}),
+                json!({"type": "response_item", "timestamp": ts_s, "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": format!("REVIEW_ID: {}", rid)}]}}),
+                json!({"type": "event_msg", "timestamp": ts_s, "payload": {"type": "task_complete", "last_agent_message": "VERDICT: APPROVED"}}),
+            ];
+            fs::write(
+                sessions_dir.join(format!("rollout-{}.jsonl", sid)),
+                lines.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+            )
+            .unwrap();
+        };
+        write_rollout("sid-sol-001", "gpt-6.2-sol", "xhigh", rid_sol, "2026-11-18T08:00:01Z");
+        write_rollout("sid-astra-001", "gpt-6.2-astra", "xhigh", rid_astra, "2026-11-18T08:00:05Z");
+
+        let scanned = scan_verified_codex_reviews(now - 60.0, sess, &repo_str);
+        assert_eq!(scanned.len(), 2);
+        let sol_rec = scanned.iter().find(|r| r["review_id"] == rid_sol).unwrap();
+        let astra_rec = scanned.iter().find(|r| r["review_id"] == rid_astra).unwrap();
+        assert_eq!(sol_rec["xhigh"], false);
+        assert_eq!(astra_rec["xhigh"], true);
+
+        let _ = rio::write_json(
+            &thread_state_path(sess, &repo_str),
+            &json!({
+                "session_id": "sid-sol-001",
+                "session": sess,
+                "git_root": rio::normalize_path(&repo_str),
+                "candidate_first_ts": now - 10.0,
+                "model": "gpt-6.2-sol",
+                "effort": "high",
+                "xhigh": false,
+                "updated_ts": now,
+            }),
+        );
+        assert_eq!(
+            resolve_resume_session(
+                &repo_str,
+                sess,
+                now - 10.0,
+                "",
+                false,
+                "gpt-6.2-sol",
+                "high"
+            ),
+            "sid-sol-001"
+        );
+        assert_eq!(
+            resolve_resume_session(
+                &repo_str,
+                sess,
+                now - 10.0,
+                "",
+                false,
+                "gpt-6.2-astra",
+                "xhigh"
+            ),
+            "sid-astra-001"
+        );
+
+        let cand_ts = now - 10.0;
+        save_lane_thread_state(
+            sess,
+            &repo_str,
+            cand_ts,
+            "gpt-6.2-astra",
+            "xhigh",
+            json!({
+                "session_id": "sid-astra-timeout",
+                "candidate_first_ts": cand_ts,
+                "model": "gpt-6.2-astra",
+                "effort": "xhigh",
+                "xhigh": true,
+                "pending_timeout_resume": true,
+                "next_timeout_seconds": 1200,
+                "updated_ts": now,
+            }),
+        );
+        save_lane_thread_state(
+            sess,
+            &repo_str,
+            cand_ts,
+            "gpt-6.2-sol",
+            "high",
+            json!({
+                "session_id": "sid-sol-approved",
+                "candidate_first_ts": cand_ts,
+                "model": "gpt-6.2-sol",
+                "effort": "high",
+                "xhigh": false,
+                "updated_ts": now + 1.0,
+            }),
+        );
+        save_lane_thread_state(
+            sess,
+            &repo_str,
+            cand_ts,
+            "gpt-6.2-astra",
+            "high",
+            json!({
+                "session_id": "sid-astra-high",
+                "candidate_first_ts": cand_ts,
+                "model": "gpt-6.2-astra",
+                "effort": "high",
+                "xhigh": false,
+                "pending_timeout_resume": true,
+                "next_timeout_seconds": 900,
+                "updated_ts": now + 2.0,
+            }),
+        );
+
+        let xh_st = active_thread_state_for_lane(sess, &repo_str, Some(cand_ts), "gpt-6.2-astra", "xhigh").unwrap();
+        assert_eq!(val_to_str(xh_st.get("session_id")), "sid-astra-timeout");
+        assert_eq!(val_to_f64(xh_st.get("next_timeout_seconds")) as i64, 1200);
+        assert_eq!(
+            resolve_resume_session(&repo_str, sess, cand_ts, "", false, "gpt-6.2-astra", "xhigh"),
+            "sid-astra-timeout"
+        );
+        assert_eq!(
+            resolve_resume_session(&repo_str, sess, cand_ts, "", false, "gpt-6.2-astra", "high"),
+            "sid-astra-high"
+        );
+
+        let rid_no_mdl = "cwg-nomdlbefore";
+        let rid_bleed_mid = "cwg-astramid001";
+        let rid_no_tc = "cwg-notcafter01";
+        record_packet(rid_no_mdl, &format!("REVIEW_ID: {}", rid_no_mdl), &repo_str, "xhigh", "ordinary", sess);
+        record_packet(rid_bleed_mid, &format!("REVIEW_ID: {}", rid_bleed_mid), &repo_str, "xhigh", "ordinary", sess);
+        record_packet(rid_no_tc, &format!("REVIEW_ID: {}", rid_no_tc), &repo_str, "xhigh", "ordinary", sess);
+        let multi_lines = [
+            json!({"type": "session_meta", "timestamp": "2026-11-18T08:01:00Z", "payload": {"id": "sid-bleed-01", "session_id": "sid-bleed-01", "source": "exec", "thread_source": "user"}}),
+            json!({"type": "turn_context", "timestamp": "2026-11-18T08:01:01Z", "payload": {"effort": "xhigh"}}),
+            json!({"type": "response_item", "timestamp": "2026-11-18T08:01:02Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": format!("REVIEW_ID: {}", rid_no_mdl)}]}}),
+            json!({"type": "event_msg", "timestamp": "2026-11-18T08:01:03Z", "payload": {"type": "task_complete", "last_agent_message": "VERDICT: APPROVED"}}),
+            json!({"type": "event_msg", "timestamp": "2026-11-18T08:01:04Z", "payload": {"type": "task_started"}}),
+            json!({"type": "turn_context", "timestamp": "2026-11-18T08:01:05Z", "payload": {"model": "gpt-6.2-astra", "effort": "xhigh"}}),
+            json!({"type": "response_item", "timestamp": "2026-11-18T08:01:06Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": format!("REVIEW_ID: {}", rid_bleed_mid)}]}}),
+            json!({"type": "event_msg", "timestamp": "2026-11-18T08:01:07Z", "payload": {"type": "task_complete", "last_agent_message": "VERDICT: REVISE"}}),
+            json!({"type": "event_msg", "timestamp": "2026-11-18T08:01:08Z", "payload": {"type": "task_started"}}),
+            json!({"type": "response_item", "timestamp": "2026-11-18T08:01:09Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": format!("REVIEW_ID: {}", rid_no_tc)}]}}),
+            json!({"type": "event_msg", "timestamp": "2026-11-18T08:01:10Z", "payload": {"type": "task_complete", "last_agent_message": "VERDICT: APPROVED"}}),
+        ];
+        fs::write(
+            sessions_dir.join("rollout-sid-bleed-01.jsonl"),
+            multi_lines.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        let scanned2 = scan_verified_codex_reviews(now - 60.0, sess, &repo_str);
+        let r_before = scanned2.iter().find(|r| r["review_id"] == rid_no_mdl).unwrap();
+        let r_mid = scanned2.iter().find(|r| r["review_id"] == rid_bleed_mid).unwrap();
+        let r_after = scanned2.iter().find(|r| r["review_id"] == rid_no_tc).unwrap();
+        assert_eq!(r_before["xhigh"], false);
+        assert_eq!(r_mid["xhigh"], true);
+        assert_eq!(r_after["xhigh"], false);
+
+        assert_eq!(format_review_retry_cmd("gpt-6.2-sol", false), "carbon-stack codex-lane review");
+        assert_eq!(format_review_retry_cmd("gpt-6.2-astra", true), "carbon-stack codex-lane review --xhigh");
+        assert_eq!(
+            format_review_retry_cmd("gpt-6.2-astra", false),
+            "carbon-stack codex-lane review --model gpt-6.2-astra"
+        );
+        assert_eq!(
+            format_review_retry_cmd("custom-m", true),
+            "carbon-stack codex-lane review --xhigh --model custom-m"
+        );
+
+        let sess_leg_kn = "sess-legacy-known-xh";
+        let _ = rio::write_json(
+            &thread_state_path(sess_leg_kn, &repo_str),
+            &json!({
+                "session_id": "sid-astra-001",
+                "session": sess_leg_kn,
+                "git_root": rio::normalize_path(&repo_str),
+                "candidate_first_ts": cand_ts,
+                "pending_timeout_resume": true,
+                "last_timeout_seconds": 900,
+                "next_timeout_seconds": 1200,
+                "updated_ts": now,
+            }),
+        );
+        assert!(active_thread_state_for_lane(sess_leg_kn, &repo_str, Some(cand_ts), "gpt-6.2-sol", "high").is_none());
+        let mig_xh = active_thread_state_for_lane(sess_leg_kn, &repo_str, Some(cand_ts), "gpt-6.2-astra", "xhigh").unwrap();
+        assert_eq!(val_to_str(mig_xh.get("session_id")), "sid-astra-001");
+        assert_eq!(val_to_f64(mig_xh.get("next_timeout_seconds")) as i64, 1200);
+
+        let sess_leg_unk = "sess-legacy-unk-xh";
+        let _ = rio::write_json(
+            &thread_state_path(sess_leg_unk, &repo_str),
+            &json!({
+                "session_id": "sid-unknown-old",
+                "session": sess_leg_unk,
+                "git_root": rio::normalize_path(&repo_str),
+                "candidate_first_ts": cand_ts,
+                "pending_timeout_resume": true,
+                "last_timeout_seconds": 900,
+                "next_timeout_seconds": 1200,
+                "updated_ts": now,
+            }),
+        );
+        assert_eq!(
+            resolve_resume_session(&repo_str, sess_leg_unk, cand_ts, "", false, "gpt-6.2-sol", "high"),
+            ""
+        );
+        let unk_for_xh = active_thread_state_for_lane(sess_leg_unk, &repo_str, Some(cand_ts), "gpt-6.2-astra", "xhigh").unwrap();
+        assert_eq!(val_to_str(unk_for_xh.get("session_id")), "");
+        assert_eq!(val_to_f64(unk_for_xh.get("next_timeout_seconds")) as i64, 1200);
+        save_lane_thread_state(
+            sess_leg_unk,
+            &repo_str,
+            cand_ts,
+            "gpt-6.2-astra",
+            "xhigh",
+            json!({
+                "session_id": "sid-new-astra-ok",
+                "candidate_first_ts": cand_ts,
+                "xhigh": true,
+                "updated_ts": now + 5.0,
+            }),
+        );
+        let post_xh_any = active_thread_state(sess_leg_unk, &repo_str, Some(cand_ts)).unwrap();
+        assert!(!json_truthy(post_xh_any.get("pending_timeout_resume")));
+
+        let sess_notc_xh = "sess-legacy-notc-xh";
+        let notc_lines = [
+            json!({"type": "session_meta", "timestamp": "2026-11-18T08:02:00Z", "payload": {"id": "sid-mixed-hi-xh", "session_id": "sid-mixed-hi-xh", "source": "exec", "thread_source": "user"}}),
+            json!({"type": "turn_context", "timestamp": "2026-11-18T08:02:01Z", "payload": {"model": "gpt-6.1-sol", "effort": "high"}}),
+            json!({"type": "response_item", "timestamp": "2026-11-18T08:02:02Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-oldhi0001"}]}}),
+            json!({"type": "event_msg", "timestamp": "2026-11-18T08:02:03Z", "payload": {"type": "task_complete", "last_agent_message": "VERDICT: REVISE"}}),
+            json!({"type": "event_msg", "timestamp": "2026-11-18T08:02:04Z", "payload": {"type": "task_started"}}),
+            json!({"type": "response_item", "timestamp": "2026-11-18T08:02:05Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-newxhnotc"}]}}),
+        ];
+        fs::write(
+            sessions_dir.join("rollout-sid-mixed-hi-xh.jsonl"),
+            notc_lines.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        let _ = rio::write_json(
+            &thread_state_path(sess_notc_xh, &repo_str),
+            &json!({
+                "session_id": "sid-mixed-hi-xh",
+                "last_review_id": "cwg-newxhnotc",
+                "session": sess_notc_xh,
+                "git_root": rio::normalize_path(&repo_str),
+                "candidate_first_ts": cand_ts,
+                "pending_timeout_resume": true,
+                "last_timeout_seconds": 900,
+                "next_timeout_seconds": 1200,
+                "updated_ts": now,
+            }),
+        );
+        assert_eq!(
+            resolve_resume_session(&repo_str, sess_notc_xh, cand_ts, "", false, "gpt-6.2-sol", "high"),
+            ""
+        );
+        let xh_notc_st = active_thread_state_for_lane(sess_notc_xh, &repo_str, Some(cand_ts), "gpt-6.2-astra", "xhigh").unwrap();
+        assert_eq!(val_to_f64(xh_notc_st.get("next_timeout_seconds")) as i64, 1200);
+
+        write_rollout("sid-astra-max", "gpt-6.2-astra", "max", "cwg-astramax01", "2026-11-18T08:03:00Z");
+        let sess_max = "sess-legacy-max";
+        let _ = rio::write_json(
+            &thread_state_path(sess_max, &repo_str),
+            &json!({
+                "session_id": "sid-astra-max",
+                "last_review_id": "cwg-astramax01",
+                "session": sess_max,
+                "git_root": rio::normalize_path(&repo_str),
+                "candidate_first_ts": cand_ts,
+                "pending_timeout_resume": true,
+                "last_timeout_seconds": 900,
+                "next_timeout_seconds": 1200,
+                "updated_ts": now,
+            }),
+        );
+        let max_migrated = active_thread_state_for_lane(sess_max, &repo_str, Some(cand_ts), "gpt-6.2-astra", "xhigh").unwrap();
+        assert_eq!(val_to_str(max_migrated.get("session_id")), "sid-astra-max");
+        save_lane_thread_state(
+            sess_max,
+            &repo_str,
+            cand_ts,
+            "gpt-6.2-astra",
+            "xhigh",
+            json!({
+                "session_id": "sid-astra-max",
+                "candidate_first_ts": cand_ts,
+                "xhigh": true,
+                "updated_ts": now + 10.0,
+            }),
+        );
+        let post_max = active_thread_state(sess_max, &repo_str, Some(cand_ts)).unwrap();
+        assert!(!json_truthy(post_max.get("pending_timeout_resume")));
+
+        let sess_noeff = "sess-legacy-partial-tc";
+        let noeff_lines = [
+            json!({"type": "session_meta", "timestamp": "2026-11-18T08:04:00Z", "payload": {"id": "sid-partial-noeff", "session_id": "sid-partial-noeff", "source": "exec", "thread_source": "user"}}),
+            json!({"type": "turn_context", "timestamp": "2026-11-18T08:04:01Z", "payload": {"model": "gpt-6.1-sol"}}),
+            json!({"type": "response_item", "timestamp": "2026-11-18T08:04:02Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-partialxh"}]}}),
+        ];
+        fs::write(
+            sessions_dir.join("rollout-sid-partial-noeff.jsonl"),
+            noeff_lines.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        let _ = record_packet("cwg-partialxh", "prompt", &repo_str, "xhigh", "ordinary", sess_noeff);
+        let _ = rio::write_json(
+            &thread_state_path(sess_noeff, &repo_str),
+            &json!({
+                "session_id": "sid-partial-noeff",
+                "last_review_id": "cwg-partialxh",
+                "session": sess_noeff,
+                "git_root": rio::normalize_path(&repo_str),
+                "candidate_first_ts": cand_ts,
+                "pending_timeout_resume": true,
+                "last_timeout_seconds": 900,
+                "next_timeout_seconds": 1200,
+                "updated_ts": now,
+            }),
+        );
+        assert!(active_thread_state_for_lane(sess_noeff, &repo_str, Some(cand_ts), "gpt-6.2-sol", "high").is_none());
+        let noeff_xh = active_thread_state_for_lane(sess_noeff, &repo_str, Some(cand_ts), "gpt-6.2-astra", "xhigh").unwrap();
+        assert_eq!(val_to_str(noeff_xh.get("session_id")), "");
+        assert_eq!(val_to_f64(noeff_xh.get("next_timeout_seconds")) as i64, 1200);
+
+        let sess_ast_hi600 = "sess-legacy-astra-hi600";
+        let ast600_lines = [
+            json!({"type": "session_meta", "timestamp": "2026-11-18T08:05:00Z", "payload": {"id": "sid-astra-hi-600", "session_id": "sid-astra-hi-600", "source": "exec", "thread_source": "user"}}),
+            json!({"type": "turn_context", "timestamp": "2026-11-18T08:05:01Z", "payload": {"model": "gpt-6.2-astra"}}),
+            json!({"type": "response_item", "timestamp": "2026-11-18T08:05:02Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-astrahi600"}]}}),
+        ];
+        fs::write(
+            sessions_dir.join("rollout-sid-astra-hi-600.jsonl"),
+            ast600_lines.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        let _ = rio::write_json(
+            &thread_state_path(sess_ast_hi600, &repo_str),
+            &json!({
+                "session_id": "sid-astra-hi-600",
+                "last_review_id": "cwg-astrahi600",
+                "session": sess_ast_hi600,
+                "git_root": rio::normalize_path(&repo_str),
+                "candidate_first_ts": cand_ts,
+                "pending_timeout_resume": true,
+                "last_timeout_seconds": 600,
+                "next_timeout_seconds": 900,
+                "updated_ts": now,
+            }),
+        );
+        assert!(active_thread_state_for_lane(sess_ast_hi600, &repo_str, Some(cand_ts), "gpt-6.2-astra", "xhigh").is_none());
+        let ast_hi_st = active_thread_state_for_lane(sess_ast_hi600, &repo_str, Some(cand_ts), "gpt-6.2-astra", "high").unwrap();
+        assert_eq!(val_to_str(ast_hi_st.get("session_id")), "sid-astra-hi-600");
+        assert_eq!(val_to_f64(ast_hi_st.get("next_timeout_seconds")) as i64, 900);
+
+        let unpersisted_base = format_review_retry_cmd_with_spec(&RetryCmdSpec {
+            model: "gpt-6.2-astra",
+            xhigh: true,
+            closure: true,
+            session: "sess-explicit-01",
+            cwd: "",
+            diff_file: "",
+            summary: "",
+            pretty: false,
+        });
+        let unpersisted_p = build_thinking_timeout_payload(
+            "cwg-unpersisted01",
+            900,
+            900,
+            &unpersisted_base,
+            "sid-unpersisted",
+            false,
+        );
+        assert_eq!(unpersisted_p.get("state_persisted"), Some(&Value::Bool(false)));
+        assert_eq!(unpersisted_p.get("session_continuation_saved"), Some(&Value::Bool(false)));
+        assert_eq!(unpersisted_p.get("recommended_timeout"), Some(&json!(900)));
+        assert_eq!(
+            val_to_str(unpersisted_p.get("retry_command")),
+            "carbon-stack codex-lane review --xhigh --closure --session sess-explicit-01 --resume sid-unpersisted"
+        );
+        let raw_sum = "keep \"double\" & 'single' quotes";
+        let ps_tricky = format_review_retry_cmd_with_spec(&RetryCmdSpec {
+            model: "gpt-6.2-astra",
+            xhigh: true,
+            closure: true,
+            session: "sess-1",
+            cwd: r"C:\work\release;archive",
+            diff_file: r"C:\work\$release notes",
+            summary: raw_sum,
+            pretty: false,
+        });
+        assert_eq!(
+            ps_tricky,
+            format!(
+                "carbon-stack codex-lane review --xhigh --closure --session sess-1 --cwd 'C:\\work\\release;archive' --diff-file 'C:\\work\\$release notes' --summary-hex '{}'",
+                encode_utf8_hex(raw_sum)
+            )
+        );
+        assert_eq!(decode_utf8_hex(&encode_utf8_hex(raw_sum)).unwrap(), raw_sum);
+
+        // INVARIANT: 2-block closure halt, `research-reset`, and fresh-session enforcement hold in Rust.
+        let sess_rr = "sess-rr-rust";
+        let mpath_rr = cwg_common::marker_path(sess_rr);
+        let _ = rio::write_json(
+            &mpath_rr,
+            &json!({
+                "session": sess_rr,
+                "class": cwg_common::WORK_PERSISTENT,
+                "first_ts": cand_ts,
+                "last_durable_ts": cand_ts,
+                "git_root": rio::normalize_path(&repo_str),
+                "cwd": rio::normalize_path(&repo_str),
+                "paths": [rio::normalize_path(&Path::new(&repo_str).join("auth.rs").to_string_lossy())],
+                "content_marks": [{"ts": cand_ts, "fp": "1122334455667788", "unknown": false}],
+                "closed": false,
+            }),
+        );
+        for (idx, (rid, ph)) in [("cwg-rr-o1", "ordinary"), ("cwg-rr-b1", "closure"), ("cwg-rr-b2", "closure")]
+            .into_iter()
+            .enumerate()
+        {
+            record_packet(rid, &format!("REVIEW_ID: {}", rid), &repo_str, "high", ph, sess_rr);
+            let p_path = packet_path(rid);
+            if let Some(mut pd) = rio::read_json(&p_path) {
+                pd["created_ts"] = json!(cand_ts + (idx as f64) + 1.0);
+                let _ = rio::write_json(&p_path, &pd);
+            }
+        }
+        let rr_old_sid = "sid-rr-old-01";
+        let rr_rollout = sessions_dir.join("rollout-sid-rr-old-01.jsonl");
+        let rr_lines = [
+            json!({"type": "session_meta", "timestamp": "2026-11-18T08:05:00Z", "payload": {"id": rr_old_sid, "session_id": rr_old_sid, "source": "exec", "thread_source": "user"}}),
+            json!({"type": "turn_context", "timestamp": "2026-11-18T08:05:01Z", "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
+            json!({"type": "response_item", "timestamp": "2026-11-18T08:05:02Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-rr-o1"}]}}),
+            json!({"type": "event_msg", "timestamp": "2026-11-18T08:05:03Z", "payload": {"type": "task_complete", "last_agent_message": "VERDICT: APPROVED"}}),
+            json!({"type": "turn_context", "timestamp": "2026-11-18T08:05:04Z", "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
+            json!({"type": "response_item", "timestamp": "2026-11-18T08:05:05Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-rr-b1"}]}}),
+            json!({"type": "event_msg", "timestamp": "2026-11-18T08:05:06Z", "payload": {"type": "task_complete", "last_agent_message": "CLOSURE_VALIDATION: BLOCKED"}}),
+            json!({"type": "turn_context", "timestamp": "2026-11-18T08:05:07Z", "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
+            json!({"type": "response_item", "timestamp": "2026-11-18T08:05:08Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-rr-b2"}]}}),
+            json!({"type": "event_msg", "timestamp": "2026-11-18T08:05:09Z", "payload": {"type": "task_complete", "last_agent_message": "CLOSURE_VALIDATION: BLOCKED"}}),
+        ];
+        fs::write(
+            &rr_rollout,
+            rr_lines.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        let (blk_cnt, _last_blk_ts, blk_ids) = active_cycle_closure_blocks(sess_rr, &repo_str, "");
+        assert_eq!(blk_cnt, 2);
+        assert_eq!(blk_ids, vec!["cwg-rr-b1".to_string(), "cwg-rr-b2".to_string()]);
+
+        let (sg_dec, sg_rsn) = crate::safety_guards::guard_shell_command_with_session(
+            &format!("carbon-stack codex-lane review --cwd '{}' --session {}", repo_str, sess_rr),
+            &repo_str,
+            sess_rr,
+        );
+        assert_eq!(sg_dec, "deny");
+        assert!(sg_rsn.unwrap_or_default().contains("research-reset"));
+
+        let tp_rr = Path::new(&repo_str).join("rr-transcript.jsonl");
+        fs::write(&tp_rr, "").unwrap();
+        assert_eq!(
+            run_cli(&[
+                "research-reset".to_string(),
+                "--cwd".to_string(),
+                repo_str.clone(),
+                "--session".to_string(),
+                sess_rr.to_string(),
+                "--decision".to_string(),
+                "refine".to_string(),
+                "--findings".to_string(),
+                "Verified state machine invariants in official docs.".to_string(),
+                "--transcript".to_string(),
+                tp_rr.to_string_lossy().into_owned(),
+            ]),
+            2
+        );
+        let research_steps = [
+            json!({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": "2099-01-01T00:00:01Z", "tool_calls": [{"name": "search_web", "args": {"query": "gate verification docs"}}]}),
+            json!({"step_index": 2, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": "2099-01-01T00:00:02Z", "content": "ok"}),
+        ];
+        fs::write(
+            &tp_rr,
+            research_steps.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        assert_eq!(
+            run_cli(&[
+                "research-reset".to_string(),
+                "--cwd".to_string(),
+                repo_str.clone(),
+                "--session".to_string(),
+                sess_rr.to_string(),
+                "--decision".to_string(),
+                "refine".to_string(),
+                "--findings-hex".to_string(),
+                encode_utf8_hex("Verified \"official\" docs & refined closure state machine."),
+                "--transcript".to_string(),
+                tp_rr.to_string_lossy().into_owned(),
+            ]),
+            0
+        );
+        assert_eq!(active_cycle_closure_blocks(sess_rr, &repo_str, "").0, 0);
+        assert_eq!(
+            resolve_resume_session(&repo_str, sess_rr, cand_ts, "", false, "gpt-6.2-sol", "high"),
+            ""
+        );
+
+        // INVARIANT: Second `research-reset` on an already-reset cycle is rejected under `marker_lock_path` without duplicating `research_resets` or purging Cycle-2 threads, and subagent child rollouts of pre-reset sessions fail `is_post_reset_codex_session_proven`.
+        save_lane_thread_state(
+            sess_rr,
+            &repo_str,
+            cand_ts,
+            "gpt-6.2-sol",
+            "high",
+            json!({
+                "session_id": "sid-cycle2-fresh",
+                "candidate_first_ts": cand_ts,
+                "model": "gpt-6.2-sol",
+                "effort": "high",
+                "xhigh": false,
+                "updated_ts": now + 100.0,
+            }),
+        );
+        assert_eq!(
+            run_cli(&[
+                "research-reset".to_string(),
+                "--cwd".to_string(),
+                repo_str.clone(),
+                "--session".to_string(),
+                sess_rr.to_string(),
+                "--decision".to_string(),
+                "refine".to_string(),
+                "--findings".to_string(),
+                "Duplicate reset attempt must fail.".to_string(),
+                "--transcript".to_string(),
+                tp_rr.to_string_lossy().into_owned(),
+            ]),
+            2
+        );
+        let c2_saved = active_thread_state(sess_rr, &repo_str, Some(cand_ts)).unwrap();
+        assert_eq!(val_to_str(c2_saved.get("session_id")), "sid-cycle2-fresh");
+
+        let post_rr_marker = rio::read_json(&mpath_rr).unwrap();
+        let rr_cutoff = cwg_common::last_research_reset_ts(&post_rr_marker);
+        assert_eq!(
+            post_rr_marker
+                .get("research_resets")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
+            Some(1)
+        );
+        assert!(!is_post_reset_codex_session_proven(
+            "sid-nonexistent-missing",
+            "",
+            rr_cutoff,
+            cand_ts
+        ));
+        let child_of_old = sessions_dir.join("rollout-sid-child-of-old.jsonl");
+        fs::write(
+            &child_of_old,
+            json!({
+                "type": "session_meta",
+                "timestamp": "2099-01-01T00:05:00Z",
+                "payload": {
+                    "id": "sid-child-of-old",
+                    "session_id": "sid-child-of-old",
+                    "source": {"subagent": {"thread_spawn": {"parent_thread_id": rr_old_sid}}},
+                    "thread_source": "subagent"
+                }
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+        assert!(!is_post_reset_codex_session_proven(
+            "sid-child-of-old",
+            &child_of_old.to_string_lossy(),
+            rr_cutoff,
+            cand_ts
+        ));
     }
 }

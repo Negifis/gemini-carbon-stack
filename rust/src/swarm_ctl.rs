@@ -696,16 +696,16 @@ pub fn cmd_board_summary(since_arg: i64, session: &str, cwd: &str) -> i32 {
     }
 
     let empty_act = HashMap::new();
-    let stalled = cwg_common::detect_stalled_workers(
-        &members,
-        &messages,
-        &root,
-        brain_root.as_deref(),
-        &empty_act,
-        &[],
-        None,
-        None,
-    );
+    let stalled = cwg_common::detect_stalled_workers(cwg_common::StallDetectInput {
+        members: &members,
+        board_messages: &messages,
+        cwd: &root,
+        brain_root: brain_root.as_deref(),
+        worker_last_activity: &empty_act,
+        in_flight_names: &[],
+        now_ts: None,
+        timeout_sec: None,
+    });
 
     let art_dir = Path::new(&root).join(".swarm").join("artifacts");
     let mut artifacts: Vec<String> = Vec::new();

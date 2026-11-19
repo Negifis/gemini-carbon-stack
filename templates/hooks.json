@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python -X utf8 ~/.gemini/config/plugins/gemini-carbon-stack/hooks/tokenade_hook.py --event PreToolUse",
+            "command": "~/.gemini/config/plugins/gemini-carbon-stack/bin/carbon-stack tokenade-hook --event PreToolUse",
             "timeout": 15
           }
         ]

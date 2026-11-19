@@ -73,9 +73,6 @@ pub fn run_cli(args: &[String]) -> i32 {
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_evaluate_pre_invocation_pops_notes_and_skips_subagents() {

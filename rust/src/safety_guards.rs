@@ -7,11 +7,17 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::codex_lane::{
-    DEFAULT_REVIEW_TIMEOUT_SECONDS, DEFAULT_XHIGH_REVIEW_TIMEOUT_SECONDS,
-    MAX_REVIEW_TIMEOUT_SECONDS, NATIVE_REVIEWERS, REVIEW_BOOL_FLAGS, REVIEW_VAL_FLAGS,
+    find_codex_binary, required_review_timeout, DEFAULT_REVIEW_TIMEOUT_SECONDS,
+    DEFAULT_XHIGH_REVIEW_TIMEOUT_SECONDS, MAX_REVIEW_TIMEOUT_SECONDS, NATIVE_REVIEWERS,
+    REVIEW_BOOL_FLAGS, REVIEW_VAL_FLAGS,
 };
 use crate::cwg_common;
-use crate::rio;
+use crate::cwg_mark::{
+    classify_shell_command, extract_ps_redirections, extract_ps_subexprs,
+    fold_ps_line_continuations, nav_segment_re, ps_tokens, split_shell_segments, strip_quoted,
+    strip_single_quoted,
+};
+use crate::rio::{self, json_truthy, resolve_command_cwd, val_to_i64, val_to_str};
 
 const SIMPLIFY_ALLOWED_MODELS: &[&str] = &[
     cwg_common::SONNET_HIGH_MODEL,
@@ -150,77 +156,9 @@ fn nested_subexpr_re() -> &'static Regex {
 fn blocked_swarm_ctl_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"(?i)\bswarm_ctl(?:\.py)?\b[^\n;|&]*\b(?:ownership|worktree)\b")
+        Regex::new(r"(?i)\bswarm[-_]ctl(?:\.py)?\b[^\n;|&]*\b(?:ownership|worktree)\b")
             .expect("blocked_swarm_ctl_re")
     })
-}
-
-fn nav_segment_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"(?i)^\s*(?:cd|chdir|Set-Location|sl|Push-Location|pushd|Pop-Location|popd)\b(?:\s+[^|;&\r\n]*)?$",
-        )
-        .expect("nav_segment_re")
-    })
-}
-
-fn val_to_str(v: Option<&Value>) -> String {
-    match v {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Number(n)) => n.to_string(),
-        Some(Value::Bool(b)) => b.to_string(),
-        _ => String::new(),
-    }
-}
-
-fn val_to_i64(v: Option<&Value>) -> i64 {
-    match v {
-        Some(Value::Number(n)) => n
-            .as_i64()
-            .or_else(|| n.as_u64().map(|u| u.min(i64::MAX as u64) as i64))
-            .or_else(|| n.as_f64().map(|f| f as i64))
-            .unwrap_or(0),
-        Some(Value::String(s)) => s.trim().parse::<i64>().unwrap_or(0),
-        Some(Value::Bool(b)) => i64::from(*b),
-        _ => 0,
-    }
-}
-
-fn json_truthy(v: Option<&Value>) -> bool {
-    match v {
-        Some(Value::Bool(b)) => *b,
-        Some(Value::Number(n)) => n.as_f64().map_or(false, |x| x != 0.0),
-        Some(Value::String(s)) => !s.is_empty(),
-        Some(Value::Array(a)) => !a.is_empty(),
-        Some(Value::Object(m)) => !m.is_empty(),
-        _ => false,
-    }
-}
-
-fn coerce_nonneg_int(raw: Option<&Value>) -> i64 {
-    let Some(v) = raw else {
-        return 0;
-    };
-    if v.is_null() {
-        return 0;
-    }
-    match v {
-        Value::Number(n) => n
-            .as_i64()
-            .or_else(|| n.as_f64().map(|f| f as i64))
-            .unwrap_or(0),
-        Value::String(s) => {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                0
-            } else {
-                trimmed.parse::<i64>().unwrap_or(0)
-            }
-        }
-        Value::Bool(b) => i64::from(*b),
-        _ => 0,
-    }
 }
 
 fn abspath_lexical(p: &Path) -> PathBuf {
@@ -253,75 +191,116 @@ fn strip_cmd_backticks(text: &str) -> String {
     cmd_backtick_re().replace_all(text, "$1").into_owned()
 }
 
-fn fold_ps_line_continuations(cmd_str: &str) -> String {
-    crate::cwg_mark::fold_ps_line_continuations(cmd_str)
-}
-
-fn split_shell_segments(core: &str, split_subclauses: bool) -> Vec<(String, String)> {
-    crate::cwg_mark::split_shell_segments(core, split_subclauses)
-}
-
-fn ps_tokens(seg: &str) -> Vec<String> {
-    crate::cwg_mark::ps_tokens(seg)
-}
-
-fn strip_single_quoted(text: &str) -> String {
-    crate::cwg_mark::strip_single_quoted(text)
-}
-
-fn strip_quoted(text: &str) -> String {
-    crate::cwg_mark::strip_quoted(text)
-}
-
-fn unquote_ps_literal(raw: &str) -> String {
-    crate::cwg_mark::unquote_ps_literal(raw)
-}
-
-fn extract_ps_subexprs(text: &str) -> Vec<String> {
-    crate::cwg_mark::extract_ps_subexprs(text)
-}
-
-fn extract_ps_redirections(seg: &str) -> (String, Vec<String>) {
-    crate::cwg_mark::extract_ps_redirections(seg)
-}
-
-fn classify_shell_command(cmd: &str) -> &'static str {
-    crate::cwg_mark::classify_shell_command(cmd)
-}
-
-fn resolve_command_cwd(cmd: &str, default_cwd: &str, fallback_dir: &str) -> String {
-    rio::resolve_command_cwd(cmd, default_cwd, fallback_dir)
-}
-
 fn codex_breaker_tripped() -> bool {
     json_truthy(crate::codex_lane::breaker_status().get("tripped"))
-}
-
-fn find_codex_binary() -> Option<String> {
-    crate::codex_lane::find_codex_binary()
 }
 
 fn active_thread_state(session: &str, git_root: &str) -> Option<Map<String, Value>> {
     crate::codex_lane::active_thread_state(session, git_root, None)
 }
 
-fn required_review_timeout(xhigh: bool, saved_next_sec: i64) -> i64 {
-    crate::codex_lane::required_review_timeout(xhigh, saved_next_sec)
+fn pending_research_mode_deny(session: &str, cwd: &str, transcript_path: &str) -> Option<String> {
+    if session.is_empty() || session == "unknown" {
+        return None;
+    }
+    let git_root = rio::git_toplevel(cwd, false).unwrap_or_else(|| cwd.to_string());
+    let (blocked_n, _, blocked_ids) =
+        crate::codex_lane::active_cycle_closure_blocks(session, &git_root, transcript_path);
+    if blocked_n < cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE {
+        return None;
+    }
+    let ids_note = if blocked_ids.is_empty() {
+        format!("{}", blocked_n)
+    } else {
+        blocked_ids.join(", ")
+    };
+    let cwd_q = crate::codex_lane::quote_cli_arg(&git_root);
+    let sess_q = crate::codex_lane::quote_cli_arg(session);
+    // INVARIANT: Hard-stop review and simplify loops after 2 `CLOSURE_VALIDATION: BLOCKED` passes until Research Mode + `research-reset` completes.
+    Some(format!(
+        "[Gate Research Mode Required] Достигнут лимит 2 блокировок эскалации (`CLOSURE_VALIDATION: BLOCKED`: {}). Продолжение ревью или линз simplify в текущем цикле запрещено. Перейдите в режим исследования: изучите через доступные плагины и интернет актуальную документацию, рекомендации и лучшие практики по блокирующей проблеме (`search_web`, `tokenade search/web`, `Context7`, `Developer Knowledge` / `Gemini Docs`, субагент `research`), выберите сценарий (`refactor` или `refine`), завершите ожидающих воркеров через `swarm(action='kill', ...)` и выполните `carbon-stack codex-lane research-reset --cwd {} --session {} --decision <refactor|refine> --findings '...'`, чтобы обнулить раунды и начать новый цикл в чистых сессиях.",
+        ids_note, cwd_q, sess_q
+    ))
 }
 
-fn extract_codex_review_timeout_opts(cmd_str: &str) -> Option<HashMap<String, String>> {
+fn pending_post_block_simplify_deny(
+    session: &str,
+    cwd: &str,
+    transcript_path: &str,
+    min_risk_override: &str,
+) -> Option<String> {
+    if session.is_empty() || session == "unknown" {
+        return None;
+    }
+    let git_root = rio::git_toplevel(cwd, false).unwrap_or_else(|| cwd.to_string());
+    let cls_summary = crate::codex_lane::active_cycle_closure_summary_with_risk(
+        session,
+        &git_root,
+        transcript_path,
+        min_risk_override,
+    );
+    if cls_summary.effective_pass_count >= cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE {
+        if cls_summary.has_fresh_ready {
+            return Some(
+                "[Sandwich Gate Policy] Для кандидата уже выполнены оба прохода `--closure` (2/2) с валидным вердиктом `CLOSURE_VALIDATION: READY`: третий проход `--closure` запрещён, закрывайте гейт."
+                    .to_string(),
+            );
+        }
+        let cwd_q = crate::codex_lane::quote_cli_arg(&git_root);
+        let sess_q = crate::codex_lane::quote_cli_arg(session);
+        return Some(format!(
+            "[Gate Research Mode Required] В текущем цикле уже израсходован лимит проходов `--closure` ({0}/{0}). Перейдите в режим исследования и выполните `carbon-stack codex-lane research-reset --cwd {1} --session {2} --decision <refactor|refine> --findings '...'`.",
+            cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE,
+            cwd_q,
+            sess_q
+        ));
+    }
+    let blocked_n = cls_summary.blocked_count;
+    let last_blk_ts = cls_summary.last_blocked_ts;
+    if blocked_n < 1 || blocked_n >= cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE || last_blk_ts <= 0.0 {
+        return None;
+    }
+    let skey = rio::safe_key(session, "default");
+    let mdata = cwg_common::read_marker_with_pending(&skey)?;
+    if !mdata.is_object() || json_truthy(mdata.get("closed")) {
+        return None;
+    }
+    if crate::cwg_stop::has_completed_simplify_after(session, &mdata, transcript_path, last_blk_ts) {
+        return None;
+    }
+    // INVARIANT: Block launching closure pass 2/2 after pass 1 `BLOCKED` before a fresh simplify pass completes.
+    Some(
+        "[Sandwich Gate Policy] Проход эскалации 1/2 вернул `CLOSURE_VALIDATION: BLOCKED`: перед запуском финального прохода 2/2 (`--closure`) обязательно выполните свежий проход линз `simplify` на текущем кандидате."
+            .to_string(),
+    )
+}
+
+fn extract_codex_review_cmd_opts(cmd_str: &str) -> Vec<HashMap<String, String>> {
+    let mut found: Vec<HashMap<String, String>> = Vec::new();
     let folded = fold_ps_line_continuations(cmd_str);
     for (_, seg_str) in split_shell_segments(&folded, false) {
         let seg = ps_tokens(&seg_str);
         for (idx, tok) in seg.iter().enumerate() {
-            if tok_basename_lower(tok) != "codex_lane.py" {
+            let base = tok_basename_lower(tok);
+            let rem_start = if base == "codex_lane.py" {
+                if idx + 1 >= seg.len() || !seg[idx + 1].eq_ignore_ascii_case("review") {
+                    continue;
+                }
+                idx + 2
+            } else if base == "carbon-stack" || base == "carbon-stack.exe" {
+                if idx + 2 >= seg.len()
+                    || !(seg[idx + 1].eq_ignore_ascii_case("codex-lane")
+                        || seg[idx + 1].eq_ignore_ascii_case("codex_lane"))
+                    || !seg[idx + 2].eq_ignore_ascii_case("review")
+                {
+                    continue;
+                }
+                idx + 3
+            } else {
                 continue;
-            }
-            if idx + 1 >= seg.len() || !seg[idx + 1].eq_ignore_ascii_case("review") {
-                continue;
-            }
+            };
             let mut opts: HashMap<String, String> = HashMap::new();
-            let rem = &seg[idx + 2..];
+            let rem = &seg[rem_start..];
             let mut j = 0usize;
             while j < rem.len() {
                 let rtok = &rem[j];
@@ -337,26 +316,32 @@ fn extract_codex_review_timeout_opts(cmd_str: &str) -> Option<HashMap<String, St
                 };
                 let low_opt = opt.to_lowercase();
                 if REVIEW_VAL_FLAGS.contains(&low_opt.as_str()) {
-                    if has_sep {
-                        opts.insert(low_opt, inline_val.to_string());
+                    let raw_val = if has_sep {
                         j += 1;
+                        inline_val.to_string()
                     } else if j + 1 < rem.len() && !rem[j + 1].starts_with("--") {
-                        opts.insert(low_opt, rem[j + 1].clone());
+                        let v = rem[j + 1].clone();
                         j += 2;
+                        v
                     } else {
-                        opts.insert(low_opt, String::new());
                         j += 1;
+                        String::new()
+                    };
+                    if let Some(base_opt) = low_opt.strip_suffix("-hex") {
+                        if let Ok(decoded) = crate::codex_lane::decode_utf8_hex(&raw_val) {
+                            opts.insert(base_opt.to_string(), decoded);
+                        }
+                    } else {
+                        opts.insert(low_opt, raw_val);
                     }
                     continue;
                 }
                 j += 1;
             }
-            if opts.contains_key("--timeout") {
-                return Some(opts);
-            }
+            found.push(opts);
         }
     }
-    None
+    found
 }
 
 fn check_codex_review_timeout_policy(
@@ -366,97 +351,163 @@ fn check_codex_review_timeout_policy(
     session: &str,
 ) -> (String, Option<String>) {
     let low_cmd = norm_cmd.to_lowercase();
-    if !low_cmd.contains("codex_lane.py") || !low_cmd.contains("--timeout") {
+    if !(low_cmd.contains("codex_lane") || low_cmd.contains("codex-lane"))
+        || !low_cmd.contains("review")
+    {
         return ("allow".to_string(), None);
     }
-    let Some(parsed_opts) = extract_codex_review_timeout_opts(norm_cmd)
-        .or_else(|| extract_codex_review_timeout_opts(stripped))
-    else {
+    let mut invocations = extract_codex_review_cmd_opts(norm_cmd);
+    if invocations.is_empty() {
+        invocations = extract_codex_review_cmd_opts(stripped);
+    }
+    if invocations.is_empty() {
         return ("allow".to_string(), None);
-    };
-    let raw_to = parsed_opts
-        .get("--timeout")
-        .map(|s| s.trim())
-        .unwrap_or("");
+    }
     let base_cwd = resolve_command_cwd(stripped, cwd, "");
-    let raw_cwd_opt = parsed_opts.get("--cwd").map(|s| s.trim()).unwrap_or("");
-    let eff_cwd = if !raw_cwd_opt.is_empty() {
-        let p = Path::new(raw_cwd_opt);
-        if p.is_absolute() {
-            abspath_lexical(p).to_string_lossy().into_owned()
+    for parsed_opts in &invocations {
+        let raw_cwd_opt = parsed_opts.get("--cwd").map(|s| s.trim()).unwrap_or("");
+        let eff_cwd = if !raw_cwd_opt.is_empty() {
+            let p = Path::new(raw_cwd_opt);
+            if p.is_absolute() {
+                abspath_lexical(p).to_string_lossy().into_owned()
+            } else {
+                abspath_lexical(&Path::new(&base_cwd).join(p))
+                    .to_string_lossy()
+                    .into_owned()
+            }
         } else {
-            abspath_lexical(&Path::new(&base_cwd).join(p))
-                .to_string_lossy()
-                .into_owned()
+            base_cwd.clone()
+        };
+        let git_root = rio::git_toplevel(&eff_cwd, false).unwrap_or_else(|| eff_cwd.clone());
+
+        let raw_sess_opt = parsed_opts
+            .get("--session")
+            .map(|s| s.trim())
+            .unwrap_or("");
+        let eff_session = if !raw_sess_opt.is_empty() {
+            raw_sess_opt
+        } else if session != "unknown" {
+            session
+        } else {
+            ""
+        };
+        if let Some(rm_deny) = pending_research_mode_deny(eff_session, &eff_cwd, "") {
+            return ("deny".to_string(), Some(rm_deny));
         }
-    } else {
-        base_cwd
-    };
-    let git_root = rio::git_toplevel(&eff_cwd, false).unwrap_or(eff_cwd);
-
-    let raw_sess_opt = parsed_opts
-        .get("--session")
-        .map(|s| s.trim())
-        .unwrap_or("");
-    let eff_session = if !raw_sess_opt.is_empty() {
-        raw_sess_opt
-    } else if session != "unknown" {
-        session
-    } else {
-        ""
-    };
-    let has_new_sess = parsed_opts
-        .get("--new-session")
-        .map_or(false, |s| !s.is_empty());
-    let is_xhigh = parsed_opts
-        .get("--xhigh")
-        .map_or(false, |s| !s.is_empty());
-    let tstate = if has_new_sess {
-        None
-    } else {
-        active_thread_state(eff_session, &git_root)
-    };
-
-    // INVARIANT: Forbid custom upfront `--timeout` on `codex_lane.py review`; standard defaults are 600s (HIGH) and 900s (XHIGH).
-    let pending_resume = tstate
-        .as_ref()
-        .map_or(false, |ts| json_truthy(ts.get("pending_timeout_resume")));
-    if !pending_resume {
-        return (
-            "deny".to_string(),
-            Some(format!(
-                "[Codex Timeout Policy] Запрещено передавать свой `--timeout` заранее при вызове `codex_lane.py review`: штатный таймаут уже составляет 10 минут (`{}s`) для `HIGH` и 15 минут (`{}s`) для `--xhigh`. Запустите `codex_lane.py review` без флага `--timeout`.",
-                DEFAULT_REVIEW_TIMEOUT_SECONDS, DEFAULT_XHIGH_REVIEW_TIMEOUT_SECONDS
-            )),
+        let is_cls_opt = parsed_opts.contains_key("--closure")
+            || parsed_opts
+                .get("--phase")
+                .map_or(false, |p| p.trim().eq_ignore_ascii_case("closure"));
+        if is_cls_opt {
+            let req_risk = if parsed_opts
+                .get("--xhigh")
+                .map_or(false, |s| !s.is_empty())
+            {
+                "XHIGH"
+            } else {
+                ""
+            };
+            if let Some(sim_deny) =
+                pending_post_block_simplify_deny(eff_session, &eff_cwd, "", req_risk)
+            {
+                return ("deny".to_string(), Some(sim_deny));
+            }
+        }
+        let raw_resume = parsed_opts.get("--resume").map(|s| s.trim()).unwrap_or("");
+        if !raw_resume.is_empty() && !eff_session.is_empty() {
+            let last_rr_ts = cwg_common::read_marker_with_pending(eff_session)
+                .filter(|m| !json_truthy(m.get("closed")))
+                .map(|m| cwg_common::last_research_reset_ts(&m))
+                .unwrap_or(0.0);
+            let cand_ts = crate::codex_lane::candidate_first_ts(eff_session);
+            if last_rr_ts > 0.0
+                && !crate::codex_lane::is_post_reset_codex_session_proven(
+                    raw_resume, "", last_rr_ts, cand_ts,
+                )
+            {
+                return (
+                    "deny".to_string(),
+                    Some(format!(
+                        "[Gate Fresh Session Policy] Возобновление до-исследовательской сессии Codex (`--resume {}`) после `research-reset` запрещено: уберите `--resume`, чтобы новый цикл стартовал в чистой сессии ревью.",
+                        raw_resume
+                    )),
+                );
+            }
+        }
+        let Some(raw_to_s) = parsed_opts.get("--timeout") else {
+            continue;
+        };
+        let raw_to = raw_to_s.trim();
+        let has_new_sess = parsed_opts
+            .get("--new-session")
+            .map_or(false, |s| !s.is_empty());
+        let is_xhigh = parsed_opts
+            .get("--xhigh")
+            .map_or(false, |s| !s.is_empty());
+        let req_effort = if is_xhigh { "xhigh" } else { "high" };
+        let req_model = crate::codex_lane::resolve_review_model(
+            parsed_opts.get("--model").map(|s| s.as_str()).unwrap_or(""),
+            is_xhigh,
         );
-    }
+        let tstate = if has_new_sess {
+            None
+        } else {
+            crate::codex_lane::active_thread_state_for_lane(
+                eff_session,
+                &git_root,
+                None,
+                &req_model,
+                req_effort,
+            )
+        };
+        let is_closure = parsed_opts.contains_key("--closure")
+            || parsed_opts
+                .get("--phase")
+                .map_or(false, |p| p.trim().eq_ignore_ascii_case("closure"));
+        let retry_cmd =
+            crate::codex_lane::format_review_retry_cmd_phase(&req_model, is_xhigh, is_closure);
 
-    let saved_next = tstate
-        .as_ref()
-        .map_or(0, |ts| val_to_i64(ts.get("next_timeout_seconds")));
-    let req_min = required_review_timeout(is_xhigh, saved_next);
-    let parsed_to = if !raw_to.is_empty() && raw_to.bytes().all(|b| b.is_ascii_digit()) {
-        raw_to.parse::<i64>().ok()
-    } else {
-        None
-    };
-    if parsed_to.map_or(true, |v| v < req_min) {
-        return (
-            "deny".to_string(),
-            Some(format!(
-                "[Codex Timeout Policy] После незавершённого таймаута Codex нельзя занижать `--timeout` до `{}s` (требуется `>= {}s`). Уберите флаг `--timeout` — `codex_lane.py review` автоматически продолжит сохранённую сессию с таймаутом `{}s` без потери раунда.",
-                raw_to, req_min, req_min
-            )),
-        );
-    }
-    if parsed_to.unwrap_or(0) > MAX_REVIEW_TIMEOUT_SECONDS {
-        return (
-            "deny".to_string(),
-            Some(format!(
-                "[Codex Timeout Policy] Значение `--timeout {}` превышает потолок `{}s`. Уберите флаг `--timeout` для автоматического продолжения сессии.",
-                raw_to, MAX_REVIEW_TIMEOUT_SECONDS
-            )),
-        );
+        // INVARIANT: Forbid custom upfront `--timeout` on `carbon-stack codex-lane review`; standard defaults are 600s (HIGH) and 900s (XHIGH).
+        let pending_resume = tstate
+            .as_ref()
+            .map_or(false, |ts| json_truthy(ts.get("pending_timeout_resume")));
+        if !pending_resume {
+            return (
+                "deny".to_string(),
+                Some(format!(
+                    "[Codex Timeout Policy] Запрещено передавать свой `--timeout` заранее при вызове `carbon-stack codex-lane review`: штатный таймаут уже составляет 10 минут (`{}s`) для `HIGH` и 15 минут (`{}s`) для `--xhigh`. Запустите `{}` без флага `--timeout`.",
+                    DEFAULT_REVIEW_TIMEOUT_SECONDS, DEFAULT_XHIGH_REVIEW_TIMEOUT_SECONDS, retry_cmd
+                )),
+            );
+        }
+
+        let saved_next = tstate
+            .as_ref()
+            .map_or(0, |ts| val_to_i64(ts.get("next_timeout_seconds")));
+        let req_min = required_review_timeout(is_xhigh, saved_next);
+        let parsed_to = if !raw_to.is_empty() && raw_to.bytes().all(|b| b.is_ascii_digit()) {
+            raw_to.parse::<i64>().ok()
+        } else {
+            None
+        };
+        if parsed_to.map_or(true, |v| v < req_min) {
+            return (
+                "deny".to_string(),
+                Some(format!(
+                    "[Codex Timeout Policy] После незавершённого таймаута Codex нельзя занижать `--timeout` до `{}s` (требуется `>= {}s`). Уберите флаг `--timeout` — `{}` автоматически продолжит сохранённую сессию с таймаутом `{}s` без потери раунда.",
+                    raw_to, req_min, retry_cmd, req_min
+                )),
+            );
+        }
+        if parsed_to.unwrap_or(0) > MAX_REVIEW_TIMEOUT_SECONDS {
+            return (
+                "deny".to_string(),
+                Some(format!(
+                    "[Codex Timeout Policy] Значение `--timeout {}` превышает потолок `{}s`. Уберите флаг `--timeout` для автоматического продолжения сессии.",
+                    raw_to, MAX_REVIEW_TIMEOUT_SECONDS
+                )),
+            );
+        }
     }
     ("allow".to_string(), None)
 }
@@ -477,18 +528,17 @@ pub fn guard_shell_command_with_session(
         return (to_dec, to_reason);
     }
 
-    if bare_worktree_remove_re().is_match(&norm_cmd) && !norm_cmd.contains("worktree_guard.py") {
-        let guard_script = rio::normalize_path(
-            &rio::plugin_root()
-                .join("tools")
-                .join("worktree_guard.py")
-                .to_string_lossy(),
-        );
+    let low_norm_cmd = norm_cmd.to_lowercase();
+    if bare_worktree_remove_re().is_match(&norm_cmd)
+        && !low_norm_cmd.contains("worktree_guard")
+        && !low_norm_cmd.contains("worktree-guard")
+    {
+        let cs_bin = rio::normalize_path(&rio::carbon_stack_bin_path().to_string_lossy());
         return (
             "deny".to_string(),
             Some(format!(
-                "[Worktree Safety Guard] Прямой вызов `git worktree remove` на Windows опасен (Git рекурсивно обходит NTFS junctions вроде `node_modules`/`.venv` и может удалить файлы основного дерева, а незакоммиченные правки теряются). Используйте безопасную обёртку: `python -X utf8 \"{}\" remove --worktree <path>`.",
-                guard_script
+                "[Worktree Safety Guard] Прямой вызов `git worktree remove` на Windows опасен (Git рекурсивно обходит NTFS junctions вроде `node_modules`/`.venv` и может удалить файлы основного дерева, а незакоммиченные правки теряются). Используйте безопасную обёртку: `& \"{}\" worktree-guard remove --worktree <path>`.",
+                cs_bin
             )),
         );
     }
@@ -509,17 +559,12 @@ pub fn guard_shell_command_with_session(
             }
             let (rc, st_out, _) = rio::run_git(&git_root, &["status", "--porcelain=v1"], 4.0);
             if (rc == 0 && !st_out.trim().is_empty()) || rc == 124 {
-                let guard_script = rio::normalize_path(
-                    &rio::plugin_root()
-                        .join("tools")
-                        .join("worktree_guard.py")
-                        .to_string_lossy(),
-                );
+                let cs_bin = rio::normalize_path(&rio::carbon_stack_bin_path().to_string_lossy());
                 return (
                     "deny".to_string(),
                     Some(format!(
-                        "[Dirty Worktree Protection] Рабочее дерево содержит незакоммиченные изменения, которые будут безвозвратно уничтожены этой командой. Сначала сохраните снимок состояния без изменения индекса: `python -X utf8 \"{}\" snapshot --label before-reset`, либо откатывайте только конкретные собственные хунки.",
-                        guard_script
+                        "[Dirty Worktree Protection] Рабочее дерево содержит незакоммиченные изменения, которые будут безвозвратно уничтожены этой командой. Сначала сохраните снимок состояния без изменения индекса: `& \"{}\" worktree-guard snapshot --label before-reset`, либо откатывайте только конкретные собственные хунки.",
+                        cs_bin
                     )),
                 );
             }
@@ -588,10 +633,20 @@ fn pending_codex_timeout_escalation_deny(
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .unwrap_or("auto");
+    let retry_note = if json_truthy(tstate.get("legacy_unknown_tier")) {
+        "`carbon-stack codex-lane review` (или `carbon-stack codex-lane review --xhigh` для `XHIGH`)"
+            .to_string()
+    } else {
+        let eff = val_to_str(tstate.get("effort"));
+        let is_xh = json_truthy(tstate.get("xhigh")) || cwg_common::is_codex_xhigh_effort(&eff);
+        let mdl = val_to_str(tstate.get("model"));
+        let is_cls = val_to_str(tstate.get("phase")).eq_ignore_ascii_case("closure");
+        format!("`{}`", crate::codex_lane::format_review_retry_cmd_phase(&mdl, is_xh, is_cls))
+    };
     // INVARIANT: Block switching to internal review after a non-network Codex thinking timeout while Codex remains healthy.
     Some(format!(
-        "[Codex Timeout Policy] Переключение на внутреннее ревью (`{}`) после таймаута размышления Codex запрещено: локальный таймаут не является сбоем Codex и не расходует раунд ревью. Повторите вызов `codex_lane.py review` без флага `--timeout`, чтобы продолжить ту же сессию Codex (`{}`) с увеличенным таймаутом (`{}s`).",
-        target_label, sid_note, next_to
+        "[Codex Timeout Policy] Переключение на внутреннее ревью (`{}`) после таймаута размышления Codex запрещено: локальный таймаут не является сбоем Codex и не расходует раунд ревью. Повторите вызов {} без флага `--timeout`, чтобы продолжить ту же сессию Codex (`{}`) с увеличенным таймаутом (`{}s`).",
+        target_label, retry_note, sid_note, next_to
     ))
 }
 
@@ -633,10 +688,48 @@ pub fn guard_swarm_invocation_with_payload(
     }
     let caller_worker = payload.map(resolve_swarm_worker_identity).unwrap_or_default();
     let is_non_coord_worker = !caller_worker.is_empty() && !is_coordinator_role(&caller_worker);
+    let is_simp_target = is_simplify_swarm_target(&name_str, &brief_str);
+    let is_rev_target = is_adversarial_review_swarm_target(&name_str, &model, &brief_str);
+    if action == "add" && !is_non_coord_worker && (is_simp_target || is_rev_target) {
+        if let Some(p) = payload {
+            let session = rio::session_key(p);
+            let cwd = rio::effective_cwd(p);
+            let tp = p.get("transcriptPath").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(rm_deny) = pending_research_mode_deny(&session, &cwd, tp) {
+                return ("deny".to_string(), Some(rm_deny));
+            }
+            let fork_str = val_to_str(args.get("fork")).trim().to_string();
+            if !fork_str.is_empty() && !session.is_empty() && session != "unknown" {
+                let last_rr_ts = cwg_common::read_marker_with_pending(&session)
+                    .filter(|m| !json_truthy(m.get("closed")))
+                    .map(|m| cwg_common::last_research_reset_ts(&m))
+                    .unwrap_or(0.0);
+                if last_rr_ts > 0.0 {
+                    return (
+                        "deny".to_string(),
+                        Some(
+                            "[Gate Fresh Session Policy] Создание линзы simplify или ревью через `fork` после `research-reset` запрещено: новый цикл обязан стартовать в чистой сессии без старой истории."
+                                .to_string(),
+                        ),
+                    );
+                }
+            }
+        }
+    }
     if action == "add"
-        && is_adversarial_review_swarm_target(&name_str, &model, &brief_str)
+        && is_rev_target
         && !is_non_coord_worker
     {
+        if brief_str.to_lowercase().contains("closure_validation:") {
+            if let Some(p) = payload {
+                let s = rio::session_key(p);
+                let c = rio::effective_cwd(p);
+                let t = p.get("transcriptPath").and_then(|v| v.as_str()).unwrap_or("");
+                if let Some(sim_deny) = pending_post_block_simplify_deny(&s, &c, t, "") {
+                    return ("deny".to_string(), Some(sim_deny));
+                }
+            }
+        }
         let label = if model.is_empty() {
             name_str.as_str()
         } else {
@@ -695,6 +788,13 @@ pub fn guard_subagent_invocation_with_payload(
     let worker_model = rio::swarm_worker_model(transcript_path, Some(&steps_head), conv_id);
     let is_swarm_worker = worker_model.is_some();
 
+    if !is_swarm_worker && (NATIVE_REVIEWERS.contains(&base_sub_type) || is_simplify_sub) {
+        let session = rio::session_key(payload);
+        let cwd = rio::effective_cwd(payload);
+        if let Some(rm_deny) = pending_research_mode_deny(&session, &cwd, transcript_path) {
+            return ("deny".to_string(), Some(rm_deny), None);
+        }
+    }
     if !is_swarm_worker && NATIVE_REVIEWERS.contains(&base_sub_type) {
         if let Some(esc_deny) = pending_codex_timeout_escalation_deny(Some(payload), base_sub_type) {
             return ("deny".to_string(), Some(esc_deny), None);
@@ -1042,7 +1142,7 @@ pub fn guard_read_board(
         .filter(|v| !v.is_null())
         .or_else(|| args.get("after").filter(|v| !v.is_null()))
         .or_else(|| args.get("cursor").filter(|v| !v.is_null()));
-    let since_val = coerce_nonneg_int(raw_since);
+    let since_val = val_to_i64(raw_since);
 
     let cpath = cursor_state_path(&session);
     let state = rio::read_json(&cpath)
@@ -1290,7 +1390,11 @@ fn is_blocked_worker_swarm_ctl(tokens: &[String], seg_text: &str) -> bool {
     for (idx, tok) in clean_toks.iter().enumerate() {
         let norm = tok.trim_start_matches(['&', '.']).replace('\\', "/").to_lowercase();
         let name = norm.rsplit('/').next().unwrap_or("");
-        if name == "swarm_ctl" || name == "swarm_ctl.py" || norm == "plugin.tools.swarm_ctl" {
+        if name == "swarm_ctl"
+            || name == "swarm-ctl"
+            || name == "swarm_ctl.py"
+            || norm == "plugin.tools.swarm_ctl"
+        {
             matched_idx = Some(idx);
             break;
         }
@@ -1307,7 +1411,10 @@ fn is_blocked_worker_swarm_ctl(tokens: &[String], seg_text: &str) -> bool {
         .map(|t| tok_basename_lower(t.trim_start_matches(['&', '.'])))
         .unwrap_or_default();
     let is_invoker = INTERPRETER_BASENAMES.contains(&first_name.as_str())
-        || matches!(first_name.as_str(), "swarm_ctl" | "swarm_ctl.py" | "env" | "&" | ".");
+        || matches!(
+            first_name.as_str(),
+            "swarm_ctl" | "swarm-ctl" | "swarm_ctl.py" | "carbon-stack" | "carbon-stack.exe" | "env" | "&" | "."
+        );
 
     let rest = &clean_toks[midx + 1..];
     let mut pos: Vec<String> = Vec::new();
@@ -1517,7 +1624,7 @@ fn guard_worker_shell_ownership(
             return (
                 "deny".to_string(),
                 Some(format!(
-                    "[File Ownership Guard] Произвольная или непроверяемая shell-мутация воркера `{}` запрещена при активном `.swarm/ownership.json`: используйте `edit_file`/`write_file` в рамках owned_paths={:?} или изолированный worktree (`swarm_ctl.py worktree create`).",
+                    "[File Ownership Guard] Произвольная или непроверяемая shell-мутация воркера `{}` запрещена при активном `.swarm/ownership.json`: используйте `edit_file`/`write_file` в рамках owned_paths={:?} или изолированный worktree (`carbon-stack swarm-ctl worktree create`).",
                     worker, owned
                 )),
             );
@@ -1573,8 +1680,9 @@ pub fn guard_file_ownership(
         String::new()
     };
     let is_coord = worker.is_empty() || is_coordinator_role(&worker);
-    let is_swarm_ctl_fix =
-        is_coord && cmd_text.contains("swarm_ctl") && cmd_text.contains("ownership");
+    let is_swarm_ctl_fix = is_coord
+        && (cmd_text.contains("swarm_ctl") || cmd_text.contains("swarm-ctl"))
+        && cmd_text.contains("ownership");
     if !is_swarm_ctl_fix {
         // INVARIANT: PreToolUse runs pure syntactic overlap checks (O(W^2*G^2)) without spawning `git ls-files`.
         let overlaps = cwg_common::detect_ownership_overlaps(&manifest, "");
@@ -1582,7 +1690,7 @@ pub fn guard_file_ownership(
             return (
                 "deny".to_string(),
                 Some(format!(
-                    "[File Ownership Guard] Пересечение `owned_paths` в `.swarm/ownership.json`: `{}` ({}) vs `{}` ({}). Устраните пересечение через `swarm_ctl.py ownership set` или выделите изолированные `worktree create`.",
+                    "[File Ownership Guard] Пересечение `owned_paths` в `.swarm/ownership.json`: `{}` ({}) vs `{}` ({}). Устраните пересечение через `carbon-stack swarm-ctl ownership set` или выделите изолированные `worktree create`.",
                     val_to_str(pair.get("worker_a")),
                     val_to_str(pair.get("glob_a")),
                     val_to_str(pair.get("worker_b")),
@@ -1700,7 +1808,7 @@ pub fn guard_swarm_wait(payload: &Value, args: Option<&Value>) -> (String, Optio
     }
 
     let eff_args = args.or_else(|| payload.get("toolCall").and_then(|t| t.get("args")));
-    let since_val = coerce_nonneg_int(eff_args.and_then(|a| a.get("since")));
+    let since_val = val_to_i64(eff_args.and_then(|a| a.get("since")));
 
     let mut active_workers: Vec<String> = Vec::new();
     let mut in_flight: Vec<String> = Vec::new();
@@ -1731,16 +1839,18 @@ pub fn guard_swarm_wait(payload: &Value, args: Option<&Value>) -> (String, Optio
     }
 
     if !in_flight.is_empty() {
-        let stalled = cwg_common::detect_stalled_workers(
-            &members,
-            &raw_board,
-            &rio::effective_cwd(payload),
-            Some(&brain_root),
-            &HashMap::new(),
-            &in_flight,
-            None,
-            None,
-        );
+        let eff_cwd = rio::effective_cwd(payload);
+        let empty_act = HashMap::new();
+        let stalled = cwg_common::detect_stalled_workers(cwg_common::StallDetectInput {
+            members: &members,
+            board_messages: &raw_board,
+            cwd: &eff_cwd,
+            brain_root: Some(&brain_root),
+            worker_last_activity: &empty_act,
+            in_flight_names: &in_flight,
+            now_ts: None,
+            timeout_sec: None,
+        });
         if !stalled.is_empty() {
             let desc: String = stalled
                 .iter()
@@ -1797,6 +1907,95 @@ pub fn guard_swarm_wait(payload: &Value, args: Option<&Value>) -> (String, Optio
         );
     }
 
+    ("allow".to_string(), None)
+}
+
+pub fn guard_post_message(
+    payload: &Value,
+    args: &Value,
+    cwd: &str,
+) -> (String, Option<String>) {
+    let tp = payload
+        .get("transcriptPath")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if rio::is_subagent_session(tp, None) {
+        return ("allow".to_string(), None);
+    }
+    let caller_worker = resolve_swarm_worker_identity(payload);
+    if !caller_worker.is_empty() && !is_coordinator_role(&caller_worker) {
+        return ("allow".to_string(), None);
+    }
+    let session = rio::session_key(payload);
+    if session.is_empty() || session == "unknown" {
+        return ("allow".to_string(), None);
+    }
+    let text = val_to_str(args.get("text"));
+    if !text.contains('@') {
+        return ("allow".to_string(), None);
+    }
+    let brain_root = resolve_brain_root_for_payload(payload);
+    let members = rio::load_swarm_members(&brain_root, &session);
+    if members.is_empty() {
+        return ("allow".to_string(), None);
+    }
+    let mentions_all = rio::text_contains_mention(&text, "all");
+    let mut targeted: Vec<String> = Vec::new();
+    for (mname, minfo) in &members {
+        if !minfo.is_object()
+            || rio::is_swarm_role_member(mname, Some(minfo))
+            || rio::is_swarm_member_killed(Some(minfo))
+        {
+            continue;
+        }
+        if !cwg_common::is_simplify_or_review_swarm_worker(mname, Some(minfo)) {
+            continue;
+        }
+        if mentions_all || rio::text_mentions_swarm_worker(&text, mname) {
+            targeted.push(mname.clone());
+        }
+    }
+    if targeted.is_empty() {
+        return ("allow".to_string(), None);
+    }
+    targeted.sort();
+    if let Some(rm_deny) = pending_research_mode_deny(&session, cwd, tp) {
+        return ("deny".to_string(), Some(rm_deny));
+    }
+    if text.to_lowercase().contains("closure_validation:")
+        && targeted.iter().any(|w| !cwg_common::is_simplify_worker_name(w))
+    {
+        if let Some(sim_deny) = pending_post_block_simplify_deny(&session, cwd, tp, "") {
+            return ("deny".to_string(), Some(sim_deny));
+        }
+    }
+    if let Some(marker) = cwg_common::read_marker_with_pending(&session).filter(|m| !json_truthy(m.get("closed"))) {
+        let rr_ts = cwg_common::last_research_reset_ts(&marker);
+        let rr_seq = cwg_common::last_research_reset_board_seq(&marker);
+        if rr_ts > 0.0 || rr_seq > 0 {
+            let board_path = rio::swarm_dir(&brain_root, &session).join("board.jsonl");
+            let raw_board = rio::read_jsonl(&board_path, None);
+            for wname in &targeted {
+                if cwg_common::is_worker_spawned_before_reset(
+                    wname,
+                    members.get(wname),
+                    &raw_board,
+                    rr_ts,
+                    rr_seq,
+                    Some(&marker),
+                    Some(&brain_root),
+                ) {
+                    return (
+                        "deny".to_string(),
+                        Some(format!(
+                            "[Gate Fresh Session Policy] Пробуждение воркера `{}` из предыдущего цикла после `research-reset` запрещено: завершите его через `swarm(action='kill', name='{}')` и создайте новую сессию линзы/ревью.",
+                            wname, wname
+                        )),
+                    );
+                }
+            }
+        }
+    }
     ("allow".to_string(), None)
 }
 
@@ -1863,6 +2062,17 @@ pub fn evaluate_pre_tool_use(payload: &Value) -> (String, Option<String>, Option
                 rio::log_hook_event(
                     "hygiene-events",
                     "model_guard_deny",
+                    json!({"session": session, "reason": reason.as_deref().unwrap_or("")}),
+                );
+                return (dec, reason, None);
+            }
+        }
+        "post_message" => {
+            let (dec, reason) = guard_post_message(payload, &args, &cwd);
+            if dec != "allow" {
+                rio::log_hook_event(
+                    "hygiene-events",
+                    "post_message_guard_deny",
                     json!({"session": session, "reason": reason.as_deref().unwrap_or("")}),
                 );
                 return (dec, reason, None);
@@ -2066,6 +2276,9 @@ mod tests {
 
     #[test]
     fn test_cursor_guard_and_swarm_wait_guard() {
+        let _guard = crate::win32_sqlite::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let root = env::temp_dir().join(format!("carbon-swg-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let sid = format!("test-swg-sess-{}", std::process::id());

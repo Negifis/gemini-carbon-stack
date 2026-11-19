@@ -9,6 +9,7 @@ use crate::win32_sqlite::run_command_with_job;
 
 const BYPASS_TOKENS: &[&str] = &[
     "tokenade",
+    "carbon-stack",
     "codex_lane.py",
     "gate_inbox.py",
     "cwg_stop.py",

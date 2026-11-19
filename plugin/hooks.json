@@ -17,7 +17,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "read_file|run_command|invoke_subagent|swarm|swarm_wait|read_board|edit_file|write_file",
+        "matcher": "read_file|run_command|invoke_subagent|swarm|swarm_wait|read_board|post_message|edit_file|write_file",
         "hooks": [
           {
             "type": "command",
