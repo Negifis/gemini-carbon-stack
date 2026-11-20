@@ -11,9 +11,9 @@
 ## 2. Делегирование и маршрутизация моделей
 
 - При поиске шире `2–3` файлов или в незнакомой подсистеме делегируйте разведку в `invoke_subagent` (`code-explorer` / `research`, возвращая только краткую выжимку `path:line-range`), а проверку живого веб-интерфейса — в субагент `browser` на `Gemini 4 Hydrogen`.
-- Модели `Gemini Flash` запрещены — используйте `Gemini 4 Hydrogen` (`low..xhigh`). Овердрафт кредитов (`useG1Credits`) отключён (`false`).
+- Модели `Gemini Flash` запрещены — используйте **`Gemini 4 Neon`** (`low..xhigh`) для сложных билдеров/отладки/UI-to-Code и **`Gemini 4 Hydrogen`** (`low..xhigh`) для быстрых/механических задач (`browser`, `translator`, скауты). Овердрафт кредитов (`useG1Credits`) отключён (`false`).
 - Для **Swarm 2.0** (разведка `3+` подсистем, параллельные билдеры, гейт) подключайте скилл `swarm-orchestration`: `carbon-stack swarm-ctl` для непересекающихся `owned_paths`/`worktree`, `.swarm/artifacts/*.md` (`<= 12` строк на доске) и `read_board(since=<id>)`.
-- Верификация `HIGH`/`XHIGH` идёт методом бутерброда `tests -> carbon-stack codex-lane review (1..3) -> simplify (ALL при <=2 ф. и <=30 ст.) -> batch kill -> --closure (до 2 раундов)`; после 2 `BLOCKED` обязателен режим исследования и `carbon-stack codex-lane research-reset` с запуском новых сессий.
+- Верификация `HIGH`/`XHIGH` идёт методом бутерброда `tests -> carbon-stack codex-lane review (1..3, эскалация Opus -> Neon XHigh [HIGH] / Carbon [XHIGH]) -> simplify (ALL при <=2 ф. и <=30 ст., fallback Neon XHigh / Hydrogen XHigh) -> batch kill -> --closure (до 2 раундов)`; после 2 `BLOCKED` обязателен режим исследования и `carbon-stack codex-lane research-reset` с запуском новых сессий.
 
 ## 3. Короткие команды проверок и терминала (PowerShell 5.1)
 

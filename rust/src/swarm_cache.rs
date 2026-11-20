@@ -93,14 +93,7 @@ pub fn resolve_brain_root(brain_root_arg: &str) -> PathBuf {
     rio::resolve_brain_root(brain_root_arg)
 }
 
-fn is_hydrogen_model(model_low: &str) -> bool {
-    model_low == cwg_common::HYDROGEN_LOW_MODEL
-        || model_low == cwg_common::HYDROGEN_MEDIUM_MODEL
-        || model_low == cwg_common::HYDROGEN_HIGH_MODEL
-        || model_low == cwg_common::HYDROGEN_XHIGH_MODEL
-}
-
-fn matches_label(worker_name: &str, label: &str, model: &str) -> bool {
+fn matches_label(worker_name: &str, label: &str, model: &str, brief: &str) -> bool {
     let clean = label.trim().to_lowercase();
     if clean.is_empty() {
         return true;
@@ -113,22 +106,27 @@ fn matches_label(worker_name: &str, label: &str, model: &str) -> bool {
         if !is_simplify {
             return false;
         }
-        return model_low.is_empty()
-            || model_low == cwg_common::SONNET_HIGH_MODEL
-            || model_low == cwg_common::SIMPLIFY_FALLBACK_MODEL;
+        return model_low.is_empty() || cwg_common::is_simplify_allowed_model(&model_low);
     }
     if clean == "review" {
+        // INVARIANT: Align Warm Pool review-worker selection with the gate (`cwg_stop` /
+        // `cwg_common`): allow only gate review models (`opus-high`, `carbon-high`, `neon-xhigh`,
+        // or unset), and require role confirmation via name or assignment brief for multi-role
+        // models (`carbon-high`, `neon-xhigh`) so Carbon builders never trigger `resume_in_place`
+        // while brief-assigned Neon reviewers (e.g. `neon-audit`) are included.
+        if is_simplify {
+            return false;
+        }
+        if model_low == cwg_common::OPUS_HIGH_MODEL {
+            return true;
+        }
         if !model_low.is_empty()
-            && (is_hydrogen_model(&model_low) || cwg_common::is_flash_model(&model_low))
+            && model_low != cwg_common::CARBON_HIGH_MODEL
+            && model_low != cwg_common::NEON_XHIGH_MODEL
         {
             return false;
         }
-        return !is_simplify
-            && (model_low == cwg_common::OPUS_HIGH_MODEL
-                || low.contains("review")
-                || low.contains("adversarial")
-                || low.contains("critic")
-                || low.contains("verifier"));
+        return cwg_common::is_review_worker_hint(&low, brief);
     }
     low.contains(&clean)
 }
@@ -219,10 +217,72 @@ pub fn inspect_swarm_workers(
     now_ts: Option<f64>,
     current_round: i64,
 ) -> Value {
+    inspect_swarm_workers_inner(
+        session,
+        brain_root,
+        ttl_seconds,
+        label,
+        now_ts,
+        current_round,
+        None,
+    )
+}
+
+fn inspect_swarm_workers_with_marker(
+    session: &str,
+    brain_root: &Path,
+    ttl_seconds: u64,
+    label: &str,
+    now_ts: Option<f64>,
+    current_round: i64,
+    marker: Option<&Value>,
+) -> Value {
+    inspect_swarm_workers_inner(
+        session,
+        brain_root,
+        ttl_seconds,
+        label,
+        now_ts,
+        current_round,
+        Some(marker),
+    )
+}
+
+fn inspect_swarm_workers_inner(
+    session: &str,
+    brain_root: &Path,
+    ttl_seconds: u64,
+    label: &str,
+    now_ts: Option<f64>,
+    current_round: i64,
+    marker_override: Option<Option<&Value>>,
+) -> Value {
     let now = now_ts.unwrap_or_else(now_sec);
     let members = rio::load_swarm_members(brain_root, session);
     let mut names: Vec<&String> = members.keys().collect();
     names.sort();
+
+    let label_low = label.trim().to_lowercase();
+    let is_gated_lane = label_low == "simplify" || label_low == "review";
+    let loaded_marker = if marker_override.is_none() && is_gated_lane && !members.is_empty() {
+        cwg_common::read_active_marker_with_pending(session)
+    } else {
+        None
+    };
+    let marker = match marker_override {
+        Some(m) => m,
+        None => loaded_marker.as_ref(),
+    };
+    let rr_ts = marker.map_or(0.0, cwg_common::last_research_reset_ts);
+    let rr_seq = marker.map_or(0, cwg_common::last_research_reset_board_seq);
+    let has_reset = rr_ts > 0.0 || rr_seq > 0;
+    let known_workers = if label_low == "review" {
+        rio::swarm_worker_names(&members)
+    } else {
+        Vec::new()
+    };
+    let mut raw_board_cache: Option<Vec<Value>> = None;
+    let mut board_briefs_cache: Option<std::collections::HashMap<String, String>> = None;
 
     let mut active: Vec<Value> = Vec::new();
     let mut killed_count: usize = 0;
@@ -235,13 +295,59 @@ pub fn inspect_swarm_workers(
             continue;
         }
         let model = val_to_str(meta.get("model")).trim().to_lowercase();
+        let meta_brief = val_to_str(meta.get("brief"));
+        let direct_match = matches_label(name, &label_low, &model, &meta_brief);
+        let can_match_via_board = !direct_match
+            && label_low == "review"
+            && (model.is_empty()
+                || model == cwg_common::CARBON_HIGH_MODEL
+                || model == cwg_common::NEON_XHIGH_MODEL);
+        if !direct_match && !can_match_via_board {
+            continue;
+        }
+        // INVARIANT: Align Warm Pool selection with `cwg_stop`'s `research-reset` cycle boundary:
+        // ignore pre-reset simplify/review workers (fresh sessions enforced) and never inherit
+        // pre-reset coordinator board briefs when a post-reset worker reuses the same roster name.
+        if has_reset && is_gated_lane {
+            let raw_board = raw_board_cache
+                .get_or_insert_with(|| cwg_common::read_swarm_board_tail(brain_root, session));
+            if cwg_common::is_worker_spawned_before_reset(
+                name,
+                Some(meta),
+                raw_board,
+                rr_ts,
+                rr_seq,
+                marker,
+                Some(brain_root),
+            ) {
+                continue;
+            }
+        }
+        let matched = if direct_match {
+            true
+        } else {
+            let briefs = board_briefs_cache.get_or_insert_with(|| {
+                let raw_board = raw_board_cache
+                    .get_or_insert_with(|| cwg_common::read_swarm_board_tail(brain_root, session));
+                cwg_common::collect_coordinator_board_briefs(
+                    raw_board,
+                    &known_workers,
+                    &known_workers,
+                    rr_seq,
+                    rr_ts,
+                )
+            });
+            briefs
+                .get(name)
+                .is_some_and(|b| matches_label(name, &label_low, &model, b))
+        };
         if rio::is_swarm_member_killed(Some(meta)) {
-            if matches_label(name, label, &model) {
+            if matched {
                 killed_count += 1;
             }
             continue;
         }
-        if !matches_label(name, label, &model) {
+        if !matched {
             continue;
         }
 
@@ -680,13 +786,15 @@ pub fn prepare_round(input: PrepareRoundInput<'_>) -> Value {
         let _ = rio::write_json(&rounds_file, &Value::Object(state));
     }
 
-    let worker_status = inspect_swarm_workers(
+    let active_marker = marker.as_ref().filter(|m| cwg_common::is_active_marker(m));
+    let worker_status = inspect_swarm_workers_with_marker(
         session,
         brain_root,
         ttl_seconds,
         &clean_label,
         Some(now),
         cur_round,
+        active_marker,
     );
 
     let mut next_names = Map::new();
@@ -1108,5 +1216,812 @@ mod tests {
         let _ = fs::remove_dir_all(&repo);
         let _ = fs::remove_dir_all(&brain);
         let _ = fs::remove_dir_all(&tmp_home);
+    }
+
+    #[test]
+    fn test_matches_label_neon_routing() {
+        assert!(matches_label(
+            "simplify-reuse-r1",
+            "simplify",
+            cwg_common::NEON_XHIGH_MODEL,
+            ""
+        ));
+        assert!(matches_label(
+            "simplify-quality-r1",
+            "simplify",
+            cwg_common::HYDROGEN_XHIGH_MODEL,
+            ""
+        ));
+        assert!(matches_label(
+            "internal-reviewer",
+            "review",
+            cwg_common::NEON_XHIGH_MODEL,
+            ""
+        ));
+        assert!(matches_label(
+            "internal-reviewer-xhigh",
+            "review",
+            cwg_common::CARBON_HIGH_MODEL,
+            ""
+        ));
+        assert!(matches_label(
+            "neon-audit",
+            "review",
+            cwg_common::NEON_XHIGH_MODEL,
+            "Audit diff and emit VERDICT: APPROVED or REVISE"
+        ));
+        assert!(!matches_label(
+            "builder-carbon",
+            "review",
+            cwg_common::CARBON_HIGH_MODEL,
+            "Implement feature module"
+        ));
+        assert!(!matches_label(
+            "root-cause-debugger",
+            "review",
+            cwg_common::NEON_XHIGH_MODEL,
+            "Diagnose flaky test"
+        ));
+        assert!(!matches_label(
+            "repo-architect-scout",
+            "review",
+            cwg_common::NEON_XHIGH_MODEL,
+            ""
+        ));
+    }
+
+    #[test]
+    fn test_inspect_workers_review_role_and_overall_action() {
+        let brain = make_temp_dir("swarm-cache-review-role");
+        let now = 1_795_120_000.0;
+
+        let write_warm_worker = |cid: &str| {
+            let log_dir = brain.join(cid).join(".system_generated").join("logs");
+            fs::create_dir_all(&log_dir).unwrap();
+            let step = json!({
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-19T20:26:00Z",
+                "metadata": {"modelUsage": {"inputTokens": 40, "outputTokens": 10, "cacheReadTokens": 100}}
+            });
+            fs::write(
+                log_dir.join("transcript_full.jsonl"),
+                format!("{}\n", serde_json::to_string(&step).unwrap()),
+            )
+            .unwrap();
+        };
+
+        // Case 1: Active warm Carbon builder must NOT trigger `resume_in_place` for `--label review`.
+        let sess_builder = "sess-carbon-builder-only";
+        let sw_builder = rio::swarm_dir(&brain, sess_builder);
+        fs::create_dir_all(&sw_builder).unwrap();
+        write_warm_worker("cid-carbon-builder");
+        fs::write(
+            sw_builder.join("members.json"),
+            serde_json::to_string(&json!({
+                "members": {
+                    "builder-carbon": {
+                        "role": "worker",
+                        "conversation_id": "cid-carbon-builder",
+                        "model": cwg_common::CARBON_HIGH_MODEL,
+                        "brief": "Implement parser module",
+                        "killed": false
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let res_builder = inspect_swarm_workers(
+            sess_builder,
+            &brain,
+            cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
+            "review",
+            Some(now),
+            1,
+        );
+        assert_eq!(res_builder["active_count"], json!(0));
+        assert_eq!(res_builder["overall_action"], json!("initial_spawn"));
+
+        // Case 2: Active warm Neon worker `neon-audit` assigned a review role via board.jsonl brief MUST trigger `resume_in_place`.
+        let sess_neon_audit = "sess-neon-audit-brief-review";
+        let sw_neon = rio::swarm_dir(&brain, sess_neon_audit);
+        fs::create_dir_all(&sw_neon).unwrap();
+        write_warm_worker("cid-neon-audit");
+        fs::write(
+            sw_neon.join("members.json"),
+            serde_json::to_string(&json!({
+                "members": {
+                    "builder-carbon": {
+                        "role": "worker",
+                        "conversation_id": "cid-carbon-builder",
+                        "model": cwg_common::CARBON_HIGH_MODEL,
+                        "brief": "Implement parser module",
+                        "killed": false
+                    },
+                    "neon-audit": {
+                        "role": "worker",
+                        "conversation_id": "cid-neon-audit",
+                        "model": cwg_common::NEON_XHIGH_MODEL,
+                        "killed": false
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            sw_neon.join("board.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::to_string(&json!({
+                    "seq": 1,
+                    "agent": "coordinator",
+                    "time": "2026-11-19T20:25:00Z",
+                    "text": "@neon-audit Adversarial audit of diff; report VERDICT: APPROVED or REVISE."
+                }))
+                .unwrap()
+            ),
+        )
+        .unwrap();
+        let res_neon = inspect_swarm_workers(
+            sess_neon_audit,
+            &brain,
+            cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
+            "review",
+            Some(now),
+            1,
+        );
+        assert_eq!(res_neon["active_count"], json!(1));
+        assert_eq!(res_neon["warm_workers"], json!(["neon-audit"]));
+        assert_eq!(res_neon["overall_action"], json!("resume_in_place"));
+
+        // Case 3: After `research-reset`, a new post-reset Neon builder reusing roster name `neon-audit`
+        // must NOT inherit pre-reset reviewer board briefs (must stay `initial_spawn`, not `resume_in_place`).
+        let rr_ts = rio::parse_iso_ts("2026-11-19T20:25:30Z");
+        let rr_marker = json!({
+            "closed": false,
+            "research_resets": [{
+                "reset_ts": rr_ts,
+                "board_head_seq": 5,
+                "pre_reset_worker_cids": ["cid-neon-audit-pre-reset"]
+            }]
+        });
+        let sess_rr_reuse = "sess-neon-audit-post-reset-builder-reuse";
+        let sw_rr = rio::swarm_dir(&brain, sess_rr_reuse);
+        fs::create_dir_all(&sw_rr).unwrap();
+        write_warm_worker("cid-neon-builder-post-reset");
+        fs::write(
+            sw_rr.join("members.json"),
+            serde_json::to_string(&json!({
+                "members": {
+                    "neon-audit": {
+                        "role": "worker",
+                        "conversation_id": "cid-neon-builder-post-reset",
+                        "model": cwg_common::NEON_XHIGH_MODEL,
+                        "created_at": "2026-11-19T20:25:45Z",
+                        "killed": false
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            sw_rr.join("board.jsonl"),
+            [
+                json!({
+                    "seq": 1,
+                    "agent": "coordinator",
+                    "time": "2026-11-19T20:25:00Z",
+                    "text": "@neon-audit Adversarial audit of diff; report VERDICT: APPROVED or REVISE."
+                }),
+                json!({
+                    "seq": 6,
+                    "agent": "coordinator",
+                    "time": "2026-11-19T20:25:50Z",
+                    "text": "@neon-audit Implement parser module in src/parser.rs."
+                }),
+            ]
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let res_rr_builder = inspect_swarm_workers_with_marker(
+            sess_rr_reuse,
+            &brain,
+            cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
+            "review",
+            Some(now),
+            1,
+            Some(&rr_marker),
+        );
+        assert_eq!(res_rr_builder["active_count"], json!(0));
+        assert_eq!(res_rr_builder["overall_action"], json!("initial_spawn"));
+
+        // Case 4: Pre-reset unkilled reviewer `neon-audit` (`cid` in `pre_reset_worker_cids`) must NOT
+        // trigger Warm Pool `resume_in_place` after `research-reset`.
+        let sess_rr_pre = "sess-neon-audit-pre-reset-stale";
+        let sw_rr_pre = rio::swarm_dir(&brain, sess_rr_pre);
+        fs::create_dir_all(&sw_rr_pre).unwrap();
+        write_warm_worker("cid-neon-audit-pre-reset");
+        fs::write(
+            sw_rr_pre.join("members.json"),
+            serde_json::to_string(&json!({
+                "members": {
+                    "neon-audit": {
+                        "role": "worker",
+                        "conversation_id": "cid-neon-audit-pre-reset",
+                        "model": cwg_common::NEON_XHIGH_MODEL,
+                        "killed": false
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            sw_rr_pre.join("board.jsonl"),
+            format!(
+                "{}\n",
+                json!({
+                    "seq": 1,
+                    "agent": "coordinator",
+                    "time": "2026-11-19T20:25:00Z",
+                    "text": "@neon-audit Adversarial audit of diff; report VERDICT: APPROVED or REVISE."
+                })
+            ),
+        )
+        .unwrap();
+        let res_rr_pre = inspect_swarm_workers_with_marker(
+            sess_rr_pre,
+            &brain,
+            cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
+            "review",
+            Some(now),
+            1,
+            Some(&rr_marker),
+        );
+        assert_eq!(res_rr_pre["active_count"], json!(0));
+        assert_eq!(res_rr_pre["overall_action"], json!("initial_spawn"));
+
+        // Case 5: Post-reset Neon reviewer `neon-audit` assigned AFTER `research-reset` MUST trigger `resume_in_place`.
+        let sess_rr_post_rev = "sess-neon-audit-post-reset-reviewer";
+        let sw_rr_post = rio::swarm_dir(&brain, sess_rr_post_rev);
+        fs::create_dir_all(&sw_rr_post).unwrap();
+        write_warm_worker("cid-neon-reviewer-post-reset");
+        fs::write(
+            sw_rr_post.join("members.json"),
+            serde_json::to_string(&json!({
+                "members": {
+                    "neon-audit": {
+                        "role": "worker",
+                        "conversation_id": "cid-neon-reviewer-post-reset",
+                        "model": cwg_common::NEON_XHIGH_MODEL,
+                        "created_at": "2026-11-19T20:25:45Z",
+                        "killed": false
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            sw_rr_post.join("board.jsonl"),
+            format!(
+                "{}\n",
+                json!({
+                    "seq": 6,
+                    "agent": "coordinator",
+                    "time": "2026-11-19T20:25:50Z",
+                    "text": "@neon-audit Adversarial audit of diff; report VERDICT: APPROVED or REVISE."
+                })
+            ),
+        )
+        .unwrap();
+        let res_rr_post = inspect_swarm_workers_with_marker(
+            sess_rr_post_rev,
+            &brain,
+            cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
+            "review",
+            Some(now),
+            1,
+            Some(&rr_marker),
+        );
+        assert_eq!(res_rr_post["active_count"], json!(1));
+        assert_eq!(res_rr_post["warm_workers"], json!(["neon-audit"]));
+        assert_eq!(res_rr_post["overall_action"], json!("resume_in_place"));
+
+        // Case 6: Post-reset Neon reviewer assigned with `seq > board_head_seq` and a coarse same-second
+        // board timestamp (`20:25:30Z` vs `reset_ts = 20:25:30.500Z`) MUST be preserved (`resume_in_place`),
+        // matching `cwg_stop` when `board_head_seq` proves the row is post-reset.
+        let rr_half_sec = rio::parse_iso_ts("2026-11-19T20:25:30.500Z");
+        let rr_half_marker = json!({
+            "closed": false,
+            "research_resets": [{
+                "reset_ts": rr_half_sec,
+                "board_head_seq": 5,
+                "pre_reset_worker_cids": ["cid-neon-audit-pre-reset"]
+            }]
+        });
+        let sess_rr_samesec = "sess-neon-audit-post-reset-same-second-coarse";
+        let sw_rr_ss = rio::swarm_dir(&brain, sess_rr_samesec);
+        fs::create_dir_all(&sw_rr_ss).unwrap();
+        write_warm_worker("cid-neon-reviewer-samesec");
+        fs::write(
+            sw_rr_ss.join("members.json"),
+            serde_json::to_string(&json!({
+                "members": {
+                    "neon-audit": {
+                        "role": "worker",
+                        "conversation_id": "cid-neon-reviewer-samesec",
+                        "model": cwg_common::NEON_XHIGH_MODEL,
+                        "created_at": "2026-11-19T20:25:30.600Z",
+                        "killed": false
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            sw_rr_ss.join("board.jsonl"),
+            format!(
+                "{}\n",
+                json!({
+                    "seq": 6,
+                    "agent": "coordinator",
+                    "time": "2026-11-19T20:25:30Z",
+                    "text": "@neon-audit Adversarial audit of diff; report VERDICT: APPROVED or REVISE."
+                })
+            ),
+        )
+        .unwrap();
+        let res_rr_ss = inspect_swarm_workers_with_marker(
+            sess_rr_samesec,
+            &brain,
+            cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
+            "review",
+            Some(now),
+            1,
+            Some(&rr_half_marker),
+        );
+        assert_eq!(res_rr_ss["active_count"], json!(1));
+        assert_eq!(res_rr_ss["warm_workers"], json!(["neon-audit"]));
+        assert_eq!(res_rr_ss["overall_action"], json!("resume_in_place"));
+
+        // Case 7: Pre-reset row appended between `board_head_seq` snapshot (`seq=5`) and `reset_ts`
+        // (`20:25:30.500Z`) has `seq=6 > rr_seq` but exact timestamp `20:25:30.200Z <= reset_ts`;
+        // MUST be filtered out so a post-reset Neon builder reusing `neon-audit` stays `initial_spawn`,
+        // while a subsequent post-reset coarse same-second row (`seq=7`, `20:25:30Z`) retains its
+        // full upper bound (`20:25:31Z > 20:25:30.500Z`) and is preserved when assigning a reviewer.
+        let sess_rr_gap_b = "sess-neon-audit-pre-reset-gap-builder";
+        let sw_rr_gb = rio::swarm_dir(&brain, sess_rr_gap_b);
+        fs::create_dir_all(&sw_rr_gb).unwrap();
+        write_warm_worker("cid-neon-builder-gap");
+        fs::write(
+            sw_rr_gb.join("members.json"),
+            serde_json::to_string(&json!({
+                "members": {
+                    "neon-audit": {
+                        "role": "worker",
+                        "conversation_id": "cid-neon-builder-gap",
+                        "model": cwg_common::NEON_XHIGH_MODEL,
+                        "created_at": "2026-11-19T20:25:30.600Z",
+                        "killed": false
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            sw_rr_gb.join("board.jsonl"),
+            [
+                json!({
+                    "seq": 6,
+                    "agent": "coordinator",
+                    "time": "2026-11-19T20:25:30.200Z",
+                    "text": "@neon-audit Adversarial audit of diff; report VERDICT: APPROVED or REVISE."
+                }),
+                json!({
+                    "seq": 7,
+                    "agent": "coordinator",
+                    "time": "2026-11-19T20:25:30Z",
+                    "text": "@neon-audit Implement parser module in src/parser.rs."
+                }),
+            ]
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let res_rr_gb = inspect_swarm_workers_with_marker(
+            sess_rr_gap_b,
+            &brain,
+            cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
+            "review",
+            Some(now),
+            1,
+            Some(&rr_half_marker),
+        );
+        assert_eq!(res_rr_gb["active_count"], json!(0));
+        assert_eq!(res_rr_gb["overall_action"], json!("initial_spawn"));
+
+        let sess_rr_gap_r = "sess-neon-audit-pre-reset-gap-then-post-coarse-rev";
+        let sw_rr_gr = rio::swarm_dir(&brain, sess_rr_gap_r);
+        fs::create_dir_all(&sw_rr_gr).unwrap();
+        write_warm_worker("cid-neon-rev-after-gap");
+        fs::write(
+            sw_rr_gr.join("members.json"),
+            serde_json::to_string(&json!({
+                "members": {
+                    "neon-audit": {
+                        "role": "worker",
+                        "conversation_id": "cid-neon-rev-after-gap",
+                        "model": cwg_common::NEON_XHIGH_MODEL,
+                        "created_at": "2026-11-19T20:25:30.600Z",
+                        "killed": false
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            sw_rr_gr.join("board.jsonl"),
+            [
+                json!({
+                    "seq": 6,
+                    "agent": "coordinator",
+                    "time": "2026-11-19T20:25:30.200Z",
+                    "text": "@neon-audit Implement old cycle builder."
+                }),
+                json!({
+                    "seq": 7,
+                    "agent": "coordinator",
+                    "time": "2026-11-19T20:25:30Z",
+                    "text": "@neon-audit Adversarial audit of diff; report VERDICT: APPROVED or REVISE."
+                }),
+            ]
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let res_rr_gr = inspect_swarm_workers_with_marker(
+            sess_rr_gap_r,
+            &brain,
+            cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
+            "review",
+            Some(now),
+            1,
+            Some(&rr_half_marker),
+        );
+        assert_eq!(res_rr_gr["active_count"], json!(1));
+        assert_eq!(res_rr_gr["warm_workers"], json!(["neon-audit"]));
+        assert_eq!(res_rr_gr["overall_action"], json!("resume_in_place"));
+
+        // Case 8: Coarse pre-reset row `seq=6` (`20:25:30Z`, `@neon-audit VERDICT: APPROVED`) followed by
+        // exact pre-reset row `seq=7` (`20:25:30.300Z <= reset_ts 20:25:30.500Z`) proves BOTH `seq=6` and
+        // `seq=7` preceded reset via append-only causal prefix tightening; post-reset Neon builder reusing
+        // `neon-audit` (`seq=8` coarse `20:25:30Z`) MUST stay `initial_spawn` (not `resume_in_place`),
+        // while a post-reset reviewer assigned at `seq=8` (coarse `20:25:30Z`) IS still preserved.
+        let sess_rr_cp_b = "sess-neon-audit-causal-prefix-builder";
+        let sw_rr_cpb = rio::swarm_dir(&brain, sess_rr_cp_b);
+        fs::create_dir_all(&sw_rr_cpb).unwrap();
+        write_warm_worker("cid-neon-builder-cp");
+        fs::write(
+            sw_rr_cpb.join("members.json"),
+            serde_json::to_string(&json!({
+                "members": {
+                    "neon-audit": {
+                        "role": "worker",
+                        "conversation_id": "cid-neon-builder-cp",
+                        "model": cwg_common::NEON_XHIGH_MODEL,
+                        "created_at": "2026-11-19T20:25:30.600Z",
+                        "killed": false
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            sw_rr_cpb.join("board.jsonl"),
+            [
+                json!({
+                    "seq": 6,
+                    "agent": "coordinator",
+                    "time": "2026-11-19T20:25:30Z",
+                    "text": "@neon-audit Adversarial audit of diff; report VERDICT: APPROVED or REVISE."
+                }),
+                json!({
+                    "seq": 7,
+                    "agent": "coordinator",
+                    "time": "2026-11-19T20:25:30.300Z",
+                    "text": "@other-worker sync"
+                }),
+                json!({
+                    "seq": 8,
+                    "agent": "coordinator",
+                    "time": "2026-11-19T20:25:30Z",
+                    "text": "@neon-audit Implement parser module in src/parser.rs."
+                }),
+            ]
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let res_rr_cpb = inspect_swarm_workers_with_marker(
+            sess_rr_cp_b,
+            &brain,
+            cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
+            "review",
+            Some(now),
+            1,
+            Some(&rr_half_marker),
+        );
+        assert_eq!(res_rr_cpb["active_count"], json!(0));
+        assert_eq!(res_rr_cpb["overall_action"], json!("initial_spawn"));
+
+        let sess_rr_cp_r = "sess-neon-audit-causal-prefix-reviewer";
+        let sw_rr_cpr = rio::swarm_dir(&brain, sess_rr_cp_r);
+        fs::create_dir_all(&sw_rr_cpr).unwrap();
+        write_warm_worker("cid-neon-reviewer-cp");
+        fs::write(
+            sw_rr_cpr.join("members.json"),
+            serde_json::to_string(&json!({
+                "members": {
+                    "neon-audit": {
+                        "role": "worker",
+                        "conversation_id": "cid-neon-reviewer-cp",
+                        "model": cwg_common::NEON_XHIGH_MODEL,
+                        "created_at": "2026-11-19T20:25:30.600Z",
+                        "killed": false
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            sw_rr_cpr.join("board.jsonl"),
+            [
+                json!({
+                    "seq": 6,
+                    "agent": "coordinator",
+                    "time": "2026-11-19T20:25:30Z",
+                    "text": "@neon-audit Implement old cycle builder."
+                }),
+                json!({
+                    "seq": 7,
+                    "agent": "coordinator",
+                    "time": "2026-11-19T20:25:30.300Z",
+                    "text": "@other-worker sync"
+                }),
+                json!({
+                    "seq": 8,
+                    "agent": "coordinator",
+                    "time": "2026-11-19T20:25:30Z",
+                    "text": "@neon-audit Adversarial audit of diff; report VERDICT: APPROVED or REVISE."
+                }),
+            ]
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let res_rr_cpr = inspect_swarm_workers_with_marker(
+            sess_rr_cp_r,
+            &brain,
+            cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
+            "review",
+            Some(now),
+            1,
+            Some(&rr_half_marker),
+        );
+        assert_eq!(res_rr_cpr["active_count"], json!(1));
+        assert_eq!(res_rr_cpr["warm_workers"], json!(["neon-audit"]));
+        assert_eq!(res_rr_cpr["overall_action"], json!("resume_in_place"));
+
+        // Case 9: Tail truncation (>400 board rows without explicit `seq`/`msg_id`/`id`) must preserve
+        // true full-board ordinal seq so row 401 after `board_head_seq=400` is NOT dropped into the old cycle.
+        let sess_rr_tail = "sess-neon-audit-tail-401-no-seq";
+        let sw_rr_tail = rio::swarm_dir(&brain, sess_rr_tail);
+        fs::create_dir_all(&sw_rr_tail).unwrap();
+        write_warm_worker("cid-neon-rev-tail401");
+        fs::write(
+            sw_rr_tail.join("members.json"),
+            serde_json::to_string(&json!({
+                "members": {
+                    "neon-audit": {
+                        "role": "worker",
+                        "conversation_id": "cid-neon-rev-tail401",
+                        "model": cwg_common::NEON_XHIGH_MODEL,
+                        "created_at": "2026-11-19T20:25:35Z",
+                        "killed": false
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut tail_lines: Vec<String> = Vec::with_capacity(401);
+        for i in 1..=400 {
+            tail_lines.push(
+                json!({
+                    "agent": "coordinator",
+                    "time": "2026-11-19T20:20:00Z",
+                    "text": format!("@other-worker note {}", i)
+                })
+                .to_string(),
+            );
+        }
+        tail_lines.push(
+            json!({
+                "agent": "coordinator",
+                "time": "2026-11-19T20:25:40.000Z",
+                "text": "@neon-audit Adversarial audit of diff; report VERDICT: APPROVED or REVISE."
+            })
+            .to_string(),
+        );
+        fs::write(sw_rr_tail.join("board.jsonl"), tail_lines.join("\n") + "\n").unwrap();
+        let rr_tail_marker = json!({
+            "closed": false,
+            "research_resets": [{
+                "reset_ts": rr_half_sec,
+                "board_head_seq": 400,
+                "pre_reset_worker_cids": ["cid-neon-audit-pre-reset"]
+            }]
+        });
+        let res_rr_tail = inspect_swarm_workers_with_marker(
+            sess_rr_tail,
+            &brain,
+            cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
+            "review",
+            Some(now),
+            1,
+            Some(&rr_tail_marker),
+        );
+        assert_eq!(res_rr_tail["active_count"], json!(1));
+        assert_eq!(res_rr_tail["warm_workers"], json!(["neon-audit"]));
+        assert_eq!(res_rr_tail["overall_action"], json!("resume_in_place"));
+
+        // Case 10: Fractional Unix string timestamp `"1795119930.300"` (<= `reset_ts = 1795119930.500`)
+        // must be classified as exact (not coarse) so it excludes itself and earlier coarse seq=6 from Warm Pool.
+        let sess_rr_unix = "sess-neon-audit-unix-frac-reset";
+        let sw_rr_unix = rio::swarm_dir(&brain, sess_rr_unix);
+        fs::create_dir_all(&sw_rr_unix).unwrap();
+        write_warm_worker("cid-neon-builder-unix");
+        fs::write(
+            sw_rr_unix.join("members.json"),
+            serde_json::to_string(&json!({
+                "members": {
+                    "neon-audit": {
+                        "role": "worker",
+                        "conversation_id": "cid-neon-builder-unix",
+                        "model": cwg_common::NEON_XHIGH_MODEL,
+                        "created_at": "2026-11-19T20:25:30.600Z",
+                        "killed": false
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let rr_sec_int = rr_half_sec.floor() as i64;
+        fs::write(
+            sw_rr_unix.join("board.jsonl"),
+            [
+                json!({
+                    "seq": 6,
+                    "agent": "coordinator",
+                    "time": format!("{}", rr_sec_int),
+                    "text": "@neon-audit Adversarial audit of diff; report VERDICT: APPROVED or REVISE."
+                }),
+                json!({
+                    "seq": 7,
+                    "agent": "coordinator",
+                    "time": format!("{}.300", rr_sec_int),
+                    "text": "@other-worker sync"
+                }),
+                json!({
+                    "seq": 8,
+                    "agent": "coordinator",
+                    "time": format!("{}", rr_sec_int),
+                    "text": "@neon-audit Implement parser module."
+                }),
+            ]
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let res_rr_unix = inspect_swarm_workers_with_marker(
+            sess_rr_unix,
+            &brain,
+            cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
+            "review",
+            Some(now),
+            1,
+            Some(&rr_half_marker),
+        );
+        assert_eq!(res_rr_unix["active_count"], json!(0));
+        assert_eq!(res_rr_unix["overall_action"], json!("initial_spawn"));
+
+        // Case 11: Non-object JSONL rows (`null`, `[1, 2]`) before the 400th object in an old cycle
+        // must NOT inflate fallback ordinal `seq` in `read_swarm_board_tail` past `board_head_seq=400`.
+        let sess_rr_nonobj = "sess-neon-audit-nonobj-jsonl-ordinal";
+        let sw_rr_no = rio::swarm_dir(&brain, sess_rr_nonobj);
+        fs::create_dir_all(&sw_rr_no).unwrap();
+        write_warm_worker("cid-neon-builder-nonobj");
+        fs::write(
+            sw_rr_no.join("members.json"),
+            serde_json::to_string(&json!({
+                "members": {
+                    "neon-audit": {
+                        "role": "worker",
+                        "conversation_id": "cid-neon-builder-nonobj",
+                        "model": cwg_common::NEON_XHIGH_MODEL,
+                        "created_at": "2026-11-19T20:25:30.600Z",
+                        "killed": false
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut nonobj_lines: Vec<String> = Vec::with_capacity(403);
+        nonobj_lines.push("null".to_string());
+        nonobj_lines.push("[1, 2]".to_string());
+        nonobj_lines.push("{\"text\":\"\\uD800\"}".to_string());
+        for i in 1..=399 {
+            nonobj_lines.push(
+                json!({
+                    "agent": "coordinator",
+                    "time": "2026-11-19T20:20:00Z",
+                    "text": format!("@other-worker note {}", i)
+                })
+                .to_string(),
+            );
+        }
+        // 400th JSON object (same second as reset_ts 20:25:30.500Z, pre-reset under board_head_seq=400):
+        nonobj_lines.push(
+            json!({
+                "agent": "coordinator",
+                "time": "2026-11-19T20:25:30Z",
+                "text": "@neon-audit Adversarial audit of diff; report VERDICT: APPROVED or REVISE."
+            })
+            .to_string(),
+        );
+        fs::write(sw_rr_no.join("board.jsonl"), nonobj_lines.join("\n") + "\n").unwrap();
+        let res_rr_no = inspect_swarm_workers_with_marker(
+            sess_rr_nonobj,
+            &brain,
+            cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
+            "review",
+            Some(now),
+            1,
+            Some(&rr_tail_marker),
+        );
+        assert_eq!(res_rr_no["active_count"], json!(0));
+        assert_eq!(res_rr_no["overall_action"], json!("initial_spawn"));
+
+        let _ = fs::remove_dir_all(&brain);
     }
 }

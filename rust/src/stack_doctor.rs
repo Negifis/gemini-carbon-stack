@@ -866,6 +866,11 @@ pub(crate) fn collect_doctor_report_for_os(
     if !compact || !ok {
         report.insert("skills".to_string(), json!(skills));
         report.insert("agents".to_string(), json!(agents));
+        let mut neon_levels = BTreeMap::new();
+        neon_levels.insert("low", cwg_common::NEON_LOW_MODEL);
+        neon_levels.insert("medium", cwg_common::NEON_MEDIUM_MODEL);
+        neon_levels.insert("high", cwg_common::NEON_HIGH_MODEL);
+        neon_levels.insert("xhigh", cwg_common::NEON_XHIGH_MODEL);
         let mut hydrogen_levels = BTreeMap::new();
         hydrogen_levels.insert("low", cwg_common::HYDROGEN_LOW_MODEL);
         hydrogen_levels.insert("medium", cwg_common::HYDROGEN_MEDIUM_MODEL);
@@ -874,6 +879,7 @@ pub(crate) fn collect_doctor_report_for_os(
         report.insert(
             "model_routing".to_string(),
             json!({
+                "coordinator": cwg_common::ORCHESTRATOR_NEON_MODEL,
                 "pipeline_order": "unittest -> primary review -> simplify once -> batch kill -> --closure",
                 "simplify_lenses": {
                     "lenses": cwg_common::SIMPLIFY_LENSES,
@@ -881,17 +887,38 @@ pub(crate) fn collect_doctor_report_for_os(
                     "high_xhigh_mode": "fast_path ALL (<=2 files & <=30 lines) else three_parallel_lenses (reuse, quality, efficiency)",
                     "primary_model": cwg_common::SONNET_HIGH_MODEL,
                     "fallback_model": cwg_common::SIMPLIFY_FALLBACK_MODEL,
+                    "secondary_fallback_model": cwg_common::HYDROGEN_XHIGH_MODEL,
                     "prompt_cache_ttl_seconds": cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
                 },
                 "external_review": "codex-cli (primary logic review + final --closure)",
                 "internal_review": {
                     "primary_model": cwg_common::OPUS_HIGH_MODEL,
-                    "escalation_model": cwg_common::CARBON_HIGH_MODEL,
+                    "high_escalation_model": cwg_common::NEON_XHIGH_MODEL,
+                    "xhigh_escalation_model": cwg_common::CARBON_HIGH_MODEL,
+                },
+                "neon_swarm": {
+                    "replaces": "gemini-4-argon (superseded)",
+                    "models_by_complexity": neon_levels,
+                    "roles": [
+                        "root-cause-debugger",
+                        "frontend-ui-builder",
+                        "repo-architect-scout",
+                        "test-author",
+                        "complex_disjoint_builder",
+                        "simplify_fallback",
+                        "high_review_escalation",
+                    ],
                 },
                 "auxiliary_hydrogen": {
                     "replaces": "gemini-flash (disabled)",
                     "models_by_complexity": hydrogen_levels,
-                    "roles": ["browser", "translator", "scout_swarm", "disjoint_builder", "simplify_fallback"],
+                    "roles": [
+                        "browser",
+                        "translator",
+                        "scout_swarm",
+                        "simple_disjoint_builder",
+                        "simplify_secondary_fallback",
+                    ],
                 },
             }),
         );
@@ -1160,6 +1187,34 @@ mod tests {
         assert_eq!(report["swarm_v2"]["gitignore_has_swarm"], true);
         assert_eq!(report["rust_engine"]["available"], true);
         assert!(report["model_routing"].is_object());
+        assert_eq!(
+            report["model_routing"]["coordinator"],
+            cwg_common::ORCHESTRATOR_NEON_MODEL
+        );
+        assert_eq!(
+            report["model_routing"]["simplify_lenses"]["fallback_model"],
+            cwg_common::NEON_XHIGH_MODEL
+        );
+        assert_eq!(
+            report["model_routing"]["simplify_lenses"]["secondary_fallback_model"],
+            cwg_common::HYDROGEN_XHIGH_MODEL
+        );
+        assert_eq!(
+            report["model_routing"]["internal_review"]["high_escalation_model"],
+            cwg_common::NEON_XHIGH_MODEL
+        );
+        assert_eq!(
+            report["model_routing"]["internal_review"]["xhigh_escalation_model"],
+            cwg_common::CARBON_HIGH_MODEL
+        );
+        assert_eq!(
+            report["model_routing"]["neon_swarm"]["models_by_complexity"]["xhigh"],
+            cwg_common::NEON_XHIGH_MODEL
+        );
+        assert_eq!(
+            report["model_routing"]["neon_swarm"]["models_by_complexity"]["low"],
+            cwg_common::NEON_LOW_MODEL
+        );
 
         let compact = collect_doctor_report(
             &ws.to_string_lossy(),

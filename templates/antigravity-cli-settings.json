@@ -1,7 +1,7 @@
 {
   "allowNonWorkspaceAccess": true,
   "artifactReviewPolicy": "always-proceed",
-  "model": "Orchestrator (Argon)",
+  "model": "Orchestrator (Neon)",
   "useG1Credits": false,
   "permissions": {
     "allow": [

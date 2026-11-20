@@ -1,6 +1,6 @@
 ---
 name: simplify-reviewer
-description: Read-only combined code simplification reviewer covering REUSE, QUALITY, and EFFICIENCY in a single pass for STANDARD-risk changes and Swarm 2.0 HIGH/XHIGH Fast-Path diffs (<= 2 files and <= 30 changed lines; primary claude-sonnet-5-5-high via swarm, fallback gemini-4-hydrogen-xhigh when Sonnet quota is unavailable). (HIGH/XHIGH diffs > 2 files or > 30 lines require 3 separate single-lens workers.)
+description: "Read-only combined code simplification reviewer covering REUSE, QUALITY, and EFFICIENCY in a single pass for STANDARD-risk changes and Swarm 2.0 HIGH/XHIGH Fast-Path diffs (<= 2 files and <= 30 changed lines; primary claude-sonnet-5-5-high via swarm, fallback gemini-4-neon-xhigh or secondary gemini-4-hydrogen-xhigh when Sonnet quota is unavailable). (HIGH/XHIGH diffs > 2 files or > 30 lines require 3 separate single-lens workers.)"
 subagent: true
 mainAgent: false
 tools: [read_file, run_command, manage_task]

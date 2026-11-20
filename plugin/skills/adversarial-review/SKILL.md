@@ -6,7 +6,7 @@ description: Triggered by /adversarial-review or HIGH/XHIGH changes requiring in
 # `/adversarial-review` — Независимое критическое ревью кода
 
 Один независимый review-движок на раунд, максимум 3 обычных раунда, строгая криптографическая/системная проверка происхождения вердикта хуком `cwg_stop.rs`.
-**Инвариант порядка Swarm 2.0 (`Logic-First`, см. `development-verification`):** для `HIGH`/`XHIGH` сначала проходят локальные тесты (`unittest`), затем **первичное независимое ревью (`VERDICT: APPROVED`)**, затем **один проход `simplify`**, пакетный `kill` `waiting` simplify-воркеров и финальная closure-проверка (`carbon-stack codex-lane review --closure` `CLOSURE_VALIDATION: READY`, либо внутреннее closure-ревью `CLOSURE_VALIDATION: READY|BLOCKED` при недоступности Codex с последующим `kill` `internal-reviewer`).
+**Инвариант порядка Swarm 2.0 (`Logic-First`, см. `development-verification`):** для `HIGH`/`XHIGH` сначала проходят локальные тесты (`cargo test` / `pytest` / `npm test`), затем **первичное независимое ревью (`VERDICT: APPROVED`)**, затем **один проход `simplify`**, пакетный `kill` `waiting` simplify-воркеров и финальная closure-проверка (`carbon-stack codex-lane review --closure` `CLOSURE_VALIDATION: READY`, либо внутреннее closure-ревью `CLOSURE_VALIDATION: READY|BLOCKED` при недоступности Codex с последующим `kill` `internal-reviewer`).
 
 ## Шаг 1. Приоритет №1 (всегда основной контур) — OpenAI Codex CLI (`carbon-stack codex-lane`)
 
@@ -26,7 +26,7 @@ description: Triggered by /adversarial-review or HIGH/XHIGH changes requiring in
 
 - **Единая сессия чата в рамках кандидата:** 1-й раунд открывает новую сессию Codex и сохраняет её `session_id` в `state/gate/threads/`; все последующие раунды (`REVISE` -> раунды 2/3 и финальный/пост-эскалационный `--closure`) по тому же кандидату (`--session` + `git_root`) **автоматически продолжаются в том же самом чате** через `codex exec resume <session_id>` (`SESSION_MODE: resumed`). Передавайте `--new-session` только для принудительного сброса, а `--resume <id>` — для явного выбора сессии.
 
-## Шаг 2. Приоритет №2 (только при подтверждённой недоступности Codex) — `Claude Opus 5.5 (High)` -> эскалация на `Gemini 4 Carbon (High)`
+## Шаг 2. Приоритет №2 (только при подтверждённой недоступности Codex) — `Claude Opus 5.5 (High)` -> эскалация на `Gemini 4 Neon (XHigh)` [`HIGH`] / `Gemini 4 Carbon (High)` [`XHIGH`]
 
 Используется **ИСКЛЮЧИТЕЛЬНО** при открытом circuit breaker / подтверждённом сбое или недоступности `carbon-stack codex-lane` (`available: false`):
 
@@ -42,10 +42,11 @@ description: Triggered by /adversarial-review or HIGH/XHIGH changes requiring in
    )
    ```
    В Раунде 2+ (`REVISE` -> Раунд 2/3) и на финальном шаге `CLOSURE_VALIDATION` повторно запустите `carbon-stack swarm-cache prepare ... --label review` и будите того же `waiting`-воркера в **Warm Pool** через `post_message("@internal-reviewer ...")` с `<incremental_diff_path>` (холодная ротация `-r<N>` допустима только если воркер завис по `Stall Watchdog` или был убит). Завершите `internal-reviewer` через `swarm(action="kill", ...)` после финального `CLOSURE_VALIDATION` (либо сразу после `APPROVED` только на задачах без `simplify`/closure).
-3. **Эскалация на `gemini-4-carbon-high`, если с Opus что-то не так:**
+3. **Эскалация, если с Opus что-то не так:**
    - Если `claude-opus-5-5-high` имеет квоту `0%`, недоступен, вернул `ERROR_MESSAGE` / `RESOURCE_EXHAUSTED` или завис:
-   - Переключите воркер на месте вызовом `swarm(action="model", name="internal-reviewer", model="gemini-4-carbon-high")` (сохраняя его контекст) либо вызовите резервный субагент `adversarial-reviewer` / `adversarial-reviewer-xhigh`.
-   - **Гарантия от обхода:** `cwg_stop.rs` проверяет `.system_generated/swarm/members.json` и системные транскрипты и **отклоняет** вердикт `gemini-4-carbon-high`, если в runtime нет подтверждённого сбоя или нулевой квоты `claude-opus-5-5-high`.
+   - Для **`HIGH`**: переключите воркер на **`gemini-4-neon-xhigh`** (`swarm(action="model", name="internal-reviewer", model="gemini-4-neon-xhigh")` или `adversarial-reviewer`, с резервом `gemini-4-carbon-high`).
+   - Для **`XHIGH`**: переключите воркер на **`gemini-4-carbon-high`** (`swarm(action="model", name="internal-reviewer-xhigh", model="gemini-4-carbon-high")` либо `adversarial-reviewer-xhigh`; `internal-neon` для `XHIGH` не принимается).
+   - **Гарантия от обхода:** `cwg_stop.rs` проверяет `.system_generated/swarm/members.json` и системные транскрипты и **отклоняет** вердикт `gemini-4-neon-xhigh` / `gemini-4-carbon-high`, если в runtime нет подтверждённого сбоя или нулевой квоты `claude-opus-5-5-high` (а для `XHIGH` отклоняет `internal-neon`).
 
 ## Шаг 3. Обработка вердикта
 

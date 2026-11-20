@@ -1475,6 +1475,14 @@ pub fn is_swarm_role_member(name: &str, meta: Option<&Value>) -> bool {
         || swarm_role_member_re().is_match(name)
 }
 
+pub fn swarm_worker_names(members: &Map<String, Value>) -> Vec<&str> {
+    members
+        .iter()
+        .filter(|(n, m)| m.is_object() && !is_swarm_role_member(n, Some(m)))
+        .map(|(n, _)| n.as_str())
+        .collect()
+}
+
 pub fn is_swarm_member_killed(meta: Option<&Value>) -> bool {
     let Some(Value::Object(m)) = meta else {
         return false;

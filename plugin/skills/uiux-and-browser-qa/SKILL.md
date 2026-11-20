@@ -22,8 +22,9 @@ description: Frontend UI states, accessibility, and live browser subagent QA (BR
 
 **Сгенерированный JSX/HTML/CSS без запуска не считается проверенным интерфейсом.**
 
-1. Соберите фронтенд (`npm run build` / typecheck) и при необходимости поднимите локальный dev-сервер в фоне (`run_command` с `IsDaemon: true`).
-2. Делегируйте визуальную и интерактивную проверку встроенному субагенту `browser` **на `Gemini 4 Hydrogen` (никогда не `Model="flash"`)**:
+1. Для сложной генерации интерфейсов по макетам/скриншотам или отладки визуально-стейтовых багов в рое делегируйте реализацию в **`frontend-ui-builder`** (`swarm(action="add", ..., model="gemini-4-neon-high"|"gemini-4-neon-xhigh")` с выделенными `owned_paths`) или диагностику в `root-cause-debugger` (`gemini-4-neon-xhigh`).
+2. Соберите фронтенд (`npm run build` / typecheck) и при необходимости поднимите локальный dev-сервер в фоне (`run_command` с `IsDaemon: true`).
+3. Делегируйте визуальную и интерактивную проверку встроенному субагенту `browser` **на `Gemini 4 Hydrogen` (никогда не `Model="flash"`)**:
    - Если текущая сессия работает не на Hydrogen (например, на `Gemini 4 Carbon`), запустите `swarm`-воркера `browser-qa` на модели по сложности сценария:
      - `gemini-4-hydrogen-low` — одиночный smoke-check URL и скриншот;
      - `gemini-4-hydrogen-medium` — стандартная интерактивная QA (клики, формы, `loading`/`empty`/`populated`/`error`, консоль, desktop/mobile);

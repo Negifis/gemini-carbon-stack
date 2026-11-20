@@ -1,10 +1,10 @@
 use regex::Regex;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -38,6 +38,11 @@ pub const TEST_HARNESS_SAMPLE_PATHS: usize = 8;
 pub const SONNET_HIGH_MODEL: &str = "claude-sonnet-5-5-high";
 pub const OPUS_HIGH_MODEL: &str = "claude-opus-5-5-high";
 pub const CARBON_HIGH_MODEL: &str = "gemini-4-carbon-high";
+pub const NEON_LOW_MODEL: &str = "gemini-4-neon-low";
+pub const NEON_MEDIUM_MODEL: &str = "gemini-4-neon-medium";
+pub const NEON_HIGH_MODEL: &str = "gemini-4-neon-high";
+pub const NEON_XHIGH_MODEL: &str = "gemini-4-neon-xhigh";
+pub const ORCHESTRATOR_NEON_MODEL: &str = "gemini-pro-orchestrator-neon";
 pub const HYDROGEN_LOW_MODEL: &str = "gemini-4-hydrogen-low";
 pub const HYDROGEN_MEDIUM_MODEL: &str = "gemini-4-hydrogen-medium";
 pub const HYDROGEN_HIGH_MODEL: &str = "gemini-4-hydrogen-high";
@@ -64,8 +69,75 @@ pub fn is_codex_xhigh_turn(model: &str, effort: &str) -> bool {
     is_codex_astra_model(model) && is_codex_xhigh_effort(effort)
 }
 
+pub const TS_EPS: f64 = 1e-6;
 pub const SIMPLIFY_LENSES: &[&str] = &["reuse", "quality", "efficiency"];
-pub const SIMPLIFY_FALLBACK_MODEL: &str = HYDROGEN_XHIGH_MODEL;
+pub const SIMPLIFY_FALLBACK_MODELS: &[&str] = &[NEON_XHIGH_MODEL, HYDROGEN_XHIGH_MODEL];
+pub const SIMPLIFY_FALLBACK_MODEL: &str = SIMPLIFY_FALLBACK_MODELS[0];
+pub const SIMPLIFY_TIER_SONNET: &str = "sonnet";
+pub const SIMPLIFY_TIER_FALLBACK: &str = "fallback";
+pub const SIMPLIFY_TIER_SECONDARY_FALLBACK: &str = "secondary-fallback";
+pub const REVIEW_ENGINE_INTERNAL_OPUS: &str = "internal-opus";
+pub const REVIEW_ENGINE_INTERNAL_NEON: &str = "internal-neon";
+pub const REVIEW_ENGINE_INTERNAL_CARBON: &str = "internal-carbon";
+
+pub fn is_simplify_allowed_model(model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    m == SONNET_HIGH_MODEL || SIMPLIFY_FALLBACK_MODELS.contains(&m.as_str())
+}
+
+pub fn is_review_worker_name(name: &str) -> bool {
+    let low_name = name.trim().to_ascii_lowercase();
+    low_name.contains("review")
+        || low_name.contains("adversarial")
+        || low_name.contains("critic")
+        || low_name.contains("verifier")
+}
+
+pub fn is_review_worker_hint(name: &str, brief: &str) -> bool {
+    if is_review_worker_name(name) {
+        return true;
+    }
+    const NEGATIONS: &[&str] = &[
+        "never",
+        "do not",
+        "don't",
+        "not post",
+        "not emit",
+        "not output",
+        "no ",
+        "запрещ",
+        "не пиш",
+        "не публик",
+        "не отправ",
+    ];
+    let low_brief = brief.to_lowercase();
+    for clause in low_brief.split(['\n', '.', ';', ',']) {
+        let pos = match (clause.find("verdict:"), clause.find("closure_validation:")) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        if let Some(p) = pos {
+            let prefix = &clause[..p];
+            if !NEGATIONS.iter().any(|neg| prefix.contains(neg)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn review_escalation_chain(risk: &str) -> String {
+    if risk.eq_ignore_ascii_case("XHIGH") {
+        format!("`{}` -> `{}`", OPUS_HIGH_MODEL, CARBON_HIGH_MODEL)
+    } else {
+        format!(
+            "`{}` -> `{}` / `{}`",
+            OPUS_HIGH_MODEL, NEON_XHIGH_MODEL, CARBON_HIGH_MODEL
+        )
+    }
+}
 pub const ANTHROPIC_EPHEMERAL_TTL_SECONDS: u64 = 300;
 pub const SWARM_CACHE_SAFE_TTL_SECONDS: u64 = 270;
 pub const MAX_CLOSURE_PASSES_PER_CYCLE: usize = 2;
@@ -270,8 +342,10 @@ fn simplify_template_pair_re() -> &'static Regex {
 fn simplify_verdict_core_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
+        // INVARIANT: Leading markdown wrappers allow only horizontal whitespace (`[ \t]*`) so a
+        // prior message's closing `**` never spans `\n\n` into the next message's verdict tag.
         Regex::new(
-            r"(?i)(?:(?:\*{1,2}|__|`)\s*){0,2}SIMPLIFY_VERDICT(?:(?:\*{1,2}|__|`)\s*){0,2}\s*:\s*(?:(?:\*{1,2}|__|`)\s*){0,2}(CLEAN|FINDINGS_REPORTED|ACTIONABLE_FIXES)",
+            r"(?i)(?:(?:\*{1,2}|__|`)[ \t]*){0,2}SIMPLIFY_VERDICT(?:(?:\*{1,2}|__|`)\s*){0,2}\s*:\s*(?:(?:\*{1,2}|__|`)\s*){0,2}(CLEAN|FINDINGS_REPORTED|ACTIONABLE_FIXES)",
         )
         .expect("simplify_verdict_core_re")
     })
@@ -281,7 +355,7 @@ fn simplify_lens_core_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"(?i)(?:(?:\*{1,2}|__|`)\s*){0,2}SIMPLIFY_LENS(?:(?:\*{1,2}|__|`)\s*){0,2}\s*:\s*(?:(?:\*{1,2}|__|`)\s*){0,2}(REUSE|QUALITY|EFFICIENCY)",
+            r"(?i)(?:(?:\*{1,2}|__|`)[ \t]*){0,2}SIMPLIFY_LENS(?:(?:\*{1,2}|__|`)\s*){0,2}\s*:\s*(?:(?:\*{1,2}|__|`)\s*){0,2}(REUSE|QUALITY|EFFICIENCY)",
         )
         .expect("simplify_lens_core_re")
     })
@@ -291,7 +365,7 @@ fn simplify_combined_lens_core_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"(?i)(?:(?:\*{1,2}|__|`)\s*){0,2}SIMPLIFY_LENS(?:(?:\*{1,2}|__|`)\s*){0,2}\s*:\s*(?:(?:\*{1,2}|__|`)\s*){0,2}(ALL|COMBINED)",
+            r"(?i)(?:(?:\*{1,2}|__|`)[ \t]*){0,2}SIMPLIFY_LENS(?:(?:\*{1,2}|__|`)\s*){0,2}\s*:\s*(?:(?:\*{1,2}|__|`)\s*){0,2}(ALL|COMBINED)",
         )
         .expect("simplify_combined_lens_core_re")
     })
@@ -469,8 +543,26 @@ fn simplify_tag_suffix_ok(after: &str) -> bool {
     !simplify_alt_tail_re().is_match(after)
 }
 
-fn find_simplify_tag_matches(core_re: &Regex, text: &str) -> Vec<String> {
-    let mut out = Vec::new();
+fn mask_simplify_template_pairs(text: &str) -> std::borrow::Cow<'_, str> {
+    let re = simplify_template_pair_re();
+    let mut iter = re.find_iter(text).peekable();
+    if iter.peek().is_none() {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut buf = text.as_bytes().to_vec();
+    // INVARIANT: Replace each template pair byte-for-byte with ASCII spaces so every
+    // surviving token keeps its exact UTF-8 byte offset in `text`.
+    for m in iter {
+        buf[m.start()..m.end()].fill(b' ');
+    }
+    std::borrow::Cow::Owned(String::from_utf8(buf).expect("ascii space mask preserves utf8"))
+}
+
+fn for_each_simplify_tag_match<'a>(
+    core_re: &Regex,
+    text: &'a str,
+    mut on_match: impl FnMut(usize, usize, &'a str) -> bool,
+) {
     let mut pos = 0usize;
     while pos <= text.len() {
         let Some(caps) = core_re.captures_at(text, pos) else {
@@ -481,7 +573,9 @@ fn find_simplify_tag_matches(core_re: &Regex, text: &str) -> Vec<String> {
         let before = &text[..whole.start()];
         let after = &text[whole.end()..];
         if simplify_tag_prefix_ok(before) && simplify_tag_suffix_ok(after) {
-            out.push(val.as_str().to_string());
+            if !on_match(whole.start(), whole.end(), val.as_str()) {
+                break;
+            }
             if whole.end() > pos {
                 pos = whole.end();
             } else if let Some(ch) = text[pos..].chars().next() {
@@ -495,7 +589,40 @@ fn find_simplify_tag_matches(core_re: &Regex, text: &str) -> Vec<String> {
             break;
         }
     }
+}
+
+fn find_simplify_verdict_spans_cleaned(cleaned: &str) -> Vec<(usize, usize, bool)> {
+    let mut out = Vec::new();
+    for_each_simplify_tag_match(simplify_verdict_core_re(), cleaned, |s, e, val| {
+        out.push((s, e, val.eq_ignore_ascii_case("CLEAN")));
+        true
+    });
     out
+}
+
+fn extract_simplify_lens_flags_cleaned(cleaned: &str) -> (bool, bool) {
+    let mut has_combined = false;
+    for_each_simplify_tag_match(simplify_combined_lens_core_re(), cleaned, |_, _, _| {
+        has_combined = true;
+        false
+    });
+    if has_combined {
+        return (true, false);
+    }
+    let mut first_lens: Option<&str> = None;
+    let mut multi_lens_spoof = false;
+    for_each_simplify_tag_match(simplify_lens_core_re(), cleaned, |_, _, val| {
+        if let Some(first) = first_lens {
+            if !first.eq_ignore_ascii_case(val) {
+                multi_lens_spoof = true;
+                return false;
+            }
+        } else {
+            first_lens = Some(val);
+        }
+        true
+    });
+    (false, multi_lens_spoof)
 }
 
 fn decision_from_json_dict(obj: &Map<String, Value>) -> (Option<String>, Option<String>) {
@@ -567,31 +694,50 @@ fn advance_json_depth(line: &str, mut depth: usize, mut in_str: bool, mut esc: b
     (depth, in_str, esc)
 }
 
-fn strip_unfenced_json_blocks(lines: &[&str]) -> String {
-    // SAFETY: Exclude unfenced line-anchored `{...}` / `[...]` blocks from plain-text fallback.
-    let mut kept: Vec<&str> = Vec::new();
+fn mask_fenced_and_json_lines<'a>(lines: &[&'a str]) -> (Vec<&'a str>, bool) {
+    // SAFETY: Replace fenced code blocks and unfenced line-anchored `{...}` / `[...]` JSON blocks
+    // with a non-whitespace barrier (`"#"`) in a single pass instead of deleting lines, so `\s*` in
+    // verdict regexes can never bridge across an excluded block into subsequent prose or across
+    // message boundaries.
+    let mut out: Vec<&'a str> = Vec::with_capacity(lines.len());
+    let mut has_prose = false;
+    let mut in_fence = false;
     let mut depth = 0usize;
     let mut in_str = false;
     let mut esc = false;
     for &ln in lines {
+        if ln.trim().starts_with("```") {
+            in_fence = !in_fence;
+            out.push("#");
+            continue;
+        }
+        if in_fence {
+            out.push("#");
+            continue;
+        }
         if depth == 0 && !in_str {
             let lstripped = ln.trim_start_matches([' ', '\t']);
             if lstripped.starts_with('{') || json_array_start_re().is_match(lstripped) {
                 (depth, in_str, esc) = advance_json_depth(lstripped, 0, false, false);
+                out.push("#");
                 continue;
             }
-            kept.push(ln);
+            if !ln.trim().is_empty() {
+                has_prose = true;
+            }
+            out.push(ln);
             continue;
         }
         (depth, in_str, esc) = advance_json_depth(ln, depth, in_str, esc);
+        out.push("#");
     }
-    kept.join("\n").trim().to_string()
+    (out, has_prose)
 }
 
-fn extract_terminal_json_dict(text: &str) -> (Option<Map<String, Value>>, String) {
+fn strip_review_wrappers(text: &str) -> &str {
     let mut body = text.trim();
     if body.is_empty() {
-        return (None, String::new());
+        return "";
     }
     if let Some(m) = codex_cli_wrapper_re().find(body) {
         body = body[m.end()..].trim();
@@ -599,94 +745,79 @@ fn extract_terminal_json_dict(text: &str) -> (Option<Map<String, Value>>, String
     if let Some(m) = swarm_mention_line_re().find(body) {
         body = body[m.end()..].trim();
     }
+    body
+}
+
+fn extract_terminal_json_only(body: &str) -> (Option<Map<String, Value>>, bool) {
     if body.is_empty() {
-        return (None, String::new());
+        return (None, true);
     }
     if body.starts_with('{') {
         if !body.ends_with('}') {
-            return (None, String::new());
+            return (None, true);
         }
         if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(body) {
-            return (Some(obj), String::new());
+            return (Some(obj), true);
         }
-        return (None, String::new());
+        return (None, true);
     }
     if json_array_start_re().is_match(body) {
-        return (None, String::new());
+        return (None, true);
     }
-    if body.contains("```") {
-        let lines: Vec<&str> = body.lines().collect();
-        let fence_indices: Vec<usize> = lines
-            .iter()
-            .enumerate()
-            .filter_map(|(i, ln)| if ln.trim().starts_with("```") { Some(i) } else { None })
-            .collect();
-        let n_fences = fence_indices.len();
-        let has_terminal_fence = n_fences >= 2
-            && n_fences % 2 == 0
-            && fence_indices[n_fences - 1] == lines.len() - 1
-            && lines[lines.len() - 1].trim() == "```";
-        let mut excluded_ranges: Vec<(usize, usize)> = Vec::new();
-        let mut k = 0usize;
-        while k + 1 < n_fences {
-            excluded_ranges.push((fence_indices[k], fence_indices[k + 1]));
-            k += 2;
-        }
-        if n_fences % 2 == 1 {
-            excluded_ranges.push((fence_indices[n_fences - 1], lines.len() - 1));
-        }
-
-        let mut json_candidate: Option<Map<String, Value>> = None;
-        if has_terminal_fence {
-            let open_idx = fence_indices[n_fences - 2];
-            let fence_hdr = lines[open_idx].trim().to_lowercase();
-            let fenced = lines[open_idx + 1..lines.len() - 1].join("\n");
-            let fenced_trim = fenced.trim();
-            if (fence_hdr == "```" || fence_hdr == "```json")
-                && fenced_trim.starts_with('{')
-                && fenced_trim.ends_with('}')
-            {
-                if let Ok(Value::Object(parsed)) = serde_json::from_str::<Value>(fenced_trim) {
-                    json_candidate = Some(parsed);
-                }
-            }
-        }
-
-        let mut kept_lines: Vec<&str> = Vec::new();
-        let mut r_idx = 0usize;
-        for (idx, &ln) in lines.iter().enumerate() {
-            while r_idx < excluded_ranges.len() && idx > excluded_ranges[r_idx].1 {
-                r_idx += 1;
-            }
-            if r_idx < excluded_ranges.len()
-                && excluded_ranges[r_idx].0 <= idx
-                && idx <= excluded_ranges[r_idx].1
-            {
-                continue;
-            }
-            kept_lines.push(ln);
-        }
-        return (json_candidate, strip_unfenced_json_blocks(&kept_lines));
+    if !body.ends_with("```") {
+        return (None, false);
     }
     let lines: Vec<&str> = body.lines().collect();
-    (None, strip_unfenced_json_blocks(&lines))
+    if !lines.last().is_some_and(|ln| ln.trim() == "```") {
+        return (None, false);
+    }
+    let mut n_fences = 0usize;
+    let mut prev_fence = 0usize;
+    let mut last_fence = 0usize;
+    for (idx, ln) in lines.iter().enumerate() {
+        if ln.trim().starts_with("```") {
+            n_fences += 1;
+            prev_fence = last_fence;
+            last_fence = idx;
+        }
+    }
+    if n_fences >= 2 && n_fences % 2 == 0 && last_fence == lines.len() - 1 {
+        let fence_hdr = lines[prev_fence].trim().to_lowercase();
+        let fenced = lines[prev_fence + 1..lines.len() - 1].join("\n");
+        let fenced_trim = fenced.trim();
+        if (fence_hdr == "```" || fence_hdr == "```json")
+            && fenced_trim.starts_with('{')
+            && fenced_trim.ends_with('}')
+        {
+            if let Ok(Value::Object(parsed)) = serde_json::from_str::<Value>(fenced_trim) {
+                return (Some(parsed), false);
+            }
+        }
+    }
+    (None, false)
 }
 
 pub fn extract_review_decision(text: &str) -> (Option<String>, Option<String>) {
-    let stripped = text.trim();
-    if stripped.is_empty() {
+    let body = strip_review_wrappers(text);
+    if body.is_empty() {
         return (None, None);
     }
-    let (json_obj, prose_fallback) = extract_terminal_json_dict(stripped);
+    let (json_obj, suppress_prose) = extract_terminal_json_only(body);
     if let Some(obj) = json_obj {
         let dec = decision_from_json_dict(&obj);
-        if dec.0.is_some() || dec.1.is_some() || prose_fallback.is_empty() {
+        if dec.0.is_some() || dec.1.is_some() {
             return dec;
         }
     }
-    if prose_fallback.is_empty() {
+    if suppress_prose {
         return (None, None);
     }
+    let lines: Vec<&str> = body.lines().collect();
+    let (masked, has_prose) = mask_fenced_and_json_lines(&lines);
+    if !has_prose {
+        return (None, None);
+    }
+    let prose_fallback = masked.join("\n");
     if let Some(last_cls) = closure_line_re().captures_iter(&prose_fallback).last() {
         return (
             Some("closure".to_string()),
@@ -702,6 +833,80 @@ pub fn extract_review_decision(text: &str) -> (Option<String>, Option<String>) {
     (None, None)
 }
 
+// INVARIANT: Detect a fail-closed review revoker (`REVISE` / `ESCALATE` / `BLOCKED`) split across
+// two adjacent messages (`head` + `\n\n` + `tail`) by checking split terminal JSON only when
+// `tail` closes `}` / triple-backtick (and neither side parses it alone) and masking fenced/JSON
+// blocks with `"#"` barriers while verifying the match's first non-whitespace byte starts in
+// `head` and ends in `tail`.
+pub fn extract_split_review_revoker(head: &str, tail: &str) -> (Option<String>, Option<String>) {
+    let tail_trim_end = tail.trim_end();
+    if tail_trim_end.ends_with('}') || tail_trim_end.ends_with("```") {
+        let pair_txt = format!("{}\n\n{}", head, tail);
+        let (json_obj, _) = extract_terminal_json_only(strip_review_wrappers(&pair_txt));
+        if let Some(obj) = json_obj {
+            let dec = decision_from_json_dict(&obj);
+            if dec.0.is_some()
+                && matches!(dec.1.as_deref(), Some(d) if !matches!(d, "APPROVED" | "READY"))
+            {
+                let json_dec_alone = |s: &str| {
+                    extract_terminal_json_only(strip_review_wrappers(s))
+                        .0
+                        .map(|o| decision_from_json_dict(&o))
+                        .unwrap_or((None, None))
+                };
+                if json_dec_alone(head) != dec && json_dec_alone(tail) != dec {
+                    return dec;
+                }
+            }
+        }
+    }
+    let mut all_lines: Vec<&str> = head.split('\n').map(|s| s.trim_end_matches('\r')).collect();
+    let boundary_line_idx = all_lines.len();
+    all_lines.push("");
+    all_lines.extend(tail.split('\n').map(|s| s.trim_end_matches('\r')));
+    let (masked_lines, has_prose) = mask_fenced_and_json_lines(&all_lines);
+    if !has_prose || masked_lines[boundary_line_idx] == "#" {
+        return (None, None);
+    }
+    let mut masked = String::with_capacity(head.len() + tail.len() + 2);
+    let mut boundary_start = 0usize;
+    let mut boundary_end = 0usize;
+    for (idx, ln) in masked_lines.iter().enumerate() {
+        if idx > 0 {
+            masked.push('\n');
+        }
+        if idx == boundary_line_idx {
+            boundary_start = masked.len();
+            masked.push_str(ln);
+            boundary_end = masked.len() + 1;
+        } else {
+            masked.push_str(ln);
+        }
+    }
+    let crosses = |m: regex::Match<'_>| -> bool {
+        let s = m.as_str();
+        let content_start = m.start() + (s.len() - s.trim_start().len());
+        content_start < boundary_start && m.end() > boundary_end
+    };
+    if let Some(caps) = closure_line_re().captures_iter(&masked).last() {
+        if let Some(m) = caps.get(0) {
+            let v = caps[1].to_uppercase();
+            if crosses(m) && v != "READY" {
+                return (Some("closure".to_string()), Some(v));
+            }
+        }
+    }
+    if let Some(caps) = verdict_line_re().captures_iter(&masked).last() {
+        if let Some(m) = caps.get(0) {
+            let v = caps[1].to_uppercase();
+            if crosses(m) && v != "APPROVED" {
+                return (Some("ordinary".to_string()), Some(v));
+            }
+        }
+    }
+    (None, None)
+}
+
 pub fn extract_diff_hash(text: &str) -> String {
     diff_hash_re()
         .captures_iter(text)
@@ -709,6 +914,24 @@ pub fn extract_diff_hash(text: &str) -> String {
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().trim().to_string())
         .unwrap_or_default()
+}
+
+pub fn check_diff_hashes(text: &str, expected: &str) -> (bool, bool) {
+    let mut has_match = false;
+    let mut has_mismatch = false;
+    for caps in diff_hash_re().captures_iter(text) {
+        if let Some(m) = caps.get(1) {
+            if m.as_str() == expected {
+                has_match = true;
+            } else {
+                has_mismatch = true;
+            }
+            if has_match && has_mismatch {
+                break;
+            }
+        }
+    }
+    (has_match, has_mismatch)
 }
 
 pub fn is_flash_model(model: &str) -> bool {
@@ -764,23 +987,48 @@ pub fn swarm_stall_timeout_sec() -> f64 {
     }
 }
 
+pub fn find_simplify_verdict_spans(text: &str) -> Vec<(usize, usize, bool)> {
+    let cleaned = mask_simplify_template_pairs(text);
+    find_simplify_verdict_spans_cleaned(&cleaned)
+}
+
+pub fn parse_simplify_lens_flags(text: &str) -> (bool, bool) {
+    let cleaned = mask_simplify_template_pairs(text);
+    extract_simplify_lens_flags_cleaned(&cleaned)
+}
+
+pub fn parse_simplify_window_spans(text: &str) -> (Vec<(usize, usize, bool)>, bool, bool) {
+    let cleaned = mask_simplify_template_pairs(text);
+    let spans = find_simplify_verdict_spans_cleaned(&cleaned);
+    if spans.is_empty() {
+        return (spans, false, false);
+    }
+    let (has_combined, multi_lens_spoof) = extract_simplify_lens_flags_cleaned(&cleaned);
+    (spans, has_combined, multi_lens_spoof)
+}
+
 pub fn parse_simplify_verdict(text: &str, default_lens: Option<&str>) -> Value {
-    let cleaned = simplify_template_pair_re().replace_all(text, " ");
-    let has_combined = !find_simplify_tag_matches(simplify_combined_lens_core_re(), &cleaned).is_empty();
-    let explicit_lenses = find_simplify_tag_matches(simplify_lens_core_re(), &cleaned);
+    let cleaned = mask_simplify_template_pairs(text);
+    let mut has_combined = false;
+    for_each_simplify_tag_match(simplify_combined_lens_core_re(), &cleaned, |_, _, _| {
+        has_combined = true;
+        false
+    });
     let mut seen = HashSet::new();
     let mut unique_lenses = Vec::new();
-    for m in explicit_lenses {
-        let low = m.to_lowercase();
+    for_each_simplify_tag_match(simplify_lens_core_re(), &cleaned, |_, _, val| {
+        let low = val.to_lowercase();
         if seen.insert(low.clone()) {
             unique_lenses.push(low);
         }
-    }
-    let verdict_matches = find_simplify_tag_matches(simplify_verdict_core_re(), &cleaned);
-    let verdict = verdict_matches
-        .last()
-        .map(|s| s.to_uppercase())
-        .unwrap_or_default();
+        true
+    });
+    let mut last_verdict: Option<&str> = None;
+    for_each_simplify_tag_match(simplify_verdict_core_re(), &cleaned, |_, _, val| {
+        last_verdict = Some(val);
+        true
+    });
+    let verdict = last_verdict.map(|s| s.to_uppercase()).unwrap_or_default();
     let multi_lens_spoof = !has_combined && unique_lenses.len() > 1;
     let lens = if has_combined {
         "all".to_string()
@@ -3516,13 +3764,19 @@ pub fn receipt_requirements_summary(floor: &str, policy: Option<&Value>, has_tes
     }
     if floor == "HIGH" {
         return format!(
-            "decisive test/check execution -> primary independent APPROVED review (`carbon-stack codex-lane review` on `{}` -> `{}` -> `{}`) -> simplify once (`SIMPLIFY_LENS: ALL` fast-path if <=2 files & <=30 lines, else 3 separate lenses on `{}`, fallback `{}`) -> batch kill workers -> final `--closure` check",
-            CODEX_SOL_MODEL, OPUS_HIGH_MODEL, CARBON_HIGH_MODEL, SONNET_HIGH_MODEL, SIMPLIFY_FALLBACK_MODEL
+            "decisive test/check execution -> primary independent APPROVED review (`carbon-stack codex-lane review` on `{}` -> {}) -> simplify once (`SIMPLIFY_LENS: ALL` fast-path if <=2 files & <=30 lines, else 3 separate lenses on `{}`, fallback `{}`) -> batch kill workers -> final `--closure` check",
+            CODEX_SOL_MODEL,
+            review_escalation_chain("HIGH"),
+            SONNET_HIGH_MODEL,
+            SIMPLIFY_FALLBACK_MODEL
         );
     }
     format!(
-        "decisive test/check execution -> primary XHIGH APPROVED review (`carbon-stack codex-lane review --xhigh` on `{}` -> `{}` -> `{}`) -> simplify once (`SIMPLIFY_LENS: ALL` fast-path if <=2 files & <=30 lines, else 3 separate lenses on `{}`, fallback `{}`) -> batch kill workers -> final `--xhigh --closure` check",
-        CODEX_ASTRA_MODEL, OPUS_HIGH_MODEL, CARBON_HIGH_MODEL, SONNET_HIGH_MODEL, SIMPLIFY_FALLBACK_MODEL
+        "decisive test/check execution -> primary XHIGH APPROVED review (`carbon-stack codex-lane review --xhigh` on `{}` -> {}) -> simplify once (`SIMPLIFY_LENS: ALL` fast-path if <=2 files & <=30 lines, else 3 separate lenses on `{}`, fallback `{}`) -> batch kill workers -> final `--xhigh --closure` check",
+        CODEX_ASTRA_MODEL,
+        review_escalation_chain("XHIGH"),
+        SONNET_HIGH_MODEL,
+        SIMPLIFY_FALLBACK_MODEL
     )
 }
 
@@ -3677,14 +3931,14 @@ pub fn active_marker_closure_halt(marker: &Value) -> Option<(usize, f64, Vec<Str
     }
     let ch_first_ts = val_to_f64(ch.get("candidate_first_ts"));
     let marker_first_ts = val_to_f64(marker.get("first_ts"));
-    if ch_first_ts > 0.0 && (ch_first_ts - marker_first_ts).abs() > 1e-6 {
+    if ch_first_ts > 0.0 && (ch_first_ts - marker_first_ts).abs() > TS_EPS {
         return None;
     }
     let last_blk_ts = val_to_f64(ch.get("last_blocked_ts"));
     let cycle_base_ts = val_to_f64(ch.get("cycle_base_ts"));
     let rr_ts = last_research_reset_ts(marker);
     // INVARIANT: A latched `closure_halt` is bound to `candidate_first_ts` and remains active until a verified `research_resets` entry advances `reset_ts` past `last_blocked_ts` or `cycle_base_ts`.
-    if rr_ts > 0.0 && (rr_ts > last_blk_ts || rr_ts > cycle_base_ts + 1e-6) {
+    if rr_ts > 0.0 && (rr_ts > last_blk_ts || rr_ts > cycle_base_ts + TS_EPS) {
         return None;
     }
     let ids: Vec<String> = ch
@@ -3749,10 +4003,10 @@ pub fn latch_marker_closure_halt(latch: ClosureHaltLatch<'_>) {
             .get("round_start_msg_id")
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
-        if (live_first_ts - expected_first_ts).abs() > 1e-6
-            || (live_rr_ts - expected_rr_ts).abs() > 1e-6
+        if (live_first_ts - expected_first_ts).abs() > TS_EPS
+            || (live_rr_ts - expected_rr_ts).abs() > TS_EPS
             || live_round_seq != expected_round_start_msg_id
-            || (live_rr_ts > 0.0 && (live_rr_ts > last_blocked_ts || live_rr_ts > cycle_base_ts + 1e-6))
+            || (live_rr_ts > 0.0 && (live_rr_ts > last_blocked_ts || live_rr_ts > cycle_base_ts + TS_EPS))
         {
             return false;
         }
@@ -3818,7 +4072,7 @@ pub fn active_marker_declared_risk(marker: &Value) -> String {
     };
     let dr_first_ts = val_to_f64(dr.get("candidate_first_ts"));
     let marker_first_ts = val_to_f64(marker.get("first_ts"));
-    if marker_first_ts <= 0.0 || (dr_first_ts - marker_first_ts).abs() > 1e-6 {
+    if marker_first_ts <= 0.0 || (dr_first_ts - marker_first_ts).abs() > TS_EPS {
         return String::new();
     }
     let Some(dr_epoch) = dr.get("reset_epoch").and_then(|v| v.as_u64()) else {
@@ -3865,7 +4119,7 @@ pub fn latch_marker_declared_risk(
             return false;
         }
         if let Some(exp_fts) = expected_first_ts {
-            if (live_first_ts - exp_fts).abs() > 1e-6 {
+            if (live_first_ts - exp_fts).abs() > TS_EPS {
                 return false;
             }
         }
@@ -4122,26 +4376,1011 @@ pub fn is_simplify_or_review_swarm_worker(name: &str, meta: Option<&Value>) -> b
         })
         .map(|v| val_to_str(Some(v)).trim().to_ascii_lowercase())
         .unwrap_or_default();
-    mdl == OPUS_HIGH_MODEL
-        || mdl == SONNET_HIGH_MODEL
-        || low.contains("review")
-        || low.contains("adversarial")
-        || low.contains("critic")
-        || low.contains("verifier")
+    mdl == OPUS_HIGH_MODEL || mdl == SONNET_HIGH_MODEL || is_review_worker_name(&low)
+}
+
+pub fn is_simplify_or_review_swarm_worker_with_brief(
+    name: &str,
+    meta: Option<&Value>,
+    brief: &str,
+) -> bool {
+    if is_simplify_or_review_swarm_worker(name, meta) {
+        return true;
+    }
+    if brief.trim().is_empty() {
+        return false;
+    }
+    let low = brief.to_lowercase();
+    is_review_worker_hint(name, brief)
+        || low.contains("simplify_lens:")
+        || low.contains("simplify_verdict:")
+}
+
+pub fn extract_worker_scoped_brief(
+    text: &str,
+    worker_name: &str,
+    known_workers: &[&str],
+) -> String {
+    fn is_ident(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+    }
+    fn mention_matches_worker(tok: &str, wname: &str) -> bool {
+        if tok.eq_ignore_ascii_case(wname) {
+            return true;
+        }
+        if let Some((prefix, suffix)) = wname.rsplit_once('-') {
+            if !prefix.is_empty()
+                && !suffix.is_empty()
+                && suffix.bytes().all(|b| b.is_ascii_digit())
+                && tok.eq_ignore_ascii_case(prefix)
+            {
+                return true;
+            }
+        }
+        false
+    }
+    fn is_mention_sep(seg: &str) -> bool {
+        let trimmed = seg.trim_matches(|c: char| {
+            c.is_whitespace() || matches!(c, ',' | ';' | ':' | '/' | '&' | '+' | '-')
+        });
+        trimmed.is_empty() || trimmed.eq_ignore_ascii_case("and") || trimmed == "и"
+    }
+    fn clean_body(raw: &str) -> &str {
+        let trimmed = raw
+            .trim_start_matches(|c: char| c.is_whitespace() || c == ':' || c == ',')
+            .trim_end();
+        if trimmed.chars().all(|c| !c.is_alphanumeric()) {
+            ""
+        } else {
+            trimmed
+        }
+    }
+    fn clean_pre_segment(raw: &str) -> &str {
+        let trimmed = raw
+            .trim_start_matches(|c: char| {
+                c.is_whitespace() || matches!(c, '.' | '!' | '?' | ';' | ':' | ',')
+            })
+            .trim_end();
+        if trimmed.chars().all(|c| !c.is_alphanumeric()) {
+            ""
+        } else {
+            trimmed
+        }
+    }
+
+    let tb = text.as_bytes();
+    let mut spans: Vec<(usize, usize, bool)> = Vec::new();
+    let mut has_target = false;
+    let mut i = 0usize;
+    while i < tb.len() {
+        if tb[i] == b'@' && (i == 0 || !is_ident(tb[i - 1])) {
+            let mut end = i + 1;
+            while end < tb.len() && is_ident(tb[end]) {
+                end += 1;
+            }
+            if end > i + 1 {
+                let tok = &text[i + 1..end];
+                if !tok.eq_ignore_ascii_case("coordinator") {
+                    let is_target =
+                        tok.eq_ignore_ascii_case("all") || mention_matches_worker(tok, worker_name);
+                    if is_target || known_workers.iter().any(|w| mention_matches_worker(tok, w)) {
+                        has_target |= is_target;
+                        spans.push((i, end, is_target));
+                    }
+                }
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if !has_target {
+        return String::new();
+    }
+
+    struct MentionGroup {
+        matches_target: bool,
+        group_start: usize,
+        group_end: usize,
+        line_has_text: bool,
+    }
+    let mut groups: Vec<MentionGroup> = Vec::new();
+    let mut scan_pos = 0usize;
+    let mut cur_line_has_text = false;
+    for &(s_start, s_end, is_target) in &spans {
+        let gap = &text[scan_pos..s_start];
+        let sep_has_nl = gap.contains(['\n', '\r']);
+        let sep_has_clause_break = sep_has_nl || gap.contains(';');
+        let line_has_text_before_span = if sep_has_nl {
+            let tail_start = gap.rfind(['\n', '\r']).map_or(0, |p| p + 1);
+            gap[tail_start..].chars().any(char::is_alphanumeric)
+        } else {
+            cur_line_has_text || gap.chars().any(char::is_alphanumeric)
+        };
+        let merge_with_prev = groups.last().is_some_and(|last| {
+            is_mention_sep(gap) && (!sep_has_clause_break || !last.line_has_text)
+        });
+        if merge_with_prev {
+            if let Some(last) = groups.last_mut() {
+                last.matches_target |= is_target;
+                last.group_end = s_end;
+            }
+        } else {
+            groups.push(MentionGroup {
+                matches_target: is_target,
+                group_start: s_start,
+                group_end: s_end,
+                line_has_text: line_has_text_before_span,
+            });
+        }
+        cur_line_has_text = true;
+        scan_pos = s_end;
+    }
+
+    // INVARIANT: Segment into deterministic sentence/newline clauses first (treating each
+    // MentionGroup as an atomic token and never breaking filename dots or macro bangs like `!(`,
+    // `!=`), then classify each clause by whether mentions sit at its leading/trailing edge or
+    // stand alone. Because clause boundaries are resolved before mention attribution, inline
+    // colons (`VERDICT: @worker.`), multi-sentence newline pings (`...\n@other`), and mixed
+    // leading/trailing packets remain unambiguous in strictly O(N) time.
+    struct RawClause {
+        start: usize,
+        end: usize,
+        after_newline: bool,
+        g_start: usize,
+        g_end: usize,
+    }
+    let mut clauses: Vec<RawClause> = Vec::new();
+    let mut pos = 0usize;
+    let mut g_idx = 0usize;
+    let mut next_after_nl = false;
+    while pos < text.len() {
+        while let Some(ch) = text[pos..].chars().next() {
+            if ch == '\n' || ch == '\r' {
+                next_after_nl = true;
+                pos += ch.len_utf8();
+            } else if ch.is_whitespace() {
+                pos += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if pos >= text.len() {
+            break;
+        }
+        let c_start = pos;
+        let c_after_nl = next_after_nl;
+        next_after_nl = false;
+        let c_g_start = g_idx;
+        let mut c_end = text.len();
+        while pos < text.len() {
+            if g_idx < groups.len()
+                && pos >= groups[g_idx].group_start
+                && pos < groups[g_idx].group_end
+            {
+                pos = groups[g_idx].group_end;
+                g_idx += 1;
+                continue;
+            }
+            let Some(ch) = text[pos..].chars().next() else {
+                break;
+            };
+            let next = pos + ch.len_utf8();
+            if ch == '\n' || ch == '\r' {
+                c_end = pos;
+                next_after_nl = true;
+                pos = next;
+                break;
+            }
+            if matches!(ch, '.' | '!' | '?' | ';') {
+                let mut run_end = next;
+                while let Some(nch) = text[run_end..].chars().next() {
+                    if matches!(nch, '.' | '!' | '?' | ';') {
+                        run_end += nch.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+                let rest = &text[run_end..];
+                let breaks = if ch == '.' {
+                    rest.is_empty() || rest.starts_with(char::is_whitespace)
+                } else {
+                    rest.is_empty()
+                        || rest.starts_with(char::is_whitespace)
+                        || rest.starts_with('@')
+                };
+                pos = run_end;
+                if breaks {
+                    c_end = pos;
+                    break;
+                }
+                continue;
+            }
+            pos = next;
+        }
+        if c_end > c_start {
+            clauses.push(RawClause {
+                start: c_start,
+                end: c_end,
+                after_newline: c_after_nl,
+                g_start: c_g_start,
+                g_end: g_idx,
+            });
+        }
+    }
+
+    struct Assigned<'a> {
+        matches: bool,
+        body: &'a str,
+        after_newline: bool,
+        plain_cont: bool,
+    }
+    fn drain_same_line_preamble<'a>(
+        preamble: &mut Vec<(bool, &'a str)>,
+        assigned: &mut Vec<Assigned<'a>>,
+        matches: bool,
+    ) {
+        let mut drained: Vec<(bool, &'a str)> = Vec::new();
+        while let Some(&(after_nl, body)) = preamble.last() {
+            if body.ends_with(':') {
+                break;
+            }
+            preamble.pop();
+            drained.push((after_nl, body));
+            if after_nl {
+                break;
+            }
+        }
+        for (after_nl, body) in drained.into_iter().rev() {
+            assigned.push(Assigned {
+                matches,
+                body,
+                after_newline: after_nl,
+                plain_cont: false,
+            });
+        }
+    }
+
+    let mut preamble: Vec<(bool, &str)> = Vec::new();
+    let mut assigned: Vec<Assigned<'_>> = Vec::new();
+    let mut active_matches: Option<bool> = None;
+    let mut saw_mention = false;
+
+    for c in clauses {
+        let c_groups = &groups[c.g_start..c.g_end];
+        if c_groups.is_empty() {
+            let body = clean_body(&text[c.start..c.end]);
+            if !body.is_empty() {
+                if let Some(m) = active_matches {
+                    assigned.push(Assigned {
+                        matches: m,
+                        body,
+                        after_newline: c.after_newline,
+                        plain_cont: true,
+                    });
+                } else {
+                    preamble.push((c.after_newline, body));
+                }
+            }
+            continue;
+        }
+
+        if c_groups.len() == 1 {
+            let g = &c_groups[0];
+            let pre = clean_pre_segment(&text[c.start..g.group_start]);
+            let after_raw = &text[g.group_end..c.end];
+            let post = clean_body(after_raw);
+            let has_term_punct = after_raw.trim_end().ends_with(['.', '!', '?', ';']);
+            match (!pre.is_empty(), !post.is_empty()) {
+                (false, false) => {
+                    if !saw_mention && !c.after_newline && !preamble.is_empty() {
+                        drain_same_line_preamble(&mut preamble, &mut assigned, g.matches_target);
+                    } else if !c.after_newline && assigned.last().is_some_and(|e| e.plain_cont) {
+                        // INVARIANT: An inline trailing orphan mention claims the preceding plain
+                        // continuation ONLY when explicitly closed (`@worker.`) or preceded by
+                        // `!`/`?` (so a bare `. @other` ping on a continuation line never steals
+                        // the previous worker's sentence); when triggered on a fresh line, it
+                        // claims the entire fresh-line continuation run.
+                        let trigger = has_term_punct
+                            || assigned.last().is_some_and(|e| e.body.ends_with(['!', '?']));
+                        if trigger {
+                            let mut run_start = assigned.len() - 1;
+                            let mut fresh_line = assigned[run_start].after_newline;
+                            while !fresh_line
+                                && run_start > 0
+                                && assigned[run_start - 1].plain_cont
+                            {
+                                run_start -= 1;
+                                fresh_line = assigned[run_start].after_newline;
+                            }
+                            let slice_start = if fresh_line {
+                                run_start
+                            } else {
+                                assigned.len() - 1
+                            };
+                            for item in &mut assigned[slice_start..] {
+                                item.matches = g.matches_target;
+                                item.plain_cont = false;
+                            }
+                        }
+                    }
+                }
+                (true, false) => {
+                    if !saw_mention && !c.after_newline && !preamble.is_empty() {
+                        drain_same_line_preamble(&mut preamble, &mut assigned, g.matches_target);
+                    }
+                    assigned.push(Assigned {
+                        matches: g.matches_target,
+                        body: pre,
+                        after_newline: c.after_newline,
+                        plain_cont: false,
+                    });
+                }
+                (false, true) => {
+                    assigned.push(Assigned {
+                        matches: g.matches_target,
+                        body: post,
+                        after_newline: c.after_newline,
+                        plain_cont: false,
+                    });
+                }
+                (true, true) => {
+                    assigned.push(Assigned {
+                        matches: g.matches_target,
+                        body: pre,
+                        after_newline: c.after_newline,
+                        plain_cont: false,
+                    });
+                    assigned.push(Assigned {
+                        matches: g.matches_target,
+                        body: post,
+                        after_newline: false,
+                        plain_cont: false,
+                    });
+                }
+            }
+            saw_mention = true;
+            active_matches = Some(g.matches_target);
+            continue;
+        }
+
+        let pre0 = clean_pre_segment(&text[c.start..c_groups[0].group_start]);
+        let post_last = clean_body(&text[c_groups[c_groups.len() - 1].group_end..c.end]);
+        if !pre0.is_empty() && post_last.is_empty() {
+            if !saw_mention && !c.after_newline && !preamble.is_empty() {
+                drain_same_line_preamble(&mut preamble, &mut assigned, c_groups[0].matches_target);
+            }
+            for (j, g) in c_groups.iter().enumerate() {
+                let seg_start = if j == 0 { c.start } else { c_groups[j - 1].group_end };
+                let seg = clean_pre_segment(&text[seg_start..g.group_start]);
+                if !seg.is_empty() {
+                    assigned.push(Assigned {
+                        matches: g.matches_target,
+                        body: seg,
+                        after_newline: j == 0 && c.after_newline,
+                        plain_cont: false,
+                    });
+                }
+            }
+        } else {
+            if !pre0.is_empty() {
+                assigned.push(Assigned {
+                    matches: c_groups[0].matches_target,
+                    body: pre0,
+                    after_newline: c.after_newline,
+                    plain_cont: false,
+                });
+            }
+            for (j, g) in c_groups.iter().enumerate() {
+                let seg_end = if j + 1 < c_groups.len() {
+                    c_groups[j + 1].group_start
+                } else {
+                    c.end
+                };
+                let seg = clean_body(&text[g.group_end..seg_end]);
+                if !seg.is_empty() {
+                    assigned.push(Assigned {
+                        matches: g.matches_target,
+                        body: seg,
+                        after_newline: j == 0 && pre0.is_empty() && c.after_newline,
+                        plain_cont: false,
+                    });
+                }
+            }
+        }
+        saw_mention = true;
+        active_matches = Some(c_groups[c_groups.len() - 1].matches_target);
+    }
+
+    let mut out = String::new();
+    for (idx, (after_nl, body)) in preamble.iter().enumerate() {
+        if idx > 0 {
+            out.push(if *after_nl { '\n' } else { ' ' });
+        }
+        out.push_str(body);
+    }
+    let mut has_prev = !out.is_empty();
+    let mut prev_was_preamble = has_prev;
+    for entry in assigned {
+        if !entry.matches {
+            continue;
+        }
+        if has_prev {
+            out.push(if prev_was_preamble || entry.after_newline {
+                '\n'
+            } else {
+                ' '
+            });
+        }
+        out.push_str(entry.body);
+        has_prev = true;
+        prev_was_preamble = false;
+    }
+    out
 }
 
 pub fn active_simplify_or_review_workers(brain_root: &Path, session: &str) -> Vec<String> {
     let members = rio::load_swarm_members(brain_root, session);
+    active_simplify_or_review_workers_with_members(brain_root, session, &members)
+}
+
+pub fn append_coordinator_board_briefs(
+    btext: &str,
+    known_workers: &[&str],
+    targets: &[&str],
+    out: &mut std::collections::HashMap<String, String>,
+) {
+    if btext.trim().is_empty() || targets.is_empty() {
+        return;
+    }
+    let mentions_all = rio::text_contains_mention(btext, "all");
+    for &cname in targets {
+        if mentions_all || rio::text_mentions_swarm_worker(btext, cname) {
+            let scoped = extract_worker_scoped_brief(btext, cname, known_workers);
+            if !scoped.is_empty() {
+                let buf = out.entry(cname.to_string()).or_default();
+                if !buf.is_empty() {
+                    buf.push('\n');
+                }
+                buf.push_str(&scoped);
+            }
+        }
+    }
+}
+
+pub const SWARM_BOARD_TAIL_LIMIT: usize = 400;
+
+fn stamp_board_row_seq(orig_ord: i64, val: &mut Value) {
+    if extract_msg_seq(val, i64::MIN) == i64::MIN {
+        if let Value::Object(ref mut map) = val {
+            map.insert("seq".to_string(), json!(orig_ord));
+        }
+    }
+}
+
+// INVARIANT: Stream `board.jsonl` line-by-line with `{`-prefix + `serde_json::from_str::<Value>`
+// (exact JSON object acceptance parity with `rio::parse_jsonl_lines` / `load_swarm_board_messages`),
+// passing each row's true 1-based full-board ordinal (`valid_ord`) and parsed object to `visit`,
+// stopping early when `visit` returns `false`.
+fn for_each_swarm_board_row<F>(brain_root: &Path, session: &str, mut visit: F)
+where
+    F: FnMut(i64, Value) -> bool,
+{
+    let path = rio::swarm_dir(brain_root, session).join("board.jsonl");
+    let Ok(fh) = File::open(&path) else {
+        return;
+    };
+    let mut reader = BufReader::new(fh);
+    let mut raw_buf: Vec<u8> = Vec::new();
+    let mut valid_ord: i64 = 0;
+
+    loop {
+        raw_buf.clear();
+        let Ok(n) = reader.read_until(b'\n', &mut raw_buf) else {
+            break;
+        };
+        if n == 0 {
+            break;
+        }
+        let line = String::from_utf8_lossy(&raw_buf);
+        let trimmed = line.trim();
+        if !trimmed.starts_with('{') {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        valid_ord += 1;
+        if !visit(valid_ord, val) {
+            break;
+        }
+    }
+}
+
+// INVARIANT: Keep memory bounded to `SWARM_BOARD_TAIL_LIMIT` parsed JSON objects (first row + tail)
+// while allowing callers to observe every streamed row (`valid_ord`, `&val`) in a single pass,
+// stamping each kept row's true 1-based full-board ordinal as `"seq"` whenever explicit
+// `seq`/`msg_id`/`id` is absent so tail truncation never renumbers post-reset rows below
+// `board_head_seq` (even when `null`, arrays, or lone surrogates appear).
+fn stream_swarm_board_tail<F>(brain_root: &Path, session: &str, mut observe: F) -> (Vec<Value>, i64)
+where
+    F: FnMut(i64, &Value),
+{
+    let keep_tail = SWARM_BOARD_TAIL_LIMIT.saturating_sub(1);
+    let mut first_row: Option<(i64, Value)> = None;
+    let mut tail_rows: VecDeque<(i64, Value)> = VecDeque::with_capacity(keep_tail);
+    let mut total_rows: i64 = 0;
+    for_each_swarm_board_row(brain_root, session, |valid_ord, val| {
+        total_rows = valid_ord;
+        observe(valid_ord, &val);
+        if first_row.is_none() {
+            first_row = Some((valid_ord, val));
+        } else if keep_tail > 0 {
+            if tail_rows.len() >= keep_tail {
+                tail_rows.pop_front();
+            }
+            tail_rows.push_back((valid_ord, val));
+        }
+        true
+    });
+    let mut out = Vec::with_capacity(usize::from(first_row.is_some()) + tail_rows.len());
+    for (orig_ord, mut val) in first_row.into_iter().chain(tail_rows.into_iter()) {
+        stamp_board_row_seq(orig_ord, &mut val);
+        out.push(val);
+    }
+    (out, total_rows)
+}
+
+pub fn read_swarm_board_tail(brain_root: &Path, session: &str) -> Vec<Value> {
+    stream_swarm_board_tail(brain_root, session, |_, _| {}).0
+}
+
+pub fn is_active_marker(marker: &Value) -> bool {
+    marker.is_object() && !json_truthy(marker.get("closed"))
+}
+
+pub fn read_active_marker_with_pending(session: &str) -> Option<Value> {
+    read_marker_with_pending(session).filter(is_active_marker)
+}
+
+pub fn coarse_ts_upper_bound(ts: f64, coarse: bool) -> f64 {
+    if ts <= 0.0 {
+        0.0
+    } else if coarse {
+        ts.floor() + 1.0
+    } else {
+        ts
+    }
+}
+
+pub fn iso_ts_is_coarse(raw: &str) -> bool {
+    let s = raw.trim();
+    if let Ok(num) = s.parse::<f64>() {
+        if num.is_finite() && num > 0.0 {
+            let (mantissa, exp) = match s.find(['e', 'E']) {
+                Some(pos) => (&s[..pos], s[pos + 1..].parse::<i32>().unwrap_or(0)),
+                None => (s, 0),
+            };
+            let frac_digits = mantissa
+                .split_once('.')
+                .map_or(0i32, |(_, f)| f.bytes().filter(|b| b.is_ascii_digit()).count() as i32);
+            return frac_digits <= exp;
+        }
+    }
+    !s.split(['T', 't', ' '])
+        .nth(1)
+        .and_then(|t| t.split_once('.'))
+        .is_some_and(|(_, frac)| frac.bytes().next().is_some_and(|b| b.is_ascii_digit()))
+}
+
+// INVARIANT: `board.jsonl` is append-only in `seq` order, so an exact later timestamp (`!raw_coarse`)
+// at or after previous lower bounds (`raw_ts >= *running_lb - TS_EPS`) tightens an earlier coarse
+// same-second upper bound without under-estimating under backward clock skew, while a later coarse
+// row retains its full upper bound (`max(*running_ub, raw_ub)`).
+pub fn advance_monotonic_ub(
+    raw_ts: f64,
+    raw_coarse: bool,
+    raw_ub: f64,
+    running_lb: &mut f64,
+    running_ub: &mut f64,
+) -> f64 {
+    if raw_ts <= 0.0 {
+        return 0.0;
+    }
+    if !raw_coarse && raw_ts >= *running_lb - TS_EPS {
+        *running_ub = raw_ub;
+    } else {
+        *running_ub = running_ub.max(raw_ub);
+    }
+    if raw_ts > *running_lb {
+        *running_lb = raw_ts;
+    }
+    *running_ub
+}
+
+pub fn advance_monotonic_board_ub(
+    raw_ts: f64,
+    raw_coarse: bool,
+    running_lb: &mut f64,
+    running_ub: &mut f64,
+) -> f64 {
+    advance_monotonic_ub(
+        raw_ts,
+        raw_coarse,
+        coarse_ts_upper_bound(raw_ts, raw_coarse),
+        running_lb,
+        running_ub,
+    )
+}
+
+// INVARIANT: Because `board.jsonl` is strictly append-only in `seq` order, any sequenced row
+// whose monotonic publication upper bound satisfies `pub_ord_ub <= rr_ts` proves that every row
+// at `s <= seq` was published at or before `reset_ts` (consistent causal prefix cut). Computing
+// `eff_rr_seq` before collecting briefs or attributing messages ensures an earlier coarse row
+// tightened by a later exact pre-reset row is never leaked into a post-reset worker.
+pub fn compute_effective_reset_board_seq<I>(rows: I, rr_seq: i64, rr_ts: f64) -> i64
+where
+    I: IntoIterator<Item = (i64, f64, bool)>,
+{
+    let mut eff_seq = rr_seq.max(0);
+    if rr_ts <= 0.0 {
+        return eff_seq;
+    }
+    let mut ordered: Vec<(i64, f64, bool)> =
+        rows.into_iter().filter(|&(seq, _, _)| seq > 0).collect();
+    ordered.sort_by_key(|&(seq, _, _)| seq);
+    let mut running_lb = 0.0f64;
+    let mut running_ub = 0.0f64;
+    for (seq, pub_ts, pub_coarse) in ordered {
+        let pub_ord_ub =
+            advance_monotonic_board_ub(pub_ts, pub_coarse, &mut running_lb, &mut running_ub);
+        if pub_ord_ub > 0.0 && pub_ord_ub <= rr_ts && seq > eff_seq {
+            eff_seq = seq;
+        }
+    }
+    eff_seq
+}
+
+// INVARIANT: A board row belongs to the pre-reset cycle if EITHER its sequence number is within
+// the precomputed causal prefix cutoff `eff_rr_seq` (`seq <= eff_rr_seq`) OR (for unsequenced
+// rows) its publication upper bound `pub_ord_ub` ended at or before `reset_ts`.
+pub fn is_board_row_before_reset(seq: i64, pub_ord_ub: f64, eff_rr_seq: i64, rr_ts: f64) -> bool {
+    (eff_rr_seq > 0 && seq > 0 && seq <= eff_rr_seq)
+        || (rr_ts > 0.0 && pub_ord_ub > 0.0 && pub_ord_ub <= rr_ts)
+}
+
+fn board_row_time_meta(bp: &Value) -> (f64, bool) {
+    let raw_time = bp.get("time").and_then(|v| v.as_str()).unwrap_or("");
+    let raw_ts = rio::parse_iso_ts(raw_time);
+    (raw_ts, raw_ts > 0.0 && iso_ts_is_coarse(raw_time))
+}
+
+struct BoardResetBoundary {
+    active: bool,
+    eff_rr_seq: i64,
+    rr_ts: f64,
+}
+
+impl BoardResetBoundary {
+    fn row_tuple(bp: &Value, fallback_ord: i64) -> (i64, f64, bool) {
+        let seq = extract_msg_seq(bp, fallback_ord);
+        let (raw_ts, raw_coarse) = board_row_time_meta(bp);
+        (seq, raw_ts, raw_coarse)
+    }
+
+    fn from_rows<I>(rows: I, active: bool, rr_seq: i64, rr_ts: f64) -> Self
+    where
+        I: IntoIterator<Item = (i64, f64, bool)>,
+    {
+        let eff_rr_seq = if !active {
+            0
+        } else if rr_ts <= 0.0 {
+            rr_seq.max(0)
+        } else {
+            compute_effective_reset_board_seq(rows, rr_seq, rr_ts)
+        };
+        Self {
+            active,
+            eff_rr_seq,
+            rr_ts,
+        }
+    }
+
+    fn new(raw_board: &[Value], active: bool, rr_seq: i64, rr_ts: f64) -> Self {
+        Self::from_rows(
+            raw_board
+                .iter()
+                .enumerate()
+                .map(|(bp_idx, bp)| Self::row_tuple(bp, (bp_idx + 1) as i64)),
+            active,
+            rr_seq,
+            rr_ts,
+        )
+    }
+
+    fn is_row_before_reset(&self, bp_idx: usize, bp: &Value) -> bool {
+        self.is_row_before_reset_with_ord((bp_idx + 1) as i64, bp)
+    }
+
+    fn is_row_before_reset_with_ord(&self, fallback_ord: i64, bp: &Value) -> bool {
+        if !self.active {
+            return false;
+        }
+        let seq = extract_msg_seq(bp, fallback_ord);
+        if seq > 0 {
+            return self.eff_rr_seq > 0 && seq <= self.eff_rr_seq;
+        }
+        let pub_ub = if self.rr_ts > 0.0 {
+            let (raw_ts, raw_coarse) = board_row_time_meta(bp);
+            coarse_ts_upper_bound(raw_ts, raw_coarse)
+        } else {
+            0.0
+        };
+        is_board_row_before_reset(seq, pub_ub, self.eff_rr_seq, self.rr_ts)
+    }
+}
+
+pub fn collect_coordinator_board_briefs(
+    raw_board: &[Value],
+    known_workers: &[&str],
+    targets: &[&str],
+    rr_seq: i64,
+    rr_ts: f64,
+) -> std::collections::HashMap<String, String> {
+    let mut out: std::collections::HashMap<String, String> =
+        std::collections::HashMap::with_capacity(targets.len());
+    if targets.is_empty() || raw_board.is_empty() {
+        return out;
+    }
+    let has_reset = rr_seq > 0 || rr_ts > 0.0;
+    let reset_boundary = BoardResetBoundary::new(raw_board, has_reset, rr_seq, rr_ts);
+    for (bp_idx, bp) in raw_board.iter().enumerate() {
+        if reset_boundary.is_row_before_reset(bp_idx, bp) {
+            continue;
+        }
+        if val_to_str(bp.get("agent")) == "coordinator" {
+            let btext = val_to_str(bp.get("text"));
+            append_coordinator_board_briefs(&btext, known_workers, targets, &mut out);
+        }
+    }
+    out
+}
+
+pub fn active_simplify_or_review_workers_with_members(
+    brain_root: &Path,
+    session: &str,
+    members: &Map<String, Value>,
+) -> Vec<String> {
+    active_simplify_or_review_workers_with_members_inner(brain_root, session, members, None)
+}
+
+#[cfg(test)]
+fn active_simplify_or_review_workers_with_members_and_marker(
+    brain_root: &Path,
+    session: &str,
+    members: &Map<String, Value>,
+    marker: Option<&Value>,
+) -> Vec<String> {
+    active_simplify_or_review_workers_with_members_inner(brain_root, session, members, Some(marker))
+}
+
+fn active_simplify_or_review_workers_with_members_inner(
+    brain_root: &Path,
+    session: &str,
+    members: &Map<String, Value>,
+    marker_override: Option<Option<&Value>>,
+) -> Vec<String> {
+    let known_workers = rio::swarm_worker_names(members);
     let mut alive: Vec<String> = Vec::new();
-    for (name, meta) in &members {
+    let mut candidates: Vec<(&str, &Value)> = Vec::new();
+    for (name, meta) in members {
         if !meta.is_object()
             || rio::is_swarm_role_member(name, Some(meta))
             || rio::is_swarm_member_killed(Some(meta))
         {
             continue;
         }
-        if is_simplify_or_review_swarm_worker(name, Some(meta)) {
+        let meta_brief = val_to_str(meta.get("brief"));
+        if is_simplify_or_review_swarm_worker_with_brief(name, Some(meta), &meta_brief) {
             alive.push(name.clone());
+        } else {
+            candidates.push((name.as_str(), meta));
+        }
+    }
+    if !candidates.is_empty() {
+        let loaded_marker = if marker_override.is_none() {
+            read_active_marker_with_pending(session)
+        } else {
+            None
+        };
+        let marker = match marker_override {
+            Some(m) => m,
+            None => loaded_marker.as_ref(),
+        };
+        let rr_ts = marker.map_or(0.0, last_research_reset_ts);
+        let rr_seq = marker.map_or(0, last_research_reset_board_seq);
+        let has_reset = rr_ts > 0.0 || rr_seq > 0;
+        let total_cands = candidates.len();
+        let mut flagged = vec![false; total_cands];
+        let mut flagged_count = 0usize;
+
+        let check_row = |orig_ord: i64,
+                         bp: &Value,
+                         boundary: &BoardResetBoundary,
+                         is_pre_reset: &[bool],
+                         flagged: &mut [bool],
+                         flagged_count: &mut usize|
+         -> bool {
+            let row_before_reset = boundary.is_row_before_reset_with_ord(orig_ord, bp);
+            let poster = val_to_str(bp.get("agent"));
+            let btext = val_to_str(bp.get("text"));
+            if btext.trim().is_empty() {
+                return true;
+            }
+            if poster == "coordinator" {
+                let mentions_all = rio::text_contains_mention(&btext, "all");
+                for (c_idx, &(cname, cmeta)) in candidates.iter().enumerate() {
+                    if flagged[c_idx]
+                        || (row_before_reset && !is_pre_reset[c_idx])
+                        || (!mentions_all && !rio::text_mentions_swarm_worker(&btext, cname))
+                    {
+                        continue;
+                    }
+                    let scoped = extract_worker_scoped_brief(&btext, cname, &known_workers);
+                    if !scoped.is_empty()
+                        && is_simplify_or_review_swarm_worker_with_brief(cname, Some(cmeta), &scoped)
+                    {
+                        flagged[c_idx] = true;
+                        *flagged_count += 1;
+                    }
+                }
+            } else {
+                for (c_idx, &(cname, _)) in candidates.iter().enumerate() {
+                    if flagged[c_idx] || (row_before_reset && !is_pre_reset[c_idx]) {
+                        continue;
+                    }
+                    if poster == cname
+                        && (extract_review_decision(&btext).0.is_some()
+                            || !val_to_str(parse_simplify_verdict(&btext, None).get("verdict"))
+                                .is_empty())
+                    {
+                        flagged[c_idx] = true;
+                        *flagged_count += 1;
+                    }
+                }
+            }
+            *flagged_count < total_cands
+        };
+
+        if !has_reset {
+            // INVARIANT: Without an active research-reset boundary, scan `board.jsonl` in a single
+            // O(1)-memory streaming pass with early exit once every live candidate is classified.
+            let inactive = BoardResetBoundary {
+                active: false,
+                eff_rr_seq: 0,
+                rr_ts: 0.0,
+            };
+            let no_pre = vec![false; total_cands];
+            for_each_swarm_board_row(brain_root, session, |orig_ord, bp| {
+                check_row(
+                    orig_ord,
+                    &bp,
+                    &inactive,
+                    &no_pre,
+                    &mut flagged,
+                    &mut flagged_count,
+                )
+            });
+        } else {
+            // INVARIANT: With an active research-reset boundary, stream the bounded tail while
+            // preserving each live candidate's earliest assigner row and full-board causal reset
+            // timestamps; if the board exceeded `SWARM_BOARD_TAIL_LIMIT`, stream all rows so a live
+            // Neon reviewer whose brief/verdict scrolled past 400 rows is never missed.
+            let mut all_reset_rows: Vec<(i64, f64, bool)> = Vec::new();
+            let mut first_assign_rows: Vec<Option<Value>> = vec![None; total_cands];
+            let mut first_assign_found = 0usize;
+            let cand_added_by: Vec<(&str, &str)> = candidates
+                .iter()
+                .map(|&(cname, cmeta)| {
+                    let added = cmeta
+                        .get("added_by")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    (cname, added)
+                })
+                .collect();
+
+            let (raw_board, total_rows) =
+                stream_swarm_board_tail(brain_root, session, |valid_ord, val| {
+                    if rr_ts > 0.0 {
+                        all_reset_rows.push(BoardResetBoundary::row_tuple(val, valid_ord));
+                    }
+                    if first_assign_found < total_cands {
+                        let poster = val_to_str(val.get("agent"));
+                        let btext = val_to_str(val.get("text"));
+                        if !btext.trim().is_empty() {
+                            for (c_idx, &(cname, added_by)) in cand_added_by.iter().enumerate() {
+                                if first_assign_rows[c_idx].is_some() {
+                                    continue;
+                                }
+                                let is_assigner = poster.eq_ignore_ascii_case("coordinator")
+                                    || (!added_by.is_empty() && poster == added_by);
+                                if is_assigner && rio::text_mentions_swarm_worker(&btext, cname) {
+                                    let mut cloned = val.clone();
+                                    stamp_board_row_seq(valid_ord, &mut cloned);
+                                    first_assign_rows[c_idx] = Some(cloned);
+                                    first_assign_found += 1;
+                                }
+                            }
+                        }
+                    }
+                });
+
+            if total_rows == 0 {
+                alive.sort();
+                return alive;
+            }
+            let was_truncated = (total_rows as usize) > raw_board.len();
+            let mut is_pre_reset = vec![false; total_cands];
+            let mut pre_reset_count = 0usize;
+            for (c_idx, &(cname, cmeta)) in candidates.iter().enumerate() {
+                let probe_board: &[Value] = if was_truncated {
+                    first_assign_rows[c_idx]
+                        .as_ref()
+                        .map_or(raw_board.as_slice(), std::slice::from_ref)
+                } else {
+                    raw_board.as_slice()
+                };
+                if is_worker_spawned_before_reset(
+                    cname,
+                    Some(cmeta),
+                    probe_board,
+                    rr_ts,
+                    rr_seq,
+                    marker,
+                    Some(brain_root),
+                ) {
+                    is_pre_reset[c_idx] = true;
+                    pre_reset_count += 1;
+                }
+            }
+            let reset_boundary = BoardResetBoundary::from_rows(
+                all_reset_rows,
+                pre_reset_count < total_cands,
+                rr_seq,
+                rr_ts,
+            );
+            if was_truncated {
+                for_each_swarm_board_row(brain_root, session, |orig_ord, bp| {
+                    check_row(
+                        orig_ord,
+                        &bp,
+                        &reset_boundary,
+                        &is_pre_reset,
+                        &mut flagged,
+                        &mut flagged_count,
+                    )
+                });
+            } else {
+                for (bp_idx, bp) in raw_board.iter().enumerate() {
+                    if !check_row(
+                        (bp_idx + 1) as i64,
+                        bp,
+                        &reset_boundary,
+                        &is_pre_reset,
+                        &mut flagged,
+                        &mut flagged_count,
+                    ) {
+                        break;
+                    }
+                }
+            }
+        }
+        for (c_idx, (cname, _)) in candidates.into_iter().enumerate() {
+            if flagged[c_idx] {
+                alive.push(cname.to_string());
+            }
         }
     }
     alive.sort();
@@ -4272,5 +5511,660 @@ mod tests {
             "c:/repo/worktree/.mcp.json.tokenade-original"
         ));
         assert!(!is_ephemeral_path("c:/repo/worktree/.mcp.json"));
+    }
+
+    #[test]
+    fn test_neon_model_constants_and_receipt_routing() {
+        assert_eq!(SIMPLIFY_FALLBACK_MODEL, NEON_XHIGH_MODEL);
+        assert!(SIMPLIFY_FALLBACK_MODELS.contains(&NEON_XHIGH_MODEL));
+        assert!(SIMPLIFY_FALLBACK_MODELS.contains(&HYDROGEN_XHIGH_MODEL));
+        assert!(is_simplify_allowed_model(SONNET_HIGH_MODEL));
+        assert!(is_simplify_allowed_model(NEON_XHIGH_MODEL));
+        assert!(is_simplify_allowed_model(HYDROGEN_XHIGH_MODEL));
+        assert!(!is_simplify_allowed_model(CARBON_HIGH_MODEL));
+        assert!(!is_review_worker_hint(
+            "root-cause-debugger",
+            "Investigate race. NEVER post VERDICT:/CLOSURE_VALIDATION:."
+        ));
+        assert!(is_review_worker_hint(
+            "neon-audit",
+            "Audit auth. Return VERDICT: APPROVED or REVISE. Do NOT edit files."
+        ));
+        assert!(is_review_worker_name("adversarial-check"));
+        assert!(review_escalation_chain("HIGH").contains(NEON_XHIGH_MODEL));
+        assert!(!review_escalation_chain("XHIGH").contains(NEON_XHIGH_MODEL));
+
+        let high_sum = receipt_requirements_summary("HIGH", None, true);
+        assert!(high_sum.contains(NEON_XHIGH_MODEL));
+        assert!(high_sum.contains(CARBON_HIGH_MODEL));
+
+        let xhigh_sum = receipt_requirements_summary("XHIGH", None, true);
+        assert!(xhigh_sum.contains(NEON_XHIGH_MODEL));
+        assert!(xhigh_sum.contains(&format!(
+            "`{}` -> {}",
+            CODEX_ASTRA_MODEL,
+            review_escalation_chain("XHIGH")
+        )));
+
+        let neon_meta = json!({"role": "worker", "model": NEON_XHIGH_MODEL, "killed": false});
+        assert!(is_simplify_or_review_swarm_worker_with_brief(
+            "neon-audit",
+            Some(&neon_meta),
+            "Reply VERDICT: APPROVED"
+        ));
+        assert!(!is_simplify_or_review_swarm_worker_with_brief(
+            "neon-builder",
+            Some(&neon_meta),
+            "Do not emit VERDICT:"
+        ));
+
+        let scoped_multi = extract_worker_scoped_brief(
+            "@neon-audit Return VERDICT: APPROVED\n@test-author Report test results",
+            "neon-audit",
+            &["neon-audit", "test-author"],
+        );
+        assert_eq!(scoped_multi, "Return VERDICT: APPROVED");
+        assert_eq!(
+            extract_worker_scoped_brief(
+                "@neon-audit Return VERDICT: APPROVED\n@test-author Report test results",
+                "test-author",
+                &["neon-audit", "test-author"],
+            ),
+            "Report test results"
+        );
+        assert_eq!(
+            extract_worker_scoped_brief(
+                "@neon-audit Reply @coordinator VERDICT: APPROVED; @test-author Report to @coordinator.",
+                "test-author",
+                &["neon-audit", "test-author"],
+            ),
+            "Report to @coordinator."
+        );
+        assert_eq!(
+            extract_worker_scoped_brief(
+                "@simp-a, @simp-b Simplify Round 2. SIMPLIFY_VERDICT: CLEAN.",
+                "simp-b",
+                &["simp-a", "simp-b"],
+            ),
+            "Simplify Round 2. SIMPLIFY_VERDICT: CLEAN."
+        );
+        assert_eq!(
+            extract_worker_scoped_brief(
+                "Повтори ревью и верни VERDICT: APPROVED или REVISE, @neon-audit",
+                "neon-audit",
+                &["neon-audit", "test-author"],
+            ),
+            "Повтори ревью и верни VERDICT: APPROVED или REVISE,"
+        );
+        assert_eq!(
+            extract_worker_scoped_brief(
+                "Повтори ревью и верни VERDICT: APPROVED или REVISE, @neon-audit.",
+                "neon-audit",
+                &["neon-audit", "test-author"],
+            ),
+            "Повтори ревью и верни VERDICT: APPROVED или REVISE,"
+        );
+        assert_eq!(
+            extract_worker_scoped_brief(
+                "Проверь дифф и верни VERDICT: APPROVED, @neon-audit. Добавь тесты, @test-author.",
+                "neon-audit",
+                &["neon-audit", "test-author"],
+            ),
+            "Проверь дифф и верни VERDICT: APPROVED,"
+        );
+        assert_eq!(
+            extract_worker_scoped_brief(
+                "Проверь дифф и верни VERDICT: APPROVED, @neon-audit. Добавь тесты, @test-author.",
+                "test-author",
+                &["neon-audit", "test-author"],
+            ),
+            "Добавь тесты,"
+        );
+        assert_eq!(
+            extract_worker_scoped_brief(
+                "Проверь дифф и верни VERDICT: APPROVED, @neon-audit. @test-author добавь тесты.",
+                "neon-audit",
+                &["neon-audit", "test-author"],
+            ),
+            "Проверь дифф и верни VERDICT: APPROVED,"
+        );
+        assert_eq!(
+            extract_worker_scoped_brief(
+                "Проверь дифф и верни VERDICT: APPROVED, @neon-audit. @test-author добавь тесты.",
+                "test-author",
+                &["neon-audit", "test-author"],
+            ),
+            "добавь тесты."
+        );
+        assert_eq!(
+            extract_worker_scoped_brief(
+                "Повтори ревью и верни VERDICT: APPROVED, @all",
+                "neon-audit",
+                &["neon-audit", "test-author"],
+            ),
+            "Повтори ревью и верни VERDICT: APPROVED,"
+        );
+        assert_eq!(
+            extract_worker_scoped_brief(
+                "@neon-audit Return VERDICT: APPROVED\n@test-author",
+                "test-author",
+                &["neon-audit", "test-author"],
+            ),
+            ""
+        );
+        // Mixed 2 trailing mentions + 1 leading mention must keep each clause isolated and never leak preamble VERDICT.
+        let mixed_three = "Return VERDICT: APPROVED, @neon-audit. Add tests, @test-author. @ui-builder Check layout.";
+        let three_workers = ["neon-audit", "test-author", "ui-builder"];
+        assert_eq!(
+            extract_worker_scoped_brief(mixed_three, "neon-audit", &three_workers),
+            "Return VERDICT: APPROVED,"
+        );
+        assert_eq!(
+            extract_worker_scoped_brief(mixed_three, "test-author", &three_workers),
+            "Add tests,"
+        );
+        assert_eq!(
+            extract_worker_scoped_brief(mixed_three, "ui-builder", &three_workers),
+            "Check layout."
+        );
+        // Reverse mixed: leading mention followed by trailing mentions with filename dots.
+        let mixed_rev = "@ui-builder Edit src/ui.rs. Review src/gate.rs and emit VERDICT: APPROVED, @neon-audit. Add tests, @test-author.";
+        assert_eq!(
+            extract_worker_scoped_brief(mixed_rev, "ui-builder", &three_workers),
+            "Edit src/ui.rs."
+        );
+        assert_eq!(
+            extract_worker_scoped_brief(mixed_rev, "neon-audit", &three_workers),
+            "Review src/gate.rs and emit VERDICT: APPROVED,"
+        );
+        assert_eq!(
+            extract_worker_scoped_brief(mixed_rev, "test-author", &three_workers),
+            "Add tests,"
+        );
+        // Standalone mention on its own line after a preamble header must remain leading and keep its following body.
+        let header_own_line = "Batch for this round:\n@neon-audit\nReturn VERDICT: APPROVED.\n@test-author Add tests.";
+        assert_eq!(
+            extract_worker_scoped_brief(header_own_line, "neon-audit", &three_workers),
+            "Batch for this round:\nReturn VERDICT: APPROVED."
+        );
+        assert_eq!(
+            extract_worker_scoped_brief(header_own_line, "test-author", &three_workers),
+            "Batch for this round:\nAdd tests."
+        );
+        // Trailing mention after `!` followed only by `.` must keep the preceding clause isolated and not leak VERDICT to the next leading mention.
+        let excl_trailing = "Review the diff and return VERDICT: APPROVED or REVISE! @neon-audit. @test-author Add tests.";
+        assert_eq!(
+            extract_worker_scoped_brief(excl_trailing, "neon-audit", &three_workers),
+            "Review the diff and return VERDICT: APPROVED or REVISE!"
+        );
+        assert_eq!(
+            extract_worker_scoped_brief(excl_trailing, "test-author", &three_workers),
+            "Add tests."
+        );
+        // Leading mention followed by `!`-terminated trailing mention must split on the earlier clause break instead of dropping the trailing brief.
+        let lead_excl_trail = "@ui-builder Edit src/ui.rs. Review src/gate.rs and return VERDICT: APPROVED! @neon-audit. @test-author Add tests.";
+        assert_eq!(
+            extract_worker_scoped_brief(lead_excl_trail, "ui-builder", &three_workers),
+            "Edit src/ui.rs."
+        );
+        assert_eq!(
+            extract_worker_scoped_brief(lead_excl_trail, "neon-audit", &three_workers),
+            "Review src/gate.rs and return VERDICT: APPROVED!"
+        );
+        assert_eq!(
+            extract_worker_scoped_brief(lead_excl_trail, "test-author", &three_workers),
+            "Add tests."
+        );
+        // Standalone trailing-position mention after a multi-sentence leading brief (newline, newline+dot, or same-line bare ping) must NOT steal the previous worker's final sentence.
+        for tail_ping in [
+            "@neon-audit Read the diff. Return VERDICT: APPROVED.\n@test-author",
+            "@neon-audit Read the diff. Return VERDICT: APPROVED.\n@test-author.",
+            "@neon-audit Read the diff. Return VERDICT: APPROVED. @test-author",
+        ] {
+            assert_eq!(
+                extract_worker_scoped_brief(tail_ping, "neon-audit", &three_workers),
+                "Read the diff. Return VERDICT: APPROVED."
+            );
+            assert_eq!(
+                extract_worker_scoped_brief(tail_ping, "test-author", &three_workers),
+                ""
+            );
+        }
+        // Single `!`-terminated trailing mention at EOF (no preceding leading worker, no trailing dot) still owns its clause.
+        assert_eq!(
+            extract_worker_scoped_brief(
+                "Review the diff and return VERDICT: APPROVED! @neon-audit",
+                "neon-audit",
+                &three_workers,
+            ),
+            "Review the diff and return VERDICT: APPROVED!"
+        );
+        // Inline colon before trailing mention (`VERDICT: @neon-audit.` or `\n@test-author`) must keep the trailing clause isolated without leaking VERDICT to the preceding leading worker.
+        for colon_trailing in [
+            "@ui-builder Edit src/ui.rs. Review the diff and prefix the result with VERDICT: @neon-audit. @test-author Add tests.",
+            "@ui-builder Edit src/ui.rs. Review the diff and prefix the result with VERDICT: @neon-audit\n@test-author Add tests.",
+        ] {
+            assert_eq!(
+                extract_worker_scoped_brief(colon_trailing, "ui-builder", &three_workers),
+                "Edit src/ui.rs."
+            );
+            assert_eq!(
+                extract_worker_scoped_brief(colon_trailing, "neon-audit", &three_workers),
+                "Review the diff and prefix the result with VERDICT:"
+            );
+            assert_eq!(
+                extract_worker_scoped_brief(colon_trailing, "test-author", &three_workers),
+                "Add tests."
+            );
+        }
+        // Rust macro bangs (`!(`, `!=`) inside a clause must NOT split clauses.
+        let macro_bang = "@ui-builder Fix assert_eq!(a, b) in src/ui.rs.\n@test-author Add tests.";
+        assert_eq!(
+            extract_worker_scoped_brief(macro_bang, "ui-builder", &three_workers),
+            "Fix assert_eq!(a, b) in src/ui.rs."
+        );
+        assert_eq!(
+            extract_worker_scoped_brief(macro_bang, "test-author", &three_workers),
+            "Add tests."
+        );
+        // Stacked line-leading mentions still share their body, while trailing mention + newline + next leading mention stays isolated.
+        let stacked = "@neon-audit\n@test-author\nCheck diff.";
+        assert_eq!(
+            extract_worker_scoped_brief(stacked, "neon-audit", &three_workers),
+            "Check diff."
+        );
+        assert_eq!(
+            extract_worker_scoped_brief(stacked, "test-author", &three_workers),
+            "Check diff."
+        );
+        let excl_nl = "Review the diff and return VERDICT: APPROVED! @neon-audit\n@test-author Add tests.";
+        assert_eq!(
+            extract_worker_scoped_brief(excl_nl, "neon-audit", &three_workers),
+            "Review the diff and return VERDICT: APPROVED!"
+        );
+        assert_eq!(
+            extract_worker_scoped_brief(excl_nl, "test-author", &three_workers),
+            "Add tests."
+        );
+        // Fractional Unix timestamps (decimal and scientific notation, including sub-TS_EPS fractions) must be exact.
+        assert!(!iso_ts_is_coarse("1760000000.300"));
+        assert!(!iso_ts_is_coarse("1760000000.000"));
+        assert!(!iso_ts_is_coarse("1.7600000000000005e9"));
+        assert!(!iso_ts_is_coarse("17600000003e-1"));
+        assert!(iso_ts_is_coarse("1760000000"));
+        assert!(iso_ts_is_coarse("1760000000."));
+        assert!(iso_ts_is_coarse("1.76e9"));
+        assert!(iso_ts_is_coarse("1.760000000e9"));
+        assert!(!iso_ts_is_coarse("2026-11-19T10:00:06.300Z"));
+        assert!(iso_ts_is_coarse("2026-11-19T10:00:06Z"));
+        assert_eq!(
+            compute_effective_reset_board_seq(
+                [
+                    (6, rio::parse_iso_ts("1760000000"), iso_ts_is_coarse("1760000000")),
+                    (
+                        7,
+                        rio::parse_iso_ts("1.7600000000000005e9"),
+                        iso_ts_is_coarse("1.7600000000000005e9"),
+                    ),
+                ],
+                5,
+                1760000000.500,
+            ),
+            7
+        );
+
+        let root = std::env::temp_dir().join(format!("cwg-common-neon-audit-{}", std::process::id()));
+        let sess = "sess-neon-audit";
+        let sdir = rio::swarm_dir(&root, sess);
+        std::fs::create_dir_all(&sdir).unwrap();
+        std::fs::write(
+            sdir.join("members.json"),
+            json!({
+                "members": {
+                    "neon-audit": {"role": "worker", "model": NEON_XHIGH_MODEL, "killed": false},
+                    "neon-trailing": {"role": "worker", "model": NEON_XHIGH_MODEL, "killed": false},
+                    "test-author": {"role": "worker", "model": NEON_XHIGH_MODEL, "killed": false},
+                    "neon-builder": {"role": "worker", "model": NEON_XHIGH_MODEL, "killed": false},
+                    "neon-killed": {"role": "worker", "model": NEON_XHIGH_MODEL, "killed": true, "brief": "Reply VERDICT: REVISE"}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            sdir.join("board.jsonl"),
+            [
+                json!({"seq": 1, "agent": "coordinator", "text": "@neon-audit Return VERDICT: APPROVED\n@test-author Report test results"}),
+                json!({"seq": 2, "agent": "coordinator", "text": "@neon-builder Implement UI. Do not emit VERDICT:"}),
+                json!({"seq": 3, "agent": "coordinator", "text": "Повтори ревью и верни VERDICT: APPROVED или REVISE, @neon-trailing"}),
+            ]
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        assert_eq!(
+            active_simplify_or_review_workers(&root, sess),
+            vec!["neon-audit".to_string(), "neon-trailing".to_string()]
+        );
+
+        // Post-research-reset worker reusing roster name `neon-audit` as a builder must NOT inherit
+        // pre-reset reviewer board briefs/verdicts, while an unkilled pre-reset reviewer IS still caught.
+        let rr_ts = rio::parse_iso_ts("2026-11-19T20:25:30Z");
+        let rr_marker = json!({
+            "closed": false,
+            "research_resets": [{
+                "reset_ts": rr_ts,
+                "board_head_seq": 5,
+                "pre_reset_worker_cids": ["cid-pre-rev"]
+            }]
+        });
+        let sess_rr = "sess-neon-audit-rr";
+        let sdir_rr = rio::swarm_dir(&root, sess_rr);
+        std::fs::create_dir_all(&sdir_rr).unwrap();
+        let rr_members_val = json!({
+            "neon-audit": {
+                "role": "worker",
+                "conversation_id": "cid-post-builder",
+                "model": NEON_XHIGH_MODEL,
+                "created_at": "2026-11-19T20:25:45Z",
+                "killed": false
+            },
+            "stale-pre-rev": {
+                "role": "worker",
+                "conversation_id": "cid-pre-rev",
+                "model": NEON_XHIGH_MODEL,
+                "killed": false
+            }
+        });
+        std::fs::write(
+            sdir_rr.join("board.jsonl"),
+            [
+                json!({"seq": 1, "agent": "coordinator", "time": "2026-11-19T20:25:00Z", "text": "@neon-audit Return VERDICT: APPROVED\n@stale-pre-rev Return VERDICT: APPROVED"}),
+                json!({"seq": 2, "agent": "neon-audit", "time": "2026-11-19T20:25:10Z", "text": "VERDICT: APPROVED"}),
+                json!({"seq": 6, "agent": "coordinator", "time": "2026-11-19T20:25:50Z", "text": "@neon-audit Implement parser module"}),
+            ]
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        assert_eq!(
+            active_simplify_or_review_workers_with_members_and_marker(
+                &root,
+                sess_rr,
+                rr_members_val.as_object().unwrap(),
+                Some(&rr_marker),
+            ),
+            vec!["stale-pre-rev".to_string()]
+        );
+
+        // Coarse pre-reset row seq=6 (`20:25:30Z`) tightened by later exact pre-reset row seq=7 (`20:25:30.300Z <= 20:25:30.500Z`)
+        // must be excluded as part of the pre-reset causal prefix so post-reset builder `neon-audit` is NOT flagged.
+        let rr_half_ts = rio::parse_iso_ts("2026-11-19T20:25:30.500Z");
+        let rr_half_marker = json!({
+            "closed": false,
+            "research_resets": [{
+                "reset_ts": rr_half_ts,
+                "board_head_seq": 5,
+                "pre_reset_worker_cids": ["cid-pre-rev"]
+            }]
+        });
+        let sess_rr_prefix = "sess-neon-audit-rr-prefix";
+        let sdir_rr_p = rio::swarm_dir(&root, sess_rr_prefix);
+        std::fs::create_dir_all(&sdir_rr_p).unwrap();
+        let rr_prefix_members = json!({
+            "neon-audit": {
+                "role": "worker",
+                "conversation_id": "cid-post-builder-prefix",
+                "model": NEON_XHIGH_MODEL,
+                "created_at": "2026-11-19T20:25:30.600Z",
+                "killed": false
+            }
+        });
+        std::fs::write(
+            sdir_rr_p.join("board.jsonl"),
+            [
+                json!({"seq": 6, "agent": "coordinator", "time": "2026-11-19T20:25:30Z", "text": "@neon-audit Return VERDICT: APPROVED"}),
+                json!({"seq": 7, "agent": "coordinator", "time": "2026-11-19T20:25:30.300Z", "text": "@other-worker sync"}),
+                json!({"seq": 8, "agent": "coordinator", "time": "2026-11-19T20:25:30Z", "text": "@neon-audit Implement parser module"}),
+            ]
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        assert!(
+            active_simplify_or_review_workers_with_members_and_marker(
+                &root,
+                sess_rr_prefix,
+                rr_prefix_members.as_object().unwrap(),
+                Some(&rr_half_marker),
+            )
+            .is_empty()
+        );
+
+        // Split two-message review revoker helper coverage (prose, closure, split JSON, and non-crossing guard).
+        assert_eq!(
+            extract_split_review_revoker("VERDICT:", "REVISE"),
+            (Some("ordinary".to_string()), Some("REVISE".to_string()))
+        );
+        assert_eq!(
+            extract_split_review_revoker("CLOSURE_VALIDATION:", "BLOCKED"),
+            (Some("closure".to_string()), Some("BLOCKED".to_string()))
+        );
+        assert_eq!(
+            extract_split_review_revoker("CLOSURE_VALIDATION: READY\nVERDICT:", "REVISE"),
+            (Some("ordinary".to_string()), Some("REVISE".to_string()))
+        );
+        assert_eq!(
+            extract_split_review_revoker("{\"verdict\":", "\"REVISE\"}"),
+            (Some("ordinary".to_string()), Some("REVISE".to_string()))
+        );
+        assert_eq!(
+            extract_split_review_revoker("VERDICT: REVISE", "Please revise the comment"),
+            (None, None)
+        );
+        assert_eq!(
+            extract_split_review_revoker("VERDICT: APPROVED", "REVISE"),
+            (None, None)
+        );
+        // Markdown code-fence example in `tail` must NOT shadow a real crossing revoker.
+        assert_eq!(
+            extract_split_review_revoker("VERDICT:", "REVISE\n\n```\nVERDICT: APPROVED\n```"),
+            (Some("ordinary".to_string()), Some("REVISE".to_string()))
+        );
+        assert_eq!(
+            extract_split_review_revoker(
+                "CLOSURE_VALIDATION:",
+                "BLOCKED\n\n```md\nCLOSURE_VALIDATION: READY\n```",
+            ),
+            (Some("closure".to_string()), Some("BLOCKED".to_string()))
+        );
+        assert_eq!(
+            extract_split_review_revoker("VERDICT: REVISE\n```\nVERDICT:", "REVISE\n```"),
+            (None, None)
+        );
+        // Excluded Markdown/JSON block between a `VERDICT:` / `CLOSURE_VALIDATION:` header in `head`
+        // and explanatory `REVISE` / `BLOCKED` prose in `tail` must keep a barrier and NEVER synthesize
+        // a false revocation (both across two messages and inside a single message).
+        assert_eq!(
+            extract_split_review_revoker(
+                "VERDICT: APPROVED\n\nVERDICT:\n```\nAPPROVED\n```",
+                "REVISE is the enum value for changes requested.",
+            ),
+            (None, None)
+        );
+        assert_eq!(
+            extract_split_review_revoker(
+                "CLOSURE_VALIDATION: READY\n\nCLOSURE_VALIDATION:\n```\nREADY\n```",
+                "BLOCKED is used when checks fail.",
+            ),
+            (None, None)
+        );
+        assert_eq!(
+            extract_review_decision(
+                "VERDICT: APPROVED\n\nVERDICT:\n```\nAPPROVED\n```\nREVISE is the enum value for changes requested.",
+            ),
+            (Some("ordinary".to_string()), Some("APPROVED".to_string()))
+        );
+        // Non-split revokers wholly contained in `tail` must NOT trigger `extract_split_review_revoker`,
+        // while split JSON revokers whose keyword sits in `head` and closing `}` / ``` sits in `tail` MUST trigger.
+        assert_eq!(extract_split_review_revoker("Note\n", "VERDICT: REVISE"), (None, None));
+        assert_eq!(
+            extract_split_review_revoker("Note.", "```json\n{\"verdict\": \"REVISE\"}\n```"),
+            (None, None)
+        );
+        assert_eq!(
+            extract_split_review_revoker(
+                "{\"verdict\": \"REVISE\", \"findings\": [\"bug 1\",",
+                "\"bug 2\"]}",
+            ),
+            (Some("ordinary".to_string()), Some("REVISE".to_string()))
+        );
+        assert_eq!(
+            extract_split_review_revoker("```json\n{\"verdict\": \"REVISE\"}", "```"),
+            (Some("ordinary".to_string()), Some("REVISE".to_string()))
+        );
+        assert_eq!(
+            extract_split_review_revoker(
+                "{\"findings\":[\"A blocking issue\"],",
+                "\"verdict\":\"REVISE\"}",
+            ),
+            (Some("ordinary".to_string()), Some("REVISE".to_string()))
+        );
+        assert_eq!(
+            extract_split_review_revoker(
+                "```json\n{\"findings\":[\"Missing check\"],",
+                "\"closure_validation\":\"BLOCKED\"}\n```",
+            ),
+            (Some("closure".to_string()), Some("BLOCKED".to_string()))
+        );
+        // Semicolon after a trailing mention must NOT merge the next leading mention, while
+        // leading semicolon mention lists (`@a; @b Check diff.`) still share their body.
+        let semi_trail = "Return VERDICT: APPROVED, @neon-audit; @test-author Add tests.";
+        assert_eq!(
+            extract_worker_scoped_brief(semi_trail, "neon-audit", &three_workers),
+            "Return VERDICT: APPROVED,"
+        );
+        assert_eq!(
+            extract_worker_scoped_brief(semi_trail, "test-author", &three_workers),
+            "Add tests."
+        );
+        let semi_lead = "@neon-audit; @test-author Check diff.";
+        assert_eq!(
+            extract_worker_scoped_brief(semi_lead, "neon-audit", &three_workers),
+            "Check diff."
+        );
+        assert_eq!(
+            extract_worker_scoped_brief(semi_lead, "test-author", &three_workers),
+            "Check diff."
+        );
+        // Bare trailing `. @test-author` ping on a continuation line must keep both sentences with `neon-audit`.
+        let cont_line_ping = "@neon-audit Read the diff.\nReturn VERDICT: APPROVED. @test-author";
+        assert_eq!(
+            extract_worker_scoped_brief(cont_line_ping, "neon-audit", &three_workers),
+            "Read the diff.\nReturn VERDICT: APPROVED."
+        );
+        assert_eq!(
+            extract_worker_scoped_brief(cont_line_ping, "test-author", &three_workers),
+            ""
+        );
+
+        // Fresh-line trailing mention before newline after another leading worker (single & multi-sentence line).
+        let fresh_line_trail = "@ui-builder Edit UI.\nReview the diff and return VERDICT: APPROVED! @neon-audit\n@test-author Add tests.";
+        assert_eq!(
+            extract_worker_scoped_brief(fresh_line_trail, "ui-builder", &three_workers),
+            "Edit UI."
+        );
+        assert_eq!(
+            extract_worker_scoped_brief(fresh_line_trail, "neon-audit", &three_workers),
+            "Review the diff and return VERDICT: APPROVED!"
+        );
+        assert_eq!(
+            extract_worker_scoped_brief(fresh_line_trail, "test-author", &three_workers),
+            "Add tests."
+        );
+        let fresh_line_multi = "@ui-builder Edit UI.\nReturn VERDICT: APPROVED. Check edge cases! @neon-audit\n@test-author Add tests.";
+        assert_eq!(
+            extract_worker_scoped_brief(fresh_line_multi, "ui-builder", &three_workers),
+            "Edit UI."
+        );
+        assert_eq!(
+            extract_worker_scoped_brief(fresh_line_multi, "neon-audit", &three_workers),
+            "Return VERDICT: APPROVED. Check edge cases!"
+        );
+        assert_eq!(
+            extract_worker_scoped_brief(fresh_line_multi, "test-author", &three_workers),
+            "Add tests."
+        );
+
+        // Long board (> SWARM_BOARD_TAIL_LIMIT=400 rows): live Neon reviewer whose brief/verdict
+        // scrolled past the 400-row tail MUST still be caught, while a post-reset builder reusing
+        // the name stays unflagged.
+        let sess_long = "sess-neon-audit-long-board";
+        let sdir_long = rio::swarm_dir(&root, sess_long);
+        std::fs::create_dir_all(&sdir_long).unwrap();
+        let mut long_rows: Vec<String> = Vec::with_capacity(450);
+        for seq in 1..=450i64 {
+            let row = if seq == 10 {
+                json!({"seq": seq, "agent": "coordinator", "time": "2026-11-19T20:00:10Z", "text": "@neon-audit Return VERDICT: APPROVED"})
+            } else if seq == 11 {
+                json!({"seq": seq, "agent": "neon-audit", "time": "2026-11-19T20:00:11Z", "text": "VERDICT: APPROVED"})
+            } else {
+                json!({"seq": seq, "agent": "coordinator", "time": "2026-11-19T20:30:00Z", "text": "@other-worker ping"})
+            };
+            long_rows.push(row.to_string());
+        }
+        std::fs::write(sdir_long.join("board.jsonl"), long_rows.join("\n") + "\n").unwrap();
+        let long_live_members = json!({
+            "neon-audit": {
+                "role": "worker",
+                "model": NEON_XHIGH_MODEL,
+                "killed": false
+            }
+        });
+        assert_eq!(
+            active_simplify_or_review_workers_with_members_and_marker(
+                &root,
+                sess_long,
+                long_live_members.as_object().unwrap(),
+                None,
+            ),
+            vec!["neon-audit".to_string()]
+        );
+        let long_rr_marker = json!({
+            "closed": false,
+            "research_resets": [{
+                "reset_ts": rio::parse_iso_ts("2026-11-19T20:20:00Z"),
+                "board_head_seq": 20,
+                "pre_reset_worker_cids": ["cid-old-long"]
+            }]
+        });
+        let long_post_builder = json!({
+            "neon-audit": {
+                "role": "worker",
+                "conversation_id": "cid-new-long-builder",
+                "model": NEON_XHIGH_MODEL,
+                "created_at": "2026-11-19T20:25:00Z",
+                "killed": false
+            }
+        });
+        assert!(
+            active_simplify_or_review_workers_with_members_and_marker(
+                &root,
+                sess_long,
+                long_post_builder.as_object().unwrap(),
+                Some(&long_rr_marker),
+            )
+            .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

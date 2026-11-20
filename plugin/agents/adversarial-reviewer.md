@@ -1,6 +1,6 @@
 ---
 name: adversarial-reviewer
-description: Read-only Gemini Carbon High escalation reviewer used ONLY when both the primary Codex lane and internal Claude Opus 5.5 High (`claude-opus-5-5-high`) swarm reviewer have a verified outage, error, or exhausted quota.
+description: "Read-only Gemini escalation reviewer for HIGH-risk changes (preferring gemini-4-neon-xhigh via swarm before gemini-4-carbon-high), used ONLY when both the primary Codex lane and internal Claude Opus 5.5 High (claude-opus-5-5-high) swarm reviewer have a verified outage, error, or exhausted quota."
 subagent: true
 mainAgent: false
 tools: [read_file, run_command, manage_task]

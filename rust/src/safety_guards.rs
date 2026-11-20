@@ -19,12 +19,6 @@ use crate::cwg_mark::{
 };
 use crate::rio::{self, json_truthy, resolve_command_cwd, val_to_i64, val_to_str};
 
-const SIMPLIFY_ALLOWED_MODELS: &[&str] = &[
-    cwg_common::SONNET_HIGH_MODEL,
-    cwg_common::HYDROGEN_XHIGH_MODEL,
-];
-const SIMPLIFY_FALLBACK_MODELS: &[&str] = &[cwg_common::HYDROGEN_XHIGH_MODEL];
-
 const COPY_VERBS: &[&str] = &["copy-item", "cpi", "copy", "cp"];
 const MOVE_VERBS: &[&str] = &["move-item", "mi", "move", "mv", "rename-item", "rni", "ren"];
 const DELETE_OR_WRITE_VERBS: &[&str] = &[
@@ -591,14 +585,13 @@ fn is_adversarial_review_swarm_target(name: &str, model: &str, brief: &str) -> b
         return false;
     }
     let low_model = model.trim().to_lowercase();
-    if low_model != cwg_common::OPUS_HIGH_MODEL && low_model != cwg_common::CARBON_HIGH_MODEL {
+    if low_model != cwg_common::OPUS_HIGH_MODEL
+        && low_model != cwg_common::CARBON_HIGH_MODEL
+        && low_model != cwg_common::NEON_XHIGH_MODEL
+    {
         return false;
     }
-    let low_name = name.trim().to_lowercase();
-    let low_brief = brief.to_lowercase();
-    low_name.contains("review")
-        || low_brief.contains("verdict:")
-        || low_brief.contains("closure_validation:")
+    cwg_common::is_review_worker_hint(name, brief)
 }
 
 fn pending_codex_timeout_escalation_deny(
@@ -666,7 +659,7 @@ pub fn guard_swarm_invocation_with_payload(
     let brief_str = val_to_str(args.get("brief"));
     if is_simplify_swarm_target(&name_str, &brief_str) {
         let low_model = model.to_lowercase();
-        if model.is_empty() || !SIMPLIFY_ALLOWED_MODELS.contains(&low_model.as_str()) {
+        if model.is_empty() || !cwg_common::is_simplify_allowed_model(&low_model) {
             // SAFETY: Never allow simplify workers to default to or target Carbon, preserving main-agent quota.
             let model_disp = if model.is_empty() {
                 "inherit (Carbon)"
@@ -803,14 +796,14 @@ pub fn guard_subagent_invocation_with_payload(
 
     let simplify_fallback_ok = worker_model
         .as_deref()
-        .map_or(false, |wm| SIMPLIFY_FALLBACK_MODELS.contains(&wm))
+        .map_or(false, |wm| cwg_common::SIMPLIFY_FALLBACK_MODELS.contains(&wm))
         && (req_model.is_empty() || req_model == "inherit");
     if is_simplify_sub && !simplify_fallback_ok {
-        // SAFETY: Direct `invoke_subagent` from a Carbon session inherits Carbon and burns primary quota; enforce swarm Hydrogen fallback.
+        // SAFETY: Direct `invoke_subagent` from the main session inherits its primary model and burns quota; enforce swarm Neon/Hydrogen fallback.
         return (
             "deny".to_string(),
             Some(format!(
-                "[Simplify Model Policy] Прямой вызов субагента `{}` из не-Hydrogen сессии наследует `{}` и сжигает квоту основной модели. Запускайте simplify через `swarm(action='add', ..., model='{}')`, а при исчерпании квоты/сбое Sonnet — через `swarm(action='add', ..., model='{}')`.",
+                "[Simplify Model Policy] Прямой вызов субагента `{}` из основной сессии наследует `{}` и сжигает квоту основной модели. Запускайте simplify через `swarm(action='add', ..., model='{}')`, а при исчерпании квоты/сбое Sonnet — через `swarm(action='add', ..., model='{}')`.",
                 base_sub_type,
                 cwg_common::CARBON_HIGH_MODEL,
                 cwg_common::SONNET_HIGH_MODEL,
@@ -1940,7 +1933,9 @@ pub fn guard_post_message(
         return ("allow".to_string(), None);
     }
     let mentions_all = rio::text_contains_mention(&text, "all");
+    let known_workers = rio::swarm_worker_names(&members);
     let mut targeted: Vec<String> = Vec::new();
+    let mut active_set: Option<std::collections::HashSet<String>> = None;
     for (mname, minfo) in &members {
         if !minfo.is_object()
             || rio::is_swarm_role_member(mname, Some(minfo))
@@ -1948,10 +1943,28 @@ pub fn guard_post_message(
         {
             continue;
         }
-        if !cwg_common::is_simplify_or_review_swarm_worker(mname, Some(minfo)) {
+        if !(mentions_all || rio::text_mentions_swarm_worker(&text, mname)) {
             continue;
         }
-        if mentions_all || rio::text_mentions_swarm_worker(&text, mname) {
+        let scoped_text = cwg_common::extract_worker_scoped_brief(&text, mname, &known_workers);
+        let is_target =
+            cwg_common::is_simplify_or_review_swarm_worker_with_brief(
+                mname,
+                Some(minfo),
+                &scoped_text,
+            )
+                || active_set
+                    .get_or_insert_with(|| {
+                        cwg_common::active_simplify_or_review_workers_with_members(
+                            &brain_root,
+                            &session,
+                            &members,
+                        )
+                        .into_iter()
+                        .collect()
+                    })
+                    .contains(mname);
+        if is_target {
             targeted.push(mname.clone());
         }
     }
@@ -2207,6 +2220,42 @@ mod tests {
         }));
         assert_eq!(dec_simp_xhigh, "allow");
 
+        let (dec_simp_neon, _) = guard_swarm_invocation(&json!({
+            "action": "add",
+            "name": "simplify-efficiency",
+            "model": "gemini-4-neon-xhigh",
+        }));
+        assert_eq!(dec_simp_neon, "allow");
+
+        let (dec_simp_empty, reason_simp_empty) = guard_swarm_invocation(&json!({
+            "action": "add",
+            "name": "simplify-reviewer",
+            "model": "",
+        }));
+        assert_eq!(dec_simp_empty, "deny");
+        assert!(reason_simp_empty.unwrap().contains("Simplify Model Policy"));
+
+        assert!(is_adversarial_review_swarm_target(
+            "internal-reviewer",
+            cwg_common::NEON_XHIGH_MODEL,
+            "Read-only review; end with VERDICT: APPROVED or VERDICT: REVISE."
+        ));
+        assert!(is_adversarial_review_swarm_target(
+            "neon-audit",
+            cwg_common::NEON_XHIGH_MODEL,
+            "Audit auth. Return VERDICT: APPROVED or REVISE. Do NOT edit files."
+        ));
+        assert!(!is_adversarial_review_swarm_target(
+            "root-cause-debugger",
+            cwg_common::NEON_XHIGH_MODEL,
+            "Debug flaky shutdown race in test_04."
+        ));
+        assert!(!is_adversarial_review_swarm_target(
+            "root-cause-debugger",
+            cwg_common::NEON_XHIGH_MODEL,
+            "Investigate race. NEVER post VERDICT:/CLOSURE_VALIDATION:."
+        ));
+
         let (dec_sub_flash, _) = guard_subagent_invocation(&json!({
             "TypeName": "research",
             "Model": "gemini-3-flash",
@@ -2352,6 +2401,196 @@ mod tests {
         assert!(reason_wait.unwrap().contains("Swarm Wait Guard"));
 
         let _ = fs::remove_file(&cpath);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_multi_recipient_post_message_preserves_non_review_worker() {
+        let _guard = crate::win32_sqlite::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct HomeGuard(Option<std::ffi::OsString>);
+        impl Drop for HomeGuard {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => unsafe { env::set_var("CARBON_STACK_HOME", v) },
+                    None => unsafe { env::remove_var("CARBON_STACK_HOME") },
+                }
+            }
+        }
+        let _home_guard = HomeGuard(env::var_os("CARBON_STACK_HOME"));
+
+        let root = env::temp_dir().join(format!("carbon-swg-multi-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let carbon_home = root.join("carbon-home");
+        unsafe { env::set_var("CARBON_STACK_HOME", &carbon_home) };
+
+        let sid = format!("test-swg-multi-{}", std::process::id());
+        let brain_root = root.join("brain");
+        let tp = brain_root
+            .join(&sid)
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl");
+        let swarm_path = brain_root
+            .join(&sid)
+            .join(".system_generated")
+            .join("swarm");
+        fs::create_dir_all(tp.parent().unwrap()).unwrap();
+        fs::create_dir_all(&swarm_path).unwrap();
+        fs::write(
+            &tp,
+            "{\"step_index\":0,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"created_at\":\"2026-11-19T10:00:00Z\",\"content\":\"Run\"}\n",
+        )
+        .unwrap();
+
+        fs::write(
+            swarm_path.join("members.json"),
+            json!({
+                "members": {
+                    "test-author": {
+                        "role": "worker",
+                        "model": cwg_common::NEON_XHIGH_MODEL,
+                        "killed": false,
+                        "created_at": "2026-11-19T10:00:05Z"
+                    },
+                    "ui-builder": {
+                        "role": "worker",
+                        "model": cwg_common::NEON_XHIGH_MODEL,
+                        "killed": false,
+                        "created_at": "2026-11-19T10:00:05Z"
+                    },
+                    "neon-audit": {
+                        "role": "worker",
+                        "model": cwg_common::NEON_XHIGH_MODEL,
+                        "killed": false,
+                        "created_at": "2026-11-19T10:00:25Z"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            swarm_path.join("board.jsonl"),
+            [
+                json!({"seq": 1, "agent": "coordinator", "time": "2026-11-19T10:00:06Z", "text": "@test-author Report test results"}),
+                json!({"seq": 6, "agent": "coordinator", "time": "2026-11-19T10:00:26Z", "text": "@neon-audit Return VERDICT: APPROVED"}),
+            ]
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        let rr_ts = rio::parse_iso_ts("2026-11-19T10:00:20Z");
+        rio::write_json(
+            &cwg_common::marker_path(&sid),
+            &json!({
+                "session": sid,
+                "first_ts": rio::parse_iso_ts("2026-11-19T10:00:00Z"),
+                "closed": false,
+                "research_resets": [{"reset_ts": rr_ts, "board_head_seq": 5, "decision": "refine", "findings": "docs", "research_tools": ["search_web"]}]
+            }),
+        )
+        .unwrap();
+
+        let multi_allow = json!({
+            "conversationId": sid,
+            "transcriptPath": tp.to_string_lossy(),
+            "toolCall": {
+                "name": "post_message",
+                "args": {"text": "@neon-audit Return VERDICT: APPROVED\n@test-author Report test results"}
+            }
+        });
+        assert_eq!(evaluate_pre_tool_use(&multi_allow).0, "allow");
+
+        let pre_reset_review_deny = json!({
+            "conversationId": sid,
+            "transcriptPath": tp.to_string_lossy(),
+            "toolCall": {
+                "name": "post_message",
+                "args": {"text": "@test-author Return VERDICT: APPROVED"}
+            }
+        });
+        let (dec_deny, reason_deny, _) = evaluate_pre_tool_use(&pre_reset_review_deny);
+        assert_eq!(dec_deny, "deny");
+        assert!(reason_deny.unwrap().contains("Gate Fresh Session Policy"));
+
+        let trailing_review_deny = json!({
+            "conversationId": sid,
+            "transcriptPath": tp.to_string_lossy(),
+            "toolCall": {
+                "name": "post_message",
+                "args": {"text": "Повтори ревью и верни VERDICT: APPROVED или REVISE, @test-author"}
+            }
+        });
+        let (dec_trail, reason_trail, _) = evaluate_pre_tool_use(&trailing_review_deny);
+        assert_eq!(dec_trail, "deny");
+        assert!(reason_trail.unwrap().contains("Gate Fresh Session Policy"));
+
+        let trailing_multi_allow = json!({
+            "conversationId": sid,
+            "transcriptPath": tp.to_string_lossy(),
+            "toolCall": {
+                "name": "post_message",
+                "args": {"text": "Повтори ревью и верни VERDICT: APPROVED или REVISE, @neon-audit. Добавь тесты, @test-author."}
+            }
+        });
+        assert_eq!(evaluate_pre_tool_use(&trailing_multi_allow).0, "allow");
+
+        let mixed_trailing_leading_allow = json!({
+            "conversationId": sid,
+            "transcriptPath": tp.to_string_lossy(),
+            "toolCall": {
+                "name": "post_message",
+                "args": {"text": "Return VERDICT: APPROVED, @neon-audit. Add tests, @test-author. @ui-builder Check layout."}
+            }
+        });
+        assert_eq!(evaluate_pre_tool_use(&mixed_trailing_leading_allow).0, "allow");
+
+        let excl_trailing_allow = json!({
+            "conversationId": sid,
+            "transcriptPath": tp.to_string_lossy(),
+            "toolCall": {
+                "name": "post_message",
+                "args": {"text": "Review the diff and return VERDICT: APPROVED or REVISE! @neon-audit. @test-author Add tests."}
+            }
+        });
+        assert_eq!(evaluate_pre_tool_use(&excl_trailing_allow).0, "allow");
+
+        let lead_excl_trail_allow = json!({
+            "conversationId": sid,
+            "transcriptPath": tp.to_string_lossy(),
+            "toolCall": {
+                "name": "post_message",
+                "args": {"text": "@ui-builder Edit src/ui.rs. Review src/gate.rs and return VERDICT: APPROVED! @neon-audit. @test-author Add tests."}
+            }
+        });
+        assert_eq!(evaluate_pre_tool_use(&lead_excl_trail_allow).0, "allow");
+
+        for tail_ping in [
+            "@neon-audit Read the diff. Return VERDICT: APPROVED.\n@test-author",
+            "@neon-audit Read the diff. Return VERDICT: APPROVED. @test-author",
+            "@neon-audit Read the diff.\nReturn VERDICT: APPROVED. @test-author",
+            "@ui-builder Edit src/ui.rs. Review the diff and prefix the result with VERDICT: @neon-audit. @test-author Add tests.",
+            "@ui-builder Edit src/ui.rs. Review the diff and prefix the result with VERDICT: @neon-audit\n@test-author Add tests.",
+            "@ui-builder Edit UI.\nReview the diff and return VERDICT: APPROVED! @neon-audit\n@test-author Add tests.",
+            "@ui-builder Edit UI.\nReturn VERDICT: APPROVED. Check edge cases! @neon-audit\n@test-author Add tests.",
+        ] {
+            let tail_ping_allow = json!({
+                "conversationId": sid,
+                "transcriptPath": tp.to_string_lossy(),
+                "toolCall": {
+                    "name": "post_message",
+                    "args": {"text": tail_ping}
+                }
+            });
+            assert_eq!(evaluate_pre_tool_use(&tail_ping_allow).0, "allow");
+        }
+
         let _ = fs::remove_dir_all(&root);
     }
 }

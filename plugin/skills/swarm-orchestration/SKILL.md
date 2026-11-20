@@ -18,11 +18,13 @@ description: Swarm 2.0 three-phase orchestration (Scout Swarm, Disjoint Builder 
 
 | Фаза / Роль | Модель / Контур | Назначение |
 | :--- | :--- | :--- |
-| **Координатор** | `Orchestrator (Argon)` | Декомпозиция, владение файлами, слияние, гейт |
-| **Фаза 1 — Scout Swarm** | `gemini-4-hydrogen-medium` / `-high` | Параллельное исследование 3+ подсистем или 5+ файлов |
-| **Фаза 2 — Disjoint Builders** | `gemini-4-hydrogen-high` | Реализация непересекающихся `owned_paths` или `worktree` |
-| **Фаза 3a — Primary Logic Review** | `carbon-stack codex-lane review` (fallback `claude-opus-5-5-high` -> `gemini-4-carbon-high`) | Проверка логики и багов ДО `simplify` |
-| **Фаза 3b — Simplify (`<= 2` ф. и `<= 30` ст.)** | 1 воркер `claude-sonnet-5-5-high` (`SIMPLIFY_LENS: ALL`) | Fast-Path (fallback `gemini-4-hydrogen-xhigh`) |
+| **Координатор** | `Orchestrator (Neon)` (`gemini-pro-orchestrator-neon`) | Декомпозиция, владение файлами, слияние, гейт |
+| **Фаза 1 — Scout Swarm (стандарт)** | `gemini-4-hydrogen-medium` / `-high` | Параллельное исследование 3+ подсистем или 5+ файлов |
+| **Фаза 1 — Architect / Debugger** | `gemini-4-neon-high` / `-xhigh` (`repo-architect-scout`, `root-cause-debugger`) | Межмодульные контракты/перфоманс, глубокая корневая отладка гонок, утечек и визуально-логовых багов |
+| **Фаза 2 — Simple Disjoint Builders** | `gemini-4-hydrogen-medium` / `-high` | Простые/механические `owned_paths`, массовые правки без сложной архитектуры |
+| **Фаза 2 — Complex / UI / Tests** | `gemini-4-neon-medium`..`-xhigh` (`frontend-ui-builder`, `test-author`, сложные модули) | Сложная логика в `owned_paths`/`worktree`, UI-to-Code по макетам/скриншотам, юнит-/регрессионные тесты |
+| **Фаза 3a — Primary Logic Review** | `carbon-stack codex-lane review` (fallback `claude-opus-5-5-high` -> `gemini-4-neon-xhigh` [`HIGH`] / `gemini-4-carbon-high` [`XHIGH`]) | Проверка логики и багов ДО `simplify` |
+| **Фаза 3b — Simplify (`<= 2` ф. и `<= 30` ст.)** | 1 воркер `claude-sonnet-5-5-high` (`SIMPLIFY_LENS: ALL`) | Fast-Path (primary fallback `gemini-4-neon-xhigh`, вторичный резерв `gemini-4-hydrogen-xhigh`) |
 | **Фаза 3b — Simplify (`> 2` ф. или `> 30` ст.)** | 3 линзы `claude-sonnet-5-5-high` (`REUSE`, `QUALITY`, `EFFICIENCY`) | Параллельная полировка один раз после `APPROVED` |
 | **Фаза 3c — Final Closure** | `carbon-stack codex-lane review --closure` | Финальное подтверждение `CLOSURE_VALIDATION: READY` |
 
