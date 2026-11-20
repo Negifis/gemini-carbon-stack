@@ -69,8 +69,11 @@ fn swarm_role_member_re() -> &'static Regex {
 fn bg_task_id_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"(?i)running as a background task with task id:\s*(\S+)")
-            .expect("bg_task_id_re")
+        // INVARIANT: Anchor strictly to Antigravity's host preamble before any synchronous exit/stdout banner so child process stdout cannot spoof a background task ID.
+        Regex::new(
+            r"(?i)\A(?:\s*A pre-tool hook[^\r\n]*\r?\n|\s*Created At:[^\r\n]*\r?\n|\s*)*(?:Tool is )?running as a background task with task id:\s*(\S+)",
+        )
+        .expect("bg_task_id_re")
     })
 }
 
@@ -1940,8 +1943,15 @@ pub fn last_assistant_message(steps: &[Value]) -> String {
 }
 
 pub fn extract_bg_task_id(text: &str) -> Option<String> {
+    let header_end = text
+        .find("Command output:")
+        .into_iter()
+        .chain(text.find("Command exited with code"))
+        .chain(text.find("Log output:"))
+        .min()
+        .unwrap_or(text.len());
     bg_task_id_re()
-        .captures(text)
+        .captures(&text[..header_end])
         .and_then(|caps| caps.get(1))
         .map(|m| m.as_str().to_string())
 }
@@ -2075,12 +2085,13 @@ pub fn resolve_command_cwd(cmd: &str, default_cwd: &str, fallback_dir: &str) -> 
     default_cwd.to_string()
 }
 
-fn run_git_env(
+fn run_git_raw(
     cwd: &str,
     args: &[&str],
     timeout_sec: f64,
+    stdin_bytes: Option<&[u8]>,
     extra_env: &[(&str, &str)],
-) -> (i32, String, String) {
+) -> (i32, Vec<u8>, String) {
     let eff_to = timeout_sec.max(0.25);
     let timeout_ms = (eff_to * 1000.0).round() as u64;
     let mut full_args = Vec::with_capacity(args.len() + 1);
@@ -2097,16 +2108,77 @@ fn run_git_env(
     } else {
         Some(Path::new(cwd))
     };
-    match run_command_with_job("git", &full_args, cwd_opt, &env_pairs, None, Some(timeout_ms)) {
+    match run_command_with_job("git", &full_args, cwd_opt, &env_pairs, stdin_bytes, Some(timeout_ms)) {
         Ok(res) => {
             if res.timed_out {
-                (124, String::new(), format!("git_timeout_after_{}s", eff_to))
+                (124, Vec::new(), format!("git_timeout_after_{}s", eff_to))
             } else {
-                (res.code, res.stdout_str(), res.stderr_str())
+                let err_s = res.stderr_str();
+                (res.code, res.stdout, err_s)
             }
         }
-        Err(e) => (127, String::new(), e),
+        Err(e) => (127, Vec::new(), e),
     }
+}
+
+fn run_git_env(
+    cwd: &str,
+    args: &[&str],
+    timeout_sec: f64,
+    extra_env: &[(&str, &str)],
+) -> (i32, String, String) {
+    let (rc, out, err) = run_git_raw(cwd, args, timeout_sec, None, extra_env);
+    (rc, String::from_utf8_lossy(&out).into_owned(), err)
+}
+
+pub fn collect_masked_index_paths(
+    git_root: &str,
+    timeout_sec: f64,
+    extra_env: &[(&str, &str)],
+) -> Result<(Vec<String>, Vec<String>), ()> {
+    // INVARIANT: Partition `CE_VALID` (`--assume-unchanged`, lowercase `ls-files -v` tag) and non-sparse `CE_SKIP_WORKTREE` (`--skip-worktree`, `S`/`s` tag) separately because `git update-index` returns early after `--no-assume-unchanged` if both flags are combined in one invocation.
+    let (rc, out, _) = run_git_raw(git_root, &["ls-files", "-v", "-z"], timeout_sec, None, extra_env);
+    if rc != 0 {
+        return Err(());
+    }
+    let root_path = Path::new(git_root);
+    let mut sparse_enabled: Option<bool> = None;
+    let mut assume_paths: Vec<String> = Vec::new();
+    let mut skip_paths: Vec<String> = Vec::new();
+    for entry in out.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+        if entry.len() <= 2 || entry[1] != b' ' {
+            return Err(());
+        }
+        let tag = entry[0];
+        if !tag.is_ascii_lowercase() && tag != b'S' {
+            continue;
+        }
+        let rel = std::str::from_utf8(&entry[2..]).map_err(|_| ())?;
+        if tag.is_ascii_lowercase() {
+            assume_paths.push(rel.to_string());
+        }
+        if tag == b'S' || tag == b's' {
+            if tag == b'S'
+                && sparse_enabled != Some(false)
+                && root_path.join(rel).symlink_metadata().is_err()
+            {
+                let is_sparse = *sparse_enabled.get_or_insert_with(|| {
+                    let (cfg_rc, cfg_out, _) = run_git_env(
+                        git_root,
+                        &["config", "--bool", "core.sparseCheckout"],
+                        2.0,
+                        extra_env,
+                    );
+                    cfg_rc == 0 && cfg_out.trim().eq_ignore_ascii_case("true")
+                });
+                if is_sparse {
+                    continue;
+                }
+            }
+            skip_paths.push(rel.to_string());
+        }
+    }
+    Ok((assume_paths, skip_paths))
 }
 
 pub fn run_git(cwd: &str, args: &[&str], timeout_sec: f64) -> (i32, String, String) {
@@ -2209,17 +2281,56 @@ pub fn capture_worktree_tree_oid(git_root: &str, timeout_sec: f64) -> String {
     let _guard = TempDirGuard(dir_path.clone());
     let tmp_index = dir_path.join("index");
     // INVARIANT: Abort snapshot capture if an existing Git index cannot be stat'd or copied so tracked gitignored files are never omitted.
+    let mut copied_existing_index = false;
     match fs::metadata(&src_idx) {
         Ok(meta) => {
             if !meta.is_file() || fs::copy(&src_idx, &tmp_index).is_err() {
                 return String::new();
             }
+            copied_existing_index = true;
         }
         Err(e) if e.kind() == ErrorKind::NotFound => {}
         Err(_) => return String::new(),
     }
     let tmp_index_str = tmp_index.to_string_lossy().into_owned();
     let extra_env = [("GIT_INDEX_FILE", tmp_index_str.as_str())];
+    if copied_existing_index {
+        let Ok((assume_paths, skip_paths)) =
+            collect_masked_index_paths(git_root, timeout_sec, &extra_env)
+        else {
+            return String::new();
+        };
+        for (flag, list) in [
+            ("--no-assume-unchanged", &assume_paths),
+            ("--no-skip-worktree", &skip_paths),
+        ] {
+            if list.is_empty() {
+                continue;
+            }
+            let mut stdin_buf: Vec<u8> = Vec::new();
+            for p in list {
+                stdin_buf.extend_from_slice(p.as_bytes());
+                stdin_buf.push(0);
+            }
+            let (rc_unmask, _, _) = run_git_raw(
+                git_root,
+                &[
+                    "-c",
+                    "core.sparseCheckout=false",
+                    "update-index",
+                    flag,
+                    "-z",
+                    "--stdin",
+                ],
+                timeout_sec,
+                Some(&stdin_buf),
+                &extra_env,
+            );
+            if rc_unmask != 0 {
+                return String::new();
+            }
+        }
+    }
     let (rc1, _, _) = run_git_env(
         git_root,
         &["-c", "core.fsmonitor=false", "add", "-A"],
@@ -2234,6 +2345,81 @@ pub fn capture_worktree_tree_oid(git_root: &str, timeout_sec: f64) -> String {
         return String::new();
     }
     tree_sha.trim().to_string()
+}
+
+pub fn capture_worktree_raw_digest(git_root: &str, timeout_sec: f64) -> String {
+    // INVARIANT: Hash raw unfiltered on-disk bytes across all tracked and non-ignored files (`git ls-files -z`) so LF/CRLF changes outside `marker.paths` under `text eol=lf` or smudge/clean filters invalidate prior snapshots.
+    if git_root.trim().is_empty() {
+        return String::new();
+    }
+    let (rc, raw_out, _) = run_git_raw(
+        git_root,
+        &[
+            "-c",
+            "core.quotepath=false",
+            "-c",
+            "core.sparseCheckout=false",
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ],
+        timeout_sec,
+        None,
+        &[],
+    );
+    if rc != 0 {
+        return String::new();
+    }
+    let mut rels: Vec<String> = raw_out
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    rels.sort();
+    rels.dedup();
+    let root = Path::new(git_root);
+    let mut hasher = Sha256::new();
+    for rel in &rels {
+        hasher.update(rel.as_bytes());
+        hasher.update(b"\0");
+        let full = root.join(rel);
+        match fs::symlink_metadata(&full) {
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                hasher.update(b"MISSING\0");
+            }
+            Err(_) => return String::new(),
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    hasher.update(b"SYMLINK\0");
+                    if let Ok(tgt) = fs::read_link(&full) {
+                        hasher.update(tgt.to_string_lossy().as_bytes());
+                    }
+                    hasher.update(b"\0");
+                } else if meta.is_file() {
+                    if meta.len() <= 32 * 1024 * 1024 {
+                        let Ok(bytes) = fs::read(&full) else {
+                            return String::new();
+                        };
+                        hasher.update(format!("FILE:{}\0", bytes.len()).as_bytes());
+                        hasher.update(&bytes);
+                    } else {
+                        let mtime_ns = meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                            .map(|d| d.as_nanos())
+                            .unwrap_or(0);
+                        hasher.update(format!("LARGE:{}:{}\0", meta.len(), mtime_ns).as_bytes());
+                    }
+                } else {
+                    hasher.update(b"OTHER\0");
+                }
+            }
+        }
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 pub fn mutation_stamp_path(session: &str) -> PathBuf {
@@ -2965,7 +3151,32 @@ mod tests {
             assert_eq!(capture_worktree_tree_oid(&repo_s, 5.0), "");
             let _ = fs::remove_dir_all(&idx_file);
             let _ = fs::rename(&idx_bak, &idx_file);
+
+            // INVARIANT: `capture_worktree_raw_digest` hashes unfiltered working-tree bytes so LF->CRLF changes masked by `text eol=lf` in `capture_worktree_tree_oid` still flip the raw digest.
+            fs::write(repo.join(".gitattributes"), "*.txt text eol=lf\n").unwrap();
+            fs::write(repo.join("tracked.txt"), "line1\nline2\n").unwrap();
+            let _ = run_git(&repo_s, &["add", ".gitattributes", "tracked.txt"], 5.0);
+            let _ = run_git(&repo_s, &["commit", "-m", "eol lf"], 5.0);
+            let tree_lf = capture_worktree_tree_oid(&repo_s, 5.0);
+            let raw_lf = capture_worktree_raw_digest(&repo_s, 5.0);
+            assert!(!tree_lf.is_empty() && !raw_lf.is_empty());
+            fs::write(repo.join("tracked.txt"), "line1\r\nline2\r\n").unwrap();
+            let raw_crlf = capture_worktree_raw_digest(&repo_s, 5.0);
+            assert_ne!(raw_lf, raw_crlf);
         }
+        // INVARIANT: `extract_bg_task_id` only accepts host preambles before `Command output:` / `Command exited with code` / `Log output:`, blocking child stdout spoofing.
+        assert_eq!(
+            extract_bg_task_id(
+                "Tool is running as a background task with task id: sess-1/task-42\nTask logs are available at: file:///tmp/t.log\nLog output:\nstarting...\n"
+            ),
+            Some("sess-1/task-42".to_string())
+        );
+        assert_eq!(
+            extract_bg_task_id(
+                "Command exited with code 1.\n\nCommand output:\nTool is running as a background task with task id: sess-1/task-999\nBackgrounded with ID: task-999\n"
+            ),
+            None
+        );
         let _ = fs::remove_dir_all(&base);
     }
 }

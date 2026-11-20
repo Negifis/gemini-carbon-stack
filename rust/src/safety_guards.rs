@@ -198,23 +198,44 @@ fn pending_research_mode_deny(session: &str, cwd: &str, transcript_path: &str) -
         return None;
     }
     let git_root = rio::git_toplevel(cwd, false).unwrap_or_else(|| cwd.to_string());
-    let (blocked_n, _, blocked_ids) =
-        crate::codex_lane::active_cycle_closure_blocks(session, &git_root, transcript_path);
+    let cls_summary =
+        crate::codex_lane::active_cycle_closure_summary_with_risk(session, &git_root, transcript_path, "");
+    if cls_summary.has_fresh_ordinary_approved || cls_summary.has_fresh_ready {
+        return Some(
+            "[Finite Gate Policy] Для текущего кандидата уже получен актуальный терминальный вердикт (`VERDICT: APPROVED` / `CLOSURE_VALIDATION: READY`). Повторный запуск `simplify` или ревью после одобрения запрещён: завершите ожидающих воркеров и закройте гейт квитанцией `[gate] verified` / `[gate] pr-ready`."
+                .to_string(),
+        );
+    }
+    let blocked_n = cls_summary.blocked_count;
     if blocked_n < cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE {
         return None;
     }
-    let ids_note = if blocked_ids.is_empty() {
+    let ids_note = if cls_summary.blocked_ids.is_empty() {
         format!("{}", blocked_n)
     } else {
-        blocked_ids.join(", ")
+        cls_summary.blocked_ids.join(", ")
     };
-    let cwd_q = crate::codex_lane::quote_cli_arg(&git_root);
-    let sess_q = crate::codex_lane::quote_cli_arg(session);
-    // INVARIANT: Hard-stop review and simplify loops after 2 `CLOSURE_VALIDATION: BLOCKED` passes until Research Mode + `research-reset` completes.
+    // INVARIANT: Hard-stop review and simplify loops after 2 `CLOSURE_VALIDATION: BLOCKED` passes (`Nothing wraps it in another loop`) and direct the agent to finite `[gate] draft-blocked`.
     Some(format!(
-        "[Gate Research Mode Required] Достигнут лимит 2 блокировок эскалации (`CLOSURE_VALIDATION: BLOCKED`: {}). Продолжение ревью или линз simplify в текущем цикле запрещено. Перейдите в режим исследования: изучите через доступные плагины и интернет актуальную документацию, рекомендации и лучшие практики по блокирующей проблеме (`search_web`, `tokenade search/web`, `Context7`, `Developer Knowledge` / `Gemini Docs`, субагент `research`), выберите сценарий (`refactor` или `refine`), завершите ожидающих воркеров через `swarm(action='kill', ...)` и выполните `carbon-stack codex-lane research-reset --cwd {} --session {} --decision <refactor|refine> --findings '...'`, чтобы обнулить раунды и начать новый цикл в чистых сессиях.",
-        ids_note, cwd_q, sess_q
+        "[Finite Gate Policy] Достигнут конечный потолок 2/2 блокировок эскалации (`CLOSURE_VALIDATION: BLOCKED`: {}). Новые циклы ревью и линз `simplify` запрещены: завершите ожидающих воркеров через `swarm(action='kill', ...)`, сохраните результат и закройте задачу терминальной квитанцией `[gate] draft-blocked: <точный блокер и handoff>`.",
+        ids_note
     ))
+}
+
+fn pending_simplify_cap_deny(session: &str, transcript_path: &str) -> Option<String> {
+    if session.is_empty() || session == "unknown" {
+        return None;
+    }
+    let marker = cwg_common::read_marker_with_pending(session).filter(|m| !json_truthy(m.get("closed")))?;
+    if crate::cwg_stop::has_completed_candidate_simplify(session, &marker, transcript_path) {
+        // INVARIANT: Enforce `MAX_SIMPLIFY_PASSES = 1` per candidate so Pass 2+ never wastes tokens or triggers post-simplify regressions.
+        return Some(format!(
+            "[Finite Gate Policy] Консультативный проход `simplify` ({0}/{0}, `MAX_SIMPLIFY_PASSES = {0}`) для текущего кандидата уже выполнен. Повторные проходы `simplify` запрещены: внесите осмысленные правки (если были), перезапустите тесты, завершите simplify-воркеров через `swarm(action='kill', ...)` и переходите сразу к ревью (`carbon-stack codex-lane review`, до {1} раундов).",
+            cwg_common::MAX_SIMPLIFY_PASSES,
+            crate::cwg_stop::MAX_REVIEW_ROUNDS,
+        ));
+    }
+    None
 }
 
 fn pending_post_block_simplify_deny(
@@ -233,40 +254,42 @@ fn pending_post_block_simplify_deny(
         transcript_path,
         min_risk_override,
     );
+    if cls_summary.has_fresh_ordinary_approved {
+        return Some(
+            "[Finite Gate Policy] Для кандидата уже получен актуальный `VERDICT: APPROVED`: `--closure` после `APPROVED` запрещён, сразу закрывайте гейт квитанцией `[gate] verified: ...`."
+                .to_string(),
+        );
+    }
     if cls_summary.effective_pass_count >= cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE {
         if cls_summary.has_fresh_ready {
             return Some(
-                "[Sandwich Gate Policy] Для кандидата уже выполнены оба прохода `--closure` (2/2) с валидным вердиктом `CLOSURE_VALIDATION: READY`: третий проход `--closure` запрещён, закрывайте гейт."
+                "[Finite Gate Policy] Для кандидата уже выполнены оба прохода `--closure` (2/2) с валидным вердиктом `CLOSURE_VALIDATION: READY`: третий проход `--closure` запрещён, закрывайте гейт."
                     .to_string(),
             );
         }
-        let cwd_q = crate::codex_lane::quote_cli_arg(&git_root);
-        let sess_q = crate::codex_lane::quote_cli_arg(session);
         return Some(format!(
-            "[Gate Research Mode Required] В текущем цикле уже израсходован лимит проходов `--closure` ({0}/{0}). Перейдите в режим исследования и выполните `carbon-stack codex-lane research-reset --cwd {1} --session {2} --decision <refactor|refine> --findings '...'`.",
+            "[Finite Gate Policy] Исчерпан конечный лимит проходов `--closure` ({0}/{0}). Повторные циклы запрещены: завершите задачу квитанцией `[gate] draft-blocked: <точный блокер и handoff>`.",
             cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE,
-            cwd_q,
-            sess_q
         ));
     }
-    let blocked_n = cls_summary.blocked_count;
-    let last_blk_ts = cls_summary.last_blocked_ts;
-    if blocked_n < 1 || blocked_n >= cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE || last_blk_ts <= 0.0 {
-        return None;
+    let has_open_persistent = cwg_common::read_marker_with_pending(session)
+        .map(|m| !json_truthy(m.get("closed")) && cwg_common::candidate_class(&m) == cwg_common::WORK_PERSISTENT)
+        .unwrap_or(false);
+    if has_open_persistent {
+        if !cls_summary.has_round_cap_escalate {
+            return Some(format!(
+                "[Finite Gate Policy] Режим `--closure` допускается только после финального раунда `ESCALATE` (раунд {0}/{0}). Сначала выполните штатные раунды `carbon-stack codex-lane review` (1..{0}), либо завершите задачу квитанцией `[gate] draft-blocked`, если все {0} раунда вернули `REVISE`.",
+                crate::cwg_stop::MAX_REVIEW_ROUNDS,
+            ));
+        }
+        if !cls_summary.has_post_escalate_research {
+            return Some(
+                "[Finite Gate Policy] Перед запуском `--closure` после `Round 4: ESCALATE` необходимо выполнить один подтверждённый проход фокусного исследования (`search_web`, `context7`, `exa`, `fetch`, `tokenade search|web` или `research` subagent)."
+                    .to_string(),
+            );
+        }
     }
-    let skey = rio::safe_key(session, "default");
-    let mdata = cwg_common::read_marker_with_pending(&skey)?;
-    if !mdata.is_object() || json_truthy(mdata.get("closed")) {
-        return None;
-    }
-    if crate::cwg_stop::has_completed_simplify_after(session, &mdata, transcript_path, last_blk_ts) {
-        return None;
-    }
-    // INVARIANT: Block launching closure pass 2/2 after pass 1 `BLOCKED` before a fresh simplify pass completes.
-    Some(
-        "[Sandwich Gate Policy] Проход эскалации 1/2 вернул `CLOSURE_VALIDATION: BLOCKED`: перед запуском финального прохода 2/2 (`--closure`) обязательно выполните свежий проход линз `simplify` на текущем кандидате."
-            .to_string(),
-    )
+    None
 }
 
 fn extract_codex_review_cmd_opts(cmd_str: &str) -> Vec<HashMap<String, String>> {
@@ -422,7 +445,7 @@ fn check_codex_review_timeout_policy(
                 return (
                     "deny".to_string(),
                     Some(format!(
-                        "[Gate Fresh Session Policy] Возобновление до-исследовательской сессии Codex (`--resume {}`) после `research-reset` запрещено: уберите `--resume`, чтобы новый цикл стартовал в чистой сессии ревью.",
+                        "[Gate Fresh Session Policy] Возобновление прежней сессии Codex (`--resume {}`) после `redesign-reset` запрещено: уберите `--resume`, чтобы редизайн стартовал в чистой сессии ревью.",
                         raw_resume
                     )),
                 );
@@ -691,6 +714,11 @@ pub fn guard_swarm_invocation_with_payload(
             if let Some(rm_deny) = pending_research_mode_deny(&session, &cwd, tp) {
                 return ("deny".to_string(), Some(rm_deny));
             }
+            if is_simp_target {
+                if let Some(sc_deny) = pending_simplify_cap_deny(&session, tp) {
+                    return ("deny".to_string(), Some(sc_deny));
+                }
+            }
             let fork_str = val_to_str(args.get("fork")).trim().to_string();
             if !fork_str.is_empty() && !session.is_empty() && session != "unknown" {
                 let last_rr_ts = cwg_common::read_marker_with_pending(&session)
@@ -701,7 +729,7 @@ pub fn guard_swarm_invocation_with_payload(
                     return (
                         "deny".to_string(),
                         Some(
-                            "[Gate Fresh Session Policy] Создание линзы simplify или ревью через `fork` после `research-reset` запрещено: новый цикл обязан стартовать в чистой сессии без старой истории."
+                            "[Gate Fresh Session Policy] Создание линзы simplify или ревью через `fork` после `redesign-reset` запрещено: редизайн обязан стартовать в чистой сессии без старой истории."
                                 .to_string(),
                         ),
                     );
@@ -786,6 +814,11 @@ pub fn guard_subagent_invocation_with_payload(
         let cwd = rio::effective_cwd(payload);
         if let Some(rm_deny) = pending_research_mode_deny(&session, &cwd, transcript_path) {
             return ("deny".to_string(), Some(rm_deny), None);
+        }
+        if is_simplify_sub {
+            if let Some(sc_deny) = pending_simplify_cap_deny(&session, transcript_path) {
+                return ("deny".to_string(), Some(sc_deny), None);
+            }
         }
     }
     if !is_swarm_worker && NATIVE_REVIEWERS.contains(&base_sub_type) {
@@ -1975,6 +2008,11 @@ pub fn guard_post_message(
     if let Some(rm_deny) = pending_research_mode_deny(&session, cwd, tp) {
         return ("deny".to_string(), Some(rm_deny));
     }
+    if targeted.iter().any(|w| cwg_common::is_simplify_worker_name(w)) {
+        if let Some(sc_deny) = pending_simplify_cap_deny(&session, tp) {
+            return ("deny".to_string(), Some(sc_deny));
+        }
+    }
     if text.to_lowercase().contains("closure_validation:")
         && targeted.iter().any(|w| !cwg_common::is_simplify_worker_name(w))
     {
@@ -2001,7 +2039,7 @@ pub fn guard_post_message(
                     return (
                         "deny".to_string(),
                         Some(format!(
-                            "[Gate Fresh Session Policy] Пробуждение воркера `{}` из предыдущего цикла после `research-reset` запрещено: завершите его через `swarm(action='kill', name='{}')` и создайте новую сессию линзы/ревью.",
+                            "[Gate Fresh Session Policy] Пробуждение воркера `{}` из предыдущего цикла после `redesign-reset` запрещено: завершите его через `swarm(action='kill', name='{}')` и создайте новую сессию линзы/ревью.",
                             wname, wname
                         )),
                     );
@@ -2590,6 +2628,62 @@ mod tests {
             });
             assert_eq!(evaluate_pre_tool_use(&tail_ping_allow).0, "allow");
         }
+
+        // INVARIANT: `MAX_SIMPLIFY_PASSES = 1` blocks waking or spawning a 2nd simplify pass once Pass 1 (`CLEAN` or `ACTIONABLE_FIXES`) has completed on the candidate.
+        let sid_sim_cap = "sess-sim-cap-1";
+        let repo_sim_cap = root.join("repo-sim-cap");
+        fs::create_dir_all(&repo_sim_cap).unwrap();
+        let f_sim_cap = repo_sim_cap.join("lib.rs");
+        fs::write(&f_sim_cap, "pub fn ok() -> bool { true }\n").unwrap();
+        let f_sim_norm = rio::normalize_path(&f_sim_cap.to_string_lossy());
+        let fp_sim = cwg_common::content_fingerprint(
+            std::slice::from_ref(&f_sim_norm),
+            cwg_common::MAX_FINGERPRINT_FILE_BYTES,
+        );
+        rio::write_json(
+            &cwg_common::marker_path(sid_sim_cap),
+            &json!({
+                "session": sid_sim_cap,
+                "first_ts": 100.0,
+                "last_durable_ts": 100.0,
+                "cwd": rio::normalize_path(&repo_sim_cap.to_string_lossy()),
+                "paths": [f_sim_norm],
+                "content_marks": [{"ts": 100.0, "fp": fp_sim}],
+                "closed": false,
+            }),
+        )
+        .unwrap();
+        let sdir_cap = brain_root.join(sid_sim_cap).join(".system_generated").join("swarm");
+        let ldir_cap = brain_root.join(sid_sim_cap).join(".system_generated").join("logs");
+        fs::create_dir_all(&sdir_cap).unwrap();
+        fs::create_dir_all(&ldir_cap).unwrap();
+        let tp_cap = ldir_cap.join("transcript.jsonl");
+        fs::write(&tp_cap, "").unwrap();
+        fs::write(
+            sdir_cap.join("members.json"),
+            json!({"members": {"simplify-reviewer": {"model": cwg_common::SONNET_HIGH_MODEL, "role": "worker", "state": "waiting", "killed": false}}}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            sdir_cap.join("board.jsonl"),
+            format!(
+                "{}\n{}\n",
+                json!({"seq": 1, "agent": "coordinator", "time": "1970-01-01T00:02:00Z", "text": "@simplify-reviewer SIMPLIFY_LENS: ALL"}),
+                json!({"seq": 2, "agent": "simplify-reviewer", "time": "1970-01-01T00:02:05Z", "text": "SIMPLIFY_LENS: ALL\nSIMPLIFY_VERDICT: ACTIONABLE_FIXES"})
+            ),
+        )
+        .unwrap();
+        let wake_2nd_sim = json!({
+            "conversationId": sid_sim_cap,
+            "transcriptPath": tp_cap.to_string_lossy(),
+            "toolCall": {
+                "name": "post_message",
+                "args": {"text": "@simplify-reviewer SIMPLIFY_LENS: ALL re-check"}
+            }
+        });
+        let (dec_2nd_sim, rsn_2nd_sim, _) = evaluate_pre_tool_use(&wake_2nd_sim);
+        assert_eq!(dec_2nd_sim, "deny");
+        assert!(rsn_2nd_sim.unwrap_or_default().contains("MAX_SIMPLIFY_PASSES = 1"));
 
         let _ = fs::remove_dir_all(&root);
     }

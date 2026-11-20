@@ -84,18 +84,25 @@ pub fn default_antigravity_dir() -> PathBuf {
     rio::home_dir().join(".gemini").join("antigravity")
 }
 
-// INVARIANT: Self-contained RFC 3174 SHA-1 enables exact RFC 4122 UUIDv5 generation without extra crates.
-pub fn sha1_digest(data: &[u8]) -> [u8; 20] {
-    let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
-    let bit_len = (data.len() as u64).wrapping_mul(8);
-    let mut padded = Vec::with_capacity(data.len() + 72);
-    padded.extend_from_slice(data);
-    padded.push(0x80);
-    while (padded.len() % 64) != 56 {
-        padded.push(0x00);
+// INVARIANT: Self-contained streaming RFC 3174 SHA-1 enables exact RFC 4122 UUIDv5 and Git SHA-1 blob hashing with zero full-payload heap copies.
+pub struct Sha1Hasher {
+    state: [u32; 5],
+    buf: [u8; 64],
+    buf_len: usize,
+    total_bytes: u64,
+}
+
+impl Sha1Hasher {
+    pub fn new() -> Self {
+        Self {
+            state: [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0],
+            buf: [0u8; 64],
+            buf_len: 0,
+            total_bytes: 0,
+        }
     }
-    padded.extend_from_slice(&bit_len.to_be_bytes());
-    for chunk in padded.chunks_exact(64) {
+
+    fn compress_block(state: &mut [u32; 5], chunk: &[u8]) {
         let mut w = [0u32; 80];
         for (i, word) in chunk.chunks_exact(4).enumerate() {
             w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
@@ -103,7 +110,7 @@ pub fn sha1_digest(data: &[u8]) -> [u8; 20] {
         for i in 16..80 {
             w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
         }
-        let [mut a, mut b, mut c, mut d, mut e] = h;
+        let [mut a, mut b, mut c, mut d, mut e] = *state;
         for (i, &wi) in w.iter().enumerate() {
             let (f, k) = match i {
                 0..=19 => ((b & c) | ((!b) & d), 0x5A827999u32),
@@ -123,17 +130,62 @@ pub fn sha1_digest(data: &[u8]) -> [u8; 20] {
             b = a;
             a = temp;
         }
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
+        state[0] = state[0].wrapping_add(a);
+        state[1] = state[1].wrapping_add(b);
+        state[2] = state[2].wrapping_add(c);
+        state[3] = state[3].wrapping_add(d);
+        state[4] = state[4].wrapping_add(e);
     }
-    let mut out = [0u8; 20];
-    for (i, &word) in h.iter().enumerate() {
-        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+
+    pub fn update(&mut self, mut data: &[u8]) {
+        self.total_bytes = self.total_bytes.wrapping_add(data.len() as u64);
+        if self.buf_len > 0 {
+            let need = 64 - self.buf_len;
+            if data.len() < need {
+                self.buf[self.buf_len..self.buf_len + data.len()].copy_from_slice(data);
+                self.buf_len += data.len();
+                return;
+            }
+            self.buf[self.buf_len..64].copy_from_slice(&data[..need]);
+            Self::compress_block(&mut self.state, &self.buf);
+            self.buf_len = 0;
+            data = &data[need..];
+        }
+        let mut iter = data.chunks_exact(64);
+        for chunk in &mut iter {
+            Self::compress_block(&mut self.state, chunk);
+        }
+        let rem = iter.remainder();
+        if !rem.is_empty() {
+            self.buf[..rem.len()].copy_from_slice(rem);
+            self.buf_len = rem.len();
+        }
     }
-    out
+
+    pub fn finalize(mut self) -> [u8; 20] {
+        let bit_len = self.total_bytes.wrapping_mul(8);
+        self.buf[self.buf_len] = 0x80;
+        self.buf_len += 1;
+        if self.buf_len > 56 {
+            self.buf[self.buf_len..64].fill(0);
+            Self::compress_block(&mut self.state, &self.buf);
+            self.buf_len = 0;
+        }
+        self.buf[self.buf_len..56].fill(0);
+        self.buf[56..64].copy_from_slice(&bit_len.to_be_bytes());
+        Self::compress_block(&mut self.state, &self.buf);
+        let mut out = [0u8; 20];
+        for (i, &word) in self.state.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+}
+
+pub fn sha1_digest(data: &[u8]) -> [u8; 20] {
+    let mut hasher = Sha1Hasher::new();
+    hasher.update(data);
+    hasher.finalize()
 }
 
 pub fn deterministic_uuid_bytes(seed: &str) -> [u8; 16] {

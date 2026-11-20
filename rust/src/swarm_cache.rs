@@ -9,7 +9,6 @@ use crate::cwg_common;
 use crate::rio::{self, val_to_f64, val_to_i64, val_to_str};
 use crate::win32_sqlite::now_sec;
 
-pub const EMPTY_TREE_OID: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 pub const MAX_SWARM_WORKER_NAME_LEN: usize = 24;
 pub const MAX_ROUND_HISTORY: usize = 16;
 
@@ -460,7 +459,14 @@ fn git_diff_pair(
     new_oid: &str,
     paths: &[String],
 ) -> Result<String, String> {
-    let mut args: Vec<&str> = vec!["diff", old_oid, new_oid];
+    let mut args: Vec<&str> = vec![
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--full-index",
+        old_oid,
+        new_oid,
+    ];
     if !paths.is_empty() {
         args.push("--");
         for p in paths {
@@ -481,6 +487,67 @@ fn git_diff_pair(
     Ok(out)
 }
 
+fn has_uncovered_binary_diff(
+    git_root: &str,
+    old_oid: &str,
+    new_oid: &str,
+    paths: &[String],
+    diff_text: &str,
+) -> bool {
+    if !diff_text.contains("\nBinary files ") && !diff_text.starts_with("Binary files ") {
+        return false;
+    }
+    let mut args: Vec<&str> = vec![
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--numstat",
+        "-z",
+        old_oid,
+        new_oid,
+    ];
+    if !paths.is_empty() {
+        args.push("--");
+        for p in paths {
+            args.push(p.as_str());
+        }
+    }
+    let (rc, out, _) = rio::run_git(git_root, &args, 15.0);
+    if rc != 0 {
+        return true;
+    }
+    for rec in out.split('\0') {
+        if rec.is_empty() {
+            continue;
+        }
+        let mut parts = rec.splitn(3, '\t');
+        let (Some(added), Some(deleted), Some(rel)) = (parts.next(), parts.next(), parts.next())
+        else {
+            return true;
+        };
+        if added == "-" && deleted == "-" && !cwg_common::is_known_binary_artifact_rel(rel) {
+            return true;
+        }
+    }
+    false
+}
+
+fn format_crlf_notes(notes: &[(String, String)]) -> String {
+    if notes.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("# Working-tree CRLF files (normalized to LF in Git tree):\n");
+    for (rel, sha) in notes {
+        out.push_str("#   ");
+        out.push_str(rel);
+        out.push_str(" (raw_sha256=");
+        out.push_str(sha);
+        out.push_str(")\n");
+    }
+    out
+}
+
 fn write_scratch_text(path: &Path, content: &str) -> Result<String, String> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent).map_err(|e| format!("mkdir_failed:{}", e))?;
@@ -498,56 +565,142 @@ struct SyncDiffResult {
 struct RoundSyncInput<'a> {
     git_root: &'a str,
     head_oid: &'a str,
+    prev_head_oid: &'a str,
     cur_tree_oid: &'a str,
     prev_tree_oid: &'a str,
+    cur_crlf_summary: &'a str,
+    prev_crlf_summary: &'a str,
     rel_paths: &'a [String],
     scratch_dir: &'a Path,
     clean_label: &'a str,
     cur_round: i64,
     regen: bool,
+    enforce_text_coverage: bool,
+}
+
+fn format_head_diff_body(header: &str, full_diff: &str, cur_crlf_summary: &str) -> String {
+    let diff_body = if full_diff.is_empty() && cur_crlf_summary.is_empty() {
+        "# No diff against HEAD.\n"
+    } else {
+        full_diff
+    };
+    let mut body =
+        String::with_capacity(header.len() + diff_body.len() + cur_crlf_summary.len() + 2);
+    body.push_str(header);
+    body.push_str(diff_body);
+    if !cur_crlf_summary.is_empty() {
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str(cur_crlf_summary);
+    }
+    body
+}
+
+fn diff_snapshot_tag(
+    base_oid: &str,
+    cur_tree_oid: &str,
+    extra_meta: &str,
+    rel_paths: &[String],
+) -> String {
+    let mut material =
+        String::with_capacity(base_oid.len() + cur_tree_oid.len() + extra_meta.len() + 32);
+    material.push_str(base_oid);
+    material.push('\0');
+    material.push_str(cur_tree_oid);
+    material.push('\0');
+    material.push_str(extra_meta);
+    for p in rel_paths {
+        material.push('\0');
+        material.push_str(p);
+    }
+    rio::sha256_hex(material.as_bytes())
+        .chars()
+        .take(12)
+        .collect()
 }
 
 fn sync_round_diffs(input: RoundSyncInput<'_>) -> Result<SyncDiffResult, String> {
     let RoundSyncInput {
         git_root,
         head_oid,
+        prev_head_oid,
         cur_tree_oid,
         prev_tree_oid,
+        cur_crlf_summary,
+        prev_crlf_summary,
         rel_paths,
         scratch_dir,
         clean_label,
         cur_round,
         regen,
+        enforce_text_coverage,
     } = input;
-    let full_file = scratch_dir.join(format!("{}_r{}_full.diff", clean_label, cur_round));
+    let base_changed = cur_round >= 2 && (prev_head_oid.is_empty() || prev_head_oid != head_oid);
+    let full_tag = diff_snapshot_tag(head_oid, cur_tree_oid, cur_crlf_summary, rel_paths);
+    let full_file = scratch_dir.join(format!(
+        "{}_r{}_{}_full.diff",
+        clean_label, cur_round, full_tag
+    ));
     let need_full = regen || !full_file.is_file();
-    let full_diff = if need_full {
-        git_diff_pair(git_root, head_oid, cur_tree_oid, rel_paths)?
-    } else {
-        String::new()
-    };
 
-    let inc_file = if cur_round >= 2 && !prev_tree_oid.is_empty() {
-        Some(scratch_dir.join(format!("{}_r{}_incremental.diff", clean_label, cur_round)))
+    let inc_file = if cur_round >= 2 && (base_changed || !prev_tree_oid.is_empty()) {
+        let (inc_base, inc_meta) = if base_changed {
+            (
+                head_oid,
+                format!("BASE_SHIFT:{}\n{}", prev_head_oid, cur_crlf_summary),
+            )
+        } else {
+            (
+                prev_tree_oid,
+                format!("{}\n---\n{}", prev_crlf_summary, cur_crlf_summary),
+            )
+        };
+        let inc_tag = diff_snapshot_tag(inc_base, cur_tree_oid, &inc_meta, rel_paths);
+        Some(scratch_dir.join(format!(
+            "{}_r{}_{}_incremental.diff",
+            clean_label, cur_round, inc_tag
+        )))
     } else {
         None
     };
     let need_inc = inc_file
         .as_ref()
         .map_or(false, |f| regen || !f.is_file());
-    let mut inc_diff = if need_inc {
+    let need_head_diff = need_full || (need_inc && base_changed);
+    let full_diff = if need_head_diff {
+        git_diff_pair(git_root, head_oid, cur_tree_oid, rel_paths)?
+    } else {
+        String::new()
+    };
+    let inc_diff = if need_inc && !base_changed && prev_tree_oid != cur_tree_oid {
         git_diff_pair(git_root, prev_tree_oid, cur_tree_oid, rel_paths)?
     } else {
         String::new()
     };
 
+    if enforce_text_coverage {
+        if need_head_diff
+            && has_uncovered_binary_diff(git_root, head_oid, cur_tree_oid, rel_paths, &full_diff)
+        {
+            return Err("uncovered_binary_diff".to_string());
+        }
+        if need_inc
+            && !base_changed
+            && prev_tree_oid != cur_tree_oid
+            && has_uncovered_binary_diff(git_root, prev_tree_oid, cur_tree_oid, rel_paths, &inc_diff)
+        {
+            return Err("uncovered_binary_diff".to_string());
+        }
+    }
+
     let full_diff_path = if need_full {
-        let body = if full_diff.is_empty() {
-            "# No diff against HEAD.\n"
+        if !full_diff.is_empty() && cur_crlf_summary.is_empty() {
+            write_scratch_text(&full_file, &full_diff)?
         } else {
-            full_diff.as_str()
-        };
-        write_scratch_text(&full_file, body)?
+            let full_body = format_head_diff_body("", &full_diff, cur_crlf_summary);
+            write_scratch_text(&full_file, &full_body)?
+        }
     } else {
         rio::normalize_path(&full_file.to_string_lossy())
     };
@@ -560,7 +713,49 @@ fn sync_round_diffs(input: RoundSyncInput<'_>) -> Result<SyncDiffResult, String>
         });
     };
 
-    let inc_diff_path = if need_inc {
+    // INVARIANT: When `HEAD` shifts between rounds (`base_changed`), tree-to-tree comparison misses newly exposed `HEAD..tree` hunks; emit the full candidate diff against the new `HEAD` in `incremental_diff_path` as well.
+    if base_changed {
+        let (inc_diff_path, stat) = if need_inc {
+            let stat = summarize_diff_stat(&full_diff);
+            let prev_h_short: String = if prev_head_oid.is_empty() {
+                "unknown".to_string()
+            } else {
+                prev_head_oid.chars().take(12).collect()
+            };
+            let cur_h_short: String = head_oid.chars().take(12).collect();
+            let header = format!(
+                "# Base HEAD changed Round {} -> Round {} ({}..{}); full candidate diff against new HEAD\n",
+                cur_round - 1,
+                cur_round,
+                prev_h_short,
+                cur_h_short
+            );
+            let body = format_head_diff_body(&header, &full_diff, cur_crlf_summary);
+            (write_scratch_text(&inc_path, &body)?, stat)
+        } else {
+            let raw = fs::read(&inc_path).unwrap_or_default();
+            let cached = String::from_utf8_lossy(&raw);
+            (
+                rio::normalize_path(&inc_path.to_string_lossy()),
+                summarize_diff_stat(&cached),
+            )
+        };
+        let incremental_stat = if stat.is_empty() {
+            "HEAD base changed; no diff against new HEAD".to_string()
+        } else {
+            format!("HEAD base changed; full diff: {}", stat)
+        };
+        return Ok(SyncDiffResult {
+            full_diff_path,
+            incremental_diff_path: inc_diff_path,
+            incremental_stat,
+        });
+    }
+
+    let eol_changed = prev_crlf_summary != cur_crlf_summary;
+    let (inc_diff_path, raw_inc_empty, stat) = if need_inc {
+        let raw_inc_empty = inc_diff.is_empty();
+        let stat = summarize_diff_stat(&inc_diff);
         let prev_short: String = prev_tree_oid.chars().take(12).collect();
         let cur_short: String = cur_tree_oid.chars().take(12).collect();
         let header = format!(
@@ -570,22 +765,47 @@ fn sync_round_diffs(input: RoundSyncInput<'_>) -> Result<SyncDiffResult, String>
             prev_short,
             cur_short
         );
-        let tail = if inc_diff.is_empty() {
-            "# No textual changes since previous round.\n"
+        let mut body =
+            String::with_capacity(header.len() + inc_diff.len() + cur_crlf_summary.len() + 64);
+        body.push_str(&header);
+        if raw_inc_empty && !eol_changed {
+            body.push_str("# No textual changes since previous round.\n");
         } else {
-            inc_diff.as_str()
-        };
-        write_scratch_text(&inc_path, &format!("{}{}", header, tail))?
+            body.push_str(&inc_diff);
+        }
+        if eol_changed {
+            if !body.ends_with('\n') {
+                body.push('\n');
+            }
+            if cur_crlf_summary.is_empty() {
+                body.push_str("# Working-tree CRLF files normalized to LF since previous round.\n");
+            } else {
+                body.push_str(cur_crlf_summary);
+            }
+        }
+        (write_scratch_text(&inc_path, &body)?, raw_inc_empty, stat)
     } else {
         let raw = fs::read(&inc_path).unwrap_or_default();
-        inc_diff = String::from_utf8_lossy(&raw).into_owned();
-        rio::normalize_path(&inc_path.to_string_lossy())
+        let cached = String::from_utf8_lossy(&raw);
+        let stat = summarize_diff_stat(&cached);
+        let raw_inc_empty = !cached.contains("\ndiff --git ");
+        (
+            rio::normalize_path(&inc_path.to_string_lossy()),
+            raw_inc_empty,
+            stat,
+        )
+    };
+
+    let incremental_stat = if raw_inc_empty && eol_changed {
+        "working-tree CRLF metadata changed".to_string()
+    } else {
+        stat
     };
 
     Ok(SyncDiffResult {
         full_diff_path,
         incremental_diff_path: inc_diff_path,
-        incremental_stat: summarize_diff_stat(&inc_diff),
+        incremental_stat,
     })
 }
 
@@ -612,73 +832,586 @@ pub struct PrepareRoundInput<'a> {
     pub now_ts: Option<f64>,
 }
 
-pub fn prepare_round(input: PrepareRoundInput<'_>) -> Value {
-    let PrepareRoundInput {
-        session,
-        cwd,
-        brain_root,
-        label,
-        ttl_seconds,
-        paths,
-        reset,
-        now_ts,
-    } = input;
-    let now = now_ts.unwrap_or_else(now_sec);
-    let raw_label = if label.is_empty() { "simplify" } else { label };
-    let clean_label = rio::safe_key(raw_label, "simplify");
-
-    let eff_cwd = if cwd.trim().is_empty() { "." } else { cwd };
-    let Some(git_root) = rio::git_toplevel(eff_cwd, false) else {
-        return json!({
-            "ok": false,
-            "error": format!("not_in_git_repo:{}", cwd),
-        });
-    };
-
-    let raw_head = rio::git_head_oid(&git_root);
-    let head_oid = if raw_head.is_empty() {
-        EMPTY_TREE_OID.to_string()
-    } else {
-        raw_head
-    };
-    let cur_tree_oid = rio::capture_worktree_tree_oid(&git_root, 15.0);
-    if cur_tree_oid.is_empty() {
-        return json!({
-            "ok": false,
-            "error": "capture_worktree_tree_oid_failed",
-        });
+fn is_active_same_repo_marker(marker: &Value, folded_git_root: &str) -> bool {
+    cwg_common::is_active_marker(marker) && {
+        let m_gr = val_to_str(marker.get("git_root"));
+        !m_gr.is_empty() && rio::fold_path(&m_gr) == folded_git_root
     }
+}
 
-    let mut rel_paths: Vec<String> = Vec::new();
-    for raw_p in paths {
-        if raw_p.trim().is_empty() {
-            continue;
+fn stamp_rounds_marker_ts(state: &mut Map<String, Value>, marker_first_ts: f64) {
+    let eff_mts = if marker_first_ts != 0.0 {
+        marker_first_ts
+    } else {
+        val_to_f64(state.get("marker_first_ts"))
+    };
+    state.insert("marker_first_ts".to_string(), json!(eff_mts));
+}
+
+fn ensure_object_mut<'a>(
+    map: &'a mut Map<String, Value>,
+    key: &str,
+) -> &'a mut Map<String, Value> {
+    let slot = map
+        .entry(key.to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !slot.is_object() {
+        *slot = Value::Object(Map::new());
+    }
+    slot.as_object_mut().expect("object slot initialized")
+}
+
+// INVARIANT: Return `true` whenever capping `list` at 64 evicts an entry so bounded provenance windows fail closed by latching `snapshot_bound_required` for the remainder of the candidate cycle.
+fn push_capped_64(list: &mut Vec<String>, item: String) -> bool {
+    if item.is_empty() || list.iter().any(|s| s == &item) {
+        return false;
+    }
+    list.push(item);
+    if list.len() > 64 {
+        list.drain(1..list.len() - 63);
+        return true;
+    }
+    false
+}
+
+fn with_locked_marker<T, F>(skey: &str, mfile: &Path, f: F) -> Result<T, String>
+where
+    F: FnOnce(Option<Value>, Option<Value>, Vec<String>) -> Result<T, String>,
+{
+    rio::with_file_lock(&cwg_common::marker_lock_path(skey), 5.0, 30.0, |locked| {
+        if !locked {
+            return Err("marker_lock_timeout".to_string());
         }
-        let (rel_opt, inside) = cwg_common::resolve_repo_rel_info(raw_p, &git_root);
-        if inside {
-            if let Some(rel) = rel_opt {
-                rel_paths.push(rel);
-                continue;
+        let raw_m = rio::read_json(mfile);
+        if raw_m.is_none() && mfile.exists() {
+            return Err("marker_read_failed".to_string());
+        }
+        let (merged_opt, consumed_ids) =
+            cwg_common::apply_pending_marker_deltas(skey, raw_m.as_ref());
+        f(raw_m, merged_opt, consumed_ids)
+    })
+}
+
+fn marker_cycle_or_reset_mismatch(
+    cur_m: &Value,
+    expected_cycle_ts: f64,
+    expected_rr_ts: f64,
+) -> bool {
+    cwg_common::cycle_ts_mismatch(cwg_common::marker_cycle_first_ts(cur_m), expected_cycle_ts)
+        || (cwg_common::last_research_reset_ts(cur_m) - expected_rr_ts).abs() > cwg_common::TS_EPS
+}
+
+fn sync_marker_under_lock(
+    skey: &str,
+    mfile: &Path,
+    folded_git_root: &str,
+    now_ts: Option<f64>,
+) -> Result<(Option<Value>, bool), String> {
+    with_locked_marker(skey, mfile, |raw_m, merged_opt, consumed_ids| {
+        let Some(merged) = merged_opt else {
+            return Ok((None, false));
+        };
+        let mut caught = if is_active_same_repo_marker(&merged, folded_git_root)
+            && (merged.get("content_marks").is_some()
+                || val_to_str(merged.get("current_diff_hash")).is_empty())
+        {
+            let mark_now = now_ts.unwrap_or_else(now_sec);
+            crate::cwg_stop::catch_up_unmeasured_changes_at(&merged, Some(mark_now))
+        } else {
+            merged
+        };
+        let had_prior_cycle_prepare = cwg_common::marker_has_prepare_cycle(Some(&caught));
+        if cwg_common::is_active_marker(&caught) {
+            let cycle_ts = cwg_common::marker_cycle_first_ts(&caught);
+            let stamp_ts = if cycle_ts > 0.0 {
+                cycle_ts
+            } else {
+                now_ts.unwrap_or_else(now_sec).max(1.0)
+            };
+            if let Some(obj) = caught.as_object_mut() {
+                let prev_prep = val_to_f64(obj.get("swarm_prepare_cycle_ts"));
+                if prev_prep <= 0.0 || cwg_common::cycle_ts_mismatch(prev_prep, stamp_ts) {
+                    obj.insert("swarm_prepare_cycle_ts".to_string(), json!(stamp_ts));
+                    obj.insert(
+                        "swarm_prepare_repo_state".to_string(),
+                        Value::Object(Map::new()),
+                    );
+                }
             }
         }
-        rel_paths.push(raw_p.replace('\\', "/"));
+        if !consumed_ids.is_empty() || Some(&caught) != raw_m.as_ref() {
+            if let Err(err) = rio::write_json(mfile, &caught) {
+                return Err(format!("marker_persist_failed:{}", err));
+            }
+            if !consumed_ids.is_empty() {
+                cwg_common::ack_pending_marker_deltas(skey, &consumed_ids);
+            }
+        }
+        Ok((Some(caught), had_prior_cycle_prepare))
+    })
+}
+
+#[derive(Clone, Copy)]
+struct MarkerRepoPrepUpdate<'a> {
+    skey: &'a str,
+    mfile: &'a Path,
+    folded_git_root: &'a str,
+    expected_cycle_ts: f64,
+    expected_research_reset_ts: f64,
+    expected_last_durable_ts: f64,
+    expected_dpaths: &'a [String],
+    expected_diff_hash: &'a str,
+    seen_heads: &'a [String],
+    seen_fp_trees: &'a [String],
+    snapshot_bound_required: bool,
+}
+
+fn commit_rounds_under_marker_lock(
+    rfile: &Path,
+    rounds_doc: Option<&Value>,
+) -> Result<(), String> {
+    match rounds_doc {
+        Some(doc) => rio::write_json(rfile, doc)
+            .map_err(|err| format!("swarm_rounds_write_failed:{}", err)),
+        None if rfile.is_file() => Ok(()),
+        None => Err("concurrent_worktree_mutation".to_string()),
+    }
+}
+
+fn persist_marker_repo_prepare_state(
+    upd: MarkerRepoPrepUpdate<'_>,
+    strict_commit: bool,
+    persist_write: bool,
+    rounds_file: &Path,
+    rounds_doc: Option<&Value>,
+) -> Result<Option<Value>, String> {
+    // INVARIANT: Re-verify marker identity, `research_resets` cursor, pending hook deltas, durable path list, and measured fingerprint under `marker_lock_path`, and commit `rounds.json` inside the same lock so concurrent `research-reset` or candidate turnover cannot race `prepare`.
+    with_locked_marker(upd.skey, upd.mfile, |raw_m, merged_opt, consumed_ids| {
+        let (mut next_m, ack_ids) = if strict_commit {
+            if !consumed_ids.is_empty() {
+                return Err("concurrent_worktree_mutation".to_string());
+            }
+            let Some(cur_m) = raw_m else {
+                return Err("concurrent_worktree_mutation".to_string());
+            };
+            let live_dur = val_to_f64(cur_m.get("last_durable_ts"));
+            if !is_active_same_repo_marker(&cur_m, upd.folded_git_root)
+                || marker_cycle_or_reset_mismatch(
+                    &cur_m,
+                    upd.expected_cycle_ts,
+                    upd.expected_research_reset_ts,
+                )
+                || (live_dur - upd.expected_last_durable_ts).abs() > cwg_common::TS_EPS
+                || cwg_common::durable_paths_from_val(cur_m.get("paths")) != upd.expected_dpaths
+                || val_to_str(cur_m.get("current_diff_hash")) != upd.expected_diff_hash
+                || (!upd.expected_dpaths.is_empty()
+                    && cwg_common::content_fingerprint(
+                        upd.expected_dpaths,
+                        cwg_common::MAX_FINGERPRINT_FILE_BYTES,
+                    ) != upd.expected_diff_hash)
+            {
+                return Err("concurrent_worktree_mutation".to_string());
+            }
+            if !persist_write {
+                commit_rounds_under_marker_lock(rounds_file, rounds_doc)?;
+                return Ok(Some(cur_m));
+            }
+            (cur_m, Vec::new())
+        } else {
+            let Some(cur_m) = merged_opt else {
+                return Err("concurrent_worktree_mutation".to_string());
+            };
+            if !cwg_common::is_active_marker(&cur_m)
+                || marker_cycle_or_reset_mismatch(
+                    &cur_m,
+                    upd.expected_cycle_ts,
+                    upd.expected_research_reset_ts,
+                )
+            {
+                return Err("concurrent_worktree_mutation".to_string());
+            }
+            (cur_m, consumed_ids)
+        };
+
+        let Some(obj) = next_m.as_object_mut() else {
+            return Err("concurrent_worktree_mutation".to_string());
+        };
+        let rs_map = ensure_object_mut(obj, "swarm_prepare_repo_state");
+        let prev_count = rs_map
+            .get(upd.folded_git_root)
+            .and_then(|v| v.get("prepare_count"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        rs_map.insert(
+            upd.folded_git_root.to_string(),
+            json!({
+                "prepare_count": prev_count.saturating_add(1),
+                "seen_heads": upd.seen_heads,
+                "seen_fp_trees": upd.seen_fp_trees,
+                "snapshot_bound_required": upd.snapshot_bound_required,
+            }),
+        );
+        if let Err(err) = rio::write_json(upd.mfile, &next_m) {
+            return Err(format!("marker_persist_failed:{}", err));
+        }
+        if !ack_ids.is_empty() {
+            cwg_common::ack_pending_marker_deltas(upd.skey, &ack_ids);
+        }
+        commit_rounds_under_marker_lock(rounds_file, rounds_doc)?;
+        Ok(Some(next_m))
+    })
+}
+
+struct RepoPrepareProvenance {
+    seen_heads: Vec<String>,
+    seen_fp_trees: Vec<String>,
+    prior_other_head: bool,
+    require_snapshot_bound: bool,
+}
+
+struct RepoPrepProvQuery<'a> {
+    state: &'a Map<String, Value>,
+    marker: Option<&'a Value>,
+    folded_git_root: &'a str,
+    head_oid: &'a str,
+    cur_tree_oid: &'a str,
+    same_repo_diff_hash: &'a str,
+    had_prior_cycle_prepare: bool,
+}
+
+fn collect_repo_prepare_provenance(q: RepoPrepProvQuery<'_>) -> RepoPrepareProvenance {
+    let RepoPrepProvQuery {
+        state,
+        marker,
+        folded_git_root,
+        head_oid,
+        cur_tree_oid,
+        same_repo_diff_hash,
+        had_prior_cycle_prepare,
+    } = q;
+    let expected_repo_prefix = format!("{}|", folded_git_root);
+    let marker_rps = cwg_common::active_cycle_repo_prepare_state(marker, folded_git_root);
+    let marker_prep_count = marker_rps
+        .and_then(|r| r.get("prepare_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let marker_upgraded_without_rps = had_prior_cycle_prepare && marker_rps.is_none();
+
+    let mut seen_heads: Vec<String> = Vec::new();
+    let mut seen_fp_trees: Vec<String> = Vec::new();
+    let mut prior_other_head = false;
+    let mut prior_snapshot_bound = marker_rps
+        .and_then(|r| r.get("snapshot_bound_required"))
+        .and_then(Value::as_bool)
+        == Some(true)
+        || state
+            .get("snapshot_bound_required")
+            .and_then(Value::as_object)
+            .and_then(|sm| sm.get(folded_git_root))
+            .and_then(Value::as_bool)
+            == Some(true);
+
+    if let Some(rps) = marker_rps {
+        if let Some(arr) = rps.get("seen_heads").and_then(Value::as_array) {
+            for sh in arr.iter().filter_map(Value::as_str).filter(|s| !s.is_empty()) {
+                if sh != head_oid {
+                    prior_other_head = true;
+                }
+                prior_snapshot_bound |= push_capped_64(&mut seen_heads, sh.to_string());
+            }
+        }
+        if let Some(arr) = rps.get("seen_fp_trees").and_then(Value::as_array) {
+            for ft in arr.iter().filter_map(Value::as_str).filter(|s| !s.is_empty()) {
+                prior_snapshot_bound |= push_capped_64(&mut seen_fp_trees, ft.to_string());
+            }
+        }
     }
 
-    let skey = rio::safe_key(session, "default");
-    let marker = cwg_common::read_marker_with_pending(&skey);
-    let marker_first_ts = val_to_f64(marker.as_ref().and_then(|m| m.get("first_ts")))
-        .max(marker.as_ref().map_or(0.0, cwg_common::last_research_reset_ts));
+    let mut rounds_had_repo_provenance = false;
+    if let Some(arr) = state
+        .get("seen_heads")
+        .and_then(Value::as_object)
+        .and_then(|sm| sm.get(folded_git_root))
+        .and_then(Value::as_array)
+    {
+        for sh in arr.iter().filter_map(Value::as_str).filter(|s| !s.is_empty()) {
+            rounds_had_repo_provenance = true;
+            if sh != head_oid {
+                prior_other_head = true;
+            }
+            prior_snapshot_bound |= push_capped_64(&mut seen_heads, sh.to_string());
+        }
+    }
 
-    let rounds_file = cwg_common::swarm_rounds_path(&skey);
+    if let Some(lanes_map) = state.get("lanes").and_then(Value::as_object) {
+        for (k, v) in lanes_map {
+            if !k.starts_with(&expected_repo_prefix) {
+                continue;
+            }
+            let Some(arr) = v.as_array() else {
+                continue;
+            };
+            if !arr.is_empty() {
+                rounds_had_repo_provenance = true;
+                if marker_upgraded_without_rps
+                    && arr.first().is_some_and(|f| val_to_i64(f.get("round")) > 1)
+                {
+                    prior_snapshot_bound = true;
+                }
+            }
+            for ent in arr {
+                let eh = val_to_str(ent.get("head_oid"));
+                if eh.is_empty() || eh != head_oid {
+                    prior_other_head = true;
+                }
+                prior_snapshot_bound |= push_capped_64(&mut seen_heads, eh);
+                if !val_to_str(ent.get("head_bound_diff_hash")).is_empty() {
+                    prior_snapshot_bound = true;
+                }
+                let edh = val_to_str(ent.get("diff_hash"));
+                let etr = val_to_str(ent.get("tree_oid"));
+                if !edh.is_empty() && !etr.is_empty() {
+                    prior_snapshot_bound |=
+                        push_capped_64(&mut seen_fp_trees, format!("{}|{}", edh, etr));
+                }
+            }
+        }
+    }
+
+    prior_snapshot_bound |= push_capped_64(&mut seen_heads, head_oid.to_string());
+    let prior_other_tree_for_fp = !same_repo_diff_hash.is_empty()
+        && seen_fp_trees.iter().any(|ft| {
+            ft.split_once('|')
+                .is_some_and(|(fp, tr)| fp == same_repo_diff_hash && tr != cur_tree_oid)
+        });
+    if !same_repo_diff_hash.is_empty() && !cur_tree_oid.is_empty() {
+        prior_snapshot_bound |= push_capped_64(
+            &mut seen_fp_trees,
+            format!("{}|{}", same_repo_diff_hash, cur_tree_oid),
+        );
+    }
+    let lost_rounds_provenance =
+        (marker_prep_count > 0 || marker_upgraded_without_rps) && !rounds_had_repo_provenance;
+    let require_snapshot_bound = prior_other_head
+        || prior_other_tree_for_fp
+        || prior_snapshot_bound
+        || lost_rounds_provenance;
+
+    RepoPrepareProvenance {
+        seen_heads,
+        seen_fp_trees,
+        prior_other_head,
+        require_snapshot_bound,
+    }
+}
+
+struct UncoveredFailInput<'a> {
+    skey: &'a str,
+    mfile: &'a Path,
+    rounds_file: &'a Path,
+    marker_first_ts: f64,
+    expected_rr_ts: f64,
+    cur_tree_oid: &'a str,
+    marker_upd: Option<MarkerRepoPrepUpdate<'a>>,
+}
+
+fn record_uncovered_and_fail(
+    state: &mut Map<String, Value>,
+    inp: UncoveredFailInput<'_>,
+) -> Value {
+    stamp_rounds_marker_ts(state, inp.marker_first_ts);
+    state.insert("uncovered_prepare".to_string(), Value::Bool(true));
+    let rounds_doc = Value::Object(state.clone());
+    let commit_res = if let Some(upd) = inp.marker_upd {
+        persist_marker_repo_prepare_state(
+            upd,
+            false,
+            true,
+            inp.rounds_file,
+            Some(&rounds_doc),
+        )
+        .map(|_| ())
+    } else {
+        with_locked_marker(inp.skey, inp.mfile, |_, merged_opt, _| {
+            let Some(cur_m) = merged_opt else {
+                return Err("concurrent_worktree_mutation".to_string());
+            };
+            if !cwg_common::is_active_marker(&cur_m)
+                || marker_cycle_or_reset_mismatch(
+                    &cur_m,
+                    inp.marker_first_ts,
+                    inp.expected_rr_ts,
+                )
+            {
+                return Err("concurrent_worktree_mutation".to_string());
+            }
+            commit_rounds_under_marker_lock(inp.rounds_file, Some(&rounds_doc))
+        })
+    };
+    if let Err(err) = commit_res {
+        if err.starts_with("swarm_rounds_write_failed:") {
+            return json!({
+                "ok": false,
+                "candidate_diff_covered": false,
+                "current_diff_hash": "",
+                "current_tree_oid": inp.cur_tree_oid,
+                "error": err,
+            });
+        }
+        return json!({
+            "ok": false,
+            "error": err,
+        });
+    }
+    json!({
+        "ok": false,
+        "candidate_diff_covered": false,
+        "current_diff_hash": "",
+        "current_tree_oid": inp.cur_tree_oid,
+        "error": "partial_or_uncovered_candidate_diff",
+    })
+}
+
+struct PrepareLockedCtx<'a> {
+    input: &'a PrepareRoundInput<'a>,
+    clean_label: &'a str,
+    git_root: &'a str,
+    folded_git_root: &'a str,
+    rel_paths: &'a [String],
+    skey: &'a str,
+}
+
+fn prepare_round_locked(ctx: PrepareLockedCtx<'_>) -> Value {
+    let PrepareLockedCtx {
+        input,
+        clean_label,
+        git_root,
+        folded_git_root,
+        rel_paths,
+        skey,
+    } = ctx;
+    let mfile = cwg_common::marker_path(skey);
+
+    let mut initial_had_cycle_prepare: Option<bool> = None;
+    let mut snapshot_pair: Option<(Option<Value>, String, String, String, bool, Vec<String>)> =
+        None;
+    for _attempt in 0..2 {
+        let (synced_marker, had_prior) =
+            match sync_marker_under_lock(skey, &mfile, folded_git_root, input.now_ts) {
+                Ok(pair) => pair,
+                Err(err) => {
+                    return json!({
+                        "ok": false,
+                        "error": err,
+                    });
+                }
+            };
+        initial_had_cycle_prepare.get_or_insert(had_prior);
+
+        let same_repo_active = synced_marker
+            .as_ref()
+            .is_some_and(|m| is_active_same_repo_marker(m, folded_git_root));
+        let dpaths = synced_marker
+            .as_ref()
+            .filter(|_| same_repo_active)
+            .map(|m| cwg_common::durable_paths_from_val(m.get("paths")))
+            .unwrap_or_default();
+        let fp_before = synced_marker
+            .as_ref()
+            .filter(|_| same_repo_active)
+            .map(|m| val_to_str(m.get("current_diff_hash")))
+            .unwrap_or_default();
+
+        let head_1 = rio::git_head_oid(git_root);
+        let tree_1 = rio::capture_worktree_tree_oid(git_root, 15.0);
+        if tree_1.is_empty() {
+            return json!({
+                "ok": false,
+                "error": "capture_worktree_tree_oid_failed",
+            });
+        }
+        let fp_after = if same_repo_active && !dpaths.is_empty() {
+            cwg_common::content_fingerprint(&dpaths, cwg_common::MAX_FINGERPRINT_FILE_BYTES)
+        } else {
+            fp_before.clone()
+        };
+        if fp_before != fp_after {
+            continue;
+        }
+        // INVARIANT: Bracket `fp_before == fp_after` with two `HEAD` + worktree tree captures so concurrent edits to non-marker files or refs during `prepare_round` retry or fail closed with `concurrent_worktree_mutation`.
+        let tree_2 = rio::capture_worktree_tree_oid(git_root, 15.0);
+        let head_2 = rio::git_head_oid(git_root);
+        if head_1 == head_2 && tree_1 == tree_2 {
+            snapshot_pair = Some((
+                synced_marker,
+                head_1,
+                tree_1,
+                fp_before,
+                same_repo_active,
+                dpaths,
+            ));
+            break;
+        }
+    }
+
+    let Some((
+        mut marker,
+        raw_head,
+        cur_tree_oid,
+        same_repo_diff_hash,
+        same_repo_active,
+        dpaths_for_cov,
+    )) = snapshot_pair
+    else {
+        return json!({
+            "ok": false,
+            "error": "concurrent_worktree_mutation",
+        });
+    };
+    let had_prior_cycle_prepare = initial_had_cycle_prepare.unwrap_or(false) && same_repo_active;
+
+    let head_oid = cwg_common::effective_head_oid_from_raw(&raw_head, cur_tree_oid.len());
+
+    let now = input.now_ts.unwrap_or_else(now_sec);
+    let has_any_active_marker = marker.as_ref().is_some_and(cwg_common::is_active_marker);
+    let cov_crlf_notes = if same_repo_active
+        && rel_paths.is_empty()
+        && !same_repo_diff_hash.is_empty()
+    {
+        cwg_common::inspect_durable_paths_in_git_tree(git_root, &cur_tree_oid, &dpaths_for_cov)
+    } else {
+        None
+    };
+    let full_candidate_covered = cov_crlf_notes.is_some();
+    let unfiltered_tree_match = cov_crlf_notes.as_ref().is_some_and(Vec::is_empty);
+    let cur_crlf_summary = cov_crlf_notes
+        .as_deref()
+        .map(format_crlf_notes)
+        .unwrap_or_default();
+    let raw_wt_digest = rio::capture_worktree_raw_digest(git_root, 15.0);
+    let marker_first_ts = marker.as_ref().map_or(0.0, cwg_common::marker_cycle_first_ts);
+
+    let rounds_file = cwg_common::swarm_rounds_path(skey);
     let loaded_state = rio::read_json(&rounds_file);
+    if loaded_state.is_none() && rounds_file.exists() {
+        return json!({
+            "ok": false,
+            "error": "swarm_rounds_read_failed",
+        });
+    }
     let mut state: Map<String, Value> = match loaded_state {
         Some(Value::Object(map))
-            if map.get("session").and_then(|v| v.as_str()) == Some(session) =>
+            if map.get("session").and_then(|v| v.as_str()) == Some(input.session) =>
         {
             let prev_mts = val_to_f64(map.get("marker_first_ts"));
-            if marker_first_ts != 0.0 && (prev_mts - marker_first_ts).abs() > 1.0 {
+            if marker_first_ts > 0.0
+                && (prev_mts <= 0.0 || cwg_common::cycle_ts_mismatch(prev_mts, marker_first_ts))
+            {
                 let mut fresh = Map::new();
-                fresh.insert("session".to_string(), Value::String(session.to_string()));
+                fresh.insert(
+                    "session".to_string(),
+                    Value::String(input.session.to_string()),
+                );
                 fresh.insert("marker_first_ts".to_string(), json!(marker_first_ts));
                 fresh.insert("lanes".to_string(), Value::Object(Map::new()));
                 fresh
@@ -688,18 +1421,118 @@ pub fn prepare_round(input: PrepareRoundInput<'_>) -> Value {
         }
         _ => {
             let mut fresh = Map::new();
-            fresh.insert("session".to_string(), Value::String(session.to_string()));
+            fresh.insert(
+                "session".to_string(),
+                Value::String(input.session.to_string()),
+            );
             fresh.insert("marker_first_ts".to_string(), json!(marker_first_ts));
             fresh.insert("lanes".to_string(), Value::Object(Map::new()));
             fresh
         }
     };
 
-    if !state.get("lanes").map_or(false, |v| v.is_object()) {
-        state.insert("lanes".to_string(), Value::Object(Map::new()));
+    let cov_fp_for_prov = if full_candidate_covered {
+        same_repo_diff_hash.as_str()
+    } else {
+        ""
+    };
+    let prov = collect_repo_prepare_provenance(RepoPrepProvQuery {
+        state: &state,
+        marker: marker.as_ref(),
+        folded_git_root,
+        head_oid,
+        cur_tree_oid: &cur_tree_oid,
+        same_repo_diff_hash: cov_fp_for_prov,
+        had_prior_cycle_prepare,
+    });
+    let marker_rr_ts = marker
+        .as_ref()
+        .map_or(0.0, cwg_common::last_research_reset_ts);
+    let marker_last_durable_ts = marker
+        .as_ref()
+        .map_or(0.0, |m| val_to_f64(m.get("last_durable_ts")));
+    let marker_upd = same_repo_active.then_some(MarkerRepoPrepUpdate {
+        skey,
+        mfile: &mfile,
+        folded_git_root,
+        expected_cycle_ts: marker_first_ts,
+        expected_research_reset_ts: marker_rr_ts,
+        expected_last_durable_ts: marker_last_durable_ts,
+        expected_dpaths: &dpaths_for_cov,
+        expected_diff_hash: &same_repo_diff_hash,
+        seen_heads: &prov.seen_heads,
+        seen_fp_trees: &prov.seen_fp_trees,
+        snapshot_bound_required: prov.require_snapshot_bound,
+    });
+
+    let mut seen_heads_updated = false;
+    {
+        let seen_map = ensure_object_mut(&mut state, "seen_heads");
+        let next_val = Value::Array(
+            prov.seen_heads
+                .iter()
+                .cloned()
+                .map(Value::String)
+                .collect(),
+        );
+        if seen_map.get(folded_git_root) != Some(&next_val) {
+            seen_map.insert(folded_git_root.to_string(), next_val);
+            seen_heads_updated = true;
+        }
     }
-    let lane_key = format!("{}|{}", rio::fold_path(&git_root), clean_label);
-    let mut history: Vec<Value> = if reset {
+    let mut snapshot_bound_updated = false;
+    if prov.require_snapshot_bound {
+        let sb_map = ensure_object_mut(&mut state, "snapshot_bound_required");
+        if sb_map.get(folded_git_root).and_then(Value::as_bool) != Some(true) {
+            sb_map.insert(folded_git_root.to_string(), Value::Bool(true));
+            snapshot_bound_updated = true;
+        }
+    }
+
+    if has_any_active_marker && !full_candidate_covered {
+        return record_uncovered_and_fail(
+            &mut state,
+            UncoveredFailInput {
+                skey,
+                mfile: &mfile,
+                rounds_file: &rounds_file,
+                marker_first_ts,
+                expected_rr_ts: marker_rr_ts,
+                cur_tree_oid: &cur_tree_oid,
+                marker_upd,
+            },
+        );
+    }
+
+    let recorded_lane_diff_hash = if full_candidate_covered {
+        same_repo_diff_hash.clone()
+    } else {
+        String::new()
+    };
+    let recorded_head_bound_dh = if full_candidate_covered && prov.require_snapshot_bound {
+        cwg_common::head_bound_diff_hash(&same_repo_diff_hash, head_oid, &cur_tree_oid)
+    } else {
+        String::new()
+    };
+    let current_diff_hash = if full_candidate_covered {
+        if prov.require_snapshot_bound {
+            recorded_head_bound_dh.clone()
+        } else {
+            same_repo_diff_hash.clone()
+        }
+    } else if rel_paths.is_empty() {
+        if prov.require_snapshot_bound {
+            cwg_common::head_bound_diff_hash("", head_oid, &cur_tree_oid)
+        } else {
+            cur_tree_oid.clone()
+        }
+    } else {
+        String::new()
+    };
+
+    ensure_object_mut(&mut state, "lanes");
+    let lane_key = format!("{}|{}", folded_git_root, clean_label);
+    let mut history: Vec<Value> = if input.reset {
         Vec::new()
     } else {
         state
@@ -716,18 +1549,43 @@ pub fn prepare_round(input: PrepareRoundInput<'_>) -> Value {
             .and_then(|h| h.get("tree_oid"))
             .and_then(|v| v.as_str())
             != Some(cur_tree_oid.as_str());
+    let changed_head = history.last().map_or(false, |last| {
+        let prev_h = val_to_str(last.get("head_oid"));
+        prev_h.is_empty() || prev_h != head_oid
+    });
     let changed_paths = history
         .last()
         .map_or(false, |last| entry_paths(last) != rel_paths);
+    let changed_diff_hash = history.last().map_or(false, |last| {
+        last.get("diff_hash").is_none()
+            || val_to_str(last.get("diff_hash")) != recorded_lane_diff_hash
+            || val_to_str(last.get("head_bound_diff_hash")) != recorded_head_bound_dh
+            || last.get("unfiltered_tree_match").and_then(Value::as_bool)
+                != Some(unfiltered_tree_match)
+            || val_to_str(last.get("crlf_summary")) != cur_crlf_summary
+            || val_to_str(last.get("raw_worktree_digest")) != raw_wt_digest
+    });
+    let had_prev_recorded_dh = history
+        .last()
+        .is_some_and(|last| !val_to_str(last.get("diff_hash")).is_empty());
+    let advance_round = changed_tree
+        || changed_head
+        || (full_candidate_covered && had_prev_recorded_dh && changed_diff_hash && !changed_paths);
 
-    if changed_tree {
+    if advance_round {
         let next_round = history
             .last()
             .map(|h| val_to_i64(h.get("round")) + 1)
             .unwrap_or(1);
         history.push(json!({
             "round": next_round,
+            "head_oid": head_oid,
             "tree_oid": cur_tree_oid,
+            "diff_hash": recorded_lane_diff_hash,
+            "head_bound_diff_hash": recorded_head_bound_dh,
+            "unfiltered_tree_match": unfiltered_tree_match,
+            "crlf_summary": cur_crlf_summary,
+            "raw_worktree_digest": raw_wt_digest,
             "paths": rel_paths,
             "ts": (now * 1000.0).round() / 1000.0,
         }));
@@ -735,9 +1593,30 @@ pub fn prepare_round(input: PrepareRoundInput<'_>) -> Value {
             let keep_from = history.len() - MAX_ROUND_HISTORY;
             history = history[keep_from..].to_vec();
         }
-    } else if changed_paths {
+    } else if changed_paths || changed_diff_hash {
         if let Some(Value::Object(last_obj)) = history.last_mut() {
+            last_obj.insert("head_oid".to_string(), Value::String(head_oid.to_string()));
             last_obj.insert("paths".to_string(), json!(rel_paths));
+            last_obj.insert(
+                "diff_hash".to_string(),
+                Value::String(recorded_lane_diff_hash),
+            );
+            last_obj.insert(
+                "head_bound_diff_hash".to_string(),
+                Value::String(recorded_head_bound_dh),
+            );
+            last_obj.insert(
+                "unfiltered_tree_match".to_string(),
+                Value::Bool(unfiltered_tree_match),
+            );
+            last_obj.insert(
+                "crlf_summary".to_string(),
+                Value::String(cur_crlf_summary.clone()),
+            );
+            last_obj.insert(
+                "raw_worktree_digest".to_string(),
+                Value::String(raw_wt_digest.clone()),
+            );
         }
     }
 
@@ -745,26 +1624,58 @@ pub fn prepare_round(input: PrepareRoundInput<'_>) -> Value {
         .last()
         .map(|h| val_to_i64(h.get("round")))
         .unwrap_or(1);
-    let prev_tree_oid = if history.len() >= 2 {
-        val_to_str(history[history.len() - 2].get("tree_oid"))
+    let (prev_head_oid, prev_tree_oid, prev_crlf_summary) = if history.len() >= 2 {
+        let prev = &history[history.len() - 2];
+        (
+            val_to_str(prev.get("head_oid")),
+            val_to_str(prev.get("tree_oid")),
+            val_to_str(prev.get("crlf_summary")),
+        )
     } else {
-        String::new()
+        (String::new(), String::new(), String::new())
+    };
+    let head_changed_in_round = if cur_round >= 2 {
+        prev_head_oid.is_empty() || prev_head_oid != head_oid
+    } else {
+        prov.prior_other_head
     };
 
-    let proj_key = rio::project_key(&git_root, &[], &git_root, "");
-    let scratch_dir = brain_root.join(session).join("scratch").join(proj_key);
+    let proj_key = rio::project_key(git_root, &[], git_root, "");
+    let scratch_dir = input
+        .brain_root
+        .join(input.session)
+        .join("scratch")
+        .join(proj_key);
     let diff_res = match sync_round_diffs(RoundSyncInput {
-        git_root: &git_root,
-        head_oid: &head_oid,
+        git_root,
+        head_oid,
+        prev_head_oid: &prev_head_oid,
         cur_tree_oid: &cur_tree_oid,
         prev_tree_oid: &prev_tree_oid,
-        rel_paths: &rel_paths,
+        cur_crlf_summary: &cur_crlf_summary,
+        prev_crlf_summary: &prev_crlf_summary,
+        rel_paths,
         scratch_dir: &scratch_dir,
-        clean_label: &clean_label,
+        clean_label,
         cur_round,
-        regen: changed_tree || changed_paths,
+        regen: advance_round || changed_paths || changed_diff_hash,
+        enforce_text_coverage: full_candidate_covered,
     }) {
         Ok(res) => res,
+        Err(err) if err == "uncovered_binary_diff" && has_any_active_marker => {
+            return record_uncovered_and_fail(
+                &mut state,
+                UncoveredFailInput {
+                    skey,
+                    mfile: &mfile,
+                    rounds_file: &rounds_file,
+                    marker_first_ts,
+                    expected_rr_ts: marker_rr_ts,
+                    cur_tree_oid: &cur_tree_oid,
+                    marker_upd,
+                },
+            );
+        }
         Err(err) => {
             return json!({
                 "ok": false,
@@ -773,25 +1684,64 @@ pub fn prepare_round(input: PrepareRoundInput<'_>) -> Value {
         }
     };
 
-    if changed_tree || changed_paths {
-        if let Some(Value::Object(lanes_map)) = state.get_mut("lanes") {
-            lanes_map.insert(lane_key, Value::Array(history));
+    let state_mutated = advance_round
+        || changed_paths
+        || changed_diff_hash
+        || seen_heads_updated
+        || snapshot_bound_updated;
+    let marker_rps_missing =
+        cwg_common::active_cycle_repo_prepare_state(marker.as_ref(), folded_git_root).is_none();
+    if rio::git_head_oid(git_root) != raw_head
+        || rio::capture_worktree_tree_oid(git_root, 15.0) != cur_tree_oid
+    {
+        return json!({
+            "ok": false,
+            "error": "concurrent_worktree_mutation",
+        });
+    }
+    let rounds_doc_opt = if state_mutated {
+        ensure_object_mut(&mut state, "lanes").insert(lane_key, Value::Array(history));
+        stamp_rounds_marker_ts(&mut state, marker_first_ts);
+        Some(Value::Object(state))
+    } else {
+        None
+    };
+    if let Some(upd) = marker_upd {
+        match persist_marker_repo_prepare_state(
+            upd,
+            true,
+            state_mutated || marker_rps_missing,
+            &rounds_file,
+            rounds_doc_opt.as_ref(),
+        ) {
+            Ok(updated_m) => {
+                marker = updated_m;
+            }
+            Err(err) => {
+                return json!({
+                    "ok": false,
+                    "error": err,
+                });
+            }
         }
-        let eff_mts = if marker_first_ts != 0.0 {
-            marker_first_ts
-        } else {
-            val_to_f64(state.get("marker_first_ts"))
-        };
-        state.insert("marker_first_ts".to_string(), json!(eff_mts));
-        let _ = rio::write_json(&rounds_file, &Value::Object(state));
+    } else if let Err(err) = with_locked_marker(skey, &mfile, |_, merged_opt, _| {
+        if merged_opt.is_some_and(|m| cwg_common::is_active_marker(&m)) {
+            return Err("concurrent_worktree_mutation".to_string());
+        }
+        commit_rounds_under_marker_lock(&rounds_file, rounds_doc_opt.as_ref())
+    }) {
+        return json!({
+            "ok": false,
+            "error": err,
+        });
     }
 
     let active_marker = marker.as_ref().filter(|m| cwg_common::is_active_marker(m));
     let worker_status = inspect_swarm_workers_with_marker(
-        session,
-        brain_root,
-        ttl_seconds,
-        &clean_label,
+        input.session,
+        input.brain_root,
+        input.ttl_seconds,
+        clean_label,
         Some(now),
         cur_round,
         active_marker,
@@ -813,13 +1763,13 @@ pub fn prepare_round(input: PrepareRoundInput<'_>) -> Value {
         }
     }
 
-    let marker_doc = cwg_common::read_marker_with_pending(session)
+    let marker_doc = marker
         .filter(|v| v.is_object())
         .unwrap_or_else(|| json!({}));
     let eff_repo_root = if !git_root.is_empty() {
-        git_root.as_str()
+        git_root
     } else {
-        cwd
+        input.cwd
     };
     let diff_metrics = cwg_common::compute_diff_metrics(&marker_doc, eff_repo_root, None);
     let fast_path_eligible =
@@ -828,11 +1778,14 @@ pub fn prepare_round(input: PrepareRoundInput<'_>) -> Value {
     let overall_action = val_to_str(worker_status.get("overall_action"));
     json!({
         "ok": true,
-        "session": session,
+        "session": input.session,
         "label": clean_label,
-        "git_root": rio::normalize_path(&git_root),
+        "git_root": rio::normalize_path(git_root),
         "head_oid": head_oid,
+        "head_changed": head_changed_in_round,
         "round": cur_round,
+        "candidate_diff_covered": full_candidate_covered,
+        "current_diff_hash": current_diff_hash,
         "current_tree_oid": cur_tree_oid,
         "previous_tree_oid": prev_tree_oid,
         "full_diff_path": diff_res.full_diff_path,
@@ -844,6 +1797,68 @@ pub fn prepare_round(input: PrepareRoundInput<'_>) -> Value {
         "next_worker_names": next_names,
         "worker_status": worker_status,
     })
+}
+
+pub fn prepare_round(input: PrepareRoundInput<'_>) -> Value {
+    let raw_label = if input.label.is_empty() {
+        "simplify"
+    } else {
+        input.label
+    };
+    let clean_label = rio::safe_key(raw_label, "simplify");
+
+    let eff_cwd = if input.cwd.trim().is_empty() {
+        "."
+    } else {
+        input.cwd
+    };
+    let Some(git_root) = rio::git_toplevel(eff_cwd, false) else {
+        return json!({
+            "ok": false,
+            "error": format!("not_in_git_repo:{}", input.cwd),
+        });
+    };
+
+    let mut rel_paths: Vec<String> = Vec::new();
+    for raw_p in input.paths {
+        if raw_p.trim().is_empty() {
+            continue;
+        }
+        let (rel_opt, inside) = cwg_common::resolve_repo_rel_info(raw_p, &git_root);
+        if inside {
+            if let Some(rel) = rel_opt {
+                rel_paths.push(rel);
+                continue;
+            }
+        }
+        rel_paths.push(raw_p.replace('\\', "/"));
+    }
+
+    let skey = rio::safe_key(input.session, "default");
+    let folded_git_root = rio::fold_path(&git_root);
+
+    // INVARIANT: Serialize per-session `prepare_round` execution on `swarm_rounds_lock_path`, sample `HEAD` + worktree tree stability and persist `swarm_prepare_cycle_ts` strictly under locks, refuse (`ok: false`, writing zero diff files) any partial `--paths`, `-diff`/binary-masked text edit, or uncovered candidate snapshot when an active CWG marker exists, and key diff filenames by snapshot digest.
+    rio::with_file_lock(
+        &cwg_common::swarm_rounds_lock_path(&skey),
+        15.0,
+        60.0,
+        |rounds_locked| {
+            if !rounds_locked {
+                return json!({
+                    "ok": false,
+                    "error": "swarm_rounds_lock_timeout",
+                });
+            }
+            prepare_round_locked(PrepareLockedCtx {
+                input: &input,
+                clean_label: &clean_label,
+                git_root: &git_root,
+                folded_git_root: &folded_git_root,
+                rel_paths: &rel_paths,
+                skey: &skey,
+            })
+        },
+    )
 }
 
 fn take_flag_value(args: &[String], idx: &mut usize, flag_name: &str) -> Result<String, String> {
@@ -2023,5 +3038,125 @@ mod tests {
         assert_eq!(res_rr_no["overall_action"], json!("initial_spawn"));
 
         let _ = fs::remove_dir_all(&brain);
+    }
+
+    #[test]
+    fn test_strict_prepare_commit_rejects_mid_prepare_marker_and_delta_mutations() {
+        let _guard = crate::win32_sqlite::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp_home = env::temp_dir().join(format!("swarm-cache-strict-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp_home);
+        fs::create_dir_all(&tmp_home).unwrap();
+        let prev = env::var_os("CARBON_STACK_HOME");
+        env::set_var("CARBON_STACK_HOME", &tmp_home);
+
+        let repo_dir = tmp_home.join("repo");
+        fs::create_dir_all(repo_dir.join("src")).unwrap();
+        let fpath = repo_dir.join("src").join("lib.rs");
+        fs::write(&fpath, "pub fn a() -> i32 { 1 }\n").unwrap();
+        let fnorm = rio::normalize_path(&fpath.to_string_lossy());
+        let fp1 = cwg_common::content_fingerprint(&[fnorm.clone()], cwg_common::MAX_FINGERPRINT_FILE_BYTES);
+        let gr_norm = rio::normalize_path(&repo_dir.to_string_lossy());
+        let folded_gr = rio::fold_path(&gr_norm);
+
+        let skey = "sess_strict_commit";
+        let mfile = cwg_common::marker_path(skey);
+        let base_marker = json!({
+            "session": skey,
+            "first_ts": 1000.0,
+            "last_durable_ts": 1005.0,
+            "git_root": gr_norm,
+            "paths": [fnorm.clone()],
+            "current_diff_hash": fp1.clone()
+        });
+        rio::write_json(&mfile, &base_marker).unwrap();
+        let seen_h = vec!["1111111111111111111111111111111111111111".to_string()];
+        let seen_t = vec![format!("{}|2222222222222222222222222222222222222222", fp1)];
+        let dpaths = vec![fnorm.clone()];
+        let rfile = cwg_common::swarm_rounds_path(skey);
+        let sample_rounds = json!({"session": skey, "marker_first_ts": 1000.0, "lanes": {}});
+        let upd = MarkerRepoPrepUpdate {
+            skey,
+            mfile: &mfile,
+            folded_git_root: &folded_gr,
+            expected_cycle_ts: 1000.0,
+            expected_research_reset_ts: 0.0,
+            expected_last_durable_ts: 1005.0,
+            expected_dpaths: &dpaths,
+            expected_diff_hash: &fp1,
+            seen_heads: &seen_h,
+            seen_fp_trees: &seen_t,
+            snapshot_bound_required: false,
+        };
+        assert!(persist_marker_repo_prepare_state(
+            upd,
+            true,
+            true,
+            &rfile,
+            Some(&sample_rounds),
+        )
+        .is_ok());
+        assert!(rfile.is_file());
+
+        let _ = fs::remove_file(&rfile);
+        assert_eq!(
+            persist_marker_repo_prepare_state(upd, true, false, &rfile, None).unwrap_err(),
+            "concurrent_worktree_mutation",
+            "unlinked rounds.json during non-mutating prepare must fail closed"
+        );
+
+        let mut reset_marker = base_marker.clone();
+        reset_marker
+            .as_object_mut()
+            .unwrap()
+            .insert("research_resets".to_string(), json!([{"reset_ts": 990.0}]));
+        rio::write_json(&mfile, &reset_marker).unwrap();
+        assert_eq!(
+            persist_marker_repo_prepare_state(upd, true, true, &rfile, Some(&sample_rounds))
+                .unwrap_err(),
+            "concurrent_worktree_mutation"
+        );
+        assert_eq!(
+            persist_marker_repo_prepare_state(upd, false, true, &rfile, Some(&sample_rounds))
+                .unwrap_err(),
+            "concurrent_worktree_mutation"
+        );
+        assert!(
+            !rfile.exists(),
+            "aborted prepare after concurrent research-reset must not recreate rounds.json"
+        );
+        rio::write_json(&mfile, &base_marker).unwrap();
+
+        let pdir = cwg_common::marker_pending_dir(skey);
+        fs::create_dir_all(&pdir).unwrap();
+        let delta_file = pdir.join("0001.json");
+        rio::write_json(
+            &delta_file,
+            &json!({"ts": 1006.0, "durable": true, "paths": [fnorm], "measured_fp": "other_fp"}),
+        )
+        .unwrap();
+        assert_eq!(
+            persist_marker_repo_prepare_state(upd, true, false, &rfile, None).unwrap_err(),
+            "concurrent_worktree_mutation"
+        );
+        assert!(
+            delta_file.is_file(),
+            "aborted strict commit must leave concurrent pending delta intact"
+        );
+        let _ = fs::remove_file(&delta_file);
+
+        fs::write(&fpath, "pub fn a() -> i32 { 2 }\n").unwrap();
+        assert_eq!(
+            persist_marker_repo_prepare_state(upd, true, true, &rfile, Some(&sample_rounds))
+                .unwrap_err(),
+            "concurrent_worktree_mutation"
+        );
+
+        match prev {
+            Some(v) => env::set_var("CARBON_STACK_HOME", v),
+            None => env::remove_var("CARBON_STACK_HOME"),
+        }
+        let _ = fs::remove_dir_all(&tmp_home);
     }
 }

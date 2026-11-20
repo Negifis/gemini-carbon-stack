@@ -21,24 +21,80 @@ fn bus_snapshot_re() -> &'static Regex {
     })
 }
 
+fn bus_resolved_prefix_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)\A\s*\[(?:[A-Z0-9_\s]+_RESOLVED|[A-Z0-9_]+\s+RESOLVED|RESOLVED)\b")
+            .expect("bus_resolved_prefix_re")
+    })
+}
+
 fn bus_non_anomaly_prefix_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"(?i)\A\s*\[(?:TASK_DONE|LOCK_ACQUIRED|LOCK_RELEASED|COORDINATION|HANDOFF_ACK|ANOMALY_RESOLVED|RESOLVED|ACK)\b",
+            r"(?i)\A\s*\[(?:[A-Z0-9_]+_DONE|[A-Z0-9_]+_STARTED|[A-Z0-9_]+_QUEUE|LOCK_ACQUIRED|LOCK_RELEASED|COORDINATION|INFO|HANDOFF|HANDOFF_ACK|ACK)\b",
         )
         .expect("bus_non_anomaly_prefix_re")
     })
 }
 
-fn bus_report_re() -> &'static Regex {
+fn bus_explicit_anomaly_tag_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"(?i)\[(?:[A-Z0-9_]*ANOMALY[A-Z0-9_]*|[A-Z0-9_]*DEADLOCK[A-Z0-9_]*|[A-Z0-9_]*REPORT[A-Z0-9_]*|[A-Z0-9_]*BUG[A-Z0-9_]*)(?:\s+[^\]]*)?\]|GATE_ANOMALY|\banom-[0-9a-f]{6,}\b|\bdeadlock\b|\bcwg_stop\b|\bcodex_lane\b|\bsafety_guards\b|аномал",
+            r"(?i)\[([A-Z0-9_]*(?:GATE_ANOMALY|ANOMALY|DEADLOCK|REPORT|BUG)[A-Z0-9_]*)(?:\s+[^\]]*)?\]",
         )
-        .expect("bus_report_re")
+        .expect("bus_explicit_anomaly_tag_re")
     })
+}
+
+fn has_explicit_anomaly_tag(body: &str) -> bool {
+    bus_explicit_anomaly_tag_re().captures_iter(body).any(|cap| {
+        let head_ok = cap
+            .get(1)
+            .is_some_and(|m| !m.as_str().to_ascii_uppercase().ends_with("_RESOLVED"));
+        let full_ok = cap.get(0).is_some_and(|m| {
+            let inner = m.as_str().trim_end_matches(']').trim().to_ascii_uppercase();
+            !inner.ends_with("_RESOLVED") && !inner.ends_with(" RESOLVED")
+        });
+        head_ok && full_ok
+    })
+}
+
+fn bus_report_keyword_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)\bGATE_ANOMALY\b|\banom-[0-9a-f]{6,}\b|\bdeadlock\b|\bcwg_stop\b|\bcodex_lane\b|\bsafety_guards\b|аномал",
+        )
+        .expect("bus_report_keyword_re")
+    })
+}
+
+pub fn is_valid_anomaly_bus_body(body: &str) -> bool {
+    // INVARIANT: Share one canonical anomaly-body predicate across `unhandled_bus_reports`, `bus_has_anomaly_notification`, and `cwg_stop` transcript verification so coordination/resolved status messages (`[NEON_DONE]`, `[REPORT_DONE]`, `[REPORT_RESOLVED]`, etc.) never count as handler notifications while dropped by the inbox.
+    let trimmed = body.trim();
+    if trimmed.is_empty() || bus_resolved_prefix_re().is_match(trimmed) {
+        return false;
+    }
+    if let Some(m) = bus_non_anomaly_prefix_re().find(trimmed) {
+        let rest_start = trimmed[m.end()..]
+            .find(']')
+            .map(|idx| m.end() + idx + 1)
+            .unwrap_or(m.end());
+        return has_explicit_anomaly_tag(&trimmed[rest_start..]);
+    }
+    has_explicit_anomaly_tag(trimmed) || bus_report_keyword_re().is_match(trimmed)
+}
+
+pub fn is_valid_anomaly_notification(body: &str, report_id: &str) -> bool {
+    let rid = report_id.trim();
+    !rid.is_empty()
+        && is_valid_anomaly_bus_body(body)
+        && anom_id_re()
+            .find_iter(body)
+            .any(|m| m.as_str().eq_ignore_ascii_case(rid))
 }
 
 fn anom_id_re() -> &'static Regex {
@@ -432,10 +488,7 @@ pub fn unhandled_bus_reports_limited(handler_session: Option<&str>, limit: usize
             continue;
         }
         let body_s = row[4].as_str().trim().to_string();
-        if body_s.is_empty()
-            || bus_non_anomaly_prefix_re().is_match(&body_s)
-            || !bus_report_re().is_match(&body_s)
-        {
+        if !is_valid_anomaly_bus_body(&body_s) {
             continue;
         }
         let anom_ids: Vec<String> = anom_id_re()
@@ -498,14 +551,33 @@ pub fn bus_has_anomaly_notification(
     let Ok(conn) = SqliteConn::open(&db_path, SQLITE_OPEN_READONLY) else {
         return false;
     };
-    let sql = "SELECT 1 FROM messages WHERE from_id = ? AND to_id = ? AND created_ts >= ? AND LOWER(body) LIKE ? LIMIT 1";
-    let params = [
-        SqlParam::Text(fsess),
-        SqlParam::Text(hsess),
-        SqlParam::Float((since_ts - 5.0).max(0.0)),
-        SqlParam::Text(format!("%{}%", rid_low)),
-    ];
-    conn.query(sql, &params).map_or(false, |rows| !rows.is_empty())
+    let sql = "SELECT body FROM messages WHERE from_id = ? AND to_id = ? AND created_ts >= ? AND LOWER(body) LIKE ? ORDER BY created_ts DESC, rowid DESC LIMIT 64 OFFSET ?";
+    let since_bound = (since_ts - 5.0).max(0.0);
+    let like_pat = format!("%{}%", rid_low);
+    let mut offset: i64 = 0;
+    loop {
+        let params = [
+            SqlParam::Text(fsess.clone()),
+            SqlParam::Text(hsess.clone()),
+            SqlParam::Float(since_bound),
+            SqlParam::Text(like_pat.clone()),
+            SqlParam::Int(offset),
+        ];
+        let Ok(rows) = conn.query(sql, &params) else {
+            return false;
+        };
+        if rows.iter().any(|r| {
+            r.first()
+                .map(|cell| cell.as_str())
+                .is_some_and(|body| is_valid_anomaly_notification(&body, &rid_low))
+        }) {
+            return true;
+        }
+        if rows.len() < 64 {
+            return false;
+        }
+        offset = offset.saturating_add(64);
+    }
 }
 
 pub fn format_handler_digest(limit: usize, cfg: Option<&Value>) -> String {
@@ -1132,10 +1204,15 @@ mod tests {
         assert!(bus_non_anomaly_prefix_re().is_match("[LOCK_RELEASED] done"));
         assert!(bus_non_anomaly_prefix_re().is_match("[COORDINATION] note"));
         assert!(bus_non_anomaly_prefix_re().is_match("[HANDOFF_ACK] ok"));
-        assert!(bus_non_anomaly_prefix_re().is_match("[ANOMALY_RESOLVED] fixed"));
-        assert!(bus_report_re().is_match("[GATE_ANOMALY anom-1234abcd] fail"));
-        assert!(bus_report_re().is_match("deadlock in worker"));
-        assert!(bus_report_re().is_match("Обнаружена аномалия"));
+        assert!(bus_resolved_prefix_re().is_match("[ANOMALY_RESOLVED] fixed"));
+        assert!(bus_resolved_prefix_re().is_match("[REPORT_RESOLVED] fixed"));
+        assert!(has_explicit_anomaly_tag("[HANDOFF] [GATE_ANOMALY anom-1234abcd] fail"));
+        assert!(!has_explicit_anomaly_tag("[HANDOFF] [ANOMALY_RESOLVED] anom-1234abcd"));
+        assert!(is_valid_anomaly_bus_body("[GATE_ANOMALY anom-1234abcd] fail"));
+        assert!(is_valid_anomaly_bus_body("deadlock in worker"));
+        assert!(is_valid_anomaly_bus_body("Обнаружена аномалия"));
+        assert!(!is_valid_anomaly_bus_body("[REPORT_RESOLVED] anom-1234abcd"));
+        assert!(!is_valid_anomaly_bus_body("[NEON_DONE] anom-1234abcd"));
         assert!(anom_id_re().is_match("see anom-deadbeef for details"));
     }
 
@@ -1165,12 +1242,21 @@ mod tests {
 
             let rows = [
                 ("m-done", "t1", "w1", "W1", handler_id, "[TASK_DONE] anom-aaaaaa11 done", "delivered", 0.0, 10.0),
+                ("m-ndone", "t1", "w1", "W1", handler_id, "[NEON_DONE] pushed main; you can land anom-693fb707", "delivered", 0.0, 10.5),
+                ("m-nstart", "t1", "w1", "W1", handler_id, "[NEON_STARTED] starting after anom-693fb707", "delivered", 0.0, 10.6),
+                ("m-info", "t1", "w1", "W1", handler_id, "[INFO / READY] gate ready anom-693fb707", "delivered", 0.0, 10.7),
                 ("m-lock", "t1", "w1", "W1", handler_id, "[LOCK_RELEASED] bug cleared", "delivered", 0.0, 11.0),
                 ("m-coord", "t1", "w1", "W1", handler_id, "[COORDINATION] deadlock check", "delivered", 0.0, 12.0),
                 ("m-hack", "t1", "w1", "W1", handler_id, "[HANDOFF_ACK] cwg_stop ok", "delivered", 0.0, 13.0),
                 ("m-ares", "t1", "w1", "W1", handler_id, "[ANOMALY_RESOLVED] anom-bbbbbb22", "delivered", 0.0, 14.0),
+                ("m-rres", "t1", "w1", "W1", handler_id, "[REPORT_RESOLVED] anom-bbbbbb22", "delivered", 0.0, 14.2),
+                ("m-bres", "t1", "w1", "W1", handler_id, "[BUG_RESOLVED] anom-bbbbbb22", "delivered", 0.0, 14.3),
+                ("m-hares", "t1", "w1", "W1", handler_id, "[HANDOFF] [ANOMALY_RESOLVED] anom-bbbbbb22", "delivered", 0.0, 14.5),
+                ("m-hrres", "t1", "w1", "W1", handler_id, "[HANDOFF] [REPORT_RESOLVED] anom-bbbbbb22", "delivered", 0.0, 14.7),
                 ("m-acked", "t1", "w1", "W1", handler_id, "[GATE_ANOMALY anom-cccccc33] acked", "delivered", 50.0, 15.0),
                 ("m-real", "t2", "w2", "Cross-Chat", handler_id, "[ANOMALY REPORT] cwg_stop blocked unexpectedly", "unread", 0.0, 16.0),
+                ("m-handoff-anom", "t3", "w3", "Peer", handler_id, "[HANDOFF] [GATE_ANOMALY anom-1234abcd] cwg_stop blocked unexpectedly", "unread", 0.0, 17.0),
+                ("m-handoff-rep", "t4", "w4", "Peer2", handler_id, "[HANDOFF] [REPORT anom-5678efab] cwg_stop blocked unexpectedly", "unread", 0.0, 18.0),
             ];
             for (mid, tid, fid, ft, to, body, st, ack, ts) in rows {
                 conn.execute(
@@ -1192,12 +1278,56 @@ mod tests {
         }
 
         let got = unhandled_bus_reports(handler_id);
-        assert_eq!(got.len(), 1);
+        assert_eq!(got.len(), 3);
         assert_eq!(got[0]["msg_id"], json!("m-real"));
+        assert_eq!(got[1]["msg_id"], json!("m-handoff-anom"));
+        assert_eq!(got[2]["msg_id"], json!("m-handoff-rep"));
+        assert!(
+            !bus_has_anomaly_notification("w1", handler_id, 5.0, "anom-693fb707"),
+            "coordination [NEON_DONE]/[INFO] mentioning anom-id must not satisfy handler notification"
+        );
+        assert!(
+            !bus_has_anomaly_notification("w1", handler_id, 5.0, "anom-bbbbbb22"),
+            "[*_RESOLVED] messages must not satisfy handler notification"
+        );
+        assert!(
+            bus_has_anomaly_notification("w3", handler_id, 5.0, "anom-1234abcd"),
+            "explicit [GATE_ANOMALY ...] handoff must satisfy handler notification"
+        );
+        {
+            let conn = SqliteConn::open(&db_path, SQLITE_OPEN_READWRITE).unwrap();
+            for idx in 0..70 {
+                conn.execute(
+                    "INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    &[
+                        SqlParam::Text(format!("m-noise-{}", idx)),
+                        SqlParam::Text("t3".to_string()),
+                        SqlParam::Text("w3".to_string()),
+                        SqlParam::Text("Peer".to_string()),
+                        SqlParam::Text(handler_id.to_string()),
+                        SqlParam::Text("[NEON_DONE] follow-up status mentioning anom-1234abcd".to_string()),
+                        SqlParam::Text("unread".to_string()),
+                        SqlParam::Float(0.0),
+                        SqlParam::Float(20.0 + idx as f64),
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        assert!(
+            bus_has_anomaly_notification("w3", handler_id, 5.0, "anom-1234abcd"),
+            ">25 newer filtered status messages mentioning same anom-id must not hide delivered anomaly notification"
+        );
+        assert!(
+            bus_has_anomaly_notification("w1", handler_id, 5.0, "anom-cccccc33"),
+            "explicit [GATE_ANOMALY ...] notification remains valid even after handler acks it"
+        );
         let banner = format_handler_banner(handler_id).unwrap();
         assert!(banner.contains("m-real"));
+        assert!(banner.contains("m-handoff-anom"));
+        assert!(banner.contains("m-handoff-rep"));
         let summary = unresolved_summary(handler_id);
-        assert_eq!(summary["bus_count"], json!(1));
+        assert_eq!(summary["bus_count"], json!(3));
 
         match prev {
             Some(v) => std::env::set_var("CARBON_STACK_HOME", v),
@@ -1239,5 +1369,18 @@ mod tests {
             None => std::env::remove_var("CARBON_STACK_HOME"),
         }
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_is_valid_anomaly_bus_body_strips_status_tags() {
+        // INVARIANT: Leading non-anomaly bracket tags (`[REPORT_DONE]`, `[NEON_DONE]`) must not misclassify routine bus traffic as anomaly reports unless followed by `[GATE_ANOMALY ...]` or `anom-<hex>`.
+        assert!(!is_valid_anomaly_bus_body("[REPORT_DONE] routine handoff note"));
+        assert!(!is_valid_anomaly_bus_body("[NEON_DONE] completed build"));
+        assert!(is_valid_anomaly_bus_body(
+            "[REPORT_DONE] [GATE_ANOMALY anom-123456] session=s1; block=test"
+        ));
+        assert!(is_valid_anomaly_bus_body(
+            "Escalating anom-abcdef01 from worker chat"
+        ));
     }
 }

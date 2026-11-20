@@ -3157,6 +3157,9 @@ pub struct ClosureCycleSummary {
     pub counted_ordinary_rounds: usize,
     pub raw_ordinary_rounds: usize,
     pub ordinary_cap_reached: bool,
+    pub has_round_cap_escalate: bool,
+    pub escalate_verdict_ts: f64,
+    pub has_post_escalate_research: bool,
     pub has_fresh_ordinary_approved: bool,
     pub needs_simplify: bool,
     pub simplify_started_in_cycle: bool,
@@ -3598,61 +3601,133 @@ fn build_codex_exec_args(
     args
 }
 
-fn build_adversarial_prompt(
-    review_id: &str,
-    packet_nonce: &str,
-    scope_summary: &str,
-    diff_text: &str,
-    phase: &str,
+struct PromptBuildSpec<'a> {
+    review_id: &'a str,
+    packet_nonce: &'a str,
+    scope_summary: &'a str,
+    diff_text: &'a str,
+    interdiff_text: &'a str,
+    prior_ledger: &'a str,
+    phase: &'a str,
+    round_num: usize,
     is_resume: bool,
     is_timeout_resume: bool,
-) -> String {
-    let verdict_rule = if phase == "closure" {
-        "Respond in plain text/markdown (not JSON) and conclude with an exact standalone line:\n\
+}
+
+fn build_adversarial_prompt(spec: PromptBuildSpec<'_>) -> String {
+    let max_ord = crate::cwg_stop::MAX_REVIEW_ROUNDS;
+    let max_cls = cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE;
+    let round_header = if spec.phase == "closure" {
+        format!(
+            "MODE: CLOSURE_VALIDATION (Pass {}/{}{})\n",
+            spec.round_num.clamp(1, max_cls),
+            max_cls,
+            if spec.round_num >= max_cls {
+                " — FINAL PASS"
+            } else {
+                ""
+            }
+        )
+    } else {
+        format!(
+            "MODE: ORDINARY_REVIEW (Round {}/{}{})\n",
+            spec.round_num.clamp(1, max_ord),
+            max_ord,
+            if spec.round_num >= max_ord {
+                " — FINAL ORDINARY ROUND: emit VERDICT: ESCALATE if any CRITICAL/HIGH blocker remains"
+            } else {
+                ""
+            }
+        )
+    };
+
+    let verdict_rule = if spec.phase == "closure" {
+        "Check ONLY the frozen open blocker ledger, recovery interdiff, affected interfaces, and direct regressions — NEVER re-audit the whole scope.\n\
+Respond in plain text/markdown (not JSON) and conclude with an exact standalone last line (no trailing prose, no code fences):\n\
 CLOSURE_VALIDATION: READY\n\
 or\n\
 CLOSURE_VALIDATION: BLOCKED\n\
-Choose BLOCKED only if concrete correctness, security, data-loss, or contract regressions remain."
+READY means every prior CRITICAL/HIGH blocker is resolved or not applicable with evidence and no direct recovery regression blocks release. BLOCKED must name the remaining CRITICAL/HIGH blocker with a concrete trigger."
+            .to_string()
+    } else if spec.round_num >= max_ord {
+        format!(
+            "Respond in plain text/markdown (not JSON) and conclude with an exact standalone last line (no trailing prose, no code fences):\n\
+VERDICT: APPROVED\n\
+or (because this is Round {0}/{0} and ordinary budget is spent if CRITICAL/HIGH blockers remain)\n\
+VERDICT: ESCALATE\n\
+Never emit REVISE in Round {0}.",
+            max_ord
+        )
     } else {
-        "Respond in plain text/markdown (not JSON) and conclude with an exact standalone line:\n\
+        "Respond in plain text/markdown (not JSON) and conclude with an exact standalone last line (no trailing prose, no code fences):\n\
 VERDICT: APPROVED\n\
 or\n\
-VERDICT: REVISE\n\
-or (round 3 only when fundamental design trade-offs remain)\n\
-VERDICT: ESCALATE\n\
-Approve when no real correctness, security, concurrency, edge-case, or contract defects exist. \
-Do not invent nitpicks to justify REVISE."
+VERDICT: REVISE"
+            .to_string()
     };
 
-    let round_mode = if is_timeout_resume {
-        "ROUND_MODE: timeout_continuation (same review thread — your previous review turn hit the wall-clock timeout \
-before emitting a final verdict; continue from the repository context already inspected in this thread \
-without starting over, and conclude with your findings and exact standalone verdict line).\n"
-    } else if is_resume {
-        "ROUND_MODE: continuation (same review thread — verify whether prior findings are resolved, \
-check remediation delta for regressions, and do not invent nitpicks on unchanged code).\n"
+    let is_delta_scope = !spec.is_timeout_resume && (spec.phase == "closure" || spec.is_resume || spec.round_num > 1);
+    let round_mode = if spec.is_timeout_resume {
+        "ROUND_MODE: timeout_continuation (same review thread — your previous review turn hit the wall-clock timeout before emitting a final verdict; continue from the context already inspected without starting over, and conclude with your findings and exact standalone verdict line).\n"
+    } else if is_delta_scope {
+        "ROUND_MODE: delta_interdiff (re-review is strictly scoped to the remediation interdiff and prior blockers, NOT the whole change again:\n\
+- Give each prior blocker disposition: RESOLVED, NOT RESOLVED (with concrete evidence), or REGRESSED. Judge whether the failure scenario is removed, even if implemented differently from your wording.\n\
+- Inspect the changes since your last round plus their direct blast radius (callers, callees, contracts).\n\
+- SETTLED-SCOPE FREEZE: Everything examined in earlier rounds that this interdiff does NOT touch is SETTLED. Do NOT re-read settled code and do NOT raise new findings on untouched code, except a brand-new CRITICAL with explicit justification why it was invisible in Round 1.)\n"
     } else {
-        ""
+        "ROUND_MODE: round_1_full_candidate (report every qualifying CRITICAL/HIGH finding in Round 1; never hold findings back for later rounds).\n"
     };
 
-    let diff_snapshot: String = match diff_text.char_indices().nth(MAX_DIFF_SNAPSHOT_CHARS) {
-        Some((idx, _)) => diff_text[..idx].to_string(),
-        None => diff_text.to_string(),
+    let ledger_section = if is_delta_scope && !spec.prior_ledger.trim().is_empty() {
+        let trimmed_ledger: String = match spec.prior_ledger.char_indices().nth(12_000) {
+            Some((idx, _)) => spec.prior_ledger[..idx].to_string(),
+            None => spec.prior_ledger.to_string(),
+        };
+        format!("\nPRIOR ROUND FINDING LEDGER:\n{}\n", trimmed_ledger.trim())
+    } else {
+        String::new()
+    };
+
+    let primary_diff = if is_delta_scope && !spec.interdiff_text.trim().is_empty() {
+        let snap: String = match spec.interdiff_text.char_indices().nth(MAX_DIFF_SNAPSHOT_CHARS) {
+            Some((idx, _)) => spec.interdiff_text[..idx].to_string(),
+            None => spec.interdiff_text.to_string(),
+        };
+        format!("REMEDIATION INTERDIFF SINCE PREVIOUS ROUND:\n{}", snap)
+    } else {
+        let snap: String = match spec.diff_text.char_indices().nth(MAX_DIFF_SNAPSHOT_CHARS) {
+            Some((idx, _)) => spec.diff_text[..idx].to_string(),
+            None => spec.diff_text.to_string(),
+        };
+        format!("GIT DIFF SNAPSHOT:\n{}", snap)
     };
 
     format!(
         "REVIEW_ID: {}\n\
 PACKET_NONCE: {}\n\
-ROLE: Independent Adversarial Code Reviewer (Read-Only).\n\
-{}\
-RULES:\n\
-1. Do NOT modify any files. Inspect repository files directly if needed for context.\n\
-2. Verify invariants, failure paths, security boundaries, concurrency, and test coverage.\n\
-3. Separate confirmed defects ([HIGH]/[MEDIUM]) from non-blocking observations.\n\
-4. {}\n\n\
-CANDIDATE SUMMARY:\n{}\n\n\
-GIT DIFF SNAPSHOT:\n{}\n",
-        review_id, packet_nonce, round_mode, verdict_rule, scope_summary, diff_snapshot
+ROLE: Senior Read-Only Adversarial Code Reviewer.\n\
+{}{}\
+OPERATING STANCE & SEVERITY CALIBRATION (BLOCKING_THRESHOLD = HIGH):\n\
+1. Read-only authorized review: NEVER edit, write, or delete files, and NEVER end with a question. Make reasonable assumptions, state them, and finish with the standalone verdict line.\n\
+2. Adversarial search is the method; deciding whether anything blocks release is the job. A clean, evidence-backed APPROVED is a successful review, not a failed attack.\n\
+3. Severity definitions:\n\
+   - CRITICAL: data loss, security bypass, auth breach, schema corruption.\n\
+   - HIGH: a concrete reachable path to a production failure, cascading breakage, or broken rollback, with a named concrete trigger.\n\
+   - MEDIUM: a real edge case, observability gap, or race under load that does not break normal operation.\n\
+   - LOW / INFO: correctness-adjacent polish or hypothetical concern without a concrete trigger.\n\
+4. ONLY CRITICAL, HIGH, and explicit acceptance-criterion violations block. MEDIUM, LOW, and INFO are non-blocking notes inside an APPROVED verdict. A finding without a concrete trigger is LOW/INFO or nothing at all — do NOT manufacture severity to justify REVISE/BLOCKED. Pre-existing out-of-scope defects carry no severity and never affect the verdict.\n\
+5. Pre-verdict self-check: if no open CRITICAL or HIGH remains and nothing required is missing, emit APPROVED / READY immediately rather than looking for one more reason to hold.\n\
+6. {}\n\n\
+CANDIDATE SUMMARY:\n{}\n{}\n\
+{}\n",
+        spec.review_id,
+        spec.packet_nonce,
+        round_header,
+        round_mode,
+        verdict_rule,
+        spec.scope_summary,
+        ledger_section,
+        primary_diff
     )
 }
 
@@ -3997,7 +4072,8 @@ fn purge_session_lane_threads_unlocked(session: &str, git_root: &str) {
             let Some(fname) = fname_os.to_str() else {
                 continue;
             };
-            if fname == default_name || (fname.starts_with(&lane_prefix) && fname.ends_with(".json")) {
+            if fname == default_name || (fname.starts_with(&lane_prefix) && fname.ends_with(".json"))
+            {
                 unlink_quiet(&ent.path());
             }
         }
@@ -4014,13 +4090,14 @@ struct ResearchResetArgs {
 }
 
 fn cmd_research_reset(args: &ResearchResetArgs) -> i32 {
+    // INVARIANT: Allow at most `MAX_REDESIGN_RESETS = 1` finite architectural `REDESIGN` reset per candidate after Round 4 `ESCALATE` + verified post-`ESCALATE` research (clearing saved Codex threads, round counters, and simplify latches so the redesigned architecture starts in fresh reviewer/simplify sessions), while keeping `REMEDIATE` in the current Codex session (`max 2` `--closure` passes) and terminating finitely via `[gate] draft-blocked` when exhausted.
     let dec = args.decision.trim().to_ascii_lowercase();
-    if !cwg_common::RESEARCH_RESET_DECISIONS.contains(&dec.as_str()) {
+    if !cwg_common::REDESIGN_RESET_DECISIONS.contains(&dec.as_str()) {
         rio::print_cli_json(
             &json!({
                 "ok": false,
                 "error": "invalid_decision",
-                "hint": "Specify --decision refactor (redesign/refactor from scratch) or --decision refine (targeted refinement grounded in researched docs).",
+                "hint": "Only architectural REDESIGN resets rounds and reviewer sessions (--decision redesign|refactor, max 1 per candidate). Targeted REMEDIATE stays in the current Codex session via `carbon-stack codex-lane review --closure` (max 2 passes).",
             }),
             args.pretty,
         );
@@ -4032,7 +4109,7 @@ fn cmd_research_reset(args: &ResearchResetArgs) -> i32 {
             &json!({
                 "ok": false,
                 "error": "insufficient_findings",
-                "hint": "Provide a concrete --findings summary (>= 15 chars) of the researched documentation/best practices and architectural decision.",
+                "hint": "Provide a concrete --findings summary (>= 15 chars) of the researched documentation/best practices and architectural REDESIGN decision.",
             }),
             args.pretty,
         );
@@ -4072,7 +4149,7 @@ fn cmd_research_reset(args: &ResearchResetArgs) -> i32 {
                     "ok": false,
                     "review_in_progress": true,
                     "error": "concurrent_review_in_flight",
-                    "hint": "Wait for the running `carbon-stack codex-lane review` to finish before running `research-reset`.",
+                    "hint": "Wait for the running `carbon-stack codex-lane review` to finish before running `redesign-reset`.",
                 }),
                 args.pretty,
             );
@@ -4084,7 +4161,7 @@ fn cmd_research_reset(args: &ResearchResetArgs) -> i32 {
                     "ok": false,
                     "sandbox_blocked": true,
                     "detail": detail,
-                    "error": "CARBON_STACK_HOME is not writable in sandbox; re-run `carbon-stack codex-lane research-reset` with BypassSandbox=true",
+                    "error": "CARBON_STACK_HOME is not writable in sandbox; re-run `carbon-stack codex-lane redesign-reset` with BypassSandbox=true",
                 }),
                 args.pretty,
             );
@@ -4119,7 +4196,7 @@ fn cmd_research_reset(args: &ResearchResetArgs) -> i32 {
     }
     let pre_lock_rr_ts = cwg_common::last_research_reset_ts(&marker);
     let pre_lock_rr_seq = cwg_common::last_research_reset_board_seq(&marker);
-
+    let used_redesigns = cwg_common::redesign_reset_count(&marker);
     let tp_buf = if !args.transcript.trim().is_empty() {
         PathBuf::from(args.transcript.trim())
     } else {
@@ -4127,47 +4204,89 @@ fn cmd_research_reset(args: &ResearchResetArgs) -> i32 {
     };
     let tp_str = tp_buf.to_string_lossy().into_owned();
     let cls_summary = active_cycle_closure_summary(&eff_session, &git_root, &tp_str);
-    let blocked_n = cls_summary.blocked_count;
-    let blocked_ids = cls_summary.blocked_ids;
-    let cycle_exhausted_unready = cls_summary.effective_pass_count
+    let closure_exhausted = cls_summary.effective_pass_count
         >= cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE
-        && !cls_summary.has_fresh_ready;
-    let halt_floor_ts = if blocked_n >= cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE {
-        cls_summary.last_blocked_ts
-    } else {
-        cls_summary.last_closure_ts.max(cls_summary.last_blocked_ts)
-    };
-    if blocked_n < cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE && !cycle_exhausted_unready {
+        || cls_summary.blocked_count >= cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE
+        || cwg_common::active_marker_closure_halt(&marker).is_some();
+    if used_redesigns >= cwg_common::MAX_REDESIGN_RESETS {
         rio::print_cli_json(
             &json!({
                 "ok": false,
-                "error": "closure_blocks_below_threshold",
-                "blocked_closure_passes": blocked_n,
-                "effective_closure_passes": cls_summary.effective_pass_count,
-                "required": cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE,
-                "hint": "research-reset is reserved for cycles halted after 2 closure passes without a valid CLOSURE_VALIDATION: READY.",
+                "error": "redesign_reset_limit_reached",
+                "redesign_resets_used": used_redesigns,
+                "max_redesign_resets": cwg_common::MAX_REDESIGN_RESETS,
+                "terminal_draft_blocked": closure_exhausted,
+                "hint": format!(
+                    "Current candidate already consumed MAX_REDESIGN_RESETS={0}/{0}. Complete via `--closure` (max {1} passes) or terminate finitely with `[gate] draft-blocked: <exact blocker and handoff>`.",
+                    cwg_common::MAX_REDESIGN_RESETS,
+                    cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE,
+                ),
             }),
             args.pretty,
         );
         return 2;
     }
-
+    if cls_summary.has_fresh_ordinary_approved || cls_summary.has_fresh_ready {
+        rio::print_cli_json(
+            &json!({
+                "ok": false,
+                "error": "already_terminal_approved_or_ready",
+                "hint": "Current candidate already has a fresh APPROVED/READY verdict; close the gate instead of resetting.",
+            }),
+            args.pretty,
+        );
+        return 2;
+    }
+    if closure_exhausted {
+        rio::print_cli_json(
+            &json!({
+                "ok": false,
+                "error": "closure_budget_exhausted",
+                "terminal_draft_blocked": true,
+                "blocked_closure_passes": cls_summary.blocked_count,
+                "effective_closure_passes": cls_summary.effective_pass_count,
+                "hint": format!(
+                    "All {0}/{0} closure passes were already consumed or halted by 2x BLOCKED; finish finitely with `[gate] draft-blocked: <exact blocker and handoff>`.",
+                    cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE,
+                ),
+            }),
+            args.pretty,
+        );
+        return 2;
+    }
+    if !cls_summary.has_round_cap_escalate || cls_summary.escalate_verdict_ts <= 0.0 {
+        rio::print_cli_json(
+            &json!({
+                "ok": false,
+                "error": "redesign_requires_escalate",
+                "counted_ordinary_rounds": cls_summary.counted_ordinary_rounds,
+                "hint": format!(
+                    "`redesign-reset` is allowed only after Round {0} ESCALATE + focused research when choosing architectural REDESIGN (max {1} per candidate).",
+                    crate::cwg_stop::MAX_REVIEW_ROUNDS,
+                    cwg_common::MAX_REDESIGN_RESETS,
+                ),
+            }),
+            args.pretty,
+        );
+        return 2;
+    }
+    let halt_floor_ts = cls_summary
+        .escalate_verdict_ts
+        .max(cls_summary.last_blocked_ts);
     let steps = rio::read_transcript_steps(&tp_str, 4000);
-    let research_tools =
-        cwg_common::find_research_evidence_since(&steps, halt_floor_ts, None);
+    let research_tools = cwg_common::find_research_evidence_since(&steps, halt_floor_ts, None);
     if research_tools.is_empty() {
         rio::print_cli_json(
             &json!({
                 "ok": false,
-                "error": "missing_post_block_research",
-                "last_blocked_ts": halt_floor_ts,
-                "hint": "Execute external documentation/web research AFTER the closure halt (search_web, tokenade search/web, Context7, Gemini/Developer Knowledge MCP docs, or the research subagent) before running research-reset.",
+                "error": "missing_post_escalate_research",
+                "escalate_verdict_ts": halt_floor_ts,
+                "hint": "Execute focused external/docs research AFTER Round 4 ESCALATE (`search_web`, `context7`, `exa`, `fetch`, `tokenade search|web`, or `research` subagent) before running `redesign-reset`.",
             }),
             args.pretty,
         );
         return 2;
     }
-
     let brain_root = rio::swarm_brain_and_cid(&tp_str, &eff_session)
         .0
         .unwrap_or_else(|| rio::resolve_brain_root(""));
@@ -4178,7 +4297,7 @@ fn cmd_research_reset(args: &ResearchResetArgs) -> i32 {
                 "ok": false,
                 "error": "active_swarm_workers_present",
                 "workers": alive_workers,
-                "hint": "Kill all waiting/active simplify and review swarm workers via swarm(action='kill', ...) before research-reset so the new cycle starts in fresh worker sessions.",
+                "hint": "Kill all waiting/active simplify and review swarm workers via swarm(action='kill', ...) before `redesign-reset` so the redesigned cycle starts in fresh sessions.",
             }),
             args.pretty,
         );
@@ -4197,7 +4316,7 @@ fn cmd_research_reset(args: &ResearchResetArgs) -> i32 {
     let board_head_live = cwg_common::swarm_board_head_seq(&eff_session, &git_root, &tp_str, None);
     let now = now_sec().max(halt_floor_ts + 0.002);
 
-    // SAFETY: Lock `marker_lock_path` (backed by OS kernel `File::try_lock`), fold pending `PostToolUse` deltas, re-scan rollouts ONLY if `marker` changed since pre-check, verify unchanged `mpath` snapshot before writing, and persist `research_resets` BEFORE purging lane threads.
+    // SAFETY: Lock `marker_lock_path` and `thread_lock_path`, re-verify `MAX_REDESIGN_RESETS` and `ESCALATE` invariants under lock, persist `research_resets` BEFORE purging lane threads, and clear stale simplify latches so the redesigned candidate gets one fresh cycle.
     let commit_res: Result<(i64, Value), &'static str> =
         rio::with_file_lock(&cwg_common::marker_lock_path(&skey), 5.0, 30.0, |m_locked| {
             if !m_locked {
@@ -4212,13 +4331,23 @@ fn cmd_research_reset(args: &ResearchResetArgs) -> i32 {
             if !fresh_marker.is_object() || json_truthy(fresh_marker.get("closed")) {
                 return Err("no_open_candidate");
             }
+            if cwg_common::redesign_reset_count(&fresh_marker) >= cwg_common::MAX_REDESIGN_RESETS {
+                return Err("redesign_reset_limit_reached");
+            }
             if cwg_common::last_research_reset_ts(&fresh_marker) != pre_lock_rr_ts
                 || cwg_common::last_research_reset_board_seq(&fresh_marker) != pre_lock_rr_seq
             {
-                return Err("closure_blocks_below_threshold");
+                return Err("redesign_requires_escalate");
+            }
+            if cwg_common::active_marker_closure_halt(&fresh_marker).is_some() {
+                return Err("closure_budget_exhausted");
             }
             let (live_halt_ts, live_blocked_ids, eff_res_tools) = if fresh_marker == marker {
-                (halt_floor_ts, blocked_ids.clone(), research_tools.clone())
+                (
+                    halt_floor_ts,
+                    cls_summary.blocked_ids.clone(),
+                    research_tools.clone(),
+                )
             } else {
                 let live_sum = active_cycle_closure_summary_for_marker(
                     &fresh_marker,
@@ -4226,25 +4355,24 @@ fn cmd_research_reset(args: &ResearchResetArgs) -> i32 {
                     &git_root,
                     &tp_str,
                 );
-                let live_exhausted_unready = live_sum.effective_pass_count
-                    >= cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE
-                    && !live_sum.has_fresh_ready;
-                if live_sum.blocked_count < cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE
-                    && !live_exhausted_unready
-                {
-                    return Err("closure_blocks_below_threshold");
+                if live_sum.has_fresh_ordinary_approved || live_sum.has_fresh_ready {
+                    return Err("already_terminal_approved_or_ready");
                 }
-                let h_ts = if live_sum.blocked_count >= cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE {
-                    live_sum.last_blocked_ts
-                } else {
-                    live_sum.last_closure_ts.max(live_sum.last_blocked_ts)
-                };
+                if live_sum.effective_pass_count >= cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE
+                    || live_sum.blocked_count >= cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE
+                {
+                    return Err("closure_budget_exhausted");
+                }
+                if !live_sum.has_round_cap_escalate || live_sum.escalate_verdict_ts <= 0.0 {
+                    return Err("redesign_requires_escalate");
+                }
+                let h_ts = live_sum.escalate_verdict_ts.max(live_sum.last_blocked_ts);
                 let mut r_tools = research_tools.clone();
                 if h_ts > halt_floor_ts {
                     let fresh_steps = rio::read_transcript_steps(&tp_str, 4000);
                     r_tools = cwg_common::find_research_evidence_since(&fresh_steps, h_ts, None);
                     if r_tools.is_empty() {
-                        return Err("missing_post_block_research");
+                        return Err("missing_post_escalate_research");
                     }
                 }
                 (h_ts, live_sum.blocked_ids, r_tools)
@@ -4282,6 +4410,8 @@ fn cmd_research_reset(args: &ResearchResetArgs) -> i32 {
                 mobj.insert("round_start_msg_id".to_string(), json!(board_head_seq));
                 mobj.remove("closure_halt");
                 mobj.remove("cycle_declared_risk");
+                mobj.remove("simplify_fast_path_latched");
+                mobj.remove("simplify_verified_latched");
             }
             rio::with_file_lock(&thread_lock_path(&eff_session, &git_root), 5.0, 30.0, |t_locked| {
                 if !t_locked {
@@ -4317,14 +4447,15 @@ fn cmd_research_reset(args: &ResearchResetArgs) -> i32 {
         }
     };
 
-    rio::log_hook_event("gate-events", "research_cycle_reset", reset_entry.clone());
+    rio::log_hook_event("gate-events", "redesign_cycle_reset", reset_entry.clone());
     rio::print_cli_json(
         &json!({
             "ok": true,
             "session": eff_session,
             "decision": dec,
+            "redesign_resets_used": used_redesigns + 1,
+            "max_redesign_resets": cwg_common::MAX_REDESIGN_RESETS,
             "research_tools": reset_entry.get("research_tools").cloned().unwrap_or_else(|| json!(research_tools)),
-            "blocked_review_ids": reset_entry.get("blocked_review_ids").cloned().unwrap_or_else(|| json!(blocked_ids)),
             "reset_ts": reset_entry.get("reset_ts").cloned().unwrap_or_else(|| json!(now)),
             "board_head_seq": board_head_seq,
             "round_counters_reset": true,
@@ -4552,22 +4683,32 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
     let cls_summary =
         active_cycle_closure_summary_with_risk(&eff_session, &git_root, "", req_risk_override);
     let blocked_cls_n = cls_summary.blocked_count;
-    let last_cls_blk_ts = cls_summary.last_blocked_ts;
     let blocked_cls_ids = cls_summary.blocked_ids;
+    let cand_first_ts = candidate_first_ts(&eff_session);
+    if phase == "ordinary" && !eff_session.is_empty() {
+        if let Some(m_fp) = cwg_common::read_marker_with_pending(&eff_session)
+            .filter(|m| !json_truthy(m.get("closed")))
+        {
+            if crate::cwg_stop::has_completed_candidate_simplify(&eff_session, &m_fp, "")
+                && cwg_common::is_simplify_fast_path_eligible(&m_fp, None, None, &git_root)
+            {
+                let _ = cwg_common::latch_marker_fast_path_simplify(&eff_session, now_sec());
+            }
+        }
+    }
     if blocked_cls_n >= cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE {
-        // INVARIANT: Halt review continuation after 2 `CLOSURE_VALIDATION: BLOCKED` passes until Research Mode + `research-reset` runs.
+        // INVARIANT: Hard-stop review continuation after 2 `CLOSURE_VALIDATION: BLOCKED` passes (`Nothing wraps it in another loop`) and finish finitely via `[gate] draft-blocked`.
         rio::print_cli_json(
             &json!({
                 "ok": false,
-                "research_mode_required": true,
+                "terminal_draft_blocked": true,
                 "blocked_closure_passes": blocked_cls_n,
                 "blocked_review_ids": blocked_cls_ids,
                 "error": "max_closure_blocks_reached",
                 "hint": format!(
-                    "After {} CLOSURE_VALIDATION: BLOCKED passes, continuing the current cycle is forbidden. Enter Research Mode: study relevant documentation and best practices via plugins/web (search_web, tokenade search/web, Context7, Developer Knowledge / Gemini Docs), choose `refactor` or `refine`, kill any waiting simplify/review swarm workers, and run `carbon-stack codex-lane research-reset --cwd {} --session {} --decision <refactor|refine> --findings '...'` to reset round counters and start fresh simplify & review sessions.",
+                    "After {}/{} CLOSURE_VALIDATION: BLOCKED passes, the closure budget is exhausted. Do NOT restart review or simplify: preserve completed work and finish finitely with `[gate] draft-blocked: <exact blocker and handoff>`.",
                     blocked_cls_n,
-                    quote_cli_arg(&cwd),
-                    quote_cli_arg(&eff_session),
+                    cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE,
                 ),
             }),
             args.pretty,
@@ -4580,7 +4721,7 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
         rio::print_cli_json(
             &json!({
                 "ok": false,
-                "research_mode_required": !cls_summary.has_fresh_ready,
+                "terminal_draft_blocked": !cls_summary.has_fresh_ready,
                 "already_closure_ready": cls_summary.has_fresh_ready,
                 "round_consumed": false,
                 "effective_closure_passes": cls_summary.effective_pass_count,
@@ -4589,10 +4730,8 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
                     "Current candidate already completed 2/2 closure passes ending in CLOSURE_VALIDATION: READY; close the gate instead of launching a 3rd --closure pass.".to_string()
                 } else {
                     format!(
-                        "Current cycle already consumed MAX_CLOSURE_PASSES={} closure passes; enter Research Mode and run `carbon-stack codex-lane research-reset --cwd {} --session {} --decision <refactor|refine> --findings '...'` to start a fresh cycle.",
+                        "Current candidate already consumed MAX_CLOSURE_PASSES={0}/{0} closure passes; finish finitely with `[gate] draft-blocked: <exact blocker and handoff>`.",
                         cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE,
-                        quote_cli_arg(&cwd),
-                        quote_cli_arg(&eff_session),
                     )
                 },
             }),
@@ -4600,45 +4739,56 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
         );
         return 2;
     }
+    if cls_summary.has_fresh_ordinary_approved {
+        rio::print_cli_json(
+            &json!({
+                "ok": false,
+                "round_consumed": false,
+                "already_approved": true,
+                "error": "already_ordinary_approved",
+                "hint": "Current candidate already has a fresh valid `VERDICT: APPROVED`: close the gate immediately with `[gate] verified: ...` (never run post-approval simplify or `--closure`).",
+            }),
+            args.pretty,
+        );
+        return 2;
+    }
     if phase == "ordinary" {
         if cls_summary.ordinary_cap_reached {
+            let terminal_no_escalate = !cls_summary.has_round_cap_escalate;
+            let ord_cap_hint = if cls_summary.has_round_cap_escalate {
+                let can_redesign = cwg_common::read_marker_with_pending(&eff_session)
+                    .map(|m| cwg_common::redesign_reset_count(&m) < cwg_common::MAX_REDESIGN_RESETS)
+                    .unwrap_or(false);
+                if can_redesign {
+                    format!(
+                        "All {0}/{0} ordinary review rounds have been used (ending in ESCALATE): perform one focused research pass, then either (a) REMEDIATE in the same Codex session via `carbon-stack codex-lane review --closure` (max {1} passes), or (b) for an architectural REDESIGN (max {2} per candidate) kill swarm workers and run `carbon-stack codex-lane redesign-reset --cwd <repo> --session <sid> --findings \"<summary>\"` to reset rounds and start fresh simplify + review sessions.",
+                        crate::cwg_stop::MAX_REVIEW_ROUNDS,
+                        cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE,
+                        cwg_common::MAX_REDESIGN_RESETS,
+                    )
+                } else {
+                    format!(
+                        "All {0}/{0} ordinary review rounds have been used (ending in ESCALATE; {2}/{2} REDESIGN reset already used): perform one focused research pass, run tests, and run `carbon-stack codex-lane review --closure` (max {1} passes), or finish finitely with `[gate] draft-blocked`.",
+                        crate::cwg_stop::MAX_REVIEW_ROUNDS,
+                        cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE,
+                        cwg_common::MAX_REDESIGN_RESETS,
+                    )
+                }
+            } else {
+                format!(
+                    "All {0}/{0} ordinary review rounds have been exhausted without `ESCALATE` (`--closure` is unavailable): finish finitely with `[gate] draft-blocked: <exact blocker and handoff>`.",
+                    crate::cwg_stop::MAX_REVIEW_ROUNDS,
+                )
+            };
             rio::print_cli_json(
                 &json!({
                     "ok": false,
                     "round_consumed": false,
+                    "terminal_draft_blocked": terminal_no_escalate,
                     "counted_ordinary_rounds": cls_summary.counted_ordinary_rounds,
                     "raw_ordinary_rounds": cls_summary.raw_ordinary_rounds,
                     "error": "max_ordinary_rounds_reached",
-                    "hint": if cls_summary.needs_simplify {
-                        format!(
-                            "All {}/{} ordinary review rounds in this cycle have been used: run `simplify` on the current diff, kill waiting simplify workers, and then run `carbon-stack codex-lane review --closure` instead of launching another ordinary round.",
-                            crate::cwg_stop::MAX_REVIEW_ROUNDS,
-                            crate::cwg_stop::MAX_REVIEW_ROUNDS,
-                        )
-                    } else {
-                        format!(
-                            "All {}/{} ordinary review rounds in this cycle have been used: run `carbon-stack codex-lane review --closure` instead of launching another ordinary round.",
-                            crate::cwg_stop::MAX_REVIEW_ROUNDS,
-                            crate::cwg_stop::MAX_REVIEW_ROUNDS,
-                        )
-                    },
-                }),
-                args.pretty,
-            );
-            return 2;
-        }
-        if cls_summary.has_fresh_ordinary_approved {
-            rio::print_cli_json(
-                &json!({
-                    "ok": false,
-                    "round_consumed": false,
-                    "already_approved": true,
-                    "error": "already_ordinary_approved",
-                    "hint": if cls_summary.needs_simplify {
-                        "Current candidate already has a fresh valid `VERDICT: APPROVED`: run `simplify`, kill waiting simplify workers, and run `carbon-stack codex-lane review --closure` instead of another ordinary round."
-                    } else {
-                        "Current candidate already has a fresh valid `VERDICT: APPROVED`: close the gate instead of launching another ordinary round."
-                    },
+                    "hint": ord_cap_hint,
                 }),
                 args.pretty,
             );
@@ -4651,19 +4801,7 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
                     "round_consumed": false,
                     "blocked_closure_passes": blocked_cls_n,
                     "error": "closure_phase_active",
-                    "hint": "Cycle is already in `--closure` escalation after Pass 1/2 BLOCKED: run tests, run `simplify`, kill simplify workers, and run `carbon-stack codex-lane review --closure` (Pass 2/2) instead of an ordinary review.",
-                }),
-                args.pretty,
-            );
-            return 2;
-        }
-        if cls_summary.simplify_started_in_cycle && cls_summary.raw_ordinary_rounds > 0 {
-            rio::print_cli_json(
-                &json!({
-                    "ok": false,
-                    "round_consumed": false,
-                    "error": "simplify_phase_already_started",
-                    "hint": "Cycle has already entered `simplify`: complete `simplify` on the current diff, kill waiting simplify workers, and run `carbon-stack codex-lane review --closure` instead of launching another ordinary review.",
+                    "hint": "Candidate is already in `--closure` after Pass 1/2 BLOCKED: apply one bounded REMEDIATE/REDESIGN + tests and run `carbon-stack codex-lane review --closure` (Pass 2/2), or finish with `[gate] draft-blocked`.",
                 }),
                 args.pretty,
             );
@@ -4686,30 +4824,34 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
             );
             return 2;
         }
-    }
-    if phase == "closure" && blocked_cls_n >= 1 && !eff_session.is_empty() {
-        let skey_cls = rio::safe_key(&eff_session, "default");
-        if let Some(m_cls) = cwg_common::read_marker_with_pending(&skey_cls) {
-            if m_cls.is_object()
-                && !json_truthy(m_cls.get("closed"))
-                && !crate::cwg_stop::has_completed_simplify_after(
-                    &eff_session,
-                    &m_cls,
-                    "",
-                    last_cls_blk_ts,
-                )
-            {
+        let has_open_persistent_cand = cwg_common::read_marker_with_pending(&eff_session)
+            .map(|m| cwg_common::candidate_class(&m) == cwg_common::WORK_PERSISTENT)
+            .unwrap_or(false);
+        if has_open_persistent_cand {
+            if !cls_summary.has_round_cap_escalate {
                 rio::print_cli_json(
                     &json!({
                         "ok": false,
-                        "error": "missing_post_block_simplify",
-                        "blocked_closure_passes": blocked_cls_n,
-                        "last_blocked_ts": last_cls_blk_ts,
+                        "round_consumed": false,
+                        "counted_ordinary_rounds": cls_summary.counted_ordinary_rounds,
+                        "error": "closure_requires_escalate",
                         "hint": format!(
-                            "Closure pass {}/{} returned BLOCKED: run a fresh `simplify` pass on the candidate BEFORE launching final `--closure` pass 2/2.",
-                            blocked_cls_n,
-                            cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE,
+                            "`--closure` is reserved for autonomous closure AFTER Round {0} ESCALATE; run ordinary `carbon-stack codex-lane review` (rounds 1..{0}, ending in ESCALATE) first, or close finitely with `[gate] draft-blocked` if all {0} rounds returned REVISE.",
+                            crate::cwg_stop::MAX_REVIEW_ROUNDS
                         ),
+                    }),
+                    args.pretty,
+                );
+                return 2;
+            }
+            if !cls_summary.has_post_escalate_research {
+                rio::print_cli_json(
+                    &json!({
+                        "ok": false,
+                        "round_consumed": false,
+                        "escalate_verdict_ts": cls_summary.escalate_verdict_ts,
+                        "error": "missing_post_escalate_research",
+                        "hint": "Perform one focused external/docs research pass (`search_web`, `context7`, `exa`, `fetch`, `tokenade search|web`, or `research` subagent) AFTER Round 4 ESCALATE before launching `carbon-stack codex-lane review --closure`.",
                     }),
                     args.pretty,
                 );
@@ -4717,7 +4859,6 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
             }
         }
     }
-    let cand_first_ts = candidate_first_ts(&eff_session);
     let last_rr_ts = if !eff_session.is_empty() {
         cwg_common::read_marker_with_pending(&eff_session)
             .map(|m| cwg_common::last_research_reset_ts(&m))
@@ -4780,16 +4921,72 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
         resume_sid.clear();
     }
 
+    let curr_worktree_tree = if args.diff_file.is_empty()
+        && !git_root.is_empty()
+        && rio::git_toplevel(&git_root, false).is_some()
+    {
+        rio::capture_worktree_tree_oid(&git_root, 10.0)
+    } else {
+        String::new()
+    };
+
     let diff_text = if !args.diff_file.is_empty() && Path::new(&args.diff_file).is_file() {
         read_diff_file(&args.diff_file)
     } else {
-        let (rc_git, out, _) = rio::run_git(&cwd, &["diff", "HEAD"], 10.0);
-        if rc_git == 0 && !out.trim().is_empty() {
-            out
+        let tree_diff = if cwg_common::is_git_oid(&curr_worktree_tree) {
+            let (rc_td, out_td, _) =
+                rio::run_git(&cwd, &["diff", "HEAD", &curr_worktree_tree], 10.0);
+            if rc_td == 0 && !out_td.trim().is_empty() {
+                Some(out_td)
+            } else {
+                None
+            }
         } else {
-            let (_, out2, _) = rio::run_git(&cwd, &["status", "--short"], 5.0);
-            out2
+            None
+        };
+        if let Some(td) = tree_diff {
+            td
+        } else {
+            let (rc_git, out, _) = rio::run_git(&cwd, &["diff", "HEAD"], 10.0);
+            if rc_git == 0 && !out.trim().is_empty() {
+                out
+            } else {
+                let (_, out2, _) = rio::run_git(&cwd, &["status", "--short"], 5.0);
+                out2
+            }
         }
+    };
+
+    let prior_ledger = saved_thread
+        .as_ref()
+        .map(|st| val_to_str(st.get("last_review_output")))
+        .unwrap_or_default();
+    let prev_reviewed_tree = saved_thread
+        .as_ref()
+        .map(|st| val_to_str(st.get("last_reviewed_tree_oid")))
+        .unwrap_or_default();
+    // INVARIANT: Diff `prev_reviewed_tree` against `curr_worktree_tree` (`git add -A` temp-index snapshot) so remediation rounds that modify a tracked file AND add a new untracked file include both in `interdiff_text` under `Settled-Scope Freeze`.
+    let interdiff_text = if args.diff_file.is_empty()
+        && !prev_reviewed_tree.is_empty()
+        && cwg_common::is_git_oid(&prev_reviewed_tree)
+    {
+        let (rc_id, id_out, _) = if cwg_common::is_git_oid(&curr_worktree_tree) {
+            rio::run_git(&cwd, &["diff", &prev_reviewed_tree, &curr_worktree_tree], 10.0)
+        } else {
+            rio::run_git(&cwd, &["diff", &prev_reviewed_tree], 10.0)
+        };
+        if rc_id == 0 && !id_out.trim().is_empty() {
+            id_out
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+    let round_num = if phase == "closure" {
+        cls_summary.effective_pass_count + 1
+    } else {
+        cls_summary.counted_ordinary_rounds + 1
     };
 
     let scope_summary = if args.summary.is_empty() {
@@ -4869,15 +5066,18 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
             format!("cwg-{}", random_hex_12())
         };
         let packet_nonce = random_hex_12();
-        let prompt = build_adversarial_prompt(
-            &active_review_id,
-            &packet_nonce,
-            &scope_summary,
-            &diff_text,
+        let prompt = build_adversarial_prompt(PromptBuildSpec {
+            review_id: &active_review_id,
+            packet_nonce: &packet_nonce,
+            scope_summary: &scope_summary,
+            diff_text: &diff_text,
+            interdiff_text: &interdiff_text,
+            prior_ledger: &prior_ledger,
             phase,
-            !cur_resume_sid.is_empty(),
-            !cur_resume_sid.is_empty() && is_timeout_continuation,
-        );
+            round_num,
+            is_resume: !cur_resume_sid.is_empty(),
+            is_timeout_resume: !cur_resume_sid.is_empty() && is_timeout_continuation,
+        });
         match reserve_packet_exclusive(
             &active_review_id,
             &prompt,
@@ -5163,6 +5363,12 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
     if exec_res.has_verdict {
         reset_breaker_for_probe(launch_wall_ts, verdict_wall_ts);
         if !actual_sid.is_empty() {
+            // INVARIANT: Persist the exact pre-review `curr_worktree_tree` snapshot that built the reviewed packet (never a post-verdict re-capture, and empty when `--diff-file` bypassed the live worktree) so files created while the reviewer was running remain in the next round's `interdiff`.
+            let reviewed_tree_oid = if cwg_common::is_git_oid(&curr_worktree_tree) {
+                curr_worktree_tree.clone()
+            } else {
+                String::new()
+            };
             save_lane_thread_state(
                 &eff_session,
                 &git_root,
@@ -5178,6 +5384,8 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
                     "model": eff_model,
                     "effort": effort,
                     "xhigh": args.xhigh,
+                    "last_reviewed_tree_oid": reviewed_tree_oid,
+                    "last_review_output": rio::truncate_chars(exec_res.stdout.trim(), 12_000),
                     "updated_ts": now_sec(),
                 }),
             );
@@ -5283,7 +5491,7 @@ pub fn run_cli(args: &[String]) -> i32 {
     if args.is_empty() {
         let _ = writeln!(
             std::io::stderr(),
-            "usage: codex_lane <check|status|reset|breaker|scan|review|research-reset> [args...]"
+            "usage: codex_lane <check|status|reset|breaker|scan|review|redesign-reset|research-reset> [args...]"
         );
         return 2;
     }
@@ -5563,11 +5771,15 @@ pub fn run_cli(args: &[String]) -> i32 {
             }
             cmd_review(&rargs)
         }
-        "research-reset" => {
+        "redesign-reset" | "research-reset" => {
             let mut rr = ResearchResetArgs {
                 cwd: String::new(),
                 session: String::new(),
-                decision: String::new(),
+                decision: if sub == "redesign-reset" {
+                    "redesign".to_string()
+                } else {
+                    String::new()
+                },
                 findings: String::new(),
                 transcript: String::new(),
                 pretty: false,
@@ -5617,7 +5829,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         other => {
             let _ = writeln!(
                 std::io::stderr(),
-                "usage: codex_lane <check|status|reset|breaker|scan|review|research-reset> (invalid choice: '{}')",
+                "usage: codex_lane <check|status|reset|breaker|scan|review|redesign-reset|research-reset> (invalid choice: '{}')",
                 other
             );
             2
@@ -6541,7 +6753,7 @@ exit 0
             json!({"type": "session_meta", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.0), "payload": {"id": "sess-eb-2p", "session_id": "sess-eb-2p", "source": "exec", "thread_source": "user"}}),
             json!({"type": "turn_context", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.1), "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
             json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.2), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-eb-o0"}]}}),
-            json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 2.0), "payload": {"type": "task_complete", "last_agent_message": "VERDICT: APPROVED"}}),
+            json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 2.0), "payload": {"type": "task_complete", "last_agent_message": "VERDICT: ESCALATE"}}),
             json!({"type": "turn_context", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 3.1), "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
             json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 3.2), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-eb-b1"}]}}),
             json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 4.0), "payload": {"type": "task_complete", "last_agent_message": "CLOSURE_VALIDATION: BLOCKED"}}),
@@ -6625,7 +6837,7 @@ exit 0
                 "--transcript".to_string(),
                 tp_eb.to_string_lossy().into_owned(),
             ]),
-            0
+            2
         );
 
         // SAFETY: Sub-case B (`HIGH` path floor escalated via `--xhigh` or `XHIGH -> HIGH` receipt transition in same cycle after Sol `READY`) blocks `Stop` (`verified: HIGH` & `pr-ready: HIGH`), keeps `has_fresh_ready == false`, and unlocks `research-reset`.
@@ -6660,7 +6872,7 @@ exit 0
         }
         fs::write(
             &chk_dxh,
-            json!({"kind": "check", "passed": true, "ts": base_t + 6.0}).to_string() + "\n",
+            json!({"kind": "check", "passed": true, "ts": base_t + 6.0, "start_ts": base_t + 6.0}).to_string() + "\n",
         )
         .unwrap();
         for (rid_d, eff_d, ph_d, cts_d) in [
@@ -6807,11 +7019,22 @@ exit 0
         });
         bar_rr.wait();
         let rc_rr_done = rr_handle.join().unwrap();
-        assert_eq!(rc_rr_done, 0);
-        let m_after_rr = rio::read_json(&cwg_common::marker_path(sess_decl_xh)).unwrap();
+        assert_eq!(rc_rr_done, 2);
+        let mut m_after_rr = rio::read_json(&cwg_common::marker_path(sess_decl_xh)).unwrap();
+        assert_eq!(cwg_common::research_reset_epoch(&m_after_rr), 0);
+        assert_eq!(cwg_common::active_marker_declared_risk(&m_after_rr), "XHIGH");
+        m_after_rr["research_resets"] = json!([{
+            "decision": "refine",
+            "findings": "Legacy pre-migration reset fixture for epoch fencing test.",
+            "last_blocked_ts": base_t + 5.0,
+            "reset_ts": base_t + 16.5,
+            "board_head_seq": 4,
+            "research_tools": ["search_web"]
+        }]);
+        rio::write_json(&cwg_common::marker_path(sess_decl_xh), &m_after_rr).unwrap();
         assert_eq!(cwg_common::research_reset_epoch(&m_after_rr), 1);
         assert_eq!(cwg_common::active_marker_declared_risk(&m_after_rr), "");
-        // SAFETY: Stale epoch `0` latch cannot pollute epoch `1`, while new-cycle `--xhigh` (`None` epoch -> live epoch `1`) persists `XHIGH` on epoch `1` and blocks `[gate] verified: HIGH` in `Stop`.
+        // INVARIANT: Stale epoch `0` latch cannot pollute epoch `1`, while new-cycle `--xhigh` (`None` epoch -> live epoch `1`) persists `XHIGH` on epoch `1` and blocks `[gate] verified: HIGH` in `Stop`.
         assert!(!cwg_common::latch_marker_declared_risk(
             sess_decl_xh,
             Some(base_t),
@@ -6869,7 +7092,7 @@ exit 0
         }
         fs::write(
             &chk_cap,
-            json!({"kind": "check", "passed": true, "ts": base_t + 6.0}).to_string() + "\n",
+            json!({"kind": "check", "passed": true, "ts": base_t + 6.0, "start_ts": base_t + 6.0}).to_string() + "\n",
         )
         .unwrap();
         let tp_cap = tmp.0.join("tp-cap.jsonl");
@@ -6889,8 +7112,8 @@ exit 0
             stop_cap_high
         );
 
-        // SAFETY: Pre-launch ordinary review round cap rejects a 4th ordinary `codex-lane review` after 3 `REVISE` rounds without `simplify` (`rc == 2`, `max_ordinary_rounds_reached`).
-        let sess_ord3 = "sess-ord-cap-3";
+        // SAFETY: Pre-launch ordinary review round cap rejects a 5th ordinary `codex-lane review` after `MAX_REVIEW_ROUNDS` (4) `REVISE` rounds (`rc == 2`, `max_ordinary_rounds_reached`).
+        let sess_ord3 = "sess-ord-cap-4";
         rio::write_json(
             &cwg_common::marker_path(sess_ord3),
             &json!({
@@ -6905,25 +7128,28 @@ exit 0
             }),
         )
         .unwrap();
-        for (idx_o, rid_o) in ["cwg-ord3-r1", "cwg-ord3-r2", "cwg-ord3-r3"].iter().enumerate() {
+        for (idx_o, rid_o) in ["cwg-ord4-r1", "cwg-ord4-r2", "cwg-ord4-r3", "cwg-ord4-r4"].iter().enumerate() {
             record_packet(rid_o, &format!("REVIEW_ID: {}", rid_o), &repo_str, "high", "ordinary", sess_ord3);
             let p_o = packet_path(rid_o);
             let mut doc_o = rio::read_json(&p_o).unwrap();
             doc_o["created_ts"] = json!(base_t + 1.0 + (idx_o as f64) * 2.0);
             rio::write_json(&p_o, &doc_o).unwrap();
         }
-        let ord3_rf = sessions_dir.join("rollout-ord3-cap.jsonl");
+        let ord3_rf = sessions_dir.join("rollout-ord4-cap.jsonl");
         let ord3_rows = [
-            json!({"type": "session_meta", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.0), "payload": {"id": "sess-ord3-sid", "session_id": "sess-ord3-sid", "source": "exec", "thread_source": "user"}}),
+            json!({"type": "session_meta", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.0), "payload": {"id": "sess-ord4-sid", "session_id": "sess-ord4-sid", "source": "exec", "thread_source": "user"}}),
             json!({"type": "turn_context", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.1), "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
-            json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.2), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-ord3-r1"}]}}),
+            json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.2), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-ord4-r1"}]}}),
             json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 2.0), "payload": {"type": "task_complete", "last_agent_message": "VERDICT: REVISE"}}),
             json!({"type": "turn_context", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 3.1), "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
-            json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 3.2), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-ord3-r2"}]}}),
+            json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 3.2), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-ord4-r2"}]}}),
             json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 4.0), "payload": {"type": "task_complete", "last_agent_message": "VERDICT: REVISE"}}),
             json!({"type": "turn_context", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 5.1), "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
-            json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 5.2), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-ord3-r3"}]}}),
+            json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 5.2), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-ord4-r3"}]}}),
             json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 6.0), "payload": {"type": "task_complete", "last_agent_message": "VERDICT: REVISE"}}),
+            json!({"type": "turn_context", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 7.1), "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
+            json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 7.2), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-ord4-r4"}]}}),
+            json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 8.0), "payload": {"type": "task_complete", "last_agent_message": "VERDICT: ESCALATE"}}),
         ];
         fs::write(
             &ord3_rf,
@@ -6940,12 +7166,12 @@ exit 0
             "--diff-file".to_string(),
             diff_p.to_string_lossy().into_owned(),
             "--summary".to_string(),
-            "4th ordinary round must be rejected pre-launch".to_string(),
+            "5th ordinary round must be rejected pre-launch".to_string(),
         ]);
         assert_eq!(rc_4th_ord, 2);
         let inv_after_4th = fs::read_to_string(&inv_log).unwrap_or_default().lines().count();
         assert_eq!(inv_after_4th, inv_before_4th);
-        // INVARIANT: Completing `simplify` after 3 `REVISE` rounds MUST NOT un-count those 3 ordinary rounds: `cmd_review` still rejects a 4th ordinary round (`rc == 2`), and `validate_candidate_closure` rejects closing on a 4th ordinary `APPROVED` without `--closure`.
+        // INVARIANT: Completing `simplify` after `MAX_REVIEW_ROUNDS` (4) ordinary rounds MUST NOT un-count those 4 rounds: `cmd_review` still rejects a 5th ordinary round (`rc == 2`), and `validate_candidate_closure` rejects closing on an over-cap 5th ordinary `APPROVED`.
         let ord3_brain = rio::resolve_brain_root("");
         let ord3_tp = ord3_brain
             .join(sess_ord3)
@@ -6975,8 +7201,8 @@ exit 0
             .to_string(),
         )
         .unwrap();
-        let sim_t_str = crate::win32_sqlite::format_iso_utc(base_t + 7.0);
-        let sim_end_str = crate::win32_sqlite::format_iso_utc(base_t + 8.0);
+        let sim_t_str = crate::win32_sqlite::format_iso_utc(base_t + 8.2);
+        let sim_end_str = crate::win32_sqlite::format_iso_utc(base_t + 8.6);
         let ord3_board_lines = [
             json!({"seq": 1, "agent": "coordinator", "time": sim_t_str, "text": "@simp-r @simp-q @simp-e simplify"}),
             json!({"seq": 2, "agent": "simp-r", "time": sim_end_str, "text": format!("@coordinator\nDIFF_HASH: {}\nSIMPLIFY_LENS: REUSE\nSIMPLIFY_VERDICT: CLEAN", cap_fp)}),
@@ -7064,41 +7290,23 @@ exit 0
             why_4th_app
         );
 
-        // INVARIANT: Once `simplify` has started after Round 1 `APPROVED`, durable `simplify` edits cannot re-enter `ordinary` review (`simplify_phase_already_started`), AND `--closure` rejects unkilled `waiting` simplify workers (`active_swarm_workers_present`) until they are killed.
-        let sess_sw_guard = "sess-sandwich-cli-guards";
+        // INVARIANT: Under the finite gate, premature `--closure` before Round 4 `ESCALATE` is rejected (`closure_requires_escalate`), `--closure` after Round 4 `ESCALATE` rejects unkilled `waiting` simplify workers (`active_swarm_workers_present`), and killing them unlocks `--closure`.
+        let sess_sw_guard = "sess-finite-cli-guards";
         rio::write_json(
             &cwg_common::marker_path(sess_sw_guard),
             &json!({
                 "session": sess_sw_guard,
                 "first_ts": base_t,
-                "last_durable_ts": base_t + 4.0,
+                "last_durable_ts": base_t,
                 "cwd": rio::normalize_path(&repo_str),
                 "git_root": rio::normalize_path(&repo_str),
                 "paths": [cap_auth_norm.clone()],
                 "content_marks": [
-                    {"ts": base_t, "fp": "pre_sim_fp_old", "unknown": false},
-                    {"ts": base_t + 4.0, "fp": cap_fp.clone(), "unknown": false}
+                    {"ts": base_t, "fp": cap_fp.clone(), "unknown": false}
                 ],
                 "current_diff_hash": cap_fp.clone(),
                 "closed": false,
             }),
-        )
-        .unwrap();
-        record_packet("cwg-swg-r1", "REVIEW_ID: cwg-swg-r1", &repo_str, "high", "ordinary", sess_sw_guard);
-        let p_swg = packet_path("cwg-swg-r1");
-        let mut doc_swg = rio::read_json(&p_swg).unwrap();
-        doc_swg["created_ts"] = json!(base_t + 1.0);
-        rio::write_json(&p_swg, &doc_swg).unwrap();
-        let swg_rf = sessions_dir.join("rollout-swg-r1.jsonl");
-        let swg_rows = [
-            json!({"type": "session_meta", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.0), "payload": {"id": "sess-swg-sid", "session_id": "sess-swg-sid", "source": "exec", "thread_source": "user"}}),
-            json!({"type": "turn_context", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.1), "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
-            json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.2), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-swg-r1"}]}}),
-            json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 2.0), "payload": {"type": "task_complete", "last_agent_message": "VERDICT: APPROVED"}}),
-        ];
-        fs::write(
-            &swg_rf,
-            swg_rows.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
         )
         .unwrap();
         let swg_dir = ord3_brain.join(sess_sw_guard).join(".system_generated").join("swarm");
@@ -7109,7 +7317,7 @@ exit 0
         fs::write(
             swg_dir.join("members.json"),
             json!([
-                {"name": "simp-r", "model": cwg_common::SONNET_HIGH_MODEL, "state": "waiting", "killed": false},
+                {"name": "simp-r", "model": cwg_common::SONNET_HIGH_MODEL, "state": "killed", "killed": true},
                 {"name": "simp-q", "model": cwg_common::SONNET_HIGH_MODEL, "state": "killed", "killed": true},
                 {"name": "simp-e", "model": cwg_common::SONNET_HIGH_MODEL, "state": "killed", "killed": true}
             ])
@@ -7125,6 +7333,7 @@ exit 0
         assert_eq!(
             run_cli(&[
                 "review".to_string(),
+                "--closure".to_string(),
                 "--cwd".to_string(),
                 repo_str.clone(),
                 "--session".to_string(),
@@ -7132,10 +7341,48 @@ exit 0
                 "--diff-file".to_string(),
                 diff_p.to_string_lossy().into_owned(),
                 "--summary".to_string(),
-                "Post-simplify edit must not re-enter ordinary review".to_string(),
+                "Premature --closure before Round 4 ESCALATE must fail".to_string(),
             ]),
             2
         );
+        for (idx_g, rid_g) in ["cwg-swg-r1", "cwg-swg-r2", "cwg-swg-r3", "cwg-swg-r4"].iter().enumerate() {
+            record_packet(rid_g, &format!("REVIEW_ID: {}", rid_g), &repo_str, "high", "ordinary", sess_sw_guard);
+            let p_swg = packet_path(rid_g);
+            let mut doc_swg = rio::read_json(&p_swg).unwrap();
+            doc_swg["created_ts"] = json!(base_t + 1.0 + (idx_g as f64) * 1.5);
+            rio::write_json(&p_swg, &doc_swg).unwrap();
+        }
+        let swg_rf = sessions_dir.join("rollout-swg-r4.jsonl");
+        let swg_rows = [
+            json!({"type": "session_meta", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.0), "payload": {"id": "sess-swg-sid", "session_id": "sess-swg-sid", "source": "exec", "thread_source": "user"}}),
+            json!({"type": "turn_context", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.1), "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
+            json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.2), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-swg-r1"}]}}),
+            json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 1.4), "payload": {"type": "task_complete", "last_agent_message": "VERDICT: REVISE"}}),
+            json!({"type": "turn_context", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 2.6), "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
+            json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 2.7), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-swg-r2"}]}}),
+            json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 2.9), "payload": {"type": "task_complete", "last_agent_message": "VERDICT: REVISE"}}),
+            json!({"type": "turn_context", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 4.1), "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
+            json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 4.2), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-swg-r3"}]}}),
+            json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 4.4), "payload": {"type": "task_complete", "last_agent_message": "VERDICT: REVISE"}}),
+            json!({"type": "turn_context", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 5.6), "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
+            json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 5.7), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "REVIEW_ID: cwg-swg-r4"}]}}),
+            json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(base_t + 5.9), "payload": {"type": "task_complete", "last_agent_message": "VERDICT: ESCALATE"}}),
+        ];
+        fs::write(
+            &swg_rf,
+            swg_rows.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        fs::write(
+            swg_dir.join("members.json"),
+            json!([
+                {"name": "simp-r", "model": cwg_common::SONNET_HIGH_MODEL, "state": "waiting", "killed": false},
+                {"name": "simp-q", "model": cwg_common::SONNET_HIGH_MODEL, "state": "killed", "killed": true},
+                {"name": "simp-e", "model": cwg_common::SONNET_HIGH_MODEL, "state": "killed", "killed": true}
+            ])
+            .to_string(),
+        )
+        .unwrap();
         assert_eq!(
             run_cli(&[
                 "review".to_string(),
@@ -7176,7 +7423,45 @@ exit 0
                 "--diff-file".to_string(),
                 diff_p.to_string_lossy().into_owned(),
                 "--summary".to_string(),
-                "All simplify workers killed unlocks --closure".to_string(),
+                "Round 4 ESCALATE without post-escalation research must fail".to_string(),
+            ]),
+            2
+        );
+        let swg_res_steps = [
+            json!({
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": crate::win32_sqlite::format_iso_utc(base_t + 7.5),
+                "tool_calls": [{"name": "search_web", "args": {"query": "escalation remediation docs"}}]
+            }),
+            json!({
+                "step_index": 2,
+                "source": "SYSTEM",
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": crate::win32_sqlite::format_iso_utc(base_t + 8.5),
+                "content": "ok"
+            }),
+        ];
+        fs::write(
+            swg_logs.join("transcript.jsonl"),
+            swg_res_steps.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        assert_eq!(
+            run_cli(&[
+                "review".to_string(),
+                "--closure".to_string(),
+                "--cwd".to_string(),
+                repo_str.clone(),
+                "--session".to_string(),
+                sess_sw_guard.to_string(),
+                "--diff-file".to_string(),
+                diff_p.to_string_lossy().into_owned(),
+                "--summary".to_string(),
+                "All simplify workers killed + verified post-ESCALATE research unlocks --closure".to_string(),
             ]),
             0
         );
@@ -7769,26 +8054,11 @@ exit 0
             sess_rr,
         );
         assert_eq!(sg_dec, "deny");
-        assert!(sg_rsn.unwrap_or_default().contains("research-reset"));
+        let sg_msg = sg_rsn.unwrap_or_default();
+        assert!(sg_msg.contains("[Finite Gate Policy]") && sg_msg.contains("draft-blocked"));
 
+        // INVARIANT: Under the finite gate, `redesign-reset` / `research-reset` rejects `--decision refine` (`rc == 2`) and rejects reset after 2/2 closure exhaustion (`rc == 2`), preserving saved threads and terminating in `[gate] draft-blocked`.
         let tp_rr = Path::new(&repo_str).join("rr-transcript.jsonl");
-        fs::write(&tp_rr, "").unwrap();
-        assert_eq!(
-            run_cli(&[
-                "research-reset".to_string(),
-                "--cwd".to_string(),
-                repo_str.clone(),
-                "--session".to_string(),
-                sess_rr.to_string(),
-                "--decision".to_string(),
-                "refine".to_string(),
-                "--findings".to_string(),
-                "Verified state machine invariants in official docs.".to_string(),
-                "--transcript".to_string(),
-                tp_rr.to_string_lossy().into_owned(),
-            ]),
-            2
-        );
         let research_steps = [
             json!({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": "2099-01-01T00:00:01Z", "tool_calls": [{"name": "search_web", "args": {"query": "gate verification docs"}}]}),
             json!({"step_index": 2, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": "2099-01-01T00:00:02Z", "content": "ok"}),
@@ -7798,29 +8068,6 @@ exit 0
             research_steps.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
         )
         .unwrap();
-        assert_eq!(
-            run_cli(&[
-                "research-reset".to_string(),
-                "--cwd".to_string(),
-                repo_str.clone(),
-                "--session".to_string(),
-                sess_rr.to_string(),
-                "--decision".to_string(),
-                "refine".to_string(),
-                "--findings-hex".to_string(),
-                encode_utf8_hex("Verified \"official\" docs & refined closure state machine."),
-                "--transcript".to_string(),
-                tp_rr.to_string_lossy().into_owned(),
-            ]),
-            0
-        );
-        assert_eq!(active_cycle_closure_blocks(sess_rr, &repo_str, "").0, 0);
-        assert_eq!(
-            resolve_resume_session(&repo_str, sess_rr, cand_ts, "", false, "gpt-6.2-sol", "high"),
-            ""
-        );
-
-        // INVARIANT: Second `research-reset` on an already-reset cycle is rejected under `marker_lock_path` without duplicating `research_resets` or purging Cycle-2 threads, and subagent child rollouts of pre-reset sessions fail `is_post_reset_codex_session_proven`.
         save_lane_thread_state(
             sess_rr,
             &repo_str,
@@ -7828,7 +8075,7 @@ exit 0
             "gpt-6.2-sol",
             "high",
             json!({
-                "session_id": "sid-cycle2-fresh",
+                "session_id": "sid-finite-kept",
                 "candidate_first_ts": cand_ts,
                 "model": "gpt-6.2-sol",
                 "effort": "high",
@@ -7845,25 +8092,206 @@ exit 0
                 sess_rr.to_string(),
                 "--decision".to_string(),
                 "refine".to_string(),
-                "--findings".to_string(),
-                "Duplicate reset attempt must fail.".to_string(),
+                "--findings-hex".to_string(),
+                encode_utf8_hex("Verified \"official\" docs & refined closure state machine."),
                 "--transcript".to_string(),
                 tp_rr.to_string_lossy().into_owned(),
             ]),
             2
         );
-        let c2_saved = active_thread_state(sess_rr, &repo_str, Some(cand_ts)).unwrap();
-        assert_eq!(val_to_str(c2_saved.get("session_id")), "sid-cycle2-fresh");
-
-        let post_rr_marker = rio::read_json(&mpath_rr).unwrap();
-        let rr_cutoff = cwg_common::last_research_reset_ts(&post_rr_marker);
         assert_eq!(
-            post_rr_marker
-                .get("research_resets")
-                .and_then(|v| v.as_array())
-                .map(|a| a.len()),
-            Some(1)
+            run_cli(&[
+                "redesign-reset".to_string(),
+                "--cwd".to_string(),
+                repo_str.clone(),
+                "--session".to_string(),
+                sess_rr.to_string(),
+                "--findings-hex".to_string(),
+                encode_utf8_hex("Attempted redesign after 2/2 BLOCKED closure exhaustion."),
+                "--transcript".to_string(),
+                tp_rr.to_string_lossy().into_owned(),
+            ]),
+            2
         );
+        let kept_saved = active_thread_state(sess_rr, &repo_str, Some(cand_ts)).unwrap();
+        assert_eq!(val_to_str(kept_saved.get("session_id")), "sid-finite-kept");
+        let unchanged_marker = rio::read_json(&mpath_rr).unwrap();
+        assert!(unchanged_marker.get("research_resets").is_none());
+
+        // INVARIANT: After Round 4 `ESCALATE` + verified post-`ESCALATE` research (before 2/2 closure exhaustion), `redesign-reset` succeeds at most ONCE (`MAX_REDESIGN_RESETS = 1`), purging saved threads + simplify latches so the redesigned candidate runs in fresh sessions, and rejects any 2nd reset attempt (`rc == 2`).
+        let sess_red = "sess-redesign-once";
+        let mpath_red = cwg_common::marker_path(sess_red);
+        let cand_ts_red = now - 120.0;
+        rio::write_json(
+            &mpath_red,
+            &json!({
+                "session": sess_red,
+                "class": cwg_common::WORK_PERSISTENT,
+                "closed": false,
+                "first_ts": cand_ts_red,
+                "last_durable_ts": cand_ts_red,
+                "last_ts": cand_ts_red,
+                "edits": 1,
+                "cwd": rio::normalize_path(&repo_str),
+                "git_root": rio::normalize_path(&repo_str),
+                "paths": [rio::normalize_path(&Path::new(&repo_str).join("rust/src/a.rs").to_string_lossy())],
+                "content_marks": [{"ts": cand_ts_red, "fp": "1122334455667788", "unknown": false}],
+                "declared_risk": "HIGH",
+                "round_start_msg_id": 5,
+                "simplify_verified_latched": {
+                    "candidate_first_ts": cand_ts_red,
+                    "reset_epoch": 0,
+                    "verified_ts": cand_ts_red + 1.0,
+                    "verified_hashes": ["h-old"],
+                },
+            }),
+        )
+        .unwrap();
+        let esc_rid = "cwg-redesign-r4-esc";
+        let esc_sid = "sid-redesign-old";
+        let esc_roll = sessions_dir.join("rollout-redesign-esc.jsonl");
+        let base_esc_ts = cand_ts_red + 5.0;
+        let mut esc_lines: Vec<String> = vec![json!({
+            "type": "session_meta",
+            "timestamp": crate::win32_sqlite::format_iso_utc(base_esc_ts),
+            "payload": {"id": esc_sid, "session_id": esc_sid, "source": "exec", "thread_source": "user"}
+        })
+        .to_string()];
+        for r_idx in 1..=4usize {
+            let rid_i = if r_idx == 4 {
+                esc_rid.to_string()
+            } else {
+                format!("cwg-redesign-r{}", r_idx)
+            };
+            let v_str = if r_idx == 4 { "ESCALATE" } else { "REVISE" };
+            let ts_i = base_esc_ts + (r_idx as f64) * 5.0;
+            record_packet(
+                &rid_i,
+                &format!("REVIEW_ID: {}", rid_i),
+                &repo_str,
+                "high",
+                "ordinary",
+                sess_red,
+            );
+            let p_path = packet_path(&rid_i);
+            if let Some(mut pd) = rio::read_json(&p_path) {
+                pd["created_ts"] = json!(ts_i);
+                let _ = rio::write_json(&p_path, &pd);
+            }
+            esc_lines.push(
+                json!({
+                    "type": "turn_context",
+                    "timestamp": crate::win32_sqlite::format_iso_utc(ts_i + 1.0),
+                    "payload": {"model": "gpt-6.2-sol", "effort": "high"}
+                })
+                .to_string(),
+            );
+            esc_lines.push(
+                json!({
+                    "type": "response_item",
+                    "timestamp": crate::win32_sqlite::format_iso_utc(ts_i + 2.0),
+                    "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": format!("REVIEW_ID: {}", rid_i)}]}
+                })
+                .to_string(),
+            );
+            esc_lines.push(
+                json!({
+                    "type": "event_msg",
+                    "timestamp": crate::win32_sqlite::format_iso_utc(ts_i + 3.0),
+                    "payload": {"type": "task_complete", "last_agent_message": format!("VERDICT: {}", v_str)}
+                })
+                .to_string(),
+            );
+        }
+        fs::write(&esc_roll, esc_lines.join("\n") + "\n").unwrap();
+        save_lane_thread_state(
+            sess_red,
+            &repo_str,
+            cand_ts_red,
+            "gpt-6.2-sol",
+            "high",
+            json!({
+                "session_id": esc_sid,
+                "candidate_first_ts": cand_ts_red,
+                "model": "gpt-6.2-sol",
+                "effort": "high",
+                "xhigh": false,
+                "updated_ts": base_esc_ts + 24.0,
+            }),
+        );
+        let tp_red = Path::new(&repo_str).join("redesign-transcript.jsonl");
+        let red_steps = [
+            json!({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": crate::win32_sqlite::format_iso_utc(base_esc_ts + 30.0), "tool_calls": [{"name": "search_web", "args": {"query": "redesign architecture docs"}}]}),
+            json!({"step_index": 2, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(base_esc_ts + 31.0), "content": "ok"}),
+        ];
+        fs::write(
+            &tp_red,
+            red_steps.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        // INVARIANT: A latched `closure_halt` (2x `BLOCKED`) blocks `redesign-reset` even when live closure rollout records were evicted while the 4 ordinary rounds + `ESCALATE` remain visible.
+        let mut halted_red_marker = rio::read_json(&mpath_red).unwrap();
+        halted_red_marker["closure_halt"] = json!({
+            "candidate_first_ts": cand_ts_red,
+            "blocked_count": 2,
+            "last_blocked_ts": base_esc_ts + 25.0,
+            "blocked_review_ids": ["cwg-evicted-b1", "cwg-evicted-b2"],
+        });
+        rio::write_json(&mpath_red, &halted_red_marker).unwrap();
+        assert_eq!(
+            run_cli(&[
+                "redesign-reset".to_string(),
+                "--cwd".to_string(),
+                repo_str.clone(),
+                "--session".to_string(),
+                sess_red.to_string(),
+                "--findings-hex".to_string(),
+                encode_utf8_hex("Attempted redesign while latched 2x BLOCKED closure_halt is active."),
+                "--transcript".to_string(),
+                tp_red.to_string_lossy().into_owned(),
+            ]),
+            2
+        );
+        let still_halted = rio::read_json(&mpath_red).unwrap();
+        assert!(still_halted.get("closure_halt").is_some());
+        halted_red_marker.as_object_mut().unwrap().remove("closure_halt");
+        rio::write_json(&mpath_red, &halted_red_marker).unwrap();
+
+        assert_eq!(
+            run_cli(&[
+                "redesign-reset".to_string(),
+                "--cwd".to_string(),
+                repo_str.clone(),
+                "--session".to_string(),
+                sess_red.to_string(),
+                "--findings-hex".to_string(),
+                encode_utf8_hex("Architectural redesign replacing retrospective digest reconstruction with forward latch."),
+                "--transcript".to_string(),
+                tp_red.to_string_lossy().into_owned(),
+            ]),
+            0
+        );
+        assert!(active_thread_state(sess_red, &repo_str, Some(cand_ts_red)).is_none());
+        let marker_after_red = rio::read_json(&mpath_red).unwrap();
+        assert_eq!(cwg_common::redesign_reset_count(&marker_after_red), 1);
+        assert!(marker_after_red.get("simplify_verified_latched").is_none());
+        assert_eq!(
+            run_cli(&[
+                "redesign-reset".to_string(),
+                "--cwd".to_string(),
+                repo_str.clone(),
+                "--session".to_string(),
+                sess_red.to_string(),
+                "--findings-hex".to_string(),
+                encode_utf8_hex("Second redesign attempt must fail closed under MAX_REDESIGN_RESETS=1."),
+                "--transcript".to_string(),
+                tp_red.to_string_lossy().into_owned(),
+            ]),
+            2
+        );
+
+        // INVARIANT: Legacy markers that already contain historical `research_resets` still enforce `is_post_reset_codex_session_proven` against pre-reset subagent rollouts, while `build_adversarial_prompt` enforces `BLOCKING_THRESHOLD = HIGH`, interdiff, finding ledger, and Settled-Scope Freeze on Round 2+.
+        let rr_cutoff = rio::parse_iso_ts("2099-01-01T00:10:00Z");
         assert!(!is_post_reset_codex_session_proven(
             "sid-nonexistent-missing",
             "",
@@ -7893,5 +8321,62 @@ exit 0
             rr_cutoff,
             cand_ts
         ));
+
+        let p_r1 = build_adversarial_prompt(PromptBuildSpec {
+            review_id: "cwg-r1",
+            packet_nonce: "111122223333",
+            scope_summary: "Harden auth gate",
+            diff_text: "diff --git a/src/auth.rs b/src/auth.rs\n+check();\n",
+            interdiff_text: "",
+            prior_ledger: "",
+            phase: "ordinary",
+            round_num: 1,
+            is_resume: false,
+            is_timeout_resume: false,
+        });
+        assert!(p_r1.contains("BLOCKING_THRESHOLD = HIGH"));
+        assert!(p_r1.contains("MODE: ORDINARY_REVIEW (Round 1/4)"));
+        assert!(!p_r1.contains("SETTLED-SCOPE FREEZE"));
+
+        let p_r2 = build_adversarial_prompt(PromptBuildSpec {
+            review_id: "cwg-r2",
+            packet_nonce: "444455556666",
+            scope_summary: "Harden auth gate",
+            diff_text: "diff --git a/src/auth.rs b/src/auth.rs\n+check_strict();\n",
+            interdiff_text: "diff --git a/src/auth.rs b/src/auth.rs\n-check();\n+check_strict();\n",
+            prior_ledger: "- [HIGH] src/auth.rs:10 missing strict check\nVERDICT: REVISE",
+            phase: "ordinary",
+            round_num: 2,
+            is_resume: true,
+            is_timeout_resume: false,
+        });
+        assert!(p_r2.contains("MODE: ORDINARY_REVIEW (Round 2/4)"));
+        assert!(p_r2.contains("SETTLED-SCOPE FREEZE"));
+        assert!(p_r2.contains("PRIOR ROUND FINDING LEDGER"));
+        assert!(p_r2.contains("REMEDIATION INTERDIFF SINCE PREVIOUS ROUND"));
+
+        // INVARIANT: `git diff <prev_tree> <curr_tree>` via `capture_worktree_tree_oid` includes both modified tracked files and brand-new untracked files in remediation interdiffs.
+        let tmp = TempTestDir::new("codex-interdiff-untracked");
+        let repo = tmp.0.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let repo_s = repo.to_string_lossy().into_owned();
+        if rio::run_git(&repo_s, &["init"], 5.0).0 == 0 {
+            let _ = rio::run_git(&repo_s, &["config", "user.email", "t@e.st"], 5.0);
+            let _ = rio::run_git(&repo_s, &["config", "user.name", "T"], 5.0);
+            fs::write(repo.join("tracked.rs"), "pub fn v() -> i32 { 1 }\n").unwrap();
+            let _ = rio::run_git(&repo_s, &["add", "tracked.rs"], 5.0);
+            let _ = rio::run_git(&repo_s, &["commit", "-m", "init"], 5.0);
+            fs::write(repo.join("tracked.rs"), "pub fn v() -> i32 { 2 }\n").unwrap();
+            let prev_tree = rio::capture_worktree_tree_oid(&repo_s, 5.0);
+            assert!(cwg_common::is_git_oid(&prev_tree));
+            fs::write(repo.join("tracked.rs"), "pub fn v() -> i32 { 3 }\n").unwrap();
+            fs::write(repo.join("new_untracked.rs"), "pub fn helper() -> bool { true }\n").unwrap();
+            let curr_tree = rio::capture_worktree_tree_oid(&repo_s, 5.0);
+            assert!(cwg_common::is_git_oid(&curr_tree));
+            let (rc_id, id_out, _) = rio::run_git(&repo_s, &["diff", &prev_tree, &curr_tree], 5.0);
+            assert_eq!(rc_id, 0);
+            assert!(id_out.contains("tracked.rs") && id_out.contains("pub fn v() -> i32 { 3 }"));
+            assert!(id_out.contains("new_untracked.rs") && id_out.contains("pub fn helper()"));
+        }
     }
 }

@@ -4,7 +4,6 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use crate::cwg_common;
@@ -20,8 +19,8 @@ const MAX_HASHED_SNAPSHOT_BYTES: u64 = cwg_common::MAX_FINGERPRINT_FILE_BYTES;
 const MAX_VAR_VALUE_LEN: usize = 1024;
 const MAX_EXPANDED_SEG_LEN: usize = 8192;
 const CLAIM_TTL_SECONDS: f64 = 600.0;
-
-static SNAP_SEQ: AtomicU64 = AtomicU64::new(1);
+const ANON_SNAP_TTL_SECONDS: f64 = 3600.0;
+const MAX_ANON_SNAP_QUEUE: usize = 16;
 
 const NON_GIT_SKIP_DIRS: &[&str] = &[
     ".git",
@@ -257,17 +256,22 @@ fn validation_non_runner_re() -> &'static Regex {
         let py = py_interp_pat(false);
         let ruff = exe_pat_followed_by_space("ruff", r"(?:\.exe)?", false);
         let install = exe_pat_followed_by_space("install", EXT_PY, false);
+        let mcp_exec = exe_pat_followed_by_space("mcp_env_exec", EXT_PY, false);
         let cs = exe_pat_followed_by_space("carbon-stack", r"(?:\.exe)?", false);
         let agy = exe_pat_followed_by_space("agy", EXT_CMD_EXE, false);
         let node = exe_pat_followed_by_space("node", r"(?:\.exe)?", false);
+        let pkg_script =
+            r"(?:[A-Za-z0-9_.-]+:)*(?:test|tests|lint|build|typecheck|check)(?:[:_-][A-Za-z0-9_:.-]+)*";
         let pat = format!(
-            r#"(?i)\A\s*(?:\$null\s*\|\s*)?(?:&\s*)?(?:{ruff}\s+check\b|{py}\s+(?:-(?:X\s+utf8|[uBEsSO])\s+)*(?:-m\s+(?:pytest|unittest|py_compile|compileall|mypy|ruff|flake8)\b|{inst}\s+(?:[^\r\n|;&]*\s)?(?:--diagnose|--dry-run)(?:\z|[\s|;&]))|{cs}\s+install\s+(?:[^\r\n|;&]*\s)?(?:--diagnose|--dry-run)(?:\z|[\s|;&])|{node}\s+(?:(?:--no-warnings|--experimental-[A-Za-z0-9_-]+)\s+)*(?:(?:--test|--check)(?:\z|[\s|;&])|["']?(?:\.[/\\])?(?:[A-Za-z0-9_][A-Za-z0-9_.-]*[/\\])*(?:test[-_][A-Za-z0-9_.-]*|[A-Za-z0-9_][A-Za-z0-9_.-]*[-_.]tests?|[A-Za-z0-9_][A-Za-z0-9_.-]*\.spec)\.(?:c?js|mjs)["']?(?:\z|[\s|;&]))|bun(?:\.exe)?\s+test(?:\z|[\s|;&])|deno(?:\.exe)?\s+(?:test|check|lint)(?:\z|[\s|;&])|npm(?:\.cmd)?\s+(?:test|run\s+(?:test|lint|build|typecheck|check))\b|pnpm(?:\.cmd)?\s+(?:test|lint|build|typecheck)\b|yarn(?:\.cmd)?\s+(?:test|lint|build|typecheck)\b|npx(?:\.cmd)?\s+(?:tsc|vitest|jest|eslint|playwright\s+test)\b|cargo(?:\.exe)?\s+(?:\+[A-Za-z0-9._-]+\s+)?(?:test|check|clippy)\b|go(?:\.exe)?\s+(?:test|vet)\b|dotnet(?:\.exe)?\s+(?:test|build)\b|{agy}\s+plugin\s+validate\b)"#,
+            r#"(?i)\A\s*(?:\$null\s*\|\s*)?(?:&\s*)?(?:{ruff}\s+check\b|{py}\s+(?:-(?:X\s+utf8|[uBEsSO])\s+)*(?:-m\s+(?:pytest|unittest|py_compile|compileall|mypy|ruff|flake8)\b|{inst}\s+(?:[^\r\n|;&]*\s)?(?:--diagnose|--dry-run)(?:\z|[\s|;&])|{mcp}\s+--semgrep-scan\b)|{cs}\s+install\s+(?:[^\r\n|;&]*\s)?(?:--diagnose|--dry-run)(?:\z|[\s|;&])|(?:uvx(?:\.exe)?\s+(?:--offline\s+)?--from\s+semgrep\s+)?semgrep(?:\.exe)?\s+(?:--legacy\s+)?scan\b|{node}\s+(?:(?:--no-warnings|--experimental-[A-Za-z0-9_-]+)\s+)*(?:(?:--test|--check)(?:\z|[\s|;&])|["']?(?:\.[/\\])?(?:[A-Za-z0-9_][A-Za-z0-9_.-]*[/\\])*(?:test[-_][A-Za-z0-9_.-]*|[A-Za-z0-9_][A-Za-z0-9_.-]*[-_.]tests?|[A-Za-z0-9_][A-Za-z0-9_.-]*\.spec)\.(?:c?js|mjs)["']?(?:\z|[\s|;&]))|bun(?:\.exe)?\s+(?:test(?:\z|[\s|;&])|run\s+{pkg_s}\b)|deno(?:\.exe)?\s+(?:test|check|lint)(?:\z|[\s|;&])|npm(?:\.cmd)?\s+(?:test\b|run\s+{pkg_s}\b)|(?:pnpm|yarn)(?:\.cmd)?\s+(?:run\s+)?(?:test\b|{pkg_s}\b)|npx(?:\.cmd)?\s+(?:tsc|vitest|jest|eslint|playwright\s+test)\b|(?:flutter|dart)(?:\.bat|\.exe)?\s+(?:test|analyze)\b|cargo(?:\.exe)?\s+(?:\+[A-Za-z0-9._-]+\s+)?(?:test|check|clippy)\b|go(?:\.exe)?\s+(?:test|vet)\b|dotnet(?:\.exe)?\s+(?:test|build)\b|{agy}\s+plugin\s+validate\b)"#,
             ruff = ruff,
             py = py,
             inst = install,
+            mcp = mcp_exec,
             cs = cs,
             agy = agy,
             node = node,
+            pkg_s = pkg_script,
         );
         Regex::new(&pat).expect("validation_non_runner_re")
     })
@@ -306,7 +310,69 @@ fn exe_caps_boundary_ok(caps: &regex::Captures<'_>, full_str: &str) -> bool {
     }
 }
 
+fn semgrep_autofix_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)(?:\A|\s)(?:--autofix(?:\z|=|\s)|-a(?:\z|\s))").expect("semgrep_autofix_re")
+    })
+}
+
+fn benign_ps_env_assign_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)\A\s*\$(?:env:(?P<env>[A-Za-z_][A-Za-z0-9_]*)|(?P<pref>ErrorActionPreference|ProgressPreference|WarningPreference|VerbosePreference|InformationPreference|PSNativeCommandUseErrorActionPreference))\s*=\s*(?:'(?:''|[^'])*'|"(?:""|[^"$`\r\n])*"|\$true|\$false|\$null|[A-Za-z0-9_./:\\;-]+)\s*\z"#,
+        )
+        .expect("benign_ps_env_assign_re")
+    })
+}
+
+fn is_benign_ps_env_assign(seg: &str) -> bool {
+    // INVARIANT: Allow literal `$env:VAR=...` / PowerShell preference prefixes before validation runners while rejecting binary-search, loader-preload, compiler-wrapper, Git-dir, and gate-home hijack variables.
+    let Some(caps) = benign_ps_env_assign_re().captures(seg) else {
+        return false;
+    };
+    if caps.name("pref").is_some() {
+        return true;
+    }
+    let Some(env_m) = caps.name("env") else {
+        return false;
+    };
+    let up = env_m.as_str().to_ascii_uppercase();
+    !matches!(
+        up.as_str(),
+        "PATH"
+            | "PATHEXT"
+            | "PSMODULEPATH"
+            | "COMSPEC"
+            | "LD_PRELOAD"
+            | "LD_LIBRARY_PATH"
+            | "DYLD_INSERT_LIBRARIES"
+            | "DYLD_LIBRARY_PATH"
+            | "NODE_OPTIONS"
+            | "PYTHONSTARTUP"
+            | "PYTHONPATH"
+            | "PYTHONHOME"
+            | "RUBYOPT"
+            | "PERL5OPT"
+            | "JAVA_TOOL_OPTIONS"
+            | "JDK_JAVA_OPTIONS"
+            | "DOTNET_STARTUP_HOOKS"
+            | "RUSTC"
+            | "RUSTC_WRAPPER"
+            | "RUSTC_WORKSPACE_WRAPPER"
+            | "PLUGIN_ROOT"
+    ) && !up.starts_with("GIT_")
+        && !up.starts_with("CARBON_")
+        && !up.starts_with("CARGO_BUILD_")
+        && !up.starts_with("CARGO_TARGET_")
+}
+
 fn is_validation_segment(seg: &str) -> bool {
+    let low = seg.to_ascii_lowercase();
+    if low.contains("semgrep") && semgrep_autofix_re().is_match(seg) {
+        return false;
+    }
     if validation_non_runner_re().is_match(seg) {
         return true;
     }
@@ -1250,7 +1316,10 @@ fn classify_non_mutating_segments(segments: &[(String, String)]) -> &'static str
             last_val_idx = idx;
             continue;
         }
-        if read_only_cmd_re().is_match(seg) || nav_segment_re().is_match(seg) {
+        if read_only_cmd_re().is_match(seg)
+            || nav_segment_re().is_match(seg)
+            || ((op.is_empty() || op == ";" || op == "&&") && is_benign_ps_env_assign(seg))
+        {
             continue;
         }
         return "UNCERTAIN";
@@ -1269,7 +1338,7 @@ fn classify_non_mutating_segments(segments: &[(String, String)]) -> &'static str
     "READ_ONLY"
 }
 
-fn has_validation_segment(cmd: &str) -> bool {
+pub fn has_validation_segment(cmd: &str) -> bool {
     let core = rio::unwrap_tokenade_command(cmd);
     !core.is_empty()
         && split_shell_segments(&core, false)
@@ -1903,8 +1972,10 @@ fn update_candidate_marker_unlocked(
 
     if !durable_new_paths.is_empty() {
         let mut combined = cwg_common::durable_paths_from_val(marker.get("paths"));
+        let prev_len = combined.len();
         combined.extend(durable_new_paths.iter().cloned());
         let merged_paths = cwg_common::durable_paths(&combined);
+        let added_new_path = merged_paths.len() != prev_len;
         let fp = cwg_common::content_fingerprint(&merged_paths, cwg_common::MAX_FINGERPRINT_FILE_BYTES);
 
         let mut marks = marker
@@ -1945,14 +2016,17 @@ fn update_candidate_marker_unlocked(
                 "paths".to_string(),
                 Value::Array(merged_paths.into_iter().map(Value::String).collect()),
             );
-            m.insert("last_durable_ts".to_string(), json!(now));
-            let edits = m.get("edits").and_then(|v| v.as_i64()).unwrap_or(0) + 1;
-            let cl = m.get("changed_lines").and_then(|v| v.as_i64()).unwrap_or(0)
-                + changed_lines_delta.max(1);
-            m.insert("edits".to_string(), json!(edits));
-            m.insert("changed_lines".to_string(), json!(cl));
-            if shell_durable_edit {
-                m.insert("shell_durable_edit".to_string(), Value::Bool(true));
+            // INVARIANT: Do not bump `last_durable_ts` or set `shell_durable_edit` when an in-flight shell command's `before_snap` predates an interleaved `edit_file` whose post-edit `paths` and `fp` are already recorded on `marker`.
+            if changed_fp || added_new_path || !shell_durable_edit {
+                m.insert("last_durable_ts".to_string(), json!(now));
+                let edits = m.get("edits").and_then(|v| v.as_i64()).unwrap_or(0) + 1;
+                let cl = m.get("changed_lines").and_then(|v| v.as_i64()).unwrap_or(0)
+                    + changed_lines_delta.max(1);
+                m.insert("edits".to_string(), json!(edits));
+                m.insert("changed_lines".to_string(), json!(cl));
+                if shell_durable_edit {
+                    m.insert("shell_durable_edit".to_string(), Value::Bool(true));
+                }
             }
         }
         cwg_common::trim_content_marks(&mut marker, marks);
@@ -3039,13 +3113,234 @@ pub fn is_ephemeral_only_shell_mutation(
     saw_ephemeral_mutation
 }
 
+fn first_non_empty_str<'a>(map: Option<&'a Map<String, Value>>, keys: &[&str]) -> Option<&'a str> {
+    let m = map?;
+    keys.iter()
+        .filter_map(|k| m.get(*k).and_then(Value::as_str).map(str::trim))
+        .find(|s| !s.is_empty())
+}
+
+fn payload_step_idx(payload: &Value) -> Option<&Value> {
+    ["stepIdx", "stepIndex", "step_index"]
+        .iter()
+        .filter_map(|k| payload.get(*k))
+        .find(|v| v.is_i64() || v.is_u64())
+}
+
+fn tool_call_snap_key(
+    payload: &Value,
+    tc: Option<&Map<String, Value>>,
+    cwd: &str,
+    cmd: &str,
+) -> (String, String, bool) {
+    if let Some(id) = first_non_empty_str(tc, &["id", "callId", "toolCallId"]).or_else(|| {
+        first_non_empty_str(payload.as_object(), &["toolCallId", "callId", "invocationId"])
+    }) {
+        return (format!("id_{}", id), String::new(), true);
+    }
+    if let Some(si) = payload_step_idx(payload) {
+        return (format!("step_{}", si), String::new(), true);
+    }
+    let sig = format!("{}\0{}", rio::fold_path(cwd), cmd);
+    let cmd_sha = sha256_hex(sig.as_bytes());
+    (format!("anon_{}", &cmd_sha[..24]), cmd_sha, false)
+}
+
+fn with_locked_anon_queue<R, F: FnOnce() -> R>(session: &str, f: F) -> Option<R> {
+    let lock_path = cwg_common::snapshot_lock_path(session);
+    rio::with_file_lock(&lock_path, 2.0, 15.0, |locked| locked.then(f))
+}
+
+struct AnonBurstDoc {
+    queue: Vec<Value>,
+    in_flight: usize,
+    burst_min_ts: f64,
+    burst_max_ts: f64,
+    tainted: bool,
+}
+
+fn take_live_anon_burst(snap_file: &Path, cmd_sha: &str, ref_ts: f64) -> Option<AnonBurstDoc> {
+    let mut doc = rio::read_json(snap_file)?;
+    if rio::val_to_str(doc.get("cmd_sha")) != cmd_sha {
+        return None;
+    }
+    let mut queue = doc
+        .get_mut("queue")
+        .and_then(Value::as_array_mut)
+        .map(std::mem::take)
+        .unwrap_or_default();
+    let prev_len = queue.len();
+    queue.retain(|entry| {
+        let t = rio::val_to_f64(entry.get("ts"));
+        t > 0.0 && ref_ts - t < ANON_SNAP_TTL_SECONDS
+    });
+    let stored_min = rio::val_to_f64(doc.get("burst_min_ts"));
+    let stored_max = rio::val_to_f64(doc.get("burst_max_ts"));
+    let stored_in_flight = (rio::val_to_i64(doc.get("in_flight")).max(0) as usize).max(queue.len());
+    let burst_fresh = stored_max > 0.0 && ref_ts - stored_max < ANON_SNAP_TTL_SECONDS;
+    if queue.is_empty() && !(stored_in_flight > 0 && burst_fresh) {
+        return None;
+    }
+    let pruned_expired = queue.len() != prev_len;
+    let in_flight = if pruned_expired {
+        stored_in_flight.saturating_sub(prev_len - queue.len()).max(queue.len())
+    } else {
+        stored_in_flight
+    };
+    if in_flight == 0 && queue.is_empty() {
+        return None;
+    }
+    let (live_min, live_max) = queue
+        .iter()
+        .fold((f64::INFINITY, 0.0_f64), |(mn, mx), entry| {
+            let t = rio::val_to_f64(entry.get("ts"));
+            (mn.min(t), mx.max(t))
+        });
+    let burst_min_ts = if !pruned_expired && stored_min > 0.0 {
+        stored_min.min(live_min)
+    } else if live_min.is_finite() {
+        live_min
+    } else {
+        stored_min
+    };
+    let burst_max_ts = if !pruned_expired && stored_max > 0.0 {
+        stored_max.max(live_max)
+    } else {
+        live_max.max(stored_max)
+    };
+    let tainted = json_truthy(doc.get("tainted")) || pruned_expired;
+    Some(AnonBurstDoc {
+        queue,
+        in_flight,
+        burst_min_ts,
+        burst_max_ts,
+        tainted,
+    })
+}
+
+fn write_anon_burst(snap_file: &Path, cmd_sha: &str, burst: AnonBurstDoc) {
+    if burst.in_flight == 0 && burst.queue.is_empty() {
+        let _ = fs::remove_file(snap_file);
+    } else {
+        let _ = rio::write_json(
+            snap_file,
+            &json!({
+                "cmd_sha": cmd_sha,
+                "in_flight": burst.in_flight,
+                "burst_min_ts": burst.burst_min_ts,
+                "burst_max_ts": burst.burst_max_ts,
+                "tainted": burst.tainted,
+                "queue": burst.queue,
+            }),
+        );
+    }
+}
+
+fn push_anon_snapshot(session: &str, snap_file: &Path, cmd_sha: &str, snap: Value) {
+    // INVARIANT: Track conservative `in_flight`, `burst_min_ts`, `burst_max_ts`, and `tainted` across overlapping anonymous (`!has_unique_id`) calls under a per-session lock so un-ID'd completions cannot steal a post-edit `start_ts` even when `> MAX_ANON_SNAP_QUEUE` calls overlap.
+    let pre_ts = rio::val_to_f64(snap.get("ts"));
+    let _ = with_locked_anon_queue(session, || {
+        let mut burst = match take_live_anon_burst(snap_file, cmd_sha, pre_ts) {
+            Some(mut b) => {
+                if pre_ts > 0.0 {
+                    b.burst_min_ts = b.burst_min_ts.min(pre_ts);
+                    b.burst_max_ts = b.burst_max_ts.max(pre_ts);
+                }
+                b
+            }
+            None => AnonBurstDoc {
+                queue: Vec::new(),
+                in_flight: 0,
+                burst_min_ts: pre_ts,
+                burst_max_ts: pre_ts,
+                tainted: false,
+            },
+        };
+        burst.in_flight = burst.in_flight.saturating_add(1);
+        if burst.queue.len() >= MAX_ANON_SNAP_QUEUE {
+            let drop_n = burst.queue.len() + 1 - MAX_ANON_SNAP_QUEUE;
+            burst.queue.drain(0..drop_n);
+            burst.tainted = true;
+        }
+        burst.queue.push(snap);
+        burst
+            .queue
+            .sort_by(|a, b| rio::val_to_f64(a.get("ts")).total_cmp(&rio::val_to_f64(b.get("ts"))));
+        write_anon_burst(snap_file, cmd_sha, burst);
+    });
+}
+
+fn pop_anon_snapshot(
+    session: &str,
+    snap_file: &Path,
+    cmd_sha: &str,
+    confirmed_sync_zero: bool,
+) -> (Option<Value>, f64) {
+    // INVARIANT: Credit `burst_min_ts` whenever any sibling remains `in_flight` or any call in the burst backgrounded/failed/overflowed (`tainted`); credit `burst_max_ts` only when `in_flight == 0` with every call confirmed synchronous exit-0.
+    let now_ts = now_sec();
+    with_locked_anon_queue(session, || {
+        let Some(mut burst) = take_live_anon_burst(snap_file, cmd_sha, now_ts) else {
+            let _ = fs::remove_file(snap_file);
+            return (None, 0.0);
+        };
+        burst.in_flight = burst.in_flight.saturating_sub(1);
+        let head = if burst.queue.is_empty() {
+            burst.tainted = true;
+            None
+        } else {
+            Some(burst.queue.remove(0))
+        };
+        if burst.in_flight < burst.queue.len() {
+            burst.in_flight = burst.queue.len();
+        }
+        burst.tainted = burst.tainted || !confirmed_sync_zero;
+        let credited_ts = if burst.in_flight == 0 && burst.queue.is_empty() && !burst.tainted {
+            burst.burst_max_ts
+        } else if burst.burst_min_ts > 0.0 && burst.burst_min_ts.is_finite() {
+            burst.burst_min_ts
+        } else {
+            0.0
+        };
+        write_anon_burst(snap_file, cmd_sha, burst);
+        (head, credited_ts)
+    })
+    .unwrap_or((None, 0.0))
+}
+
+fn latch_live_simplify_if_ready(session: &str, transcript_path: &str) {
+    if session.trim().is_empty() || session == "unknown" {
+        return;
+    }
+    if let Some(m_pre) = cwg_common::read_marker_with_pending(session).filter(|m| {
+        !json_truthy(m.get("closed"))
+            && cwg_common::marker_has_prepare_cycle(Some(m))
+            && cwg_common::active_marker_verified_simplify_hashes(m).is_empty()
+    }) {
+        // INVARIANT: Forward-latch live-verified simplify hashes right before the first mutating edit so applying `ACTIONABLE_FIXES` or `REVISE` fixes never breaks a verified snapshot while pre-edit drift outside `marker.paths` remains unlatched.
+        let _ = crate::cwg_stop::has_completed_candidate_simplify(session, &m_pre, transcript_path);
+    }
+}
+
 pub fn record_pre_tool_use(payload: &Value) {
     let tc = payload.get("toolCall").and_then(|v| v.as_object());
     let tool_name = tc
         .and_then(|m| m.get("name"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if !SHELL_TOOLS.iter().any(|&t| t == tool_name) {
+    let is_edit_tool = EDIT_TOOLS.iter().any(|&t| t == tool_name);
+    let is_shell_tool = SHELL_TOOLS.iter().any(|&t| t == tool_name);
+    if !is_edit_tool && !is_shell_tool {
+        return;
+    }
+    let tp = payload
+        .get("transcriptPath")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if is_edit_tool {
+        if !rio::is_subagent_session(tp, None) {
+            let session = rio::session_key(payload);
+            latch_live_simplify_if_ready(&session, tp);
+        }
         return;
     }
 
@@ -3065,35 +3360,23 @@ pub fn record_pre_tool_use(payload: &Value) {
         return;
     }
 
-    let tp = payload
-        .get("transcriptPath")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
     if rio::is_subagent_session(tp, None) {
         return;
     }
 
     let session = rio::session_key(payload);
     let cwd = rio::effective_cwd(payload);
-    let fallback_id;
-    let call_id = match tc
-        .and_then(|m| m.get("id"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-    {
-        Some(id) => id,
-        None => {
-            let seq = SNAP_SEQ.fetch_add(1, Ordering::Relaxed);
-            let raw = format!("{}:{}:{}", std::process::id(), now_sec(), seq);
-            fallback_id = sha256_hex(raw.as_bytes())[..10].to_string();
-            &fallback_id
-        }
-    };
+    let (call_key, cmd_sha, has_unique_id) = tool_call_snap_key(payload, tc, &cwd, cmd);
 
     if has_direct_codex {
         capture_direct_codex_packet(cmd, &cwd, &session);
     }
     if policy != "READ_ONLY" && policy != "BOOKKEEPING" {
+        latch_live_simplify_if_ready(&session, tp);
+        // INVARIANT: Stamp `pre_ts` before snapshot subprocesses run so `PostToolUse` records the true pre-spawn `start_ts` on the same wall clock as `last_durable_ts`.
+        let pre_ts = now_sec();
+        let snap_file = cwg_common::snapshot_path(&session, &call_key);
+        let cmd_trunc: String = cmd.chars().take(240).collect();
         let wps = cwg_common::extract_workspace_paths(payload);
         let art_dir = payload
             .get("artifactDirectoryPath")
@@ -3102,14 +3385,17 @@ pub fn record_pre_tool_use(payload: &Value) {
         let cmd_cwd = resolve_command_cwd(cmd, &cwd, &session);
         cwg_common::publish_claim(&session, &[], true, &cmd_cwd);
         let mut snap = take_git_snapshot(&cmd_cwd, art_dir, &wps, None);
-        let cmd_trunc: String = cmd.chars().take(240).collect();
         if let Value::Object(ref mut m) = snap {
             m.insert("cmd_cwd".to_string(), Value::String(cmd_cwd));
             m.insert("policy".to_string(), Value::String(policy.to_string()));
             m.insert("cmd".to_string(), Value::String(cmd_trunc));
-            m.insert("ts".to_string(), json!(now_sec()));
+            m.insert("ts".to_string(), json!(pre_ts));
         }
-        let _ = rio::write_json(&cwg_common::snapshot_path(&session, call_id), &snap);
+        if has_unique_id {
+            let _ = rio::write_json(&snap_file, &snap);
+        } else {
+            push_anon_snapshot(&session, &snap_file, &cmd_sha, snap);
+        }
     }
 }
 
@@ -3233,44 +3519,95 @@ pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
     if failed {
         crate::codex_lane::record_from_command(cmd, error_text, 1);
     }
-
-    if policy == "VALIDATION" || (failed && policy == "UNCERTAIN" && has_validation_segment(cmd))
-    {
-        let cmd_trunc: String = cmd.chars().take(240).collect();
-        let err_trunc: String = if failed {
-            error_text.chars().take(200).collect()
-        } else {
-            String::new()
-        };
-        let step_idx = payload.get("stepIdx").cloned().unwrap_or(Value::Null);
-        let _ = rio::append_jsonl(
-            &cwg_common::checks_ledger_path(&session),
-            &json!({
-                "kind": "check",
-                "passed": !failed,
-                "cmd": cmd_trunc,
-                "error": err_trunc,
-                "ts": now_sec(),
-                "step_idx": step_idx,
-            }),
-            2_000_000,
-        );
-    }
-
     if policy == "READ_ONLY" || policy == "BOOKKEEPING" {
         return Ok(());
     }
 
     let cwd = rio::effective_cwd(payload);
-    let call_id = tc
-        .and_then(|m| m.get("id"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("call");
-    let snap_file = cwg_common::snapshot_path(&session, call_id);
-    let before_snap = rio::read_json(&snap_file);
-    if snap_file.exists() {
+    let (call_key, cmd_sha, has_unique_id) = tool_call_snap_key(payload, tc, &cwd, cmd);
+    let snap_file = cwg_common::snapshot_path(&session, &call_key);
+    let is_validation_like =
+        policy == "VALIDATION" || (policy == "UNCERTAIN" && has_validation_segment(cmd));
+    let out_txt = if is_validation_like {
+        payload
+            .get("toolResponse")
+            .or_else(|| payload.get("response"))
+            .or_else(|| payload.get("result"))
+            .or_else(|| payload.get("output"))
+            .map(|v| rio::val_to_str(Some(v)))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let bg_tid = if is_validation_like {
+        rio::extract_bg_task_id(&out_txt)
+    } else {
+        None
+    };
+    let exit_code = if is_validation_like && bg_tid.is_none() {
+        cwg_common::parse_host_command_exit_code(&out_txt)
+    } else {
+        None
+    };
+    let host_nonzero = matches!(exit_code, Some(code) if code != 0);
+    let check_failed = failed || host_nonzero;
+    let confirmed_sync_zero = policy == "VALIDATION" && !check_failed && exit_code == Some(0);
+
+    let (before_snap, pre_start_ts) = if has_unique_id {
+        let snap = rio::read_json(&snap_file);
         let _ = fs::remove_file(&snap_file);
+        let ts = snap
+            .as_ref()
+            .map(|s| rio::val_to_f64(s.get("ts")))
+            .unwrap_or(0.0);
+        (snap, ts)
+    } else {
+        pop_anon_snapshot(&session, &snap_file, &cmd_sha, confirmed_sync_zero)
+    };
+
+    if is_validation_like {
+        let step_idx = payload_step_idx(payload).cloned().unwrap_or(Value::Null);
+        let start_ts_val = if pre_start_ts > 0.0 {
+            json!(pre_start_ts)
+        } else {
+            Value::Null
+        };
+        if let Some(bg_tid) = bg_tid {
+            let _ = rio::append_jsonl(
+                &cwg_common::checks_ledger_path(&session),
+                &json!({
+                    "kind": "bg_launch",
+                    "task_id": bg_tid,
+                    "policy": policy,
+                    "start_ts": start_ts_val,
+                    "ts": now_sec(),
+                    "step_idx": step_idx,
+                }),
+                2_000_000,
+            );
+        } else if policy == "VALIDATION" || check_failed {
+            let cmd_trunc: String = cmd.chars().take(240).collect();
+            let err_trunc: String = if failed {
+                error_text.chars().take(200).collect()
+            } else if host_nonzero {
+                "nonzero_exit_code".to_string()
+            } else {
+                String::new()
+            };
+            let _ = rio::append_jsonl(
+                &cwg_common::checks_ledger_path(&session),
+                &json!({
+                    "kind": "check",
+                    "passed": !check_failed,
+                    "cmd": cmd_trunc,
+                    "error": err_trunc,
+                    "ts": now_sec(),
+                    "start_ts": start_ts_val,
+                    "step_idx": step_idx,
+                }),
+                2_000_000,
+            );
+        }
     }
 
     let (cmd_cwd, prev_git_root): (String, Option<String>) = match before_snap {
@@ -3616,6 +3953,21 @@ mod tests {
                 "VALIDATION",
             ),
             ("node --test backend/src/foo.mjs", "VALIDATION"),
+            (
+                r#"$env:NODE_PATH="C:\repo\node_modules"; $null | node --test landing-legacy/explore.test.js landing-legacy/pricing.test.js"#,
+                "VALIDATION",
+            ),
+            ("$null | npm run ux:check", "VALIDATION"),
+            ("pnpm run a11y:check", "VALIDATION"),
+            ("yarn test:unit", "VALIDATION"),
+            (
+                r"$null | C:/Python312/python.exe C:/Users/in/.gemini/config/mcp-launchers/mcp_env_exec.py --semgrep-scan --pro-intrafile --config code --quiet src/app.js",
+                "VALIDATION",
+            ),
+            ("semgrep scan --autofix src/app.js", "UNCERTAIN"),
+            (r#"$env:PATH="C:\fake"; cargo test"#, "UNCERTAIN"),
+            (r#"$env:CARBON_STACK_HOME="C:\fake"; cargo test"#, "UNCERTAIN"),
+            ("npm test; $env:CI='1'", "UNCERTAIN"),
             ("node --check backend/src/index.js", "VALIDATION"),
             ("node backend/src/maxClient.spec.mjs", "VALIDATION"),
             ("node --test-reporter=spec app.js", "UNCERTAIN"),
@@ -3827,6 +4179,34 @@ mod tests {
             folded_after_ack.unwrap().get("edits").and_then(|v| v.as_i64()),
             Some(3)
         );
+
+        // INVARIANT: More than `MAX_ANON_SNAP_QUEUE` (16) concurrent un-ID'd PreToolUse calls track `in_flight` accurately so the 16th drain never unlinks a shared `snap_file` while the 17th call is still running.
+        let sess_burst = "sess-anon-burst-17";
+        let shared_snap = tmp_home.join("shared-anon-17.json");
+        let cmd_sha = "sha-burst-17";
+        let shared_snap_str = shared_snap.to_string_lossy().into_owned();
+        for _ in 0..17 {
+            push_anon_snapshot(
+                sess_burst,
+                &shared_snap,
+                cmd_sha,
+                json!({
+                    "ts": crate::win32_sqlite::now_sec(),
+                    "snap_file": shared_snap_str,
+                }),
+            );
+        }
+        for i in 0..16 {
+            let _ = pop_anon_snapshot(sess_burst, &shared_snap, cmd_sha, true);
+            assert!(
+                shared_snap.is_file(),
+                "shared_snap unlinked prematurely after drain #{}",
+                i + 1
+            );
+        }
+        let last_pop = pop_anon_snapshot(sess_burst, &shared_snap, cmd_sha, true);
+        assert!(last_pop.0.is_none());
+        assert!(!shared_snap.exists());
 
         match prev_sh {
             Some(v) => std::env::set_var("CARBON_STACK_HOME", v),

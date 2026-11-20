@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -140,8 +140,15 @@ pub fn review_escalation_chain(risk: &str) -> String {
 }
 pub const ANTHROPIC_EPHEMERAL_TTL_SECONDS: u64 = 300;
 pub const SWARM_CACHE_SAFE_TTL_SECONDS: u64 = 270;
+// INVARIANT: Empirically calibrated finite gate limits across 532 Antigravity transcripts + 270 Codex turns (80% Pareto knee before nitpick/regression churn): 1 advisory simplify pass (93.3% value; Pass 2 had 0% task gain and 29% test regressions), 4 ordinary review rounds (82.1% core findings, 92.6% productive rounds; Round 5+ dropped to 0% productive rounds), 2 closure passes (`1 + 4 + 2 = 7` max total gate rounds = 79.7% total value), and at most 1 finite architectural `REDESIGN` reset per candidate (`MAX_REDESIGN_RESETS = 1`).
+pub const MAX_SIMPLIFY_PASSES: usize = 1;
+pub const MAX_ORDINARY_REVIEW_ROUNDS: usize = 4;
 pub const MAX_CLOSURE_PASSES_PER_CYCLE: usize = 2;
-pub const RESEARCH_RESET_DECISIONS: &[&str] = &["refactor", "refine"];
+pub const MAX_REDESIGN_RESETS: usize = 1;
+pub const MAX_TOTAL_GATE_ROUNDS: usize =
+    MAX_SIMPLIFY_PASSES + MAX_ORDINARY_REVIEW_ROUNDS + MAX_CLOSURE_PASSES_PER_CYCLE;
+pub const REDESIGN_RESET_DECISIONS: &[&str] = &["redesign", "refactor"];
+pub const RESEARCH_RESET_DECISIONS: &[&str] = &["redesign", "refactor", "refine"];
 
 pub const CODEX_REVIEW_OUTPUT_BANNER: &str = "--- CODEX REVIEW OUTPUT ---";
 
@@ -916,12 +923,16 @@ pub fn extract_diff_hash(text: &str) -> String {
         .unwrap_or_default()
 }
 
-pub fn check_diff_hashes(text: &str, expected: &str) -> (bool, bool) {
+pub fn check_diff_hashes_any<S: AsRef<str>>(text: &str, accepted: &[S]) -> (bool, bool) {
+    if accepted.is_empty() {
+        return (false, diff_hash_re().is_match(text));
+    }
     let mut has_match = false;
     let mut has_mismatch = false;
     for caps in diff_hash_re().captures_iter(text) {
         if let Some(m) = caps.get(1) {
-            if m.as_str() == expected {
+            let val = m.as_str();
+            if accepted.iter().any(|a| a.as_ref() == val) {
                 has_match = true;
             } else {
                 has_mismatch = true;
@@ -932,6 +943,1263 @@ pub fn check_diff_hashes(text: &str, expected: &str) -> (bool, bool) {
         }
     }
     (has_match, has_mismatch)
+}
+
+pub const SWARM_ROUNDS_TS_TOLERANCE_SEC: f64 = 1.0;
+
+pub fn is_git_oid(s: &str) -> bool {
+    (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+pub fn marker_cycle_first_ts(marker: &Value) -> f64 {
+    val_to_f64(marker.get("first_ts")).max(last_research_reset_ts(marker))
+}
+
+pub fn marker_has_prepare_cycle(marker: Option<&Value>) -> bool {
+    let Some(m) = marker else {
+        return false;
+    };
+    let prep_ts = val_to_f64(m.get("swarm_prepare_cycle_ts"));
+    if prep_ts <= 0.0 {
+        return false;
+    }
+    let cycle_ts = marker_cycle_first_ts(m);
+    cycle_ts <= 0.0 || (prep_ts - cycle_ts).abs() <= SWARM_ROUNDS_TS_TOLERANCE_SEC
+}
+
+fn meta_is_link_or_reparse(meta: &fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+enum GitBlobHasher {
+    Sha1(crate::claude_importer::Sha1Hasher),
+    Sha256(Sha256),
+}
+
+impl GitBlobHasher {
+    fn new(blob_len: u64, oid_len: usize) -> Option<Self> {
+        let hdr = format!("blob {}\0", blob_len);
+        match oid_len {
+            40 => {
+                let mut h = crate::claude_importer::Sha1Hasher::new();
+                h.update(hdr.as_bytes());
+                Some(Self::Sha1(h))
+            }
+            64 => {
+                let mut h = Sha256::new();
+                h.update(hdr.as_bytes());
+                Some(Self::Sha256(h))
+            }
+            _ => None,
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Sha1(h) => h.update(bytes),
+            Self::Sha256(h) => h.update(bytes),
+        }
+    }
+
+    fn finalize_hex(self) -> String {
+        match self {
+            Self::Sha1(h) => hex::encode(h.finalize()),
+            Self::Sha256(h) => hex::encode(h.finalize()),
+        }
+    }
+}
+
+fn verify_existing_repo_blob(
+    root_canon: &Path,
+    disk_path: &Path,
+    expected_len: u64,
+    expected_oid: &str,
+    oid_len: usize,
+) -> Option<(bool, Option<String>)> {
+    if expected_len > MAX_FINGERPRINT_FILE_BYTES {
+        return None;
+    }
+    let canon = fs::canonicalize(disk_path).ok()?;
+    if !canon.starts_with(root_canon) {
+        return None;
+    }
+    let mut fh = File::open(&canon).ok()?;
+    let open_meta = fh.metadata().ok()?;
+    if !open_meta.file_type().is_file() || open_meta.len() != expected_len {
+        return None;
+    }
+    let mut raw_hasher = GitBlobHasher::new(expected_len, oid_len)?;
+    let mut buf = [0u8; 65536];
+    let mut total = 0u64;
+    let mut has_nul = false;
+    let mut strict_crlf = expected_len > 0;
+    let mut crlf_count = 0u64;
+    let mut prev_cr = false;
+    loop {
+        let n = fh.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        total = total.saturating_add(n as u64);
+        if total > expected_len {
+            return None;
+        }
+        let slice = &buf[..n];
+        raw_hasher.update(slice);
+        for &b in slice {
+            if b == 0 {
+                has_nul = true;
+                strict_crlf = false;
+                prev_cr = false;
+            } else if prev_cr {
+                if b == b'\n' {
+                    crlf_count += 1;
+                } else {
+                    strict_crlf = false;
+                }
+                prev_cr = false;
+            } else if b == b'\r' {
+                prev_cr = true;
+            } else if b == b'\n' {
+                strict_crlf = false;
+            }
+        }
+    }
+    if prev_cr {
+        strict_crlf = false;
+    }
+    if total != expected_len {
+        return None;
+    }
+    let raw_oid = raw_hasher.finalize_hex();
+    if raw_oid.eq_ignore_ascii_case(expected_oid) {
+        return Some((has_nul, None));
+    }
+    if has_nul || !strict_crlf || crlf_count == 0 {
+        return None;
+    }
+    // INVARIANT: Rewind the same open file descriptor and re-verify `raw_verify == raw_oid` alongside `lf_hasher` + `sha256_raw` so concurrent mid-read edits cannot pass CRLF normalization.
+    fh.seek(SeekFrom::Start(0)).ok()?;
+    let mut raw_verify = GitBlobHasher::new(expected_len, oid_len)?;
+    let mut lf_hasher = GitBlobHasher::new(expected_len - crlf_count, oid_len)?;
+    let mut sha256_raw = Sha256::new();
+    let mut total2 = 0u64;
+    loop {
+        let n = fh.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        total2 = total2.saturating_add(n as u64);
+        if total2 > expected_len {
+            return None;
+        }
+        let slice = &buf[..n];
+        raw_verify.update(slice);
+        sha256_raw.update(slice);
+        for part in slice.split(|&b| b == b'\r') {
+            lf_hasher.update(part);
+        }
+    }
+    if total2 != expected_len
+        || raw_verify.finalize_hex() != raw_oid
+        || !lf_hasher.finalize_hex().eq_ignore_ascii_case(expected_oid)
+    {
+        return None;
+    }
+    Some((false, Some(hex::encode(sha256_raw.finalize()))))
+}
+
+pub fn is_known_binary_artifact_rel(rel: &str) -> bool {
+    let ext = Path::new(rel)
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(
+        ext.as_str(),
+        "exe"
+            | "dll"
+            | "pdb"
+            | "so"
+            | "dylib"
+            | "lib"
+            | "a"
+            | "o"
+            | "obj"
+            | "wasm"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "ico"
+            | "bmp"
+            | "pdf"
+            | "woff"
+            | "woff2"
+            | "ttf"
+            | "otf"
+            | "zip"
+            | "gz"
+            | "tgz"
+            | "xz"
+            | "zst"
+            | "7z"
+    )
+}
+
+fn has_safe_gitattrs(
+    git_root: &str,
+    rels: &[String],
+    allowed_binary_rels: &HashSet<String>,
+) -> bool {
+    if rels.is_empty() {
+        return true;
+    }
+    let mut args: Vec<&str> = Vec::with_capacity(7 + rels.len());
+    args.extend_from_slice(&[
+        "check-attr",
+        "-z",
+        "diff",
+        "filter",
+        "ident",
+        "working-tree-encoding",
+        "--",
+    ]);
+    for r in rels {
+        args.push(r.as_str());
+    }
+    let (rc, out, _) = rio::run_git(git_root, &args, 10.0);
+    if rc != 0 {
+        return false;
+    }
+    let mut fields: Vec<&str> = out.split('\0').collect();
+    if fields.last() == Some(&"") {
+        fields.pop();
+    }
+    if fields.len() != rels.len() * 12 {
+        return false;
+    }
+    for (idx, file_chunk) in fields.chunks_exact(12).enumerate() {
+        let expected_rel = rels[idx].as_str();
+        let is_verified_bin = allowed_binary_rels.contains(expected_rel);
+        for triplet in file_chunk.chunks_exact(3) {
+            let [p, attr, val] = triplet else {
+                return false;
+            };
+            if *p != expected_rel {
+                return false;
+            }
+            let attr_ok = match *attr {
+                "filter" | "ident" | "working-tree-encoding" => {
+                    matches!(*val, "unspecified" | "unset")
+                }
+                "diff" => {
+                    if is_verified_bin {
+                        matches!(*val, "unspecified" | "unset" | "set")
+                    } else {
+                        matches!(*val, "unspecified" | "set")
+                    }
+                }
+                _ => false,
+            };
+            if !attr_ok {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn path_seg_eq(a: &str, b: &str) -> bool {
+    #[cfg(windows)]
+    {
+        if a.is_ascii() && b.is_ascii() {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a.to_lowercase() == b.to_lowercase()
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
+    }
+}
+
+fn match_root_prefix<'a>(
+    file_norm: &str,
+    file_segs: &'a [&'a str],
+    root_norm: &str,
+    root_segs: &[String],
+) -> Option<&'a [&'a str]> {
+    if file_norm.starts_with('/') != root_norm.starts_with('/')
+        || root_segs.len() >= file_segs.len()
+    {
+        return None;
+    }
+    if root_segs
+        .iter()
+        .zip(file_segs.iter())
+        .all(|(a, b)| path_seg_eq(a, b))
+    {
+        Some(&file_segs[root_segs.len()..])
+    } else {
+        None
+    }
+}
+
+struct RepoLexicalRoot {
+    root_canon: PathBuf,
+    lex_norm: String,
+    lex_segs: Vec<String>,
+    canon_norm: String,
+    canon_segs: Vec<String>,
+}
+
+impl RepoLexicalRoot {
+    fn new(git_root: &str) -> Option<Self> {
+        let root_path = Path::new(git_root);
+        if git_root.trim().is_empty() || !root_path.is_dir() {
+            return None;
+        }
+        let root_canon = fs::canonicalize(root_path).ok()?;
+        let lex_norm = rio::normalize_path(git_root);
+        let canon_norm = rio::normalize_path(&root_canon.to_string_lossy());
+        if lex_norm.is_empty() || canon_norm.is_empty() {
+            return None;
+        }
+        let lex_segs = lex_norm
+            .trim_end_matches('/')
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        let canon_segs = canon_norm
+            .trim_end_matches('/')
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        Some(Self {
+            root_canon,
+            lex_norm,
+            lex_segs,
+            canon_norm,
+            canon_segs,
+        })
+    }
+
+    fn extract_rel_segs(&self, raw_path: &str) -> Option<Vec<String>> {
+        let trimmed = raw_path.trim().trim_matches('"');
+        if trimmed.is_empty() {
+            return None;
+        }
+        let raw_p = Path::new(trimmed);
+        // INVARIANT: Reject `..` before lexical normalization and never call `canonicalize` on in-repo tail segments so symlinks/junctions (`a -> b`) cannot redirect coverage checks to a different tracked path.
+        if raw_p
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return None;
+        }
+        if !raw_p.is_absolute() && !trimmed.starts_with('~') {
+            let rel_clean = trimmed.replace('\\', "/");
+            let segs: Vec<String> = rel_clean
+                .split('/')
+                .filter(|s| !s.is_empty() && *s != ".")
+                .map(str::to_string)
+                .collect();
+            return if segs.is_empty() { None } else { Some(segs) };
+        }
+        let file_norm = rio::normalize_path(trimmed);
+        let file_trim = file_norm.trim_end_matches('/');
+        let file_segs: Vec<&str> = file_trim.split('/').filter(|s| !s.is_empty()).collect();
+        if let Some(tail) =
+            match_root_prefix(&file_norm, &file_segs, &self.lex_norm, &self.lex_segs)
+        {
+            return Some(tail.iter().map(|s| (*s).to_string()).collect());
+        }
+        if let Some(tail) =
+            match_root_prefix(&file_norm, &file_segs, &self.canon_norm, &self.canon_segs)
+        {
+            return Some(tail.iter().map(|s| (*s).to_string()).collect());
+        }
+        let abs_p = rio::resolve_abs_path(raw_p);
+        let comps: Vec<std::path::Component<'_>> = abs_p.components().collect();
+        let mut prefix = PathBuf::new();
+        for (idx, comp) in comps.iter().enumerate() {
+            prefix.push(comp.as_os_str());
+            if matches!(
+                comp,
+                std::path::Component::Prefix(_) | std::path::Component::RootDir
+            ) {
+                continue;
+            }
+            match fs::symlink_metadata(&prefix) {
+                Ok(pm) if meta_is_link_or_reparse(&pm) => return None,
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return None,
+            }
+            if idx + 1 >= comps.len() {
+                break;
+            }
+            let Ok(p_canon) = fs::canonicalize(&prefix) else {
+                continue;
+            };
+            if p_canon != self.root_canon {
+                continue;
+            }
+            let tail: Vec<String> = comps[idx + 1..]
+                .iter()
+                .filter_map(|c| match c {
+                    std::path::Component::Normal(os) => Some(os.to_string_lossy().into_owned()),
+                    _ => None,
+                })
+                .collect();
+            return if tail.len() == comps.len() - (idx + 1) {
+                Some(tail)
+            } else {
+                None
+            };
+        }
+        None
+    }
+}
+
+pub fn inspect_durable_paths_in_git_tree(
+    git_root: &str,
+    tree_oid: &str,
+    dpaths: &[String],
+) -> Option<Vec<(String, String)>> {
+    // INVARIANT: Verify durable candidate coverage directly against `tree_oid` (`git ls-tree -r -z` + pure-Rust unfiltered Git blob hashing) using strictly lexical repo-relative path extraction plus per-component no-follow `symlink_metadata` / reparse checks so `.gitattributes` filters, `--assume-unchanged`, `--skip-worktree`, `.gitignore`, submodules, symlinks/junctions (`a -> b`), and outside-repo files cannot omit or redirect working-tree bytes.
+    if !is_git_oid(tree_oid) {
+        return None;
+    }
+    let repo_root = RepoLexicalRoot::new(git_root)?;
+    if dpaths.is_empty() {
+        return Some(Vec::new());
+    }
+    let oid_len = tree_oid.len();
+    let mut checked_dirs: HashMap<PathBuf, bool> = HashMap::new();
+    let mut seen_rels: HashSet<String> = HashSet::with_capacity(dpaths.len());
+    let mut all_rels: Vec<String> = Vec::with_capacity(dpaths.len());
+    let mut deleted_rels: Vec<String> = Vec::new();
+    let mut existing_files: Vec<(String, PathBuf, u64)> = Vec::new();
+    for p in dpaths {
+        let Some(segs) = repo_root.extract_rel_segs(p) else {
+            return None;
+        };
+        if segs.is_empty()
+            || segs[0].eq_ignore_ascii_case(".git")
+            || segs
+                .iter()
+                .any(|s| s == "." || s == ".." || s.contains('\\') || s.contains(':'))
+        {
+            return None;
+        }
+        let rel = segs.join("/");
+        if !seen_rels.insert(rel.clone()) {
+            continue;
+        }
+        let mut cur = repo_root.root_canon.clone();
+        let mut parent_missing = false;
+        for seg in &segs[..segs.len() - 1] {
+            cur.push(seg);
+            if parent_missing {
+                continue;
+            }
+            if let Some(&exists_ok) = checked_dirs.get(&cur) {
+                if !exists_ok {
+                    parent_missing = true;
+                }
+                continue;
+            }
+            match fs::symlink_metadata(&cur) {
+                Ok(dm)
+                    if !meta_is_link_or_reparse(&dm)
+                        && dm.file_type().is_dir()
+                        && matches!(
+                            fs::symlink_metadata(cur.join(".git")),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+                        ) =>
+                {
+                    checked_dirs.insert(cur.clone(), true);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    checked_dirs.insert(cur.clone(), false);
+                    parent_missing = true;
+                }
+                _ => return None,
+            }
+        }
+        cur.push(&segs[segs.len() - 1]);
+        if parent_missing {
+            deleted_rels.push(rel.clone());
+        } else {
+            match fs::symlink_metadata(&cur) {
+                Ok(meta) if !meta_is_link_or_reparse(&meta) && meta.file_type().is_file() => {
+                    existing_files.push((rel.clone(), cur, meta.len()));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    deleted_rels.push(rel.clone());
+                }
+                _ => return None,
+            }
+        }
+        all_rels.push(rel);
+    }
+
+    let mut ls_args: Vec<&str> = Vec::with_capacity(5 + all_rels.len());
+    ls_args.extend_from_slice(&["ls-tree", "-r", "-z", tree_oid, "--"]);
+    for r in &all_rels {
+        ls_args.push(r.as_str());
+    }
+    let (rc_ls, ls_out, _) = rio::run_git(git_root, &ls_args, 10.0);
+    if rc_ls != 0 {
+        return None;
+    }
+    let mut tree_blobs: HashMap<&str, (&str, &str)> = HashMap::new();
+    for rec in ls_out.split('\0') {
+        if rec.is_empty() {
+            continue;
+        }
+        let Some((meta_part, path_part)) = rec.split_once('\t') else {
+            return None;
+        };
+        let mut parts = meta_part.split_whitespace();
+        let (Some(mode), Some(kind), Some(oid)) = (parts.next(), parts.next(), parts.next()) else {
+            return None;
+        };
+        if kind != "blob" || oid.len() != oid_len {
+            return None;
+        }
+        tree_blobs.insert(path_part, (mode, oid));
+    }
+
+    let mut crlf_notes: Vec<(String, String)> = Vec::new();
+    let mut allowed_binary_rels: HashSet<String> = HashSet::new();
+    for del_rel in &deleted_rels {
+        if tree_blobs.contains_key(del_rel.as_str()) {
+            return None;
+        }
+        if is_known_binary_artifact_rel(del_rel) {
+            allowed_binary_rels.insert(del_rel.clone());
+        }
+    }
+    for (ex_rel, disk_path, expected_len) in &existing_files {
+        let Some(&(mode, expected_oid)) = tree_blobs.get(ex_rel.as_str()) else {
+            return None;
+        };
+        if mode == "120000" {
+            return None;
+        }
+        let Some((has_nul, crlf_sha256)) = verify_existing_repo_blob(
+            &repo_root.root_canon,
+            disk_path,
+            *expected_len,
+            expected_oid,
+            oid_len,
+        ) else {
+            return None;
+        };
+        let is_bin_artifact = is_known_binary_artifact_rel(ex_rel);
+        if has_nul && !is_bin_artifact {
+            return None;
+        }
+        if let Some(raw_sha) = crlf_sha256 {
+            crlf_notes.push((ex_rel.clone(), raw_sha));
+        } else if is_bin_artifact {
+            allowed_binary_rels.insert(ex_rel.clone());
+        }
+    }
+    if !has_safe_gitattrs(git_root, &all_rels, &allowed_binary_rels)
+        || !has_clean_masked_index_entries(git_root, tree_oid)
+    {
+        return None;
+    }
+    crlf_notes.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    Some(crlf_notes)
+}
+
+fn has_clean_masked_index_entries(git_root: &str, tree_oid: &str) -> bool {
+    // INVARIANT: Fail closed (`false`) if the real `.git/index` carries `--assume-unchanged` or `--skip-worktree` entries whose unmasked working-tree blob in `tree_oid` diverges from `.git/index`.
+    let Ok((mut masked_paths, skip_paths)) = rio::collect_masked_index_paths(git_root, 5.0, &[])
+    else {
+        return false;
+    };
+    let mut seen: HashSet<String> = masked_paths.iter().cloned().collect();
+    for sp in skip_paths {
+        if seen.insert(sp.clone()) {
+            masked_paths.push(sp);
+        }
+    }
+    for chunk in masked_paths.chunks(64) {
+        let mut args: Vec<&str> = Vec::with_capacity(5 + chunk.len());
+        args.extend_from_slice(&["diff-index", "--cached", "--quiet", tree_oid, "--"]);
+        for rel in chunk {
+            args.push(rel.as_str());
+        }
+        let (rc, _, _) = rio::run_git(git_root, &args, 5.0);
+        if rc != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn resolve_swarm_rounds_session_key(
+    fallback_session: &str,
+    marker: Option<&Value>,
+) -> Option<String> {
+    let raw_sess = marker
+        .map(|m| val_to_str(m.get("session")))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| fallback_session.to_string());
+    if raw_sess.trim().is_empty() {
+        None
+    } else {
+        Some(rio::safe_key(&raw_sess, "default"))
+    }
+}
+
+pub fn cycle_ts_mismatch(a: f64, b: f64) -> bool {
+    a > 0.0 && b > 0.0 && (a - b).abs() > SWARM_ROUNDS_TS_TOLERANCE_SEC
+}
+
+fn has_active_rounds_in_doc(rounds_doc: &Map<String, Value>, marker: Option<&Value>) -> bool {
+    if let Some(m) = marker {
+        if cycle_ts_mismatch(
+            marker_cycle_first_ts(m),
+            val_to_f64(rounds_doc.get("marker_first_ts")),
+        ) {
+            return false;
+        }
+    }
+    if json_truthy(rounds_doc.get("uncovered_prepare")) {
+        return true;
+    }
+    rounds_doc
+        .get("lanes")
+        .and_then(Value::as_object)
+        .is_some_and(|lanes| {
+            lanes
+                .values()
+                .any(|v| v.as_array().is_some_and(|arr| !arr.is_empty()))
+        })
+}
+
+pub const EMPTY_TREE_OID_SHA1: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+pub const EMPTY_TREE_OID_SHA256: &str =
+    "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321";
+
+pub fn effective_head_oid_from_raw(raw_head: &str, oid_len: usize) -> &str {
+    if !raw_head.is_empty() {
+        raw_head
+    } else if oid_len == 64 {
+        EMPTY_TREE_OID_SHA256
+    } else {
+        EMPTY_TREE_OID_SHA1
+    }
+}
+
+fn live_tree_oid_matches(
+    gr: &str,
+    expected_tree_oid: &str,
+    cache: &mut Option<String>,
+) -> bool {
+    let live = cache.get_or_insert_with(|| rio::capture_worktree_tree_oid(gr, 15.0));
+    !live.is_empty() && live == expected_tree_oid
+}
+
+fn live_head_oid_matches(
+    gr: &str,
+    expected_head_oid: &str,
+    oid_len: usize,
+    cache: &mut Option<String>,
+) -> bool {
+    let raw = cache.get_or_insert_with(|| rio::git_head_oid(gr));
+    expected_head_oid == effective_head_oid_from_raw(raw, oid_len)
+}
+
+pub fn head_bound_diff_hash(raw_fp: &str, head_oid: &str, tree_oid: &str) -> String {
+    let mut mat = String::with_capacity(head_oid.len() + raw_fp.len() + tree_oid.len() + 24);
+    mat.push_str("HEAD:");
+    mat.push_str(head_oid);
+    mat.push_str("\0FP:");
+    mat.push_str(raw_fp);
+    mat.push_str("\0TREE:");
+    mat.push_str(tree_oid);
+    rio::sha256_hex(mat.as_bytes()).chars().take(16).collect()
+}
+
+struct SingleHeadLaneCtx<'a> {
+    gr: &'a str,
+    marker: &'a Value,
+    last_entry: &'a Value,
+    tree_oid: &'a str,
+    has_dh_field: bool,
+    dh_matches: bool,
+    allow_tree_binding: bool,
+}
+
+struct SingleHeadLaneOutcome {
+    accepts_current_dh: bool,
+    accepts_tree_oid: bool,
+}
+
+pub fn active_cycle_repo_prepare_state<'a>(
+    marker: Option<&'a Value>,
+    folded_gr: &str,
+) -> Option<&'a Map<String, Value>> {
+    if !marker_has_prepare_cycle(marker) {
+        return None;
+    }
+    marker?
+        .get("swarm_prepare_repo_state")?
+        .as_object()?
+        .get(folded_gr)?
+        .as_object()
+}
+
+fn cached_disk_cycle_marker<'a>(
+    skey: &str,
+    mem_marker: Option<&Value>,
+    cache: &'a mut Option<Option<Value>>,
+) -> Option<&'a Value> {
+    let slot = cache.get_or_insert_with(|| {
+        let disk_m = rio::read_json(&marker_path(skey))?;
+        if !marker_has_prepare_cycle(Some(&disk_m)) {
+            return None;
+        }
+        if let Some(m) = mem_marker {
+            if cycle_ts_mismatch(marker_cycle_first_ts(m), marker_cycle_first_ts(&disk_m)) {
+                return None;
+            }
+        }
+        Some(disk_m)
+    });
+    slot.as_ref()
+}
+
+fn live_raw_digest_matches(
+    gr: &str,
+    last_entry: &Value,
+    cache: &mut Option<String>,
+) -> bool {
+    let expected = val_to_str(last_entry.get("raw_worktree_digest"));
+    if expected.is_empty() {
+        return true;
+    }
+    let live = cache.get_or_insert_with(|| rio::capture_worktree_raw_digest(gr, 15.0));
+    !live.is_empty() && live == &expected
+}
+
+fn eval_single_head_lane_entry(
+    ctx: SingleHeadLaneCtx<'_>,
+    live_oid_cache: &mut Option<String>,
+    live_raw_digest_cache: &mut Option<String>,
+    has_valid_modern_lane: &mut bool,
+    has_tainted_legacy_current_dh: &mut bool,
+    has_same_repo_base_provenance: &mut bool,
+) -> SingleHeadLaneOutcome {
+    let rejected = SingleHeadLaneOutcome {
+        accepts_current_dh: false,
+        accepts_tree_oid: false,
+    };
+    if let Some(ut) = ctx
+        .last_entry
+        .get("unfiltered_tree_match")
+        .and_then(Value::as_bool)
+    {
+        if !ctx.has_dh_field || !ctx.dh_matches {
+            return rejected;
+        }
+        // INVARIANT: Verify live working-tree `tree_oid` and `raw_worktree_digest` before accepting either `current_diff_hash` or `tree_oid` on single-`HEAD` modern lanes so post-prepare edits or LF/CRLF mutations outside `marker.paths` invalidate prior verdicts.
+        if !live_tree_oid_matches(ctx.gr, ctx.tree_oid, live_oid_cache)
+            || !live_raw_digest_matches(ctx.gr, ctx.last_entry, live_raw_digest_cache)
+        {
+            return rejected;
+        }
+        *has_valid_modern_lane = true;
+        *has_same_repo_base_provenance = true;
+        return SingleHeadLaneOutcome {
+            accepts_current_dh: true,
+            accepts_tree_oid: ut && ctx.allow_tree_binding,
+        };
+    }
+    if !ctx.dh_matches {
+        return rejected;
+    }
+    let dpaths = durable_paths_from_val(ctx.marker.get("paths"));
+    if dpaths.is_empty() {
+        return rejected;
+    }
+    if !live_tree_oid_matches(ctx.gr, ctx.tree_oid, live_oid_cache) {
+        if ctx.has_dh_field {
+            *has_tainted_legacy_current_dh = true;
+        }
+        return rejected;
+    }
+    match inspect_durable_paths_in_git_tree(ctx.gr, ctx.tree_oid, &dpaths) {
+        Some(crlf) => {
+            *has_same_repo_base_provenance = true;
+            SingleHeadLaneOutcome {
+                accepts_current_dh: ctx.allow_tree_binding,
+                accepts_tree_oid: ctx.allow_tree_binding && crlf.is_empty(),
+            }
+        }
+        None => {
+            if ctx.has_dh_field {
+                *has_tainted_legacy_current_dh = true;
+            }
+            rejected
+        }
+    }
+}
+
+struct RepoPrepProvenanceFlags<'a> {
+    gr: &'a str,
+    current_diff_hash: &'a str,
+    live_raw_head: &'a mut Option<String>,
+    live_oid_cache: &'a mut Option<String>,
+    require_head_bound: &'a mut bool,
+}
+
+fn inspect_marker_repo_prep_state(
+    rps: &Map<String, Value>,
+    flags: &mut RepoPrepProvenanceFlags<'_>,
+) {
+    if rps
+        .get("snapshot_bound_required")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        *flags.require_head_bound = true;
+    }
+    if *flags.require_head_bound {
+        return;
+    }
+    if let Some(sh_arr) = rps.get("seen_heads").and_then(Value::as_array) {
+        for sh in sh_arr.iter().filter_map(Value::as_str).filter(|s| !s.is_empty()) {
+            if !live_head_oid_matches(flags.gr, sh, sh.len(), flags.live_raw_head) {
+                *flags.require_head_bound = true;
+                return;
+            }
+        }
+    }
+    if let Some(ft_arr) = rps.get("seen_fp_trees").and_then(Value::as_array) {
+        for (_, tr) in ft_arr
+            .iter()
+            .filter_map(|v| v.as_str()?.split_once('|'))
+            .filter(|(fp, tr)| *fp == flags.current_diff_hash && !tr.is_empty())
+        {
+            if !live_tree_oid_matches(flags.gr, tr, flags.live_oid_cache) {
+                *flags.require_head_bound = true;
+                return;
+            }
+        }
+    }
+}
+
+fn collect_accepted_hashes_from_doc(
+    rounds_doc: Option<&Map<String, Value>>,
+    marker: Option<&Value>,
+    current_diff_hash: &str,
+    skey: &str,
+    require_prepare_provenance: bool,
+    disk_marker_cache: &mut Option<Option<Value>>,
+) -> Vec<String> {
+    if current_diff_hash.is_empty() {
+        return Vec::new();
+    }
+    // INVARIANT: Start with an empty accepted-hash set whenever `require_prepare_provenance` holds so `current_diff_hash` is accepted only after a same-repo lane verifies both `HEAD` and live `capture_worktree_tree_oid`.
+    let mut out = if require_prepare_provenance {
+        Vec::new()
+    } else {
+        vec![current_diff_hash.to_string()]
+    };
+    let Some(doc) = rounds_doc else {
+        return out;
+    };
+    let Some(m) = marker else {
+        return out;
+    };
+    let gr = val_to_str(m.get("git_root"));
+    if gr.trim().is_empty() {
+        return out;
+    }
+    let marker_first_ts = marker_cycle_first_ts(m);
+    let prev_mts = val_to_f64(doc.get("marker_first_ts"));
+    // INVARIANT: Fail closed (`Vec::new()`) when the marker cycle ran `prepare` and `rounds.json` holds a mismatched or missing `marker_first_ts` (e.g. failed write), while keeping pre-marker `prev_mts <= 0.0` unbound from `tree_oid` when no active-marker `prepare` occurred.
+    if marker_first_ts > 0.0 {
+        let mts_mismatch = cycle_ts_mismatch(prev_mts, marker_first_ts);
+        if mts_mismatch || prev_mts <= 0.0 {
+            let cycle_has_marker_prepare = marker_has_prepare_cycle(marker)
+                || cached_disk_cycle_marker(skey, marker, disk_marker_cache).is_some();
+            if cycle_has_marker_prepare {
+                return Vec::new();
+            }
+            if mts_mismatch {
+                return out;
+            }
+        }
+    }
+    let allow_tree_binding = !(marker_first_ts > 0.0 && prev_mts <= 0.0);
+    let folded_gr = rio::fold_path(&gr);
+    let expected_lane_prefix = format!("{}|", folded_gr);
+    let lanes_opt = doc.get("lanes").and_then(Value::as_object);
+    let has_nonempty_repo_lane = lanes_opt.is_some_and(|lm| {
+        lm.iter().any(|(k, v)| {
+            k.starts_with(&expected_lane_prefix)
+                && v.as_array().is_some_and(|arr| !arr.is_empty())
+        })
+    });
+    if require_prepare_provenance && !has_nonempty_repo_lane {
+        return Vec::new();
+    }
+
+    let mut live_raw_head: Option<String> = None;
+    let mut live_oid_cache: Option<String> = None;
+    let mut live_raw_digest_cache: Option<String> = None;
+    let mut require_head_bound = doc
+        .get("snapshot_bound_required")
+        .and_then(Value::as_object)
+        .and_then(|sm| sm.get(&folded_gr))
+        .and_then(Value::as_bool)
+        == Some(true);
+    let mut has_same_repo_base_provenance = false;
+    let mem_rps = active_cycle_repo_prepare_state(marker, &folded_gr);
+    let mut has_repo_rps = mem_rps.is_some();
+    {
+        let mut prov_flags = RepoPrepProvenanceFlags {
+            gr: &gr,
+            current_diff_hash,
+            live_raw_head: &mut live_raw_head,
+            live_oid_cache: &mut live_oid_cache,
+            require_head_bound: &mut require_head_bound,
+        };
+        if let Some(rps) = mem_rps {
+            inspect_marker_repo_prep_state(rps, &mut prov_flags);
+        }
+        if !*prov_flags.require_head_bound {
+            let disk_rps = cached_disk_cycle_marker(skey, marker, disk_marker_cache)
+                .and_then(|dm| active_cycle_repo_prepare_state(Some(dm), &folded_gr));
+            has_repo_rps = has_repo_rps || disk_rps.is_some();
+            if let Some(dr) = disk_rps.filter(|dr| Some(*dr) != mem_rps) {
+                inspect_marker_repo_prep_state(dr, &mut prov_flags);
+            }
+        }
+    }
+    if let Some(seen_arr) = doc
+        .get("seen_heads")
+        .and_then(Value::as_object)
+        .and_then(|sm| sm.get(&folded_gr))
+        .and_then(Value::as_array)
+    {
+        for sh in seen_arr.iter().filter_map(Value::as_str).filter(|s| !s.is_empty()) {
+            has_same_repo_base_provenance = true;
+            if !require_head_bound
+                && !live_head_oid_matches(&gr, sh, sh.len(), &mut live_raw_head)
+            {
+                require_head_bound = true;
+            }
+        }
+    }
+    let Some(lanes) = lanes_opt else {
+        return if require_head_bound { Vec::new() } else { out };
+    };
+    let mut has_valid_modern_lane = false;
+    let mut has_tainted_legacy_current_dh = false;
+    let mut head_bound_accepted: Vec<String> = Vec::new();
+    let current_dh_owned = current_diff_hash.to_string();
+    for (lane_key, hist_val) in lanes {
+        if !lane_key.starts_with(&expected_lane_prefix) {
+            continue;
+        }
+        let Some(hist_arr) = hist_val.as_array() else {
+            continue;
+        };
+        if !has_repo_rps && hist_arr.first().is_some_and(|f| val_to_i64(f.get("round")) > 1) {
+            require_head_bound = true;
+        }
+        for ent in hist_arr {
+            let eh = val_to_str(ent.get("head_oid"));
+            if !eh.is_empty() {
+                has_same_repo_base_provenance = true;
+                if !require_head_bound
+                    && !live_head_oid_matches(&gr, &eh, eh.len(), &mut live_raw_head)
+                {
+                    require_head_bound = true;
+                }
+            }
+            if require_head_bound {
+                continue;
+            }
+            if !val_to_str(ent.get("head_bound_diff_hash")).is_empty() {
+                require_head_bound = true;
+                continue;
+            }
+            let ent_dh = val_to_str(ent.get("diff_hash"));
+            let ent_tree = val_to_str(ent.get("tree_oid"));
+            if !ent_dh.is_empty()
+                && ent_dh == current_diff_hash
+                && is_git_oid(&ent_tree)
+                && !live_tree_oid_matches(&gr, &ent_tree, &mut live_oid_cache)
+            {
+                require_head_bound = true;
+            }
+        }
+        let Some(last_entry) = hist_arr.last() else {
+            continue;
+        };
+        if !last_entry
+            .get("paths")
+            .and_then(Value::as_array)
+            .map_or(true, Vec::is_empty)
+        {
+            continue;
+        }
+        let tree_oid = val_to_str(last_entry.get("tree_oid"));
+        if !is_git_oid(&tree_oid) {
+            continue;
+        }
+        let rec_head = val_to_str(last_entry.get("head_oid"));
+        if !rec_head.is_empty()
+            && !live_head_oid_matches(&gr, &rec_head, tree_oid.len(), &mut live_raw_head)
+        {
+            require_head_bound = true;
+            continue;
+        }
+        let has_dh_field = last_entry.get("diff_hash").is_some();
+        let rec_dh = val_to_str(last_entry.get("diff_hash"));
+        let dh_matches = if has_dh_field {
+            !rec_dh.is_empty() && rec_dh == current_diff_hash
+        } else {
+            last_mark_fp(m) == Some(current_diff_hash)
+        };
+        let rec_hb_dh = val_to_str(last_entry.get("head_bound_diff_hash"));
+        if !rec_hb_dh.is_empty() {
+            let hb_dh_matches = has_dh_field
+                && !rec_dh.is_empty()
+                && !rec_head.is_empty()
+                && (rec_dh == current_diff_hash
+                    || (current_diff_hash == rec_hb_dh
+                        && val_to_str(m.get("current_diff_hash")) == rec_dh));
+            if !hb_dh_matches
+                || rec_hb_dh != head_bound_diff_hash(&rec_dh, &rec_head, &tree_oid)
+                || last_entry
+                    .get("unfiltered_tree_match")
+                    .and_then(Value::as_bool)
+                    .is_none()
+            {
+                continue;
+            }
+            if live_tree_oid_matches(&gr, &tree_oid, &mut live_oid_cache)
+                && live_raw_digest_matches(&gr, last_entry, &mut live_raw_digest_cache)
+                && !head_bound_accepted.contains(&rec_hb_dh)
+            {
+                head_bound_accepted.push(rec_hb_dh);
+            }
+            continue;
+        }
+        if require_head_bound {
+            continue;
+        }
+        // INVARIANT: Entries predating `unfiltered_tree_match` (including Pass-1 `diff_hash` entries written via `git hash-object`) must re-verify live unfiltered blob coverage; if a matching `diff_hash` legacy entry fails `inspect_durable_paths_in_git_tree` without a valid modern lane, reject both `tree_oid` and the tainted `current_diff_hash`.
+        let outcome = eval_single_head_lane_entry(
+            SingleHeadLaneCtx {
+                gr: &gr,
+                marker: m,
+                last_entry,
+                tree_oid: &tree_oid,
+                has_dh_field,
+                dh_matches,
+                allow_tree_binding,
+            },
+            &mut live_oid_cache,
+            &mut live_raw_digest_cache,
+            &mut has_valid_modern_lane,
+            &mut has_tainted_legacy_current_dh,
+            &mut has_same_repo_base_provenance,
+        );
+        if outcome.accepts_current_dh && !out.contains(&current_dh_owned) {
+            out.push(current_dh_owned.clone());
+        }
+        if outcome.accepts_tree_oid && !out.contains(&tree_oid) {
+            out.push(tree_oid);
+        }
+    }
+    // INVARIANT: Once `HEAD` shifts or a non-marker tree change reuses the same `diff_hash` within a candidate cycle (`require_head_bound`), retire unbound working-tree `current_diff_hash`/`tree_oid` aliases so verdicts must match a fresh `head_bound_diff_hash` for the current `HEAD` and live working-tree snapshot.
+    if require_head_bound {
+        return head_bound_accepted;
+    }
+    if has_tainted_legacy_current_dh && !has_valid_modern_lane {
+        return Vec::new();
+    }
+    if require_prepare_provenance && !has_same_repo_base_provenance {
+        return Vec::new();
+    }
+    out
+}
+
+fn resolve_prepare_req(
+    skey: &str,
+    marker: Option<&Value>,
+    rpath: &Path,
+    loaded: Option<&Value>,
+    disk_marker_cache: &mut Option<Option<Value>>,
+) -> bool {
+    if marker_has_prepare_cycle(marker) {
+        return true;
+    }
+    let active_in_rounds = match loaded {
+        Some(Value::Object(rounds_doc)) => has_active_rounds_in_doc(rounds_doc, marker),
+        Some(_) => return true,
+        None => rpath.exists(),
+    };
+    active_in_rounds || cached_disk_cycle_marker(skey, marker, disk_marker_cache).is_some()
+}
+
+pub fn swarm_prepare_hash_policy(
+    fallback_session: &str,
+    marker: Option<&Value>,
+    current_diff_hash: &str,
+) -> (bool, Vec<String>) {
+    // INVARIANT: Read `swarm_rounds/<session>.json` once to resolve both `require_explicit_hash_match` and `accepted_candidate_diff_hashes` without per-worker/per-window I/O amplification, failing closed (`Vec::new()`) if `current_diff_hash` is empty (e.g. unmeasured >16 MiB candidate) or `rounds.json` base provenance is missing, unreadable, corrupt, or stale during an active `prepare` cycle.
+    let Some(skey) = resolve_swarm_rounds_session_key(fallback_session, marker) else {
+        let has_prep = marker_has_prepare_cycle(marker);
+        return (
+            has_prep,
+            if has_prep || current_diff_hash.is_empty() {
+                Vec::new()
+            } else {
+                vec![current_diff_hash.to_string()]
+            },
+        );
+    };
+    let rpath = swarm_rounds_path(&skey);
+    let loaded = rio::read_json(&rpath);
+    let mut disk_marker_cache: Option<Option<Value>> = None;
+    let req = resolve_prepare_req(
+        &skey,
+        marker,
+        &rpath,
+        loaded.as_ref(),
+        &mut disk_marker_cache,
+    );
+    if current_diff_hash.is_empty() {
+        return (req, Vec::new());
+    }
+    let acc = collect_accepted_hashes_from_doc(
+        loaded.as_ref().and_then(Value::as_object),
+        marker,
+        current_diff_hash,
+        &skey,
+        req,
+        &mut disk_marker_cache,
+    );
+    (req, acc)
+}
+
+pub fn accepted_candidate_diff_hashes(
+    fallback_session: &str,
+    marker: Option<&Value>,
+    current_diff_hash: &str,
+) -> Vec<String> {
+    swarm_prepare_hash_policy(fallback_session, marker, current_diff_hash).1
+}
+
+pub fn tree_oid_is_fast_path_eligible(repo_root: &str, tree_oid: &str) -> bool {
+    if repo_root.trim().is_empty()
+        || !is_git_oid(tree_oid)
+        || rio::git_toplevel(repo_root, false).is_none()
+    {
+        return false;
+    }
+    let (rc, out, _) = rio::run_git(repo_root, &["diff", "--numstat", "HEAD", tree_oid], 5.0);
+    if rc != 0 {
+        return false;
+    }
+    let mut files_count = 0usize;
+    let mut total_lines = 0usize;
+    for line in out.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.split('\t').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let rel = parts[2].trim();
+        if rel.is_empty() || is_scratch_or_ephemeral(rel, "", &[], repo_root) {
+            continue;
+        }
+        if parts[0].trim() == "-" || parts[1].trim() == "-" {
+            return false;
+        }
+        files_count += 1;
+        total_lines += parts[0].trim().parse::<usize>().unwrap_or(0)
+            + parts[1].trim().parse::<usize>().unwrap_or(0);
+    }
+    files_count > 0 && files_count <= FAST_PATH_MAX_FILES && total_lines <= FAST_PATH_MAX_LINES
+}
+
+pub fn has_historical_fast_path_simplify_round(
+    fallback_session: &str,
+    marker: Option<&Value>,
+    repo_root: &str,
+    max_prepare_ts: f64,
+) -> bool {
+    let Some(skey) = resolve_swarm_rounds_session_key(fallback_session, marker) else {
+        return false;
+    };
+    let Some(Value::Object(rounds_doc)) = rio::read_json(&swarm_rounds_path(&skey)) else {
+        return false;
+    };
+    if !has_active_rounds_in_doc(&rounds_doc, marker) {
+        return false;
+    }
+    let Some(lanes) = rounds_doc.get("lanes").and_then(Value::as_object) else {
+        return false;
+    };
+    let cycle_floor_ts = marker
+        .map(|m| val_to_f64(m.get("first_ts")).max(last_research_reset_ts(m)))
+        .unwrap_or(0.0);
+    for (lane_key, hist_val) in lanes {
+        if !lane_key.to_ascii_lowercase().contains("simplify") {
+            continue;
+        }
+        let Some(hist_arr) = hist_val.as_array() else {
+            continue;
+        };
+        for ent in hist_arr {
+            let ets = val_to_f64(ent.get("ts"));
+            if cycle_floor_ts > 0.0 && ets > 0.0 && ets + TS_EPS < cycle_floor_ts {
+                continue;
+            }
+            if max_prepare_ts > 0.0 && ets > max_prepare_ts + TS_EPS {
+                continue;
+            }
+            let tree_oid = val_to_str(ent.get("tree_oid"));
+            if tree_oid_is_fast_path_eligible(repo_root, &tree_oid) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub fn is_flash_model(model: &str) -> bool {
@@ -1139,7 +2407,8 @@ pub fn compute_diff_metrics(marker: &Value, repo_root: &str, diff_stats: Option<
                 if is_scratch_or_ephemeral(rel, "", &[], repo_root) {
                     continue;
                 }
-                git_files.insert(rio::normalize_path(rel));
+                let norm_rel = rel.trim().replace('\\', "/").trim_start_matches("./").to_string();
+                git_files.insert(rio::fold_path(&norm_rel));
                 if a_raw == "-" || d_raw == "-" {
                     has_binary = true;
                 } else {
@@ -1155,7 +2424,8 @@ pub fn compute_diff_metrics(marker: &Value, repo_root: &str, diff_stats: Option<
                 if rel.is_empty() || is_scratch_or_ephemeral(rel, "", &[], repo_root) {
                     continue;
                 }
-                git_files.insert(rio::normalize_path(rel));
+                let norm_rel = rel.replace('\\', "/").trim_start_matches("./").to_string();
+                git_files.insert(rio::fold_path(&norm_rel));
                 let fp = root_path.join(rel);
                 if fp.is_file() {
                     if let Ok((f_bin, f_lines)) = probe_untracked_file_lines(&fp) {
@@ -1174,7 +2444,7 @@ pub fn compute_diff_metrics(marker: &Value, repo_root: &str, diff_stats: Option<
             for cp in &candidate_dpaths {
                 if let Some(rel_cp) = resolve_repo_rel_path(cp, repo_root) {
                     if !rel_cp.is_empty() {
-                        all_files.insert(rel_cp);
+                        all_files.insert(rio::fold_path(&rel_cp));
                     }
                 }
             }
@@ -1729,7 +2999,10 @@ pub fn resolve_repo_rel_info(file_path: &str, repo_root: &str) -> (Option<String
     if raw.is_empty() {
         return (None, false);
     }
-    let root_norm = rio::normalize_path(&resolve_like_python(Path::new(repo_root)).to_string_lossy());
+    let root_norm =
+        rio::normalize_path(&resolve_like_python(Path::new(repo_root)).to_string_lossy());
+    let root_trim = root_norm.trim_end_matches('/');
+    let root_segs: Vec<&str> = root_trim.split('/').filter(|s| !s.is_empty()).collect();
     let p = Path::new(raw);
     let candidate = if p.is_absolute() {
         p.to_path_buf()
@@ -1737,23 +3010,14 @@ pub fn resolve_repo_rel_info(file_path: &str, repo_root: &str) -> (Option<String
         PathBuf::from(&root_norm).join(p)
     };
     let file_norm = rio::normalize_path(&resolve_like_python(&candidate).to_string_lossy());
-
-    let root_trim = root_norm.trim_end_matches('/');
     let file_trim = file_norm.trim_end_matches('/');
-    let root_segs: Vec<&str> = root_trim.split('/').filter(|s| !s.is_empty()).collect();
     let file_segs: Vec<&str> = file_trim.split('/').filter(|s| !s.is_empty()).collect();
 
     let same_prefix = root_segs.len() <= file_segs.len()
-        && root_segs.iter().zip(&file_segs).all(|(a, b)| {
-            #[cfg(windows)]
-            {
-                a.eq_ignore_ascii_case(b) || a.to_lowercase() == b.to_lowercase()
-            }
-            #[cfg(not(windows))]
-            {
-                a == b
-            }
-        });
+        && root_segs
+            .iter()
+            .zip(&file_segs)
+            .all(|(a, b)| path_seg_eq(a, b));
 
     if same_prefix && (file_norm.starts_with('/') == root_norm.starts_with('/')) {
         let rel = file_segs[root_segs.len()..].join("/");
@@ -2364,6 +3628,10 @@ pub fn apply_pending_marker_deltas(
                     "paths".to_string(),
                     Value::Array(merged.into_iter().map(Value::String).collect()),
                 );
+                m.insert(
+                    "current_diff_hash".to_string(),
+                    Value::String(exact_fp.unwrap_or("").to_string()),
+                );
                 let prev_dur = m.get("last_durable_ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 m.insert("last_durable_ts".to_string(), json!(prev_dur.max(rts)));
                 let edits = m.get("edits").and_then(|v| v.as_i64()).unwrap_or(0) + 1;
@@ -2403,6 +3671,12 @@ pub fn apply_pending_marker_deltas(
                 }
                 m_entry.insert("cause".to_string(), Value::String(cause));
                 marks.push(Value::Object(m_entry));
+                if let Some(m) = out.as_object_mut() {
+                    m.insert(
+                        "current_diff_hash".to_string(),
+                        Value::String(exact_fp.unwrap_or("").to_string()),
+                    );
+                }
             }
         }
     }
@@ -2438,12 +3712,39 @@ pub fn snapshot_path(session: &str, call_id: &str) -> PathBuf {
     gate_subdir(&["snapshots"]).join(format!("{}-{}.json", session, rio::safe_key(call_id, "call")))
 }
 
+pub fn snapshot_lock_path(session: &str) -> PathBuf {
+    gate_subdir(&["snapshots"]).join(format!("{}.lock", rio::safe_key(session, "default")))
+}
+
 pub fn claim_path(session: &str) -> PathBuf {
     gate_subdir(&["claims"]).join(format!("{}.json", session))
 }
 
 pub fn swarm_rounds_path(session: &str) -> PathBuf {
     gate_subdir(&["swarm_rounds"]).join(format!("{}.json", session))
+}
+
+pub fn swarm_rounds_lock_path(session: &str) -> PathBuf {
+    gate_subdir(&["swarm_rounds"]).join(format!("{}.lock", session))
+}
+
+fn host_exit_code_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?im)^\s*Command exited with code (-?\d+)\b").expect("host_exit_code_re")
+    })
+}
+
+pub fn parse_host_command_exit_code(blob: &str) -> Option<i32> {
+    // INVARIANT: Inspect only the Antigravity host header preceding `Command output:` so child stdout lines printing `Command exited with code 0` can never spoof a failing test exit code (or vice versa).
+    let header = blob
+        .find("\nCommand output:")
+        .map(|idx| &blob[..idx])
+        .unwrap_or(blob);
+    host_exit_code_re()
+        .captures(header)
+        .and_then(|caps| caps.get(1))
+        .and_then(|m| m.as_str().parse::<i32>().ok())
 }
 
 pub fn is_session_scratch_path(path: &str, artifact_dir: &str, workspace_paths: &[String]) -> bool {
@@ -3143,13 +4444,25 @@ pub fn content_fingerprint(paths: &[String], max_file_bytes: u64) -> String {
         hasher.update(key.as_bytes());
         hasher.update(b"\0");
         let path_obj = Path::new(&p);
-        if !path_obj.exists() {
-            hasher.update(b"MISSING\0");
-            continue;
-        }
-        if !path_obj.is_file() {
-            hasher.update(b"NONFILE\0");
-            continue;
+        match fs::symlink_metadata(path_obj) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                hasher.update(b"MISSING\0");
+                continue;
+            }
+            Err(_) => return String::new(),
+            Ok(meta) => {
+                if meta_is_link_or_reparse(&meta) {
+                    let tgt = fs::read_link(path_obj)
+                        .map(|t| t.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    hasher.update(format!("LINK:{}\0", tgt).as_bytes());
+                    continue;
+                }
+                if !meta.file_type().is_file() {
+                    hasher.update(b"NONFILE\0");
+                    continue;
+                }
+            }
         }
         let Ok(Some((total_len, blob_hex))) = sha256_file_bounded(path_obj, max_file_bytes) else {
             return String::new();
@@ -3804,6 +5117,26 @@ fn is_research_shell_cmd(raw_cmd: &str) -> bool {
     re.is_match(&low)
 }
 
+fn research_bg_task_sys_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?s)\A\s*(?:The following is a <SYSTEM_MESSAGE>[^\r\n]*\r?\n\s*)*(?:<SYSTEM_MESSAGE>\s*\r?\n\s*)?(?:\[Message\](?:\s+timestamp=(?P<ts>\S+))?\s+sender=(?P<sender>\S+)(?:\s+priority=\S+)?\s+content=)?Task id "(?P<tid>[^"]+)"\s+(?P<kind>finished with result:|was cancel(?:l)?ed)"#,
+        )
+        .expect("research_bg_task_sys_re")
+    })
+}
+
+fn research_subagent_sys_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?s)\A\s*(?:The following is a <SYSTEM_MESSAGE>[^\r\n]*\r?\n\s*)*(?:<SYSTEM_MESSAGE>\s*\r?\n\s*)?\[Message\](?:\s+timestamp=(?P<ts>\S+))?\s+sender=(?P<sender>\S+)(?:\s+priority=\S+)?\s+content="#,
+        )
+        .expect("research_subagent_sys_re")
+    })
+}
+
 pub fn find_research_evidence_since(
     steps: &[Value],
     since_ts: f64,
@@ -3828,12 +5161,29 @@ pub fn find_research_evidence_since(
         if tcs.is_empty() {
             continue;
         }
-        let mut gen_results: Vec<(&str, f64)> = Vec::new();
+        let mut gen_results: Vec<(&str, f64, &str)> = Vec::new();
+        let mut prev_step_idx = st.get("step_index").and_then(Value::as_i64);
         let mut scan_i = idx + 1;
         while scan_i < steps.len() {
             let gst = &steps[scan_i];
             if gst.get("type").and_then(|v| v.as_str()) != Some("GENERIC") {
                 break;
+            }
+            let g_idx = gst.get("step_index").and_then(Value::as_i64);
+            match (prev_step_idx, g_idx) {
+                (Some(p_idx), Some(gi)) => {
+                    if gi != p_idx + 1 {
+                        break;
+                    }
+                    prev_step_idx = Some(gi);
+                }
+                (None, Some(gi)) => {
+                    prev_step_idx = Some(gi);
+                }
+                (Some(_), None) if gst.get("step_index").is_some() => {
+                    prev_step_idx = None;
+                }
+                _ => {}
             }
             let status = gst.get("status").and_then(|v| v.as_str()).unwrap_or("");
             let gts = gst
@@ -3841,18 +5191,140 @@ pub fn find_research_evidence_since(
                 .and_then(|v| v.as_str())
                 .map(rio::parse_iso_ts)
                 .unwrap_or(0.0);
-            gen_results.push((status, gts));
+            let gcontent = gst.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            gen_results.push((status, gts, gcontent));
             scan_i += 1;
         }
         for (pos, tc) in tcs.iter().enumerate() {
             if pos >= gen_results.len() {
                 continue;
             }
-            let (g_status, g_ts) = gen_results[pos];
+            let (g_status, g_ts, g_content) = gen_results[pos];
             if g_status == "ERROR" {
                 continue;
             }
-            let eff_ts = step_ts.max(g_ts);
+            let bg_tid = rio::extract_bg_task_id(g_content);
+            if g_status == "RUNNING" && bg_tid.is_none() {
+                continue;
+            }
+            let mut eff_ts = step_ts.max(g_ts);
+            let name = val_to_str(tc.get("name"));
+            let name_low = name.trim().to_ascii_lowercase();
+            let decoded_args = match tc.get("args") {
+                Some(Value::String(s)) => serde_json::from_str::<Value>(s).unwrap_or(Value::Null),
+                Some(v) => v.clone(),
+                None => Value::Null,
+            };
+            if let Some(ref tid) = bg_tid {
+                // INVARIANT: Anchor background task completion matching to `\A` and require `sender == tid` (when `sender=` is present) so another task printing `tid` in `Command output:` cannot spoof completion while `tid` is still running.
+                let mut bg_done_ts: Option<f64> = None;
+                for rem in &steps[scan_i..] {
+                    if rem.get("type").and_then(|v| v.as_str()) != Some("SYSTEM_MESSAGE") {
+                        continue;
+                    }
+                    let sc = rem.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                    let Some(caps) = research_bg_task_sys_re().captures(sc) else {
+                        continue;
+                    };
+                    let Some(whole) = caps.get(0) else {
+                        continue;
+                    };
+                    if caps.name("tid").map(|m| m.as_str()) != Some(tid.as_str())
+                        || !caps
+                            .name("sender")
+                            .map_or(true, |m| m.as_str() == tid.as_str())
+                    {
+                        continue;
+                    }
+                    if caps
+                        .name("kind")
+                        .is_some_and(|m| m.as_str().starts_with("was cancel"))
+                    {
+                        break;
+                    }
+                    let after = &sc[whole.end()..];
+                    let end_sys = after.find("</SYSTEM_MESSAGE>").unwrap_or(after.len());
+                    let Some(exit_code) = parse_host_command_exit_code(&after[..end_sys]) else {
+                        continue;
+                    };
+                    if exit_code != 0 {
+                        break;
+                    }
+                    let msg_ts = caps
+                        .name("ts")
+                        .map(|m| rio::parse_iso_ts(m.as_str()))
+                        .unwrap_or(0.0);
+                    let sts = if msg_ts > 0.0 {
+                        msg_ts
+                    } else {
+                        rem.get("created_at")
+                            .and_then(|v| v.as_str())
+                            .map(rio::parse_iso_ts)
+                            .unwrap_or(eff_ts)
+                    };
+                    bg_done_ts = Some(sts.max(eff_ts));
+                    break;
+                }
+                let Some(done_ts) = bg_done_ts else {
+                    continue;
+                };
+                eff_ts = done_ts;
+            } else if matches!(parse_host_command_exit_code(g_content), Some(c) if c != 0) {
+                continue;
+            }
+            let mut async_research_sub_ready = false;
+            if name_low == "invoke_subagent" {
+                let sub_type = val_to_str(decoded_args.get("TypeName"));
+                if sub_type.trim().eq_ignore_ascii_case("research") {
+                    let sub_cid = serde_json::from_str::<Value>(g_content)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("conversationId")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        })
+                        .or_else(|| {
+                            let marker_key = "\"conversationId\":\"";
+                            let start = g_content.find(marker_key)? + marker_key.len();
+                            let end = g_content[start..].find('"')? + start;
+                            Some(g_content[start..end].to_string())
+                        })
+                        .unwrap_or_default();
+                    if sub_cid.is_empty() {
+                        async_research_sub_ready =
+                            g_status == "DONE" && !g_content.contains("conversationId");
+                    } else {
+                        let sub_done_ts = steps[scan_i..].iter().find_map(|rem| {
+                            if rem.get("type").and_then(|v| v.as_str()) != Some("SYSTEM_MESSAGE") {
+                                return None;
+                            }
+                            let sc = rem.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                            let caps = research_subagent_sys_re().captures(sc)?;
+                            if caps.name("sender").map(|m| m.as_str()) != Some(sub_cid.as_str()) {
+                                return None;
+                            }
+                            let msg_ts = caps
+                                .name("ts")
+                                .map(|m| rio::parse_iso_ts(m.as_str()))
+                                .unwrap_or(0.0);
+                            let base_ts = if msg_ts > 0.0 {
+                                msg_ts
+                            } else {
+                                rem.get("created_at")
+                                    .and_then(|v| v.as_str())
+                                    .map(rio::parse_iso_ts)
+                                    .unwrap_or(eff_ts)
+                            };
+                            let rts = base_ts.max(eff_ts);
+                            (rts > since_ts && until_ts.map_or(true, |u| rts <= u)).then_some(rts)
+                        });
+                        if let Some(done_ts) = sub_done_ts {
+                            eff_ts = done_ts;
+                            async_research_sub_ready = true;
+                        }
+                    }
+                }
+            }
             if eff_ts <= since_ts {
                 continue;
             }
@@ -3861,13 +5333,6 @@ pub fn find_research_evidence_since(
                     continue;
                 }
             }
-            let name = val_to_str(tc.get("name"));
-            let name_low = name.trim().to_ascii_lowercase();
-            let decoded_args = match tc.get("args") {
-                Some(Value::String(s)) => serde_json::from_str::<Value>(s).unwrap_or(Value::Null),
-                Some(v) => v.clone(),
-                None => Value::Null,
-            };
             let mut tag = String::new();
             if name_low == "search_web" {
                 tag = "search_web".to_string();
@@ -3881,8 +5346,7 @@ pub fn find_research_evidence_since(
                     tag = format!("call_mcp_tool:{}", srv.trim().to_ascii_lowercase());
                 }
             } else if name_low == "invoke_subagent" {
-                let sub_type = val_to_str(decoded_args.get("TypeName"));
-                if sub_type.trim().eq_ignore_ascii_case("research") {
+                if async_research_sub_ready {
                     tag = "subagent:research".to_string();
                 }
             } else if name_low == "run_command" {
@@ -4158,6 +5622,188 @@ pub fn latch_marker_declared_risk(
     })
 }
 
+pub fn active_marker_fast_path_simplify(marker: &Value) -> Option<f64> {
+    let fp_obj = marker.get("simplify_fast_path_latched")?.as_object()?;
+    let fp_first_ts = val_to_f64(fp_obj.get("candidate_first_ts"));
+    let marker_first_ts = val_to_f64(marker.get("first_ts"));
+    if marker_first_ts <= 0.0 || (fp_first_ts - marker_first_ts).abs() > TS_EPS {
+        return None;
+    }
+    let fp_epoch = fp_obj.get("reset_epoch").and_then(Value::as_u64)? as usize;
+    if fp_epoch != research_reset_epoch(marker) {
+        return None;
+    }
+    let vts = val_to_f64(fp_obj.get("verified_ts"));
+    (vts > 0.0).then_some(vts)
+}
+
+pub fn latch_marker_fast_path_simplify(session: &str, verified_ts: f64) -> bool {
+    if session.trim().is_empty() || verified_ts <= 0.0 {
+        return false;
+    }
+    let skey = rio::safe_key(session, "default");
+    let mpath = marker_path(&skey);
+    rio::with_file_lock(&marker_lock_path(&skey), 5.0, 30.0, |locked| {
+        if !locked {
+            return false;
+        }
+        let raw = rio::read_json(&mpath);
+        let (merged_opt, consumed_ids) = apply_pending_marker_deltas(&skey, raw.as_ref());
+        let Some(mut fresh) = merged_opt else {
+            return false;
+        };
+        if !fresh.is_object() || json_truthy(fresh.get("closed")) {
+            return false;
+        }
+        let live_first_ts = val_to_f64(fresh.get("first_ts"));
+        if live_first_ts <= 0.0 {
+            return false;
+        }
+        let live_epoch = research_reset_epoch(&fresh);
+        if let Some(prev_vts) = active_marker_fast_path_simplify(&fresh) {
+            if prev_vts >= verified_ts - TS_EPS && consumed_ids.is_empty() {
+                return true;
+            }
+        }
+        // INVARIANT: Latch Fast-Path `SIMPLIFY_LENS: ALL` eligibility once review starts on an eligible `<= 2`-file / `<= 30`-line candidate so subsequent `REVISE` remediation edits touching a 3rd file never retroactively invalidate the completed candidate-bound simplify pass.
+        if let Some(mobj) = fresh.as_object_mut() {
+            mobj.insert(
+                "simplify_fast_path_latched".to_string(),
+                json!({
+                    "candidate_first_ts": live_first_ts,
+                    "reset_epoch": live_epoch,
+                    "verified_ts": verified_ts,
+                }),
+            );
+        }
+        if rio::write_json(&mpath, &fresh).is_ok() {
+            if !consumed_ids.is_empty() {
+                ack_pending_marker_deltas(&skey, &consumed_ids);
+            }
+            return true;
+        }
+        false
+    })
+}
+
+pub fn redesign_reset_count(marker: &Value) -> usize {
+    marker
+        .get("research_resets")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter(|ent| {
+                    let dec = val_to_str(ent.get("decision")).trim().to_ascii_lowercase();
+                    REDESIGN_RESET_DECISIONS.contains(&dec.as_str())
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+pub fn active_marker_verified_simplify_hashes(marker: &Value) -> Vec<String> {
+    let Some(sv_obj) = marker
+        .get("simplify_verified_latched")
+        .and_then(Value::as_object)
+    else {
+        return Vec::new();
+    };
+    let live_first_ts = val_to_f64(marker.get("first_ts"));
+    let sv_first_ts = val_to_f64(sv_obj.get("candidate_first_ts"));
+    if live_first_ts <= 0.0 || sv_first_ts <= 0.0 || (sv_first_ts - live_first_ts).abs() > TS_EPS {
+        return Vec::new();
+    }
+    let sv_epoch = sv_obj
+        .get("reset_epoch")
+        .and_then(Value::as_u64)
+        .map(|u| u as usize)
+        .unwrap_or(usize::MAX);
+    if sv_epoch != research_reset_epoch(marker) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    if let Some(arr) = sv_obj.get("verified_hashes").and_then(Value::as_array) {
+        for v in arr {
+            let s = val_to_str(Some(v)).trim().to_string();
+            if !s.is_empty() && !out.contains(&s) {
+                out.push(s);
+            }
+        }
+    }
+    out
+}
+
+pub fn latch_marker_verified_simplify(
+    session: &str,
+    verified_ts: f64,
+    expected_last_durable_ts: f64,
+    hashes: &[String],
+) -> bool {
+    if session.trim().is_empty() || verified_ts <= 0.0 || hashes.is_empty() {
+        return false;
+    }
+    let mut clean_hashes: Vec<String> = Vec::new();
+    for h in hashes {
+        let t = h.trim();
+        if !t.is_empty() && !clean_hashes.iter().any(|x| x == t) {
+            clean_hashes.push(t.to_string());
+        }
+    }
+    if clean_hashes.is_empty() {
+        return false;
+    }
+    let skey = rio::safe_key(session, "default");
+    let mpath = marker_path(&skey);
+    rio::with_file_lock(&marker_lock_path(&skey), 5.0, 30.0, |locked| {
+        if !locked {
+            return false;
+        }
+        let raw = rio::read_json(&mpath);
+        let (merged_opt, consumed_ids) = apply_pending_marker_deltas(&skey, raw.as_ref());
+        let Some(mut fresh) = merged_opt else {
+            return false;
+        };
+        if !fresh.is_object() || json_truthy(fresh.get("closed")) {
+            return false;
+        }
+        let live_first_ts = val_to_f64(fresh.get("first_ts"));
+        let live_last_dur = val_to_f64(fresh.get("last_durable_ts"));
+        if live_first_ts <= 0.0 || live_last_dur > expected_last_durable_ts + TS_EPS {
+            return false;
+        }
+        let live_epoch = research_reset_epoch(&fresh);
+        let mut merged = active_marker_verified_simplify_hashes(&fresh);
+        let prev_len = merged.len();
+        for h in &clean_hashes {
+            if !merged.contains(h) {
+                merged.push(h.clone());
+            }
+        }
+        if merged.len() == prev_len && prev_len > 0 && consumed_ids.is_empty() {
+            return true;
+        }
+        // INVARIANT: Forward-latch live-verified `swarm-cache prepare` simplify hashes onto `marker.json` while the worktree matches `raw_worktree_digest`, so later `REVISE` edits (including CRLF files outside `prepare`-time `marker.paths`) never break valid simplify while rejected pre-edit drift can never be resurrected.
+        if let Some(mobj) = fresh.as_object_mut() {
+            mobj.insert(
+                "simplify_verified_latched".to_string(),
+                json!({
+                    "candidate_first_ts": live_first_ts,
+                    "reset_epoch": live_epoch,
+                    "verified_ts": verified_ts,
+                    "verified_hashes": merged,
+                }),
+            );
+        }
+        if rio::write_json(&mpath, &fresh).is_ok() {
+            if !consumed_ids.is_empty() {
+                ack_pending_marker_deltas(&skey, &consumed_ids);
+            }
+            return true;
+        }
+        false
+    })
+}
+
 pub fn latch_marker_declared_risk_for_marker(session: &str, marker: &mut Value, risk: &str) -> bool {
     let exp_fts = val_to_f64(marker.get("first_ts"));
     let exp_epoch = research_reset_epoch(marker);
@@ -4288,15 +5934,363 @@ pub fn is_worker_spawned_before_reset(
     false
 }
 
-pub fn verified_research_reset_state(
+#[derive(serde::Deserialize)]
+struct WindowStepDeser {
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default, rename = "type")]
+    step_type: String,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    step_index: Option<Value>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Value>,
+    #[serde(default)]
+    truncated_fields: Option<Vec<String>>,
+}
+
+fn push_window_gap(steps: &mut Vec<Value>) {
+    if steps
+        .last()
+        .and_then(|s| s.get("type"))
+        .and_then(Value::as_str)
+        != Some("WINDOW_GAP")
+    {
+        steps.push(json!({"type": "WINDOW_GAP"}));
+    }
+}
+
+fn emit_window_step(
+    deser: WindowStepDeser,
+    bail_on_truncated: bool,
+    steps: &mut Vec<Value>,
+    truncated_tool_calls: &mut bool,
+) -> Result<(), ()> {
+    if deser
+        .truncated_fields
+        .as_ref()
+        .is_some_and(|arr| arr.iter().any(|x| x == "tool_calls" || x == "content"))
+    {
+        if bail_on_truncated {
+            return Err(());
+        }
+        *truncated_tool_calls = true;
+    }
+    let mut map = Map::new();
+    map.insert("type".to_string(), Value::String(deser.step_type));
+    if let Some(src) = deser.source {
+        map.insert("source".to_string(), Value::String(src));
+    }
+    if let Some(ca) = deser.created_at {
+        map.insert("created_at".to_string(), Value::String(ca));
+    }
+    if let Some(si) = deser.step_index {
+        map.insert("step_index".to_string(), si);
+    }
+    if let Some(st) = deser.status {
+        map.insert("status".to_string(), Value::String(st));
+    }
+    if let Some(ct) = deser.content {
+        map.insert("content".to_string(), Value::String(ct));
+    }
+    if let Some(tcs) = deser.tool_calls {
+        map.insert("tool_calls".to_string(), tcs);
+    }
+    steps.push(Value::Object(map));
+    Ok(())
+}
+
+fn scan_transcript_file_windows(
+    tp: &Path,
+    windows: &[(f64, f64)],
+    bail_on_truncated: bool,
+) -> Result<(Vec<Value>, bool), ()> {
+    let fh = File::open(tp).map_err(|_| ())?;
+    let mut reader = BufReader::new(fh);
+    let mut line = String::new();
+    let mut steps: Vec<Value> = Vec::new();
+    let mut truncated_tool_calls = false;
+    let mut in_planner_span = false;
+    let mut pending_planner: Option<WindowStepDeser> = None;
+    let mut pending_generics: Vec<WindowStepDeser> = Vec::new();
+    let max_hi = windows.iter().map(|&(_, hi)| hi).fold(0.0_f64, f64::max);
+    let in_any_window = |ts: f64| ts > 0.0 && windows.iter().any(|&(lo, hi)| ts >= lo && ts <= hi);
+
+    while reader.read_line(&mut line).map_err(|_| ())? > 0 {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            line.clear();
+            continue;
+        }
+        let Ok(deser) = serde_json::from_str::<WindowStepDeser>(trimmed) else {
+            in_planner_span = false;
+            pending_planner = None;
+            pending_generics.clear();
+            push_window_gap(&mut steps);
+            line.clear();
+            continue;
+        };
+        match deser.step_type.as_str() {
+            "PLANNER_RESPONSE" => {
+                pending_planner = None;
+                pending_generics.clear();
+                let ts = deser.created_at.as_deref().map(rio::parse_iso_ts).unwrap_or(0.0);
+                if in_any_window(ts) {
+                    if emit_window_step(
+                        deser,
+                        bail_on_truncated,
+                        &mut steps,
+                        &mut truncated_tool_calls,
+                    )
+                    .is_err()
+                    {
+                        return Ok((Vec::new(), true));
+                    }
+                    in_planner_span = true;
+                } else {
+                    in_planner_span = false;
+                    push_window_gap(&mut steps);
+                    if ts <= max_hi {
+                        pending_planner = Some(deser);
+                    }
+                }
+            }
+            "GENERIC" if in_planner_span => {
+                if emit_window_step(
+                    deser,
+                    bail_on_truncated,
+                    &mut steps,
+                    &mut truncated_tool_calls,
+                )
+                .is_err()
+                {
+                    return Ok((Vec::new(), true));
+                }
+            }
+            "GENERIC" if pending_planner.is_some() => {
+                let gts = deser.created_at.as_deref().map(rio::parse_iso_ts).unwrap_or(0.0);
+                if in_any_window(gts) {
+                    if let Some(p_deser) = pending_planner.take() {
+                        let g_desers = std::mem::take(&mut pending_generics);
+                        for item in std::iter::once(p_deser)
+                            .chain(g_desers)
+                            .chain(std::iter::once(deser))
+                        {
+                            if emit_window_step(
+                                item,
+                                bail_on_truncated,
+                                &mut steps,
+                                &mut truncated_tool_calls,
+                            )
+                            .is_err()
+                            {
+                                return Ok((Vec::new(), true));
+                            }
+                        }
+                        in_planner_span = true;
+                    }
+                } else if gts > max_hi {
+                    pending_planner = None;
+                    pending_generics.clear();
+                } else {
+                    pending_generics.push(deser);
+                }
+            }
+            "GENERIC" => {}
+            "SYSTEM_MESSAGE" => {
+                in_planner_span = false;
+                pending_planner = None;
+                pending_generics.clear();
+                let sts = deser.created_at.as_deref().map(rio::parse_iso_ts).unwrap_or(0.0);
+                if in_any_window(sts) {
+                    if emit_window_step(
+                        deser,
+                        bail_on_truncated,
+                        &mut steps,
+                        &mut truncated_tool_calls,
+                    )
+                    .is_err()
+                    {
+                        return Ok((Vec::new(), true));
+                    }
+                } else {
+                    push_window_gap(&mut steps);
+                }
+            }
+            _ => {
+                in_planner_span = false;
+                pending_planner = None;
+                pending_generics.clear();
+                push_window_gap(&mut steps);
+            }
+        }
+        line.clear();
+    }
+    if tp.file_name().and_then(|s| s.to_str()) == Some("transcript.jsonl") && !steps.is_empty() {
+        rio::decode_compact_step_args(&mut steps);
+    }
+    Ok((steps, truncated_tool_calls))
+}
+
+fn all_windows_have_research(steps: &[Value], gap_windows: &[(f64, f64)]) -> bool {
+    gap_windows
+        .iter()
+        .all(|&(blk_ts, r_ts)| !find_research_evidence_since(steps, blk_ts, Some(r_ts + 1.0)).is_empty())
+}
+
+fn verify_gap_windows_from_transcript(
+    transcript_path: &str,
+    gap_windows: &[(f64, f64)],
+) -> Result<bool, ()> {
+    if transcript_path.trim().is_empty() || gap_windows.is_empty() {
+        return Err(());
+    }
+    let scan_ranges: Vec<(f64, f64)> = gap_windows
+        .iter()
+        .map(|&(b, r)| ((b - 300.0).max(0.0), r + 60.0))
+        .collect();
+    let compact_p = Path::new(transcript_path).with_file_name("transcript.jsonl");
+    let full_p = rio::resolve_transcript_path(transcript_path);
+    let has_distinct_full = full_p.as_ref().is_some_and(|fp| fp != &compact_p);
+    if compact_p.is_file() {
+        if let Ok((steps, false)) =
+            scan_transcript_file_windows(&compact_p, &scan_ranges, has_distinct_full)
+        {
+            if all_windows_have_research(&steps, gap_windows) {
+                return Ok(true);
+            }
+            if !has_distinct_full {
+                return Ok(false);
+            }
+        }
+    }
+    let Some(fp) = full_p else {
+        return Err(());
+    };
+    let (full_steps, _) = scan_transcript_file_windows(&fp, &scan_ranges, false)?;
+    Ok(all_windows_have_research(&full_steps, gap_windows))
+}
+
+pub fn has_verified_research_between(
+    steps: Option<&[Value]>,
+    transcript_path: Option<&str>,
+    since_ts: f64,
+    until_ts: f64,
+) -> bool {
+    // INVARIANT: Require verified external/docs research in `(since_ts, until_ts]` after Round-4 `ESCALATE` before admitting or accepting `--closure`, falling back to gap-free transcript window streaming when in-memory steps are absent, truncated, or gapped.
+    if since_ts <= 0.0 || until_ts < since_ts {
+        return false;
+    }
+    if let Some(st) = steps.filter(|s| !s.is_empty()) {
+        let has_gap = rio::has_prefix_slice_gap(st);
+        let drops_synthetic_head = st.len() > 1
+            && st[0].get("step_index").and_then(Value::as_i64) == Some(0)
+            && st[1]
+                .get("step_index")
+                .and_then(Value::as_i64)
+                .is_some_and(|i1| i1 > 1);
+        let contig_steps = if drops_synthetic_head { &st[1..] } else { st };
+        if !find_research_evidence_since(contig_steps, since_ts, Some(until_ts + 1.0)).is_empty() {
+            return true;
+        }
+        let contig_earliest_ts = contig_steps
+            .iter()
+            .filter_map(|s| {
+                s.get("created_at")
+                    .and_then(Value::as_str)
+                    .map(rio::parse_iso_ts)
+            })
+            .filter(|&ts| ts > 0.0)
+            .fold(f64::INFINITY, f64::min);
+        let has_trunc = contig_steps.iter().any(|s| {
+            s.get("truncated_fields")
+                .and_then(Value::as_array)
+                .is_some_and(|arr| !arr.is_empty())
+        });
+        if !has_gap && !has_trunc && contig_earliest_ts <= since_ts {
+            return false;
+        }
+    }
+    if let Some(tp) = transcript_path.filter(|p| !p.trim().is_empty()) {
+        return verify_gap_windows_from_transcript(tp, &[(since_ts, until_ts)]).unwrap_or(false);
+    }
+    false
+}
+
+fn transcript_read_err() -> (f64, i64, Option<String>) {
+    (
+        0.0,
+        0,
+        Some("failed to read full transcript for `research_resets` verification".to_string()),
+    )
+}
+
+fn missing_post_blocked_research_err() -> (f64, i64, Option<String>) {
+    (
+        0.0,
+        0,
+        Some(
+            "`research_resets` entry lacks verified post-BLOCKED documentation/web research in transcript"
+                .to_string(),
+        ),
+    )
+}
+
+pub fn verified_research_reset_state_with_path(
     marker: &Value,
     steps: Option<&[Value]>,
+    transcript_path: Option<&str>,
 ) -> (f64, i64, Option<String>) {
+    // INVARIANT: Exclude the synthetic `st[0]` prefix before a `has_prefix_slice_gap(st)` tail jump when computing `contig_earliest_ts`, require `contig_earliest_ts <= blk_ts` for in-memory window completeness, and stream-verify any gap-preceding `[blk_ts, r_ts]` windows directly from the transcript file when `transcript_path` is present.
     let Some(arr) = marker.get("research_resets").and_then(|v| v.as_array()) else {
         return (0.0, 0, None);
     };
+    if arr.is_empty() {
+        return (0.0, 0, None);
+    }
     let mut latest_ts = 0.0f64;
     let mut latest_seq = 0i64;
+    let mut gap_windows: Vec<(f64, f64)> = Vec::new();
+    let tail_info = if let Some(st) = steps {
+        if st.is_empty() {
+            return (
+                0.0,
+                0,
+                Some("`research_resets` entry cannot be verified against an empty transcript".to_string()),
+            );
+        }
+        let has_gap = rio::has_prefix_slice_gap(st);
+        let drops_synthetic_head = st.len() > 1
+            && st[0].get("step_index").and_then(Value::as_i64) == Some(0)
+            && st[1]
+                .get("step_index")
+                .and_then(Value::as_i64)
+                .is_some_and(|i1| i1 > 1);
+        let contig_steps = if drops_synthetic_head { &st[1..] } else { st };
+        let contig_earliest_ts = if has_gap {
+            contig_steps
+                .iter()
+                .filter_map(|s| {
+                    s.get("created_at")
+                        .and_then(Value::as_str)
+                        .map(rio::parse_iso_ts)
+                })
+                .filter(|&ts| ts > 0.0)
+                .fold(f64::INFINITY, f64::min)
+        } else {
+            0.0
+        };
+        Some((has_gap, contig_steps, contig_earliest_ts))
+    } else {
+        None
+    };
+
+    let mut redesign_count = 0usize;
     for ent in arr {
         let dec = val_to_str(ent.get("decision")).trim().to_ascii_lowercase();
         let findings = val_to_str(ent.get("findings")).trim().to_string();
@@ -4314,6 +6308,19 @@ pub fn verified_research_reset_state(
                 Some("invalid `research_resets` metadata in candidate marker".to_string()),
             );
         }
+        if REDESIGN_RESET_DECISIONS.contains(&dec.as_str()) {
+            redesign_count += 1;
+            if redesign_count > MAX_REDESIGN_RESETS {
+                return (
+                    0.0,
+                    0,
+                    Some(format!(
+                        "`research_resets` exceeded MAX_REDESIGN_RESETS={} per candidate",
+                        MAX_REDESIGN_RESETS
+                    )),
+                );
+            }
+        }
         let has_recorded_tools = ent
             .get("research_tools")
             .and_then(|v| v.as_array())
@@ -4325,28 +6332,17 @@ pub fn verified_research_reset_state(
                 Some("`research_resets` entry has empty `research_tools`".to_string()),
             );
         }
-        if let Some(st) = steps {
-            if st.is_empty() {
-                return (
-                    0.0,
-                    0,
-                    Some("`research_resets` entry cannot be verified against an empty transcript".to_string()),
-                );
-            }
-            let earliest_ts = st
-                .iter()
-                .filter_map(|s| s.get("created_at").and_then(|v| v.as_str()).map(rio::parse_iso_ts))
-                .filter(|&ts| ts > 0.0)
-                .fold(f64::INFINITY, f64::min);
-            if !earliest_ts.is_finite() || earliest_ts <= r_ts + 1.0 {
-                let ev = find_research_evidence_since(st, blk_ts, Some(r_ts + 1.0));
-                if ev.is_empty() {
-                    return (
-                        0.0,
-                        0,
-                        Some("`research_resets` entry lacks verified post-BLOCKED documentation/web research in transcript".to_string()),
-                    );
+        if let Some((has_gap, contig_steps, contig_earliest_ts)) = tail_info {
+            if !has_gap || (contig_earliest_ts.is_finite() && contig_earliest_ts <= blk_ts) {
+                if find_research_evidence_since(contig_steps, blk_ts, Some(r_ts + 1.0)).is_empty() {
+                    if transcript_path.is_some() {
+                        gap_windows.push((blk_ts, r_ts));
+                    } else {
+                        return missing_post_blocked_research_err();
+                    }
                 }
+            } else {
+                gap_windows.push((blk_ts, r_ts));
             }
         }
         if r_ts >= latest_ts {
@@ -4358,6 +6354,17 @@ pub fn verified_research_reset_state(
             if bseq > latest_seq {
                 latest_seq = bseq;
             }
+        }
+    }
+
+    if !gap_windows.is_empty() {
+        let Some(tp) = transcript_path else {
+            return transcript_read_err();
+        };
+        match verify_gap_windows_from_transcript(tp, &gap_windows) {
+            Ok(true) => {}
+            Ok(false) => return missing_post_blocked_research_err(),
+            Err(()) => return transcript_read_err(),
         }
     }
     (latest_ts, latest_seq, None)
@@ -6166,5 +8173,376 @@ mod tests {
             .is_empty()
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_verified_research_reset_state_prefix_gap_and_window_stream() {
+        let tmp = std::env::temp_dir().join(format!(
+            "cwg-rr-gap-{}-{}",
+            std::process::id(),
+            (now_sec() * 1000.0) as u64
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        let logs_dir = tmp.join(".system_generated").join("logs");
+        fs::create_dir_all(&logs_dir).unwrap();
+
+        let blk1 = rio::parse_iso_ts("2026-11-18T10:00:00Z");
+        let rst1 = rio::parse_iso_ts("2026-11-18T10:02:00Z");
+        let blk2 = rio::parse_iso_ts("2026-11-20T01:00:00Z");
+        let rst2 = rio::parse_iso_ts("2026-11-20T01:02:00Z");
+
+        let compact_lines = [
+            json!({
+                "step_index": 0,
+                "source": "SYSTEM_SDK",
+                "type": "SYSTEM_MESSAGE",
+                "created_at": "2026-11-17T06:00:00Z",
+                "content": "init"
+            }),
+            json!({
+                "step_index": 100,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-18T10:01:00Z",
+                "truncated_fields": ["tool_calls"],
+                "tool_calls": []
+            }),
+            json!({
+                "step_index": 101,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": "2026-11-18T10:01:05Z",
+                "content": "ok"
+            }),
+            json!({
+                "step_index": 5000,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-20T01:01:00Z",
+                "tool_calls": [{"name": "search_web", "args": {"query": "\"rust\"wal"}}]
+            }),
+            json!({
+                "step_index": 5001,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": "2026-11-20T01:01:05Z",
+                "content": "ok"
+            }),
+        ];
+        let full_lines = [
+            compact_lines[0].clone(),
+            json!({
+                "step_index": 100,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-18T10:01:00Z",
+                "tool_calls": [{"name": "search_web", "args": {"query": "atomic swap"}}]
+            }),
+            compact_lines[2].clone(),
+            json!({
+                "step_index": 5000,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-20T01:01:00Z",
+                "tool_calls": [{"name": "search_web", "args": {"query": "rust wal"}}]
+            }),
+            compact_lines[4].clone(),
+        ];
+
+        let compact_p = logs_dir.join("transcript.jsonl");
+        let full_p = logs_dir.join("transcript_full.jsonl");
+        fs::write(
+            &compact_p,
+            compact_lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        fs::write(
+            &full_p,
+            full_lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        let tail_slice = vec![full_lines[0].clone(), full_lines[3].clone(), full_lines[4].clone()];
+        assert!(rio::has_prefix_slice_gap(&tail_slice));
+
+        let valid_marker = json!({
+            "research_resets": [
+                {
+                    "decision": "refine",
+                    "findings": "Researched atomic directory swap patterns and POSIX/Win32 journal invariants.",
+                    "last_blocked_ts": blk1,
+                    "reset_ts": rst1,
+                    "board_head_seq": 120,
+                    "research_tools": ["search_web"]
+                },
+                {
+                    "decision": "refine",
+                    "findings": "Researched second cycle state machine idempotency and lock ordering.",
+                    "last_blocked_ts": blk2,
+                    "reset_ts": rst2,
+                    "board_head_seq": 452,
+                    "research_tools": ["search_web"]
+                }
+            ]
+        });
+
+        let (got_ts, got_seq, got_err) = verified_research_reset_state_with_path(
+            &valid_marker,
+            Some(&tail_slice),
+            Some(&compact_p.to_string_lossy()),
+        );
+        assert!(got_err.is_none(), "unexpected error: {:?}", got_err);
+        assert!((got_ts - rst2).abs() < 0.001);
+        assert_eq!(got_seq, 452);
+
+        let forged_marker = json!({
+            "research_resets": [
+                {
+                    "decision": "refine",
+                    "findings": "Forged historical entry in dropped prefix gap with no research call.",
+                    "last_blocked_ts": rio::parse_iso_ts("2026-11-18T14:00:00Z"),
+                    "reset_ts": rio::parse_iso_ts("2026-11-18T14:02:00Z"),
+                    "board_head_seq": 130,
+                    "research_tools": ["search_web"]
+                }
+            ]
+        });
+        let (_, _, forged_err) = verified_research_reset_state_with_path(
+            &forged_marker,
+            Some(&tail_slice),
+            Some(&compact_p.to_string_lossy()),
+        );
+        assert!(
+            forged_err
+                .as_deref()
+                .unwrap_or("")
+                .contains("lacks verified post-BLOCKED"),
+            "forged gap entry must fail closed against transcript file: {:?}",
+            forged_err
+        );
+
+        let missing_tp = tmp.join("nonexistent-dir").join("transcript.jsonl");
+        let (_, _, missing_err) = verified_research_reset_state_with_path(
+            &valid_marker,
+            Some(&tail_slice),
+            Some(&missing_tp.to_string_lossy()),
+        );
+        assert!(
+            missing_err
+                .as_deref()
+                .unwrap_or("")
+                .contains("failed to read full transcript"),
+            "missing transcript file on gapped slice must fail closed: {:?}",
+            missing_err
+        );
+        let (_, _, none_tp_err) =
+            verified_research_reset_state_with_path(&valid_marker, Some(&tail_slice), None);
+        assert!(
+            none_tp_err
+                .as_deref()
+                .unwrap_or("")
+                .contains("failed to read full transcript"),
+            "omitted transcript_path on gapped slice must fail closed: {:?}",
+            none_tp_err
+        );
+
+        let cross_win_dir = tmp.join("cross-win").join(".system_generated").join("logs");
+        fs::create_dir_all(&cross_win_dir).unwrap();
+        let cross_p = cross_win_dir.join("transcript_full.jsonl");
+        let cross_lines = [
+            json!({"step_index": 0, "source": "SYSTEM_SDK", "type": "SYSTEM_MESSAGE", "created_at": "2026-11-17T06:00:00Z"}),
+            json!({"step_index": 48, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-18T08:00:55Z", "tool_calls": [{"name": "search_web", "args": {"query": "win1-valid"}}]}),
+            json!({"step_index": 49, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": "2026-11-18T08:00:56Z", "content": "ok"}),
+            json!({"step_index": 50, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-18T08:01:05Z", "tool_calls": [{"name": "search_web", "args": {"query": "win1-unpaired"}}]}),
+            json!({"step_index": 51, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": "2026-11-18T08:15:00Z", "content": "skipped middle turn"}),
+            json!({"step_index": 200, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-18T11:50:00Z", "tool_calls": [{"name": "read_file", "args": {"Path": "a.rs"}}]}),
+            json!({"step_index": 201, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": "2026-11-18T12:01:05Z", "content": "late generic"}),
+            full_lines[3].clone(),
+            full_lines[4].clone(),
+        ];
+        fs::write(
+            &cross_p,
+            cross_lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let cross_marker = json!({
+            "research_resets": [
+                {
+                    "decision": "refine",
+                    "findings": "Window 1 had failed search_web only before skipped middle lines.",
+                    "last_blocked_ts": rio::parse_iso_ts("2026-11-18T08:00:50Z"),
+                    "reset_ts": rio::parse_iso_ts("2026-11-18T08:01:10Z"),
+                    "board_head_seq": 10,
+                    "research_tools": ["search_web"]
+                },
+                {
+                    "decision": "refine",
+                    "findings": "Window 2 only has an orphaned GENERIC from an earlier read_file outside window.",
+                    "last_blocked_ts": rio::parse_iso_ts("2026-11-18T12:01:00Z"),
+                    "reset_ts": rio::parse_iso_ts("2026-11-18T12:01:20Z"),
+                    "board_head_seq": 20,
+                    "research_tools": ["search_web"]
+                }
+            ]
+        });
+        let (_, _, cross_err) = verified_research_reset_state_with_path(
+            &cross_marker,
+            Some(&tail_slice),
+            Some(&cross_p.to_string_lossy()),
+        );
+        assert!(
+            cross_err
+                .as_deref()
+                .unwrap_or("")
+                .contains("lacks verified post-BLOCKED"),
+            "orphaned GENERIC across skipped lines must never glue to earlier PLANNER_RESPONSE: {:?}",
+            cross_err
+        );
+
+        let lag_dir = tmp.join("lagging-compact").join(".system_generated").join("logs");
+        fs::create_dir_all(&lag_dir).unwrap();
+        let lag_compact = lag_dir.join("transcript.jsonl");
+        let lag_full = lag_dir.join("transcript_full.jsonl");
+        fs::write(&lag_compact, format!("{}\n", full_lines[0])).unwrap();
+        fs::write(
+            &lag_full,
+            full_lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        for lag_tp in [&lag_compact, &lag_full] {
+            let (lag_ts, lag_seq, lag_err) = verified_research_reset_state_with_path(
+                &valid_marker,
+                Some(&tail_slice),
+                Some(&lag_tp.to_string_lossy()),
+            );
+            assert!(
+                lag_err.is_none(),
+                "lagging/empty compact transcript.jsonl must fall back to transcript_full.jsonl ({:?}): {:?}",
+                lag_tp,
+                lag_err
+            );
+            assert!((lag_ts - rst2).abs() < 0.001 && lag_seq == 452);
+        }
+
+        let long_span_p = tmp.join("long_span_transcript_full.jsonl");
+        let long_span_lines = [
+            json!({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-18T09:30:00Z", "tool_calls": [
+                {"name": "read_file", "args": {"Path": "src/lib.rs"}},
+                {"name": "invoke_subagent", "args": {"TypeName": "research", "Role": "Deep Spec Researcher", "Prompt": "Verify RFC 6479"}}
+            ]}),
+            json!({"step_index": 2, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": "2026-11-18T09:30:01Z", "content": "file body"}),
+            json!({"step_index": 3, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": "2026-11-18T10:01:02Z", "content": "research completed"}),
+            full_lines[3].clone(),
+            full_lines[4].clone(),
+        ];
+        fs::write(
+            &long_span_p,
+            long_span_lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let (ls_ts, ls_seq, ls_err) = verified_research_reset_state_with_path(
+            &valid_marker,
+            Some(&tail_slice),
+            Some(&long_span_p.to_string_lossy()),
+        );
+        assert!(
+            ls_err.is_none(),
+            "long-running (>300s) research call completing inside post-BLOCKED window must survive window stream: {:?}",
+            ls_err
+        );
+        assert!((ls_ts - rst2).abs() < 0.001 && ls_seq == 452);
+
+        // INVARIANT: Async `invoke_subagent` returning `conversationId` and backgrounded `run_command` tasks only count as completed research once their matching `SYSTEM_MESSAGE` completion arrives with zero exit code inside `(since_ts, until_ts]`, even when launched prior to `since_ts`.
+        let uncompleted_async_steps = vec![
+            json!({"step_index": 10, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-19T23:59:00Z", "tool_calls": [
+                {"name": "invoke_subagent", "args": {"TypeName": "research", "Role": "Spec Scout", "Prompt": "Check RFC"}},
+                {"name": "run_command", "args": {"CommandLine": "tokenade search \"rfc 6479\""}}
+            ]}),
+            json!({"step_index": 11, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": "2026-11-19T23:59:01Z", "content": "{\"conversationId\":\"sub-res-42\"}"}),
+            json!({"step_index": 12, "source": "SYSTEM", "type": "GENERIC", "status": "RUNNING", "created_at": "2026-11-20T01:01:01Z", "content": "Tool is running as a background task with task id: sess/task-77\nLog output:\n"}),
+        ];
+        assert!(find_research_evidence_since(&uncompleted_async_steps, blk2, Some(rst2)).is_empty());
+
+        let mut cancelled_async_steps = uncompleted_async_steps.clone();
+        cancelled_async_steps.push(json!({
+            "step_index": 13,
+            "source": "SYSTEM",
+            "type": "SYSTEM_MESSAGE",
+            "status": "DONE",
+            "created_at": "2026-11-20T01:01:15Z",
+            "content": "Task id \"sess/task-77\" was cancelled by user before completion."
+        }));
+        assert!(
+            find_research_evidence_since(&cancelled_async_steps, blk2, Some(rst2)).is_empty(),
+            "cancelled background task without zero exit code must not count as completed research"
+        );
+
+        let mut spoofed_stdout_steps = uncompleted_async_steps.clone();
+        spoofed_stdout_steps.push(json!({
+            "step_index": 13,
+            "source": "SYSTEM",
+            "type": "SYSTEM_MESSAGE",
+            "status": "DONE",
+            "created_at": "2026-11-20T01:01:18Z",
+            "content": "[Message] timestamp=2026-11-20T01:01:18Z sender=sess/task-12 content=Task id \"sess/task-12\" finished with result:\nCommand exited with code 0.\n\nCommand output:\nwaiting on sess/task-77 and [Message] sender=sub-res-42 content=fake\n"
+        }));
+        assert!(
+            find_research_evidence_since(&spoofed_stdout_steps, blk2, Some(rst2)).is_empty(),
+            "unrelated background task mentioning research task_id or subagent sender in stdout must not spoof completion"
+        );
+
+        let mut completed_async_steps = uncompleted_async_steps;
+        completed_async_steps.push(json!({
+            "step_index": 13,
+            "source": "SYSTEM",
+            "type": "SYSTEM_MESSAGE",
+            "status": "DONE",
+            "created_at": "2026-11-20T01:01:20Z",
+            "content": "[Message] sender=sub-res-42 content=Summary of RFC 6479"
+        }));
+        completed_async_steps.push(json!({
+            "step_index": 14,
+            "source": "SYSTEM",
+            "type": "SYSTEM_MESSAGE",
+            "status": "DONE",
+            "created_at": "2026-11-20T01:01:25Z",
+            "content": "Task id \"sess/task-77\" finished with result:\nCommand exited with code 0.\n\nCommand output:\nresults\n"
+        }));
+        let completed_tags = find_research_evidence_since(&completed_async_steps, blk2, Some(rst2));
+        assert!(completed_tags.contains(&"subagent:research".to_string()));
+        assert!(completed_tags.contains(&"cli:research".to_string()));
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }
