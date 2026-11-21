@@ -9,6 +9,7 @@ pub mod cwg_common;
 pub mod cwg_mark;
 pub mod cwg_pre_invocation;
 pub mod cwg_stop;
+pub mod design_gate;
 pub mod gate_inbox;
 pub mod hook_dispatch;
 pub mod installer;
@@ -28,7 +29,7 @@ fn main() {
     let all_args: Vec<String> = env::args().collect();
     if all_args.len() < 2 {
         eprintln!(
-            "usage: carbon-stack <install|hook|safety-guards|tokenade-hook|continuity|chip-hooks|cwg-pre-invocation|cwg-mark|cwg-stop|codex-lane|gate-inbox|swarm-cache|swarm-ctl|worktree-guard|carbon-memory|chip-handoff|code-search|stack-doctor|claude-chat-importer|--version> [args...]"
+            "usage: carbon-stack <install|hook|safety-guards|tokenade-hook|continuity|chip-hooks|cwg-pre-invocation|cwg-mark|cwg-stop|design-gate|codex-lane|gate-inbox|swarm-cache|swarm-ctl|worktree-guard|carbon-memory|chip-handoff|code-search|stack-doctor|claude-chat-importer|--version> [args...]"
         );
         process::exit(2);
     }
@@ -48,6 +49,7 @@ fn main() {
         "cwg-pre-invocation" | "cwg_pre_invocation" => cwg_pre_invocation::run_cli(rest),
         "cwg-mark" | "cwg_mark" => cwg_mark::run_cli(rest),
         "cwg-stop" | "cwg_stop" => cwg_stop::run_cli(rest),
+        "design-gate" | "design_gate" => design_gate::run_cli(rest),
         "codex-lane" | "codex_lane" => codex_lane::run_cli(rest),
         "gate-inbox" | "gate_inbox" => gate_inbox::run_cli(rest),
         "swarm-cache" | "swarm_cache" => swarm_cache::run_cli(rest),

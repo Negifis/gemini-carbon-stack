@@ -1312,6 +1312,35 @@ pub fn read_transcript_steps(transcript_path: &str, max_lines: usize) -> Vec<Val
     read_decoded_transcript(&tp, max_lines)
 }
 
+pub fn read_all_decoded_transcript_steps_checked(
+    transcript_path: &str,
+) -> Result<Vec<Value>, String> {
+    // INVARIANT: Reuse `resolve_transcript_path` (`transcript_full.jsonl` preferred) and `decode_compact_step_args` (for compact `transcript.jsonl`), streaming the ENTIRE file line-by-line with fail-closed integrity checks on I/O errors, corrupt JSON lines, or empty files.
+    let Some(tp) = resolve_transcript_path(transcript_path) else {
+        return Err("transcript file not found".to_string());
+    };
+    let file = fs::File::open(&tp).map_err(|e| format!("cannot open transcript: {}", e))?;
+    let reader = std::io::BufReader::new(file);
+    let mut steps = Vec::new();
+    for (line_no, line_res) in std::io::BufRead::lines(reader).enumerate() {
+        let line = line_res.map_err(|e| format!("transcript read error at line {}: {}", line_no + 1, e))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let val = serde_json::from_str::<Value>(trimmed)
+            .map_err(|e| format!("corrupt transcript JSON at line {}: {}", line_no + 1, e))?;
+        steps.push(val);
+    }
+    if steps.is_empty() {
+        return Err("transcript contains no steps".to_string());
+    }
+    if tp.file_name().and_then(|s| s.to_str()) == Some("transcript.jsonl") {
+        decode_compact_step_args(&mut steps);
+    }
+    Ok(steps)
+}
+
 pub fn read_compact_transcript_steps(transcript_path: &str, max_lines: usize) -> Vec<Value> {
     if transcript_path.is_empty() {
         return Vec::new();

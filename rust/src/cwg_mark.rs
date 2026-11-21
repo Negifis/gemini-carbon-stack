@@ -191,7 +191,7 @@ fn bookkeeping_cmd_re() -> &'static Regex {
         let chat_bus_bin = exe_pat_followed_by_space("chat-bus", r"(?:\.exe)?", false);
         let bk_tail = format!(r#"(?:\s+(?:[^|;&\r\n"']|{}|{})*)?"#, PS_DQ_PAT, PS_SQ_PAT);
         let pat = format!(
-            r"(?i)\A\s*(?:\$null\s*\|\s*)?(?:&\s*)?(?:{py}\s+(?:-(?:X\s+utf8|[uBEsSO])\s+)*(?:{bk}|(?:{cont}\s+{cont_sub}|{cl}\s+{cl_sub}|{cb_py}\s+{cb_sub}))|{cs}\s+(?:(?:carbon[-_]memory|gate[-_]inbox|chip[-_]handoff|swarm[-_]cache|swarm[-_]ctl)\b|continuity\s+{cont_sub}|codex[-_]lane\s+{cl_sub})|{cb}\s+{cb_sub}){tail}\z",
+            r"(?i)\A\s*(?:\$null\s*\|\s*)?(?:&\s*)?(?:{py}\s+(?:-(?:X\s+utf8|[uBEsSO])\s+)*(?:{bk}|(?:{cont}\s+{cont_sub}|{cl}\s+{cl_sub}|{cb_py}\s+{cb_sub}))|{cs}\s+(?:(?:carbon[-_]memory|gate[-_]inbox|chip[-_]handoff|swarm[-_]cache|swarm[-_]ctl|design[-_]gate)\b|continuity\s+{cont_sub}|codex[-_]lane\s+{cl_sub})|{cb}\s+{cb_sub}){tail}\z",
             py = py,
             bk = bk_scripts,
             cont = continuity,
@@ -241,7 +241,7 @@ fn read_only_cmd_re() -> &'static Regex {
         let wt_guard = exe_pat_followed_by_space("worktree_guard", EXT_PY, false);
         let cs_tok = exe_pat_followed_by_space("carbon-stack", r"(?:\.exe)?", false);
         let pat = format!(
-            r#"(?i)\A\s*(?:\$null\s*\|\s*)?(?:(?:(?:&\s*)?{git}\s+(?:--no-pager\s+)?(?:-C\s+["']?[^"'|;&\r\n]+["']?\s+)?(?:status|diff|log|show|rev-parse|ls-files|ls-tree|check-ignore|remote\s+-v|worktree\s+list)|(?:&\s*)?{rg}|findstr(?:\.exe)?\b|where(?:\.exe)?\b|Get-ChildItem\b|gci\b|Get-Content\b|gc\b|Select-String\b|sls\b|Get-Command\b|gcm\b|Test-Path\b|Get-Item\b|gi\b|Get-ItemProperty\b|gp\b|Get-ItemPropertyValue\b|gpv\b|Get-CimInstance\b|gcim\b|Get-WmiObject\b|gwmi\b|Get-WinEvent\b|Get-EventLog\b|Get-Process\b|gps\b|Get-Service\b|gsv\b|Get-Location\b|gl\b|Write-Output\b|(?:&\s*)?{codex}\s+(?:--version|login\s+status|exec\b[^|;&\r\n]*-s\s+read-only\b)|(?:&\s*)?{agy}\s+(?:--help|--version|plugin\s+(?:list|help)|mcp\s+(?:list|help)|models\b)|(?:&\s*)?{tok}\s+(?:--version|--help|help|map|query|skeleton|semantic|ask|sem|impact|expand-ref|gain|dashboard|healthcheck|detect|measure|statusline)\b|(?:&\s*)?{py}\s+(?:-(?:X\s+utf8|[uBEsSO])\s+)*(?:{ro}|{wt}\s+{wt_ro})|(?:&\s*)?{cs}\s+(?:code[-_]search\b|stack[-_]doctor\b|worktree[-_]guard\s+{wt_ro}))(?:\s+[^|;&\r\n]*)?|(?:&\s*)?{git}\s+(?:--no-pager\s+)?(?:-C\s+["']?[^"'|;&\r\n]+["']?\s+)?branch(?:\s+(?:--list|-l|-a|--all|-r|--remotes|-v|-vv|--show-current|--no-color))*)\z"#,
+            r#"(?i)\A\s*(?:\$null\s*\|\s*)?(?:(?:(?:&\s*)?{git}\s+(?:--no-pager\s+)?(?:-C\s+["']?[^"'|;&\r\n]+["']?\s+)?(?:status|diff|log|show|rev-parse|ls-files|ls-tree|check-ignore|remote\s+-v|worktree\s+list)|(?:&\s*)?{rg}|findstr(?:\.exe)?\b|where(?:\.exe)?\b|Get-ChildItem\b|gci\b|Get-Content\b|gc\b|Select-String\b|sls\b|Get-Command\b|gcm\b|Test-Path\b|Get-Item\b|gi\b|Get-ItemProperty\b|gp\b|Get-ItemPropertyValue\b|gpv\b|Get-CimInstance\b|gcim\b|Get-WmiObject\b|gwmi\b|Get-WinEvent\b|Get-EventLog\b|Get-Process\b|gps\b|Get-Service\b|gsv\b|Get-Location\b|gl\b|Write-Output\b|(?:&\s*)?{codex}\s+(?:--version|login\s+status|exec\b[^|;&\r\n]*-s\s+read-only\b)|(?:&\s*)?{agy}\s+(?:--help|--version|plugin\s+(?:list|help)|mcp\s+(?:list|help)|models\b)|(?:&\s*)?{tok}\s+(?:--version|--help|help|map|query|skeleton|semantic|ask|sem|impact|search|web|read|expand-ref|gain|dashboard|healthcheck|detect|measure|statusline)\b|(?:&\s*)?{py}\s+(?:-(?:X\s+utf8|[uBEsSO])\s+)*(?:{ro}|{wt}\s+{wt_ro})|(?:&\s*)?{cs}\s+(?:code[-_]search\b|stack[-_]doctor\b|worktree[-_]guard\s+{wt_ro}))(?:\s+[^|;&\r\n]*)?|(?:&\s*)?{git}\s+(?:--no-pager\s+)?(?:-C\s+["']?[^"'|;&\r\n]+["']?\s+)?branch(?:\s+(?:--list|-l|-a|--all|-r|--remotes|-v|-vv|--show-current|--no-color))*)\z"#,
             git = git_tok,
             rg = rg_tok,
             codex = codex_tok,
@@ -4722,6 +4722,10 @@ mod tests {
             ),
             (
                 r#"$null | & "C:\Users\in\.gemini\config\plugins\gemini-carbon-stack\bin\carbon-stack.exe" codex-lane redesign-reset --session "s1" --decision redesign"#,
+                "BOOKKEEPING",
+            ),
+            (
+                r#"$null | & "C:\Users\in\.gemini\config\plugins\gemini-carbon-stack\bin\carbon-stack.exe" design-gate record-screenshot --session "s1" --path "shots/desktop.png" --viewport desktop"#,
                 "BOOKKEEPING",
             ),
             (

@@ -323,7 +323,7 @@ fn reset_sticky_issue_state(state: &mut Map<String, Value>) {
     }
 }
 
-fn subagent_uri_re() -> &'static Regex {
+pub(crate) fn subagent_uri_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
@@ -1173,14 +1173,14 @@ fn extract_json_dict(blob: &str) -> Option<Map<String, Value>> {
 }
 
 #[derive(Debug, Clone)]
-struct TimedChunk {
-    ts: f64,
-    text: String,
+pub(crate) struct TimedChunk {
+    pub(crate) ts: f64,
+    pub(crate) text: String,
     kind: &'static str,
     is_signoff: bool,
 }
 
-fn extract_subagent_timed_chunks(
+pub(crate) fn extract_subagent_timed_chunks(
     subagent_transcript_path: Option<&str>,
     parent_cid: &str,
 ) -> (Vec<TimedChunk>, f64, bool) {
@@ -6615,2059 +6615,6 @@ fn is_standalone_non_repo_doc_candidate(
     true
 }
 
-fn design_review_verdict_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"(?i)(?:(?:\*{1,2}|__|`)[ \t]*){0,2}(VISUAL|UX)_REVIEW_VERDICT(?:(?:\*{1,2}|__|`)\s*){0,2}\s*:\s*(?:(?:\*{1,2}|__|`)\s*){0,2}(APPROVED|REVISE|BLOCKED|CHANGES_REQUESTED|REJECTED)\b",
-        )
-        .expect("design_review_verdict_re")
-    })
-}
-
-fn design_verdict_alt_tail_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"(?i)\A\s*(?:(?:\*{1,2}|__|`)\s*){0,2}(?:\||/|(?:\b(?:or|или)\b)\s+(?:APPROVED|REVISE|BLOCKED|CHANGES_REQUESTED|REJECTED)\b)",
-        )
-        .expect("design_verdict_alt_tail_re")
-    })
-}
-
-fn design_reviewer_name_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"(?i)(?:visual[-_]?(?:qa|design|critic|review)|ui[-_]?qa|uiux|ux[-_]?(?:adversarial|audit|critic|review)|design[-_]?(?:critic|audit|review|qa))",
-        )
-        .expect("design_reviewer_name_re")
-    })
-}
-
-fn design_dedicated_capture_cmd_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"(?i)(?:^|\s)(?:(?:npx|pnpx|bunx)\s+(?:--\S+\s+)*)?(?:playwright(?:[-_]cli)?\s+screenshot\b|android\s+(?:screen|preview\s+render)\b|(?:chrome-devtools|agent-browser)\b[^\r\n;|&]*\bscreenshot\b)",
-        )
-        .expect("design_dedicated_capture_cmd_re")
-    })
-}
-
-fn design_explicit_screenshot_cmd_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"(?i)^\s*(?:(?:uv|poetry|pipenv|pdm|hatch)\s+run\s+)?(?:(?:npx|pnpx|bunx)\s+(?:--\S+\s+)*)?(?:playwright(?:[-_]cli)?|node|python(?:3(?:\.\d+)?)?|pytest|npm|pnpm|yarn|bun)\b[^\r\n;|&]*(?:screenshot|toHaveScreenshot|toMatchSnapshot)",
-        )
-        .expect("design_explicit_screenshot_cmd_re")
-    })
-}
-
-fn design_generic_test_runner_cmd_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"(?i)^\s*(?:(?:uv|poetry|pipenv|pdm|hatch)\s+run\s+)?(?:(?:npx|pnpx|bunx)\s+(?:--\S+\s+)*)?(?:playwright\b[^\r\n;|&]*\b(?:test|--update-snapshots)\b|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test(?::\S*)?|vitest|jest|storybook|e2e|visual|cypress|wdio|playwright)\b|(?:node|python(?:3(?:\.\d+)?)?)\b[^\r\n;|&]*(?:\b-m\s+(?:pytest|unittest)\b|visual|playwright|e2e|cypress|storybook|wdio|puppeteer)|\b(?:pytest|vitest|jest|cypress|wdio|storybook|flutter\s+test)\b)",
-        )
-        .expect("design_generic_test_runner_cmd_re")
-    })
-}
-
-fn screenshot_visual_signal_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r#"(?i)(?:\b(?:screenshot|screenshots|screen\s*shot|snapshot|snapshots|visual|playwright|viewport|browser|toHaveScreenshot|toMatchSnapshot|render(?:ed)?)\b|(?:^|[\s"'`(/\\])(?:screenshots|playwright-report|visual-artifacts)[^/\\\s]*[/\\]|-snapshots[/\\]|(?:^|[\s"'`(/\\])test-results[^/\\\s]*[/\\](?:[^\r\n]*[/\\])?(?:[^/\\\s"'`()]*[._-])?(?:actual|screenshot|snapshot|test-failed|test-finished)(?:[._-][^/\\\s"'`()]*)?\.(?:png|jpe?g|webp)\b)"#,
-        )
-        .expect("screenshot_visual_signal_re")
-    })
-}
-
-fn capture_action_verb_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?i)\b(?:saved|wrote|written|captured|rendered|generated|exported|emitted|created)\b")
-            .expect("capture_action_verb_re")
-    })
-}
-
-fn input_only_log_line_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r#"(?i)(?:\b(?:loaded|loading|reading|read|comparing|compare|diffing)\b|\b(?:fixture|baseline|expected|reference|input)\s*[:=]|(?:^|[\s"'`(/\\])(?:fixtures?|baselines?|inputs?|references?|expected)[/\\]|(?:^|[\s"'`(/\\])(?:(?:input|fixture|baseline|expected|reference)(?:[._-][^/\\\s"'`()]*)?|[^/\\\s"'`()]*[._-](?:input|fixture|baseline|expected|reference))\.(?:png|jpe?g|webp)\b)"#,
-        )
-        .expect("input_only_log_line_re")
-    })
-}
-
-fn capture_output_marker_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r#"(?i)(?:(?:output|screenshot|snapshot|artifact)\s*(?:path)?\s*[:=]\s*[^\r\n]+\.(?:png|jpe?g|webp)|->|=>|(?:^|[\s"'`(/\\])(?:screenshots|playwright-report|visual-artifacts)[^/\\\s]*[/\\]|-snapshots[/\\]|(?:^|[\s"'`(/\\])test-results[^/\\\s]*[/\\](?:[^\r\n]*[/\\])?(?:[^/\\\s"'`()]*[._-])?(?:actual|screenshot|snapshot|test-failed|test-finished)(?:[._-][^/\\\s"'`()]*)?\.(?:png|jpe?g|webp)\b)"#,
-        )
-        .expect("capture_output_marker_re")
-    })
-}
-
-fn capture_output_flag_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r#"(?i)(?:^|\s)(?:--(?:output|out|screenshot|save)|-o)(?:=|\s+)("[^"]+"|'[^']+'|\S+)"#)
-            .expect("capture_output_flag_re")
-    })
-}
-
-fn non_capture_cli_flag_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"(?:(?i:(?:^|\s)(?:--version|--help|-h|install|uninstall)(?:$|\s))|(?:^|\s)-V(?:$|\s)|^\s*(?i:(?:(?:npx|pnpx|bunx)\s+)?(?:playwright(?:[-_]cli)?|node|npm|pnpm|yarn|bun|python(?:\d+(?:\.\d+)*)?|android|chrome-devtools|agent-browser))\s+-v\s*$)",
-        )
-        .expect("non_capture_cli_flag_re")
-    })
-}
-
-fn non_capture_shell_cmd_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"(?i)^\s*(?:\$null\s*\|\s*)?(?:echo|printf|write-output|write-host|cat|get-content|type|ls|dir|get-childitem)\b",
-        )
-        .expect("non_capture_shell_cmd_re")
-    })
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum DesignCaptureCmdKind {
-    None,
-    GenericTestRunner,
-    ExplicitScreenshot,
-    DedicatedCapture,
-}
-
-fn split_shell_segments_for_capture(cmd: &str) -> Vec<String> {
-    let mut segs = Vec::new();
-    let mut cur = String::new();
-    let chars: Vec<char> = cmd.chars().collect();
-    let mut i = 0usize;
-    let mut in_single = false;
-    let mut in_double = false;
-    while i < chars.len() {
-        let ch = chars[i];
-        if in_single {
-            cur.push(ch);
-            if ch == '\'' {
-                in_single = false;
-            }
-            i += 1;
-            continue;
-        }
-        if in_double {
-            if (ch == '`' || ch == '\\') && i + 1 < chars.len() && chars[i + 1] == '"' {
-                cur.push(ch);
-                cur.push('"');
-                i += 2;
-                continue;
-            }
-            cur.push(ch);
-            if ch == '"' {
-                in_double = false;
-            }
-            i += 1;
-            continue;
-        }
-        match ch {
-            '\'' => {
-                in_single = true;
-                cur.push(ch);
-                i += 1;
-            }
-            '"' => {
-                in_double = true;
-                cur.push(ch);
-                i += 1;
-            }
-            '\r' | '\n' | ';' => {
-                let t = cur.trim();
-                if !t.is_empty() {
-                    segs.push(t.to_string());
-                }
-                cur.clear();
-                i += 1;
-            }
-            '|' => {
-                let t = cur.trim();
-                if !t.is_empty() {
-                    segs.push(t.to_string());
-                }
-                cur.clear();
-                if i + 1 < chars.len() && chars[i + 1] == '|' {
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            '&' if i + 1 < chars.len() && chars[i + 1] == '&' => {
-                let t = cur.trim();
-                if !t.is_empty() {
-                    segs.push(t.to_string());
-                }
-                cur.clear();
-                i += 2;
-            }
-            _ => {
-                cur.push(ch);
-                i += 1;
-            }
-        }
-    }
-    let t = cur.trim();
-    if !t.is_empty() {
-        segs.push(t.to_string());
-    }
-    segs
-}
-
-fn tokenize_shell_segment_unquoted(seg: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut cur = String::new();
-    let mut has_tok = false;
-    let chars: Vec<char> = seg.chars().collect();
-    let mut i = 0usize;
-    let mut in_single = false;
-    let mut in_double = false;
-    while i < chars.len() {
-        let ch = chars[i];
-        if in_single {
-            if ch == '\'' {
-                if i + 1 < chars.len() && chars[i + 1] == '\'' {
-                    cur.push('\'');
-                    i += 2;
-                } else {
-                    in_single = false;
-                    i += 1;
-                }
-            } else {
-                cur.push(ch);
-                i += 1;
-            }
-            continue;
-        }
-        if in_double {
-            if (ch == '`' || ch == '\\') && i + 1 < chars.len() && chars[i + 1] == '"' {
-                cur.push('"');
-                i += 2;
-                continue;
-            }
-            if ch == '"' {
-                in_double = false;
-                i += 1;
-            } else {
-                cur.push(ch);
-                i += 1;
-            }
-            continue;
-        }
-        if ch.is_whitespace() {
-            if has_tok {
-                tokens.push(std::mem::take(&mut cur));
-                has_tok = false;
-            }
-            i += 1;
-        } else if ch == '\'' {
-            in_single = true;
-            has_tok = true;
-            i += 1;
-        } else if ch == '"' {
-            in_double = true;
-            has_tok = true;
-            i += 1;
-        } else {
-            cur.push(ch);
-            has_tok = true;
-            i += 1;
-        }
-    }
-    if has_tok {
-        tokens.push(cur);
-    }
-    tokens
-}
-
-fn strip_exec_basename(tok: &str) -> String {
-    let base = tok.rsplit(['/', '\\']).next().unwrap_or(tok);
-    let low = base.to_ascii_lowercase();
-    for ext in [".cmd", ".exe", ".bat", ".ps1", ".com"] {
-        if low.ends_with(ext) && base.len() > ext.len() {
-            return base[..base.len() - ext.len()].to_string();
-        }
-    }
-    base.to_string()
-}
-
-fn is_env_assignment_tok(tok: &str) -> bool {
-    let Some(eq) = tok.find('=') else {
-        return false;
-    };
-    let key = &tok[..eq];
-    !key.is_empty()
-        && key
-            .as_bytes()
-            .first()
-            .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
-        && key
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-}
-
-fn explicit_screenshot_word_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?i)\b(?:screenshot|screenshots|screen\s*shot|snapshot|snapshots|toHaveScreenshot|toMatchSnapshot)\b")
-            .expect("explicit_screenshot_word_re")
-    })
-}
-
-fn negated_capture_log_line_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"(?i)(?:\b(?:no|zero|0)\s+(?:screenshots?|screen\s*shots?|snapshots?|images?|captures?)\b|\b(?:not|never|didn't|did\s+not|cannot|can't|could\s+not|couldn't|unable\s+to|failed\s+to|without|skip(?:ped|ping)?|omit(?:ted|ting)?|refus(?:ed|ing)\s+to)\s+(?:be\s+)?(?:sav(?:e|ed|ing)|writ(?:e|ten|ing)|captur(?:e|ed|ing)|render(?:ed|ing)|generat(?:e|ed|ing)|export(?:ed|ing)|emit(?:ted|ting)?|creat(?:e|ed|ing)|tak(?:e|en|ing))\b|\b(?:skip(?:ped|ping)?|omit(?:ted|ting)?)\s+(?:the\s+|a\s+)?(?:screenshots?|screen\s*shots?|snapshots?)\b|\b(?:screenshots?|screen\s*shots?|snapshots?)\s+(?:was|were|is|are)\s+(?:not|never)\s+(?:saved|written|captured|rendered|generated|created|taken)\b)",
-        )
-        .expect("negated_capture_log_line_re")
-    })
-}
-
-fn join_cwd_override(base: Option<&str>, next: &str) -> Option<String> {
-    let clean = next.trim();
-    if clean.is_empty() {
-        return base.map(str::to_string);
-    }
-    let p = Path::new(clean);
-    if p.is_absolute() {
-        Some(clean.to_string())
-    } else if let Some(b) = base {
-        Some(Path::new(b).join(p).to_string_lossy().into_owned())
-    } else {
-        Some(clean.to_string())
-    }
-}
-
-fn extract_dir_flag_eq(tok: &str, prefixes: &[&str]) -> Option<String> {
-    let low = tok.to_ascii_lowercase();
-    for pref in prefixes {
-        if low.starts_with(pref) && tok.len() > pref.len() {
-            return Some(tok[pref.len()..].to_string());
-        }
-    }
-    None
-}
-
-enum WrapperUnwrapResult {
-    Tokens(Vec<String>),
-    InlineShell(String),
-}
-
-fn unwrap_pkg_exec_wrappers(mut cur: Vec<String>) -> (WrapperUnwrapResult, Option<String>) {
-    // INVARIANT: Structurally unwrap JS/Python package-runner wrappers (`npm exec -- ...`, `pnpm exec ...`, `pnpm dlx ...`, `yarn exec/dlx ...`, `bun x ...`, `npx/pnpx/bunx ...`, `uv/poetry/pipenv/pdm/hatch run ...`) AND preserve effective working-directory overrides (`--dir`, `-C`, `--prefix`, `--cwd`, `--directory`, `--project`) so relative screenshot artifacts inside subpackages resolve in the subcommand's real directory.
-    let mut cwd_override: Option<String> = None;
-    for _ in 0..4 {
-        if cur.is_empty() {
-            break;
-        }
-        let exec_low = cur[0].to_ascii_lowercase();
-        if exec_low == "corepack" && cur.len() >= 2 {
-            let mut next = Vec::with_capacity(cur.len() - 1);
-            next.push(strip_exec_basename(&cur[1]));
-            next.extend(cur.into_iter().skip(2));
-            cur = next;
-            continue;
-        }
-        if matches!(exec_low.as_str(), "npx" | "pnpx" | "bunx") {
-            let mut j = 1usize;
-            while j < cur.len() {
-                let a = cur[j].as_str();
-                if a == "--" {
-                    j += 1;
-                    break;
-                }
-                if (a.eq_ignore_ascii_case("-c") || a.eq_ignore_ascii_case("--call"))
-                    && j + 1 < cur.len()
-                {
-                    return (WrapperUnwrapResult::InlineShell(cur[j + 1].clone()), cwd_override);
-                }
-                if a == "-C"
-                    || a.eq_ignore_ascii_case("--prefix")
-                    || a.eq_ignore_ascii_case("--cwd")
-                    || a.eq_ignore_ascii_case("--dir")
-                {
-                    if let Some(val) = cur.get(j + 1) {
-                        cwd_override = join_cwd_override(cwd_override.as_deref(), val);
-                    }
-                    j = (j + 2).min(cur.len());
-                } else if let Some(val) = extract_dir_flag_eq(a, &["--prefix=", "--cwd=", "--dir="]) {
-                    cwd_override = join_cwd_override(cwd_override.as_deref(), &val);
-                    j += 1;
-                } else if a.eq_ignore_ascii_case("-p") || a.eq_ignore_ascii_case("--package") {
-                    j = (j + 2).min(cur.len());
-                } else if a.starts_with('-') {
-                    j += 1;
-                } else {
-                    break;
-                }
-            }
-            if j < cur.len() {
-                let mut next = Vec::with_capacity(cur.len() - j);
-                next.push(strip_exec_basename(&cur[j]));
-                next.extend(cur.into_iter().skip(j + 1));
-                cur = next;
-                continue;
-            }
-            break;
-        }
-        if matches!(exec_low.as_str(), "npm" | "pnpm" | "yarn" | "bun") {
-            let mut sub_idx = 1usize;
-            while sub_idx < cur.len() {
-                let a = cur[sub_idx].as_str();
-                let low = a.to_ascii_lowercase();
-                if a == "-C" || matches!(low.as_str(), "--prefix" | "--dir" | "--cwd") {
-                    if let Some(val) = cur.get(sub_idx + 1) {
-                        cwd_override = join_cwd_override(cwd_override.as_deref(), val);
-                    }
-                    sub_idx = (sub_idx + 2).min(cur.len());
-                } else if let Some(val) = extract_dir_flag_eq(a, &["--prefix=", "--dir=", "--cwd="]) {
-                    cwd_override = join_cwd_override(cwd_override.as_deref(), &val);
-                    sub_idx += 1;
-                } else if matches!(low.as_str(), "-w" | "--workspace" | "--filter") {
-                    sub_idx = (sub_idx + 2).min(cur.len());
-                } else if low.starts_with("--workspace=")
-                    || low.starts_with("--filter=")
-                    || matches!(low.as_str(), "--silent" | "-s" | "--quiet" | "-q" | "--if-present")
-                {
-                    sub_idx += 1;
-                } else {
-                    break;
-                }
-            }
-            let sub_low = cur
-                .get(sub_idx)
-                .map(|s| s.to_ascii_lowercase())
-                .unwrap_or_default();
-            let is_exec_wrapper = match exec_low.as_str() {
-                "npm" => matches!(sub_low.as_str(), "exec" | "x"),
-                "pnpm" => matches!(sub_low.as_str(), "exec" | "dlx"),
-                "yarn" => matches!(sub_low.as_str(), "exec" | "dlx"),
-                "bun" => matches!(sub_low.as_str(), "x"),
-                _ => false,
-            };
-            if is_exec_wrapper {
-                let mut j = sub_idx + 1;
-                while j < cur.len() {
-                    let a = cur[j].as_str();
-                    if a == "--" {
-                        j += 1;
-                        break;
-                    }
-                    if (a.eq_ignore_ascii_case("-c") || a.eq_ignore_ascii_case("--call"))
-                        && j + 1 < cur.len()
-                    {
-                        return (WrapperUnwrapResult::InlineShell(cur[j + 1].clone()), cwd_override);
-                    }
-                    let low = a.to_ascii_lowercase();
-                    if a == "-C" || matches!(low.as_str(), "--prefix" | "--dir" | "--cwd") {
-                        if let Some(val) = cur.get(j + 1) {
-                            cwd_override = join_cwd_override(cwd_override.as_deref(), val);
-                        }
-                        j = (j + 2).min(cur.len());
-                    } else if let Some(val) = extract_dir_flag_eq(a, &["--prefix=", "--dir=", "--cwd="]) {
-                        cwd_override = join_cwd_override(cwd_override.as_deref(), &val);
-                        j += 1;
-                    } else if matches!(low.as_str(), "-p" | "--package" | "-w" | "--workspace" | "--filter") {
-                        j = (j + 2).min(cur.len());
-                    } else if a.starts_with('-') {
-                        j += 1;
-                    } else {
-                        break;
-                    }
-                }
-                if j < cur.len() {
-                    let mut next = Vec::with_capacity(cur.len() - j);
-                    next.push(strip_exec_basename(&cur[j]));
-                    next.extend(cur.into_iter().skip(j + 1));
-                    cur = next;
-                    continue;
-                }
-                break;
-            }
-            if sub_idx > 1 && sub_idx < cur.len() {
-                let mut next = Vec::with_capacity(1 + cur.len() - sub_idx);
-                next.push(cur[0].clone());
-                next.extend(cur.into_iter().skip(sub_idx));
-                cur = next;
-            }
-            break;
-        }
-        if matches!(exec_low.as_str(), "uv" | "poetry" | "pipenv" | "pdm" | "hatch") {
-            let mut sub_idx = 1usize;
-            while sub_idx < cur.len() {
-                let a = cur[sub_idx].as_str();
-                let low = a.to_ascii_lowercase();
-                if a == "-C" || matches!(low.as_str(), "--directory" | "--project") {
-                    if let Some(val) = cur.get(sub_idx + 1) {
-                        cwd_override = join_cwd_override(cwd_override.as_deref(), val);
-                    }
-                    sub_idx = (sub_idx + 2).min(cur.len());
-                } else if let Some(val) = extract_dir_flag_eq(a, &["--directory=", "--project="]) {
-                    cwd_override = join_cwd_override(cwd_override.as_deref(), &val);
-                    sub_idx += 1;
-                } else {
-                    break;
-                }
-            }
-            if cur.get(sub_idx).is_some_and(|s| s.eq_ignore_ascii_case("run")) {
-                let mut j = sub_idx + 1;
-                while j < cur.len() {
-                    let a = cur[j].as_str();
-                    if a == "--" {
-                        j += 1;
-                        break;
-                    }
-                    let low = a.to_ascii_lowercase();
-                    if matches!(low.as_str(), "--directory" | "--project") {
-                        if let Some(val) = cur.get(j + 1) {
-                            cwd_override = join_cwd_override(cwd_override.as_deref(), val);
-                        }
-                        j = (j + 2).min(cur.len());
-                    } else if let Some(val) = extract_dir_flag_eq(a, &["--directory=", "--project="]) {
-                        cwd_override = join_cwd_override(cwd_override.as_deref(), &val);
-                        j += 1;
-                    } else if matches!(
-                        low.as_str(),
-                        "--with" | "--from" | "--python" | "-p" | "--group" | "--extra"
-                    ) {
-                        j = (j + 2).min(cur.len());
-                    } else if a.starts_with('-') {
-                        j += 1;
-                    } else {
-                        break;
-                    }
-                }
-                if j < cur.len() {
-                    let mut next = Vec::with_capacity(cur.len() - j);
-                    next.push(strip_exec_basename(&cur[j]));
-                    next.extend(cur.into_iter().skip(j + 1));
-                    cur = next;
-                    continue;
-                }
-            }
-            break;
-        }
-        break;
-    }
-    (WrapperUnwrapResult::Tokens(cur), cwd_override)
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct DesignCaptureCmdSegment {
-    kind: DesignCaptureCmdKind,
-    effective_cwd: Option<String>,
-    raw_segment: String,
-}
-
-fn classify_design_capture_segments_inner(
-    raw_cmd: &str,
-    depth: u8,
-    base_dir: Option<&str>,
-    out: &mut Vec<DesignCaptureCmdSegment>,
-) {
-    // INVARIANT: Normalize PowerShell/POSIX call-operator, path-qualified, quoted, and package-manager wrapper invocations per segment while retaining EVERY recognized capture segment with its own effective working directory (`cd`/`Set-Location`/`--dir`/`-C`/`--prefix`/`--cwd`/`--directory`) and raw segment text so chained multi-package commands (`pnpm --dir admin exec playwright test; pnpm --dir web exec playwright test`) resolve each segment's artifacts in its own directory.
-    let unwrapped = if depth == 0 {
-        rio::unwrap_tokenade_command(raw_cmd)
-    } else {
-        raw_cmd.to_string()
-    };
-    let mut cur_dir: Option<String> = base_dir.map(str::to_string);
-    for seg in split_shell_segments_for_capture(&unwrapped) {
-        let toks = tokenize_shell_segment_unquoted(&seg);
-        let mut idx = 0usize;
-        while idx < toks.len() {
-            let t = toks[idx].as_str();
-            if matches!(t, "&" | ".")
-                || t.eq_ignore_ascii_case("$null")
-                || t.eq_ignore_ascii_case("env")
-                || t.eq_ignore_ascii_case("command")
-                || t.eq_ignore_ascii_case("exec")
-                || is_env_assignment_tok(t)
-            {
-                idx += 1;
-            } else {
-                break;
-            }
-        }
-        if idx >= toks.len() {
-            continue;
-        }
-        let exec = strip_exec_basename(&toks[idx]);
-        let exec_low = exec.to_ascii_lowercase();
-        let rest = &toks[idx + 1..];
-        if matches!(
-            exec_low.as_str(),
-            "cd" | "chdir" | "set-location" | "sl" | "push-location" | "pushd"
-        ) {
-            for arg in rest {
-                let low = arg.to_ascii_lowercase();
-                if matches!(low.as_str(), "/d" | "-path" | "-literalpath" | "--") {
-                    continue;
-                }
-                if !arg.starts_with('-') {
-                    cur_dir = join_cwd_override(cur_dir.as_deref(), arg);
-                    break;
-                }
-            }
-            continue;
-        }
-        if depth == 0 && matches!(exec_low.as_str(), "pwsh" | "powershell" | "cmd") {
-            for (pos, arg) in rest.iter().enumerate() {
-                if arg.eq_ignore_ascii_case("-c")
-                    || arg.eq_ignore_ascii_case("-command")
-                    || arg.eq_ignore_ascii_case("/c")
-                {
-                    if let Some(inner) = rest.get(pos + 1) {
-                        classify_design_capture_segments_inner(
-                            inner,
-                            depth + 1,
-                            cur_dir.as_deref(),
-                            out,
-                        );
-                    }
-                    break;
-                }
-            }
-            continue;
-        }
-        let mut initial = Vec::with_capacity(1 + rest.len());
-        initial.push(exec);
-        initial.extend(rest.iter().cloned());
-        let (unwrap_res, wrapper_dir) = unwrap_pkg_exec_wrappers(initial);
-        let seg_dir = match wrapper_dir.as_deref() {
-            Some(wd) => join_cwd_override(cur_dir.as_deref(), wd),
-            None => cur_dir.clone(),
-        };
-        let norm_toks = match unwrap_res {
-            WrapperUnwrapResult::InlineShell(inner) => {
-                if depth == 0 {
-                    classify_design_capture_segments_inner(
-                        &inner,
-                        depth + 1,
-                        seg_dir.as_deref(),
-                        out,
-                    );
-                }
-                continue;
-            }
-            WrapperUnwrapResult::Tokens(v) => v,
-        };
-        let norm = norm_toks.join(" ");
-        if non_capture_shell_cmd_re().is_match(&norm) || non_capture_cli_flag_re().is_match(&norm) {
-            continue;
-        }
-        let seg_kind = if design_dedicated_capture_cmd_re().is_match(&norm) {
-            DesignCaptureCmdKind::DedicatedCapture
-        } else if design_generic_test_runner_cmd_re().is_match(&norm) {
-            DesignCaptureCmdKind::GenericTestRunner
-        } else {
-            let norm_no_out_vals = capture_output_flag_re().replace_all(&norm, " ");
-            if design_explicit_screenshot_cmd_re().is_match(&norm_no_out_vals) {
-                DesignCaptureCmdKind::ExplicitScreenshot
-            } else {
-                DesignCaptureCmdKind::None
-            }
-        };
-        if seg_kind != DesignCaptureCmdKind::None {
-            out.push(DesignCaptureCmdSegment {
-                kind: seg_kind,
-                effective_cwd: seg_dir,
-                raw_segment: seg,
-            });
-        }
-    }
-}
-
-fn classify_design_capture_segments(raw_cmd: &str) -> Vec<DesignCaptureCmdSegment> {
-    let mut segs = Vec::new();
-    classify_design_capture_segments_inner(raw_cmd, 0, None, &mut segs);
-    segs
-}
-
-#[cfg(test)]
-fn classify_design_capture_cmd(raw_cmd: &str) -> DesignCaptureCmdKind {
-    let rank = |k: DesignCaptureCmdKind| match k {
-        DesignCaptureCmdKind::None => 0,
-        DesignCaptureCmdKind::GenericTestRunner => 1,
-        DesignCaptureCmdKind::ExplicitScreenshot => 2,
-        DesignCaptureCmdKind::DedicatedCapture => 3,
-    };
-    classify_design_capture_segments(raw_cmd)
-        .into_iter()
-        .map(|s| s.kind)
-        .max_by_key(|&k| rank(k))
-        .unwrap_or(DesignCaptureCmdKind::None)
-}
-
-fn brief_review_intent_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"(?i)(?:read[- ]?only|readonly|только\s+чтени|без\s+правок|не\s+редактируй|visual[- ]?qa|visual[^\r\n]{0,24}(?:review|audit|critic)|ux[^\r\n]{0,24}(?:review|audit|critic)|design[^\r\n]{0,24}(?:review|audit|critic)|a11y[^\r\n]{0,24}audit|\b(?:review|audit|critic)\b|ревью|аудит|критик)",
-        )
-        .expect("brief_review_intent_re")
-    })
-}
-
-fn brief_readonly_negation_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"(?i)(?:(?:do\s+not|don't|must\s+not|mustn't|should\s+not|cannot|can't|never|without|no)\s+(?:[a-z]+\s+){0,2}(?:edit(?:ing)?|modif(?:y|ying)|writ(?:e|ing)|patch(?:ing)?|chang(?:e|ing)|refactor(?:ing)?|touch(?:ing)?|fix(?:ing)?|implement(?:ing)?)|read[- ]?only|readonly|не\s+(?:\w+\s+){0,2}(?:редактируй\w*|изменяй\w*|правь\w*|меняй\w*)|без\s+правок|без\s+изменений|только\s+чтени\w*)",
-        )
-        .expect("brief_readonly_negation_re")
-    })
-}
-
-fn brief_write_instruction_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"(?i)(?:\b(?:edit_file|write_file|replace_file_content|multi_replace_file_content|write_to_file|create_file|delete_file|owned_paths)\b|\b(?:implement(?:ing)?|modif(?:y|ying)|refactor(?:ing)?|patch(?:ing)?|edit(?:ing)?|rewrite|rewriting|write|fix(?:ing)?|build(?:ing)?|create)\s+(?:the\s+|this\s+|these\s+|all\s+)?(?:code|files?|components?|css|styles?|stylesheets?|layout|ui|pages?|screens?|views?|widgets?|bugs?|spacing|colors?|tokens?|html|tsx|jsx|source)\b|реализуй\w*|внеси\w*\s+правк\w*|исправь\w*\s+код|измени\w*\s+файл\w*|перепиш\w*|отредактируй\w*|напиши\w*\s+код)",
-        )
-        .expect("brief_write_instruction_re")
-    })
-}
-
-fn brief_has_write_instruction(brief: &str) -> bool {
-    let trimmed = brief.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    let stripped = brief_readonly_negation_re().replace_all(trimmed, " ");
-    brief_write_instruction_re().is_match(&stripped)
-}
-
-fn brief_is_readonly_design_review(brief: &str) -> bool {
-    let trimmed = brief.trim();
-    if trimmed.is_empty() || !brief_review_intent_re().is_match(trimmed) {
-        return false;
-    }
-    !brief_has_write_instruction(trimmed)
-}
-
-fn is_builtin_readonly_reviewer_type(type_low: &str) -> bool {
-    matches!(
-        type_low,
-        "visual-qa-reviewer"
-            | "research"
-            | "adversarial-reviewer"
-            | "adversarial-reviewer-xhigh"
-            | "flutter_a11y_agent"
-            | "code-explorer"
-            | "editorial-auditor"
-    )
-}
-
-fn child_transcript_has_write_activity(tp: &Path) -> bool {
-    if !tp.is_file() {
-        return false;
-    }
-    let steps = rio::read_transcript_steps(&tp.to_string_lossy(), 400);
-    for st in &steps {
-        let Some(tcs) = st.get("tool_calls").and_then(Value::as_array) else {
-            continue;
-        };
-        for tc in tcs {
-            let tname = tc
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if matches!(
-                tname.as_str(),
-                "write_file"
-                    | "edit_file"
-                    | "replace_file_content"
-                    | "multi_replace_file_content"
-                    | "write_to_file"
-                    | "create_file"
-                    | "delete_file"
-            ) {
-                return true;
-            }
-            if tname == "run_command" {
-                let cmd = tc
-                    .get("arguments")
-                    .or_else(|| tc.get("args"))
-                    .and_then(|a| a.get("CommandLine").or_else(|| a.get("commandLine")))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                if !cmd.trim().is_empty()
-                    && cwg_mark::classify_shell_command_core(&rio::unwrap_tokenade_command(cmd))
-                        == "MUTATING"
-                {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-fn child_transcript_first_user_input(tp: &Path) -> String {
-    if !tp.is_file() {
-        return String::new();
-    }
-    let steps = rio::read_transcript_steps(&tp.to_string_lossy(), 30);
-    for st in &steps {
-        if st
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .eq_ignore_ascii_case("USER_INPUT")
-        {
-            return st
-                .get("content")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-        }
-    }
-    String::new()
-}
-
-fn file_has_valid_image_magic(path: &Path) -> bool {
-    let Ok(mut f) = fs::File::open(path) else {
-        return false;
-    };
-    let mut buf = [0u8; 12];
-    let Ok(n) = std::io::Read::read(&mut f, &mut buf) else {
-        return false;
-    };
-    if n >= 8 && &buf[..8] == b"\x89PNG\r\n\x1a\n" {
-        return true;
-    }
-    if n >= 3 && buf[0] == 0xFF && buf[1] == 0xD8 && buf[2] == 0xFF {
-        return true;
-    }
-    if n >= 12 && &buf[..4] == b"RIFF" && &buf[8..12] == b"WEBP" {
-        return true;
-    }
-    if n >= 6 && (&buf[..6] == b"GIF87a" || &buf[..6] == b"GIF89a") {
-        return true;
-    }
-    false
-}
-
-fn browser_qa_worker_name_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"(?i)(?:browser[-_]?qa|\bbrowser\b|visual[-_]?(?:qa|design|critic|review)|ui[-_]?qa|uiux|ux[-_]?(?:adversarial|audit|critic|review)|design[-_]?(?:critic|audit|review|qa))",
-        )
-        .expect("browser_qa_worker_name_re")
-    })
-}
-
-fn quoted_image_artifact_path_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r#"(?i)(?:"(?:file:///)?([^"\r\n]+\.(?:png|webp|jpe?g))"|'(?:file:///)?([^'\r\n]+\.(?:png|webp|jpe?g))'|`(?:file:///)?([^`\r\n]+\.(?:png|webp|jpe?g))`)"#,
-        )
-        .expect("quoted_image_artifact_path_re")
-    })
-}
-
-fn win_drive_image_artifact_path_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r#"(?i)(?:file:///)?([A-Za-z]:[/\\][^\r\n"'`()\[\]<>|;,]*?\.(?:png|webp|jpe?g))\b"#,
-        )
-        .expect("win_drive_image_artifact_path_re")
-    })
-}
-
-fn delimited_image_artifact_path_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r#"(?i)(?:->|=>|:\s+|=\s*|\bto\s+)(?:file:///)?((?:/|\.{1,2}[/\\]|[^\s"'`()\[\]<>|:;,]+[/\\])[^\r\n"'`()\[\]<>|:;,]*?\.(?:png|webp|jpe?g))\b"#,
-        )
-        .expect("delimited_image_artifact_path_re")
-    })
-}
-
-fn extract_image_paths_from_line(line: &str) -> Vec<String> {
-    // INVARIANT: Structurally extract image artifact paths from a log/command line in priority order (quoted paths, Windows drive-letter paths with spaces, delimiter-introduced paths with spaces, then plain non-whitespace tokens) deduplicated by end-offset span so paths containing spaces (`C:/work/Client Portal/screenshots/desktop.png`, `"screenshots/my shot.png"`) are extracted whole and never fragmented into `Portal/screenshots/desktop.png`.
-    let mut spans: Vec<(usize, usize, String)> = Vec::new();
-    let push_span = |spans: &mut Vec<(usize, usize, String)>, s: usize, e: usize, raw: &str| {
-        let cleaned = raw.trim().trim_start_matches("file:///").trim();
-        if cleaned.is_empty() {
-            return;
-        }
-        if spans.iter().any(|(ps, pe, _)| *ps <= s && *pe >= e) {
-            return;
-        }
-        spans.retain(|(ps, pe, _)| !(s <= *ps && e >= *pe));
-        spans.push((s, e, cleaned.to_string()));
-    };
-    for caps in quoted_image_artifact_path_re().captures_iter(line) {
-        if let Some(m) = caps.get(1).or_else(|| caps.get(2)).or_else(|| caps.get(3)) {
-            push_span(&mut spans, m.start(), m.end(), m.as_str());
-        }
-    }
-    for caps in win_drive_image_artifact_path_re().captures_iter(line) {
-        if let Some(m) = caps.get(1) {
-            push_span(&mut spans, m.start(), m.end(), m.as_str());
-        }
-    }
-    for caps in delimited_image_artifact_path_re().captures_iter(line) {
-        if let Some(m) = caps.get(1) {
-            push_span(&mut spans, m.start(), m.end(), m.as_str());
-        }
-    }
-    for caps in image_artifact_path_re().captures_iter(line) {
-        if let Some(m) = caps.get(1) {
-            push_span(&mut spans, m.start(), m.end(), m.as_str());
-        }
-    }
-    spans.sort_by_key(|(s, _, _)| *s);
-    spans.into_iter().map(|(_, _, p)| p).collect()
-}
-
-fn image_artifact_path_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r#"(?i)(?:file:///)?((?:[A-Za-z]:[/\\]|/|(?:\.{1,2}[/\\])?[^\s`"'()\[\]<>|]+[/\\])?[^\s`"'()\[\]<>|]+\.(?:png|webp|jpe?g))"#,
-        )
-        .expect("image_artifact_path_re")
-    })
-}
-
-#[derive(Debug, Default)]
-struct DesignGateEvidence {
-    screenshot_ts: f64,
-    visual_approved_ts: f64,
-    visual_blocked_ts: f64,
-    ux_seen: bool,
-    ux_launched_ts: f64,
-    ux_approved_ts: f64,
-    ux_blocked_ts: f64,
-}
-
-fn is_design_verdict_line_prefix_clean(text: &str, match_start: usize) -> bool {
-    let line_start = text[..match_start].rfind('\n').map_or(0, |i| i + 1);
-    let mut prefix = text[line_start..match_start].trim();
-    loop {
-        let prev = prefix;
-        prefix = prefix
-            .trim_start_matches(|c: char| matches!(c, ' ' | '\t' | '-' | '*' | '+' | '>' | '#' | '_' | '`'))
-            .trim_start();
-        if let Some(rest) = prefix.strip_prefix('[') {
-            if let Some(close) = rest.find(']') {
-                let tag = rest[..close].trim().to_ascii_lowercase();
-                if matches!(tag.as_str(), "done" | "ok" | "pass" | "revise" | "blocked" | "verdict") {
-                    prefix = rest[close + 1..].trim_start();
-                }
-            }
-        }
-        if prefix == prev {
-            break;
-        }
-    }
-    prefix.is_empty()
-}
-
-fn is_ux_and_uiux_role(name: &str) -> (bool, bool) {
-    let low = name.to_ascii_lowercase();
-    let is_uiux = low.contains("uiux")
-        || low.contains("ui-ux")
-        || low.contains("ui_ux")
-        || (low.contains("visual") && low.contains("ux"));
-    let is_ux = low.contains("ux");
-    (is_ux, is_uiux)
-}
-
-fn record_design_verdicts(
-    text: &str,
-    ts: f64,
-    is_design_agent: bool,
-    is_ux_agent: bool,
-    is_uiux_agent: bool,
-    ev: &mut DesignGateEvidence,
-) {
-    // INVARIANT: Only verified independent design/visual/UX reviewers may emit Design Gate verdicts; builder/coordinator prose quoting verdict tags is never accepted.
-    if !is_design_agent {
-        return;
-    }
-    let eff_ts = if ts > 0.0 { ts } else { 1.0 };
-    let mut matched_explicit = false;
-    for caps in design_review_verdict_re().captures_iter(text) {
-        let Some(whole) = caps.get(0) else {
-            continue;
-        };
-        if !is_design_verdict_line_prefix_clean(text, whole.start()) {
-            continue;
-        }
-        if design_verdict_alt_tail_re().is_match(&text[whole.end()..]) {
-            continue;
-        }
-        let is_ux_tag = caps[1].eq_ignore_ascii_case("UX");
-        if is_ux_tag && !(is_ux_agent || is_uiux_agent) {
-            continue;
-        }
-        if !is_ux_tag && is_ux_agent && !is_uiux_agent {
-            continue;
-        }
-        matched_explicit = true;
-        let is_approved = caps[2].eq_ignore_ascii_case("APPROVED");
-        if is_ux_tag {
-            ev.ux_seen = true;
-            if is_approved {
-                ev.ux_approved_ts = ev.ux_approved_ts.max(eff_ts);
-            } else {
-                ev.ux_blocked_ts = ev.ux_blocked_ts.max(eff_ts);
-            }
-        } else if is_approved {
-            ev.visual_approved_ts = ev.visual_approved_ts.max(eff_ts);
-        } else {
-            ev.visual_blocked_ts = ev.visual_blocked_ts.max(eff_ts);
-        }
-    }
-    if matched_explicit {
-        return;
-    }
-    let (kind_opt, Some(v)) = cwg_common::extract_review_decision(text) else {
-        return;
-    };
-    if kind_opt.as_deref() != Some("ordinary") {
-        return;
-    }
-    if is_ux_agent && !is_uiux_agent {
-        ev.ux_seen = true;
-        if v == "APPROVED" {
-            ev.ux_approved_ts = ev.ux_approved_ts.max(eff_ts);
-        } else {
-            ev.ux_blocked_ts = ev.ux_blocked_ts.max(eff_ts);
-        }
-    } else if v == "APPROVED" {
-        ev.visual_approved_ts = ev.visual_approved_ts.max(eff_ts);
-    } else {
-        ev.visual_blocked_ts = ev.visual_blocked_ts.max(eff_ts);
-    }
-}
-
-fn confirmed_tool_response_ts(
-    next_step: Option<&Value>,
-    fallback_ts: f64,
-    require_exit_zero: bool,
-) -> Option<f64> {
-    let nxt = next_step?;
-    let ns = nxt.get("status").and_then(Value::as_str).unwrap_or("");
-    if ns.eq_ignore_ascii_case("ERROR") {
-        return None;
-    }
-    let nc = nxt.get("content").and_then(Value::as_str).unwrap_or("");
-    let trimmed = nc.trim();
-    let low = trimmed.to_ascii_lowercase();
-    if low.contains("\"iserror\":true")
-        || low.contains("\"iserror\": true")
-        || low.contains("\"ok\":false")
-        || low.contains("\"ok\": false")
-        || low.starts_with("error:")
-        || low.starts_with("mcp error")
-        || low.starts_with("tool error")
-        || low.starts_with("permission denied")
-    {
-        return None;
-    }
-    if require_exit_zero {
-        if nc.contains("Command exited with code ") && !nc.contains("Command exited with code 0") {
-            return None;
-        }
-        if low.contains("failed") && !nc.contains("Command exited with code 0") {
-            return None;
-        }
-    }
-    let rts = nxt
-        .get("created_at")
-        .and_then(Value::as_str)
-        .map(rio::parse_iso_ts)
-        .unwrap_or(0.0);
-    Some(if rts > 0.0 {
-        rts
-    } else if fallback_ts > 0.0 {
-        fallback_ts
-    } else {
-        1.0
-    })
-}
-
-fn browser_host_facts_has_screenshot(content: &str) -> bool {
-    if !content.contains("BROWSER_HOST_FACTS") {
-        return false;
-    }
-    let low = content.to_ascii_lowercase();
-    if low.contains(".png")
-        || low.contains(".webp")
-        || low.contains(".jpg")
-        || low.contains(".jpeg")
-    {
-        return true;
-    }
-    for line in low.lines() {
-        let t = line.trim();
-        if t.contains("screenshot") {
-            if let Some((_, val)) = t.split_once(':') {
-                let v = val.trim().trim_matches(|c| matches!(c, '"' | '\'' | ',' | '}'));
-                if !v.is_empty() && !matches!(v, "none" | "null" | "n/a" | "false" | "-") {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-fn input_image_flag_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r#"(?i)(?:^|\s)(?:--(?:baseline|expected|reference|ref|compare|input|old|before)|-i)(?:=|\s+)(?:"[^"]+"|'[^']+'|\S+)"#,
-        )
-        .expect("input_image_flag_re")
-    })
-}
-
-fn strip_input_image_flags(cmd: &str) -> String {
-    input_image_flag_re().replace_all(cmd, " ").into_owned()
-}
-
-fn normalize_artifact_path_cmp(raw: &str, eff_cwd: &str) -> (String, String, String, bool) {
-    let trimmed = raw.trim().trim_matches(|c| c == '"' || c == '\'');
-    let has_dir = trimmed.contains('/') || trimmed.contains('\\');
-    let rel_clean = clean_lexical_path(Path::new(&trimmed.replace('\\', "/")))
-        .to_string_lossy()
-        .replace('\\', "/")
-        .trim_start_matches("./")
-        .to_lowercase();
-    let full_path = if Path::new(trimmed).is_absolute() || eff_cwd.trim().is_empty() {
-        PathBuf::from(trimmed)
-    } else {
-        Path::new(eff_cwd).join(trimmed)
-    };
-    let full_clean = clean_lexical_path(&full_path)
-        .to_string_lossy()
-        .replace('\\', "/")
-        .to_lowercase();
-    let file_name = Path::new(&trimmed.replace('\\', "/"))
-        .file_name()
-        .map(|s| s.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    (full_clean, rel_clean, file_name, has_dir)
-}
-
-fn extract_confirmed_screenshot_text(text: &str, require_visual_signal: bool) -> String {
-    // INVARIANT: Shared capture-output provenance filter used across main CLI outputs, child browser transcripts, subagent replies, and Swarm `browser-qa` board posts — rejects input/fixture/baseline read logs AND negated/failed/skipped capture statements (`No screenshot was saved`, `not saved`, `0 screenshots captured`) while crediting genuine fresh captures.
-    let mut out = String::new();
-    for line in text.lines() {
-        if !image_artifact_path_re().is_match(line)
-            || input_only_log_line_re().is_match(line)
-            || negated_capture_log_line_re().is_match(line)
-        {
-            continue;
-        }
-        if !(capture_action_verb_re().is_match(line) || capture_output_marker_re().is_match(line)) {
-            continue;
-        }
-        if require_visual_signal && !screenshot_visual_signal_re().is_match(line) {
-            continue;
-        }
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(line);
-    }
-    out
-}
-
-fn output_target_confirmed_in_stdout(resp_out: &str, raw_target: &str, eff_cwd: &str) -> bool {
-    // INVARIANT: For generic test runners (`npm test`, `playwright test`, `pytest`), `--output <file.png>` names a candidate path only — parse image paths from positive, non-negated, non-input capture lines and compare normalized full paths (or exact Unicode filename when stdout logs a bare filename) with zero byte-index slicing so localized UTF-8 names never panic and partial suffix matches (`Мобильная-Главная.png` vs `Главная.png`) never falsely pass.
-    let (target_full, target_rel, target_file, _) = normalize_artifact_path_cmp(raw_target, eff_cwd);
-    if target_file.is_empty() {
-        return false;
-    }
-    for line in resp_out.lines() {
-        if input_only_log_line_re().is_match(line) || negated_capture_log_line_re().is_match(line) {
-            continue;
-        }
-        if !(capture_action_verb_re().is_match(line) || capture_output_marker_re().is_match(line)) {
-            continue;
-        }
-        if !(screenshot_visual_signal_re().is_match(line)
-            || explicit_screenshot_word_re().is_match(line))
-        {
-            continue;
-        }
-        for cap_raw in extract_image_paths_from_line(line) {
-            let (cap_full, cap_rel, cap_file, cap_has_dir) =
-                normalize_artifact_path_cmp(&cap_raw, eff_cwd);
-            if cap_has_dir {
-                if cap_full == target_full || cap_rel == target_rel {
-                    return true;
-                }
-            } else if !cap_file.is_empty() && cap_file == target_file {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn extract_capture_output_image_text(
-    cmd: &str,
-    resp_out: &str,
-    eff_cwd: &str,
-    is_dedicated: bool,
-    require_visual_signal: bool,
-) -> String {
-    // INVARIANT: Only consider confirmed capture output lines in stdout/stderr (saving/writing/capturing screenshots or Playwright output directories, excluding input/fixture/baseline read logs without blocking paths like `test-results/form-input/actual.png`) plus explicit output-flag targets (validated against input/fixture patterns and, for generic test runners, separately confirmed in stdout/stderr via normalized path comparison) or positional targets of dedicated capture CLIs like `playwright screenshot`.
-    let mut out = extract_confirmed_screenshot_text(resp_out, require_visual_signal);
-    if is_dedicated {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(&strip_input_image_flags(cmd));
-    } else {
-        for caps in capture_output_flag_re().captures_iter(cmd) {
-            if let Some(m) = caps.get(1) {
-                let raw_target = m.as_str().trim_matches(|c| c == '"' || c == '\'');
-                if !image_artifact_path_re().is_match(raw_target)
-                    || input_only_log_line_re().is_match(raw_target)
-                {
-                    continue;
-                }
-                if require_visual_signal
-                    && !output_target_confirmed_in_stdout(resp_out, raw_target, eff_cwd)
-                {
-                    continue;
-                }
-                if !out.is_empty() {
-                    out.push('\n');
-                }
-                out.push_str(m.as_str());
-            }
-        }
-    }
-    out
-}
-
-fn bounded_image_credit_ts(step_ts: f64, img_ts: f64) -> f64 {
-    if step_ts > 0.0 {
-        if img_ts > 0.0 && (step_ts - img_ts).abs() < 86_400.0 {
-            step_ts.min(img_ts + 1.0)
-        } else {
-            step_ts
-        }
-    } else {
-        img_ts.max(1.0)
-    }
-}
-
-fn text_has_existing_image_artifact(text: &str, base_cwd: &str, min_ts: f64) -> Option<f64> {
-    let mut best_ts: Option<f64> = None;
-    for line in text.lines() {
-        for raw_s in extract_image_paths_from_line(line) {
-            let raw = raw_s.trim();
-            let candidate = PathBuf::from(raw);
-            let resolved = if candidate.is_file() {
-                Some(candidate)
-            } else if !base_cwd.trim().is_empty() {
-                let joined = Path::new(base_cwd).join(raw);
-                if joined.is_file() {
-                    Some(joined)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            let Some(path) = resolved else {
-                continue;
-            };
-            if !file_has_valid_image_magic(&path) {
-                continue;
-            }
-            let mtime = fs::metadata(&path)
-                .ok()
-                .and_then(|md| md.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs_f64())
-                .unwrap_or(0.0);
-            // INVARIANT: Require verified on-disk `mtime >= min_ts - 0.05` whenever a freshness floor is active so pre-edit images cannot satisfy post-edit visual verification.
-            if min_ts <= 0.0 || (mtime > 0.0 && mtime + 0.05 >= min_ts) {
-                best_ts = Some(best_ts.map_or(mtime, |prev| prev.max(mtime)));
-            }
-        }
-    }
-    best_ts
-}
-
-fn is_screenshot_mcp_tool(srv: &str, tool_low: &str) -> bool {
-    if !(srv.eq_ignore_ascii_case("playwright") || srv.eq_ignore_ascii_case("chrome-devtools")) {
-        return false;
-    }
-    // INVARIANT: Only accept image-capturing screenshot tools, never text-only accessibility snapshots (`browser_snapshot`/`take_snapshot`) or non-image audits.
-    matches!(tool_low, "browser_take_screenshot" | "take_screenshot")
-}
-
-#[derive(Debug, Default, Clone)]
-struct SwarmWorkerAuthority {
-    is_ro_reviewer: bool,
-    is_ux: bool,
-    is_uiux: bool,
-    is_browser_qa: bool,
-    tainted_writer: bool,
-    cid: String,
-    launched_ts: f64,
-}
-
-fn register_spawned_swarm_names(
-    args: Option<&Value>,
-    resp_step: Option<&Value>,
-    spawned: &mut HashMap<String, SwarmWorkerAuthority>,
-    track_ux: bool,
-    eff_step_ts: f64,
-) {
-    let Some(wname) = args
-        .and_then(|a| a.get("name"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    else {
-        return;
-    };
-    let ws = args
-        .and_then(|a| a.get("workspace"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let is_writer_ws = matches!(ws.as_str(), "share" | "branch");
-    let brief = args
-        .and_then(|a| a.get("brief"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    // INVARIANT: Verify independent reviewer authority from workspace isolation (`inherit`/default, never `share`/`branch`), explicit write instructions, `members.json` read-only authority, and zero child-transcript writes — never permanently tainting an `inherit` reviewer merely because its brief omitted a review keyword or used nouns like "latest edit".
-    let brief_has_write = brief_has_write_instruction(brief);
-    let brief_ro = !brief_has_write && brief_review_intent_re().is_match(brief.trim());
-    let resp_cid = extract_step_cid(resp_step);
-    let mut names = Vec::new();
-    let tasks_len = args
-        .and_then(|a| a.get("tasks"))
-        .and_then(Value::as_array)
-        .map(|arr| arr.len())
-        .unwrap_or(0);
-    let n_val = args
-        .and_then(|a| a.get("n"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as usize;
-    let shard_count = if tasks_len > 0 { tasks_len } else { n_val };
-    if shard_count > 1 {
-        for k in 1..=shard_count {
-            names.push(format!("{}-{}", wname, k));
-        }
-    } else {
-        names.push(wname.to_string());
-    }
-    for nm in names {
-        let low = nm.to_ascii_lowercase();
-        let is_design_name = design_reviewer_name_re().is_match(&nm);
-        let (is_ux, is_uiux) = is_ux_and_uiux_role(&format!("{} {}", nm, brief));
-        let is_ro_rev = !is_writer_ws && brief_ro && is_design_name;
-        let is_bqa = !is_writer_ws && browser_qa_worker_name_re().is_match(&nm);
-        let ent = spawned.entry(low).or_default();
-        if is_writer_ws {
-            ent.tainted_writer = true;
-            ent.is_ro_reviewer = false;
-        } else if brief_has_write {
-            ent.is_ro_reviewer = false;
-        } else if is_ro_rev && !ent.tainted_writer {
-            ent.is_ro_reviewer = true;
-        }
-        ent.is_ux = ent.is_ux || (track_ux && is_ux);
-        ent.is_uiux = ent.is_uiux || is_uiux;
-        ent.is_browser_qa = ent.is_browser_qa || is_bqa;
-        if !resp_cid.is_empty() && ent.cid.is_empty() {
-            ent.cid = resp_cid.clone();
-        }
-        ent.launched_ts = ent.launched_ts.max(eff_step_ts);
-    }
-}
-
-fn record_design_board_row(
-    row: &Value,
-    fallback_ts: f64,
-    cand_floor_ts: f64,
-    image_min_ts: f64,
-    base_cwd: &str,
-    spawned_swarm_workers: &HashMap<String, SwarmWorkerAuthority>,
-    seen_seqs: &mut HashSet<i64>,
-    ev: &mut DesignGateEvidence,
-) {
-    if let Some(seq) = row.get("seq").and_then(Value::as_i64) {
-        if !seen_seqs.insert(seq) {
-            return;
-        }
-    }
-    let agent = row.get("agent").and_then(Value::as_str).unwrap_or("").trim();
-    if agent.is_empty() || agent.eq_ignore_ascii_case("coordinator") {
-        return;
-    }
-    // INVARIANT: Credit board rows strictly for spawned Swarm workers verified as non-writer/read-only for that specific launch (workspace, brief, role, and zero child-transcript writes).
-    let Some(auth) = spawned_swarm_workers.get(&agent.to_ascii_lowercase()) else {
-        return;
-    };
-    if auth.tainted_writer {
-        return;
-    }
-    let rts = row
-        .get("time")
-        .and_then(Value::as_str)
-        .map(rio::parse_iso_ts)
-        .unwrap_or(0.0);
-    let eff_ts = if rts > 0.0 { rts } else { fallback_ts };
-    if eff_ts > 0.0 && eff_ts < cand_floor_ts - TS_EPS {
-        return;
-    }
-    let rtext = row.get("text").and_then(Value::as_str).unwrap_or("");
-    if rtext.is_empty() {
-        return;
-    }
-    if auth.is_browser_qa {
-        let confirmed = extract_confirmed_screenshot_text(rtext, true);
-        if !confirmed.is_empty() {
-            if let Some(img_ts) = text_has_existing_image_artifact(&confirmed, base_cwd, image_min_ts)
-            {
-                ev.screenshot_ts = ev.screenshot_ts.max(bounded_image_credit_ts(eff_ts, img_ts));
-            }
-        }
-    }
-    if !auth.is_ro_reviewer {
-        return;
-    }
-    if auth.is_ux {
-        ev.ux_seen = true;
-        ev.ux_launched_ts = ev.ux_launched_ts.max(if eff_ts > 0.0 { eff_ts } else { 1.0 });
-    }
-    record_design_verdicts(rtext, eff_ts, true, auth.is_ux, auth.is_uiux, ev);
-}
-
-fn extract_step_cid(step: Option<&Value>) -> String {
-    let Some(st) = step else {
-        return String::new();
-    };
-    let content = st.get("content").and_then(Value::as_str).unwrap_or("");
-    serde_json::from_str::<Value>(content)
-        .ok()
-        .and_then(|parsed| {
-            parsed
-                .get("conversationId")
-                .or_else(|| parsed.get("conversation_id"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_default()
-}
-
-fn scan_design_tool_calls(
-    tcs: &[Value],
-    step_idx: usize,
-    step_ts: f64,
-    following_steps: &[Value],
-    track_roles: bool,
-    image_min_ts: f64,
-    base_cwd: &str,
-    subagent_def_writable: &mut HashMap<String, bool>,
-    design_subagent_cids: &mut HashMap<String, (bool, bool, f64)>,
-    browser_subagent_cids: &mut HashSet<String>,
-    spawned_swarm_workers: &mut HashMap<String, SwarmWorkerAuthority>,
-    board_response_step_indices: &mut HashSet<usize>,
-    handled_cmd_resp_indices: &mut HashSet<usize>,
-    ev: &mut DesignGateEvidence,
-) {
-    let eff_step_ts = if step_ts > 0.0 { step_ts } else { 1.0 };
-    for (pos, tc) in tcs.iter().enumerate() {
-        let resp_step = following_steps.get(pos);
-        let tname = tc.get("name").and_then(Value::as_str).unwrap_or("");
-        let args = tc.get("arguments").or_else(|| tc.get("args"));
-        if tname.eq_ignore_ascii_case("define_subagent") {
-            if let Some(nm) = args
-                .and_then(|a| a.get("Name").or_else(|| a.get("name")))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                let writable = args
-                    .and_then(|a| a.get("EnableWriteTools").or_else(|| a.get("enableWriteTools")))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                subagent_def_writable.insert(nm.to_ascii_lowercase(), writable);
-            }
-            continue;
-        }
-        if tname.eq_ignore_ascii_case("read_board") || tname.eq_ignore_ascii_case("swarm_wait") {
-            if track_roles && resp_step.is_some() {
-                board_response_step_indices.insert(step_idx + 1 + pos);
-            }
-            continue;
-        }
-        if tname.eq_ignore_ascii_case("invoke_subagent") {
-            let sub_type = args
-                .and_then(|a| a.get("TypeName").or_else(|| a.get("typeName")))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let sub_type_low = sub_type.trim().to_ascii_lowercase();
-            let role = args
-                .and_then(|a| a.get("Role").or_else(|| a.get("role")))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let cid = extract_step_cid(resp_step);
-            if sub_type_low == "browser" || role.to_ascii_lowercase().contains("browser") {
-                if !cid.is_empty() {
-                    browser_subagent_cids.insert(cid.clone());
-                }
-            }
-            let is_verified_ro_subagent = is_builtin_readonly_reviewer_type(&sub_type_low)
-                || subagent_def_writable.get(&sub_type_low) == Some(&false);
-            if track_roles
-                && is_verified_ro_subagent
-                && (design_reviewer_name_re().is_match(sub_type)
-                    || design_reviewer_name_re().is_match(role))
-            {
-                let combined = format!("{} {}", sub_type, role);
-                let (is_ux, is_uiux) = is_ux_and_uiux_role(&combined);
-                if !cid.is_empty()
-                    && resp_step.map_or(false, |n| {
-                        !n.get("status")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .eq_ignore_ascii_case("ERROR")
-                    })
-                {
-                    design_subagent_cids.insert(cid.clone(), (is_ux, is_uiux, eff_step_ts));
-                }
-            }
-            continue;
-        }
-        if tname.eq_ignore_ascii_case("swarm") {
-            if track_roles {
-                let act = args
-                    .and_then(|a| a.get("action"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                if act.eq_ignore_ascii_case("add")
-                    && confirmed_tool_response_ts(resp_step, eff_step_ts, false).is_some()
-                {
-                    register_spawned_swarm_names(
-                        args,
-                        resp_step,
-                        spawned_swarm_workers,
-                        true,
-                        eff_step_ts,
-                    );
-                }
-            }
-            continue;
-        }
-        if tname.eq_ignore_ascii_case("call_mcp_tool") {
-            let srv = args
-                .and_then(|a| a.get("ServerName").or_else(|| a.get("serverName")))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let tool = args
-                .and_then(|a| a.get("ToolName").or_else(|| a.get("toolName")))
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if is_screenshot_mcp_tool(srv, &tool) {
-                if let Some(ok_ts) = confirmed_tool_response_ts(resp_step, eff_step_ts, false) {
-                    ev.screenshot_ts = ev.screenshot_ts.max(ok_ts);
-                }
-            }
-        } else if tname.eq_ignore_ascii_case("run_command") {
-            if resp_step.is_some() {
-                handled_cmd_resp_indices.insert(step_idx + 1 + pos);
-            }
-            let cmd = args
-                .and_then(|a| a.get("CommandLine").or_else(|| a.get("commandLine")))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let capture_segments = classify_design_capture_segments(cmd);
-            if !capture_segments.is_empty() {
-                if let Some(ok_ts) = confirmed_tool_response_ts(resp_step, eff_step_ts, true) {
-                    let run_cwd = args
-                        .and_then(|a| a.get("Cwd").or_else(|| a.get("cwd")))
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or(base_cwd);
-                    let resp_out = resp_step
-                        .and_then(|s| s.get("content"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    // INVARIANT: Evaluate each recognized capture segment against its own effective working directory (`--dir`/`-C`/`--prefix`/`--cwd`/`--directory`/`cd`, falling back to `run_cwd`) and its own raw flags so chained multi-package commands (`pnpm --dir admin ...; pnpm --dir web ...`) resolve every package's artifacts accurately without cross-segment flag leakage, and credit only fresh in-window image artifacts (`[eff_step_ts - 0.05, ok_ts + 1.5]`).
-                    for seg in &capture_segments {
-                        let eff_run_cwd = match seg.effective_cwd.as_deref() {
-                            Some(sub) => {
-                                let sp = Path::new(sub);
-                                let raw_p = if sp.is_absolute() {
-                                    sp.to_path_buf()
-                                } else {
-                                    Path::new(run_cwd).join(sp)
-                                };
-                                clean_lexical_path(&raw_p).to_string_lossy().into_owned()
-                            }
-                            None => run_cwd.to_string(),
-                        };
-                        let is_dedicated = seg.kind == DesignCaptureCmdKind::DedicatedCapture;
-                        let require_visual_signal =
-                            seg.kind == DesignCaptureCmdKind::GenericTestRunner;
-                        let out_text = extract_capture_output_image_text(
-                            &seg.raw_segment,
-                            resp_out,
-                            &eff_run_cwd,
-                            is_dedicated,
-                            require_visual_signal,
-                        );
-                        if !out_text.is_empty() {
-                            let found_img = text_has_existing_image_artifact(
-                                &out_text,
-                                &eff_run_cwd,
-                                image_min_ts,
-                            )
-                            .or_else(|| {
-                                (eff_run_cwd != run_cwd).then(|| {
-                                    text_has_existing_image_artifact(
-                                        &out_text,
-                                        run_cwd,
-                                        image_min_ts,
-                                    )
-                                })?
-                            });
-                            if let Some(img_ts) = found_img {
-                                let same_era = img_ts > 0.0
-                                    && eff_step_ts > 0.0
-                                    && (eff_step_ts - img_ts).abs() < 86_400.0;
-                                if !same_era
-                                    || (img_ts + 0.05 >= eff_step_ts && img_ts <= ok_ts + 1.5)
-                                {
-                                    ev.screenshot_ts = ev
-                                        .screenshot_ts
-                                        .max(bounded_image_credit_ts(ok_ts, img_ts));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            let low = tname.to_ascii_lowercase();
-            if matches!(low.as_str(), "browser_take_screenshot" | "take_screenshot") {
-                if let Some(ok_ts) = confirmed_tool_response_ts(resp_step, eff_step_ts, false) {
-                    ev.screenshot_ts = ev.screenshot_ts.max(ok_ts);
-                }
-            }
-        }
-    }
-}
-
-fn scan_child_transcript_screenshots(
-    sub_tp: &Path,
-    cand_floor_ts: f64,
-    image_min_ts: f64,
-    base_cwd: &str,
-    ev: &mut DesignGateEvidence,
-) {
-    if !sub_tp.is_file() {
-        return;
-    }
-    let child_steps = rio::read_transcript_steps(&sub_tp.to_string_lossy(), 400);
-    let mut dummy_defs: HashMap<String, bool> = HashMap::new();
-    let mut dummy_design: HashMap<String, (bool, bool, f64)> = HashMap::new();
-    let mut dummy_browser: HashSet<String> = HashSet::new();
-    let mut dummy_swarm: HashMap<String, SwarmWorkerAuthority> = HashMap::new();
-    let mut dummy_board_idxs: HashSet<usize> = HashSet::new();
-    let mut handled_cmd_resp_idxs: HashSet<usize> = HashSet::new();
-    for (idx, st) in child_steps.iter().enumerate() {
-        let st_ts = st
-            .get("created_at")
-            .and_then(Value::as_str)
-            .map(rio::parse_iso_ts)
-            .unwrap_or(0.0);
-        if st_ts > 0.0 && st_ts < cand_floor_ts - TS_EPS {
-            continue;
-        }
-        let st_type = st.get("type").and_then(Value::as_str).unwrap_or("");
-        let st_src = st.get("source").and_then(Value::as_str).unwrap_or("");
-        let content = st.get("content").and_then(Value::as_str).unwrap_or("");
-        if (st_type.eq_ignore_ascii_case("SYSTEM_MESSAGE") || st_src.eq_ignore_ascii_case("SYSTEM"))
-            && browser_host_facts_has_screenshot(content)
-        {
-            ev.screenshot_ts = ev.screenshot_ts.max(if st_ts > 0.0 { st_ts } else { 1.0 });
-        }
-        let st_status = st.get("status").and_then(Value::as_str).unwrap_or("");
-        if !st_status.eq_ignore_ascii_case("ERROR") {
-            if let Some(tcs) = st.get("tool_calls").and_then(Value::as_array) {
-                scan_design_tool_calls(
-                    tcs,
-                    idx,
-                    st_ts,
-                    &child_steps[idx + 1..],
-                    false,
-                    image_min_ts,
-                    base_cwd,
-                    &mut dummy_defs,
-                    &mut dummy_design,
-                    &mut dummy_browser,
-                    &mut dummy_swarm,
-                    &mut dummy_board_idxs,
-                    &mut handled_cmd_resp_idxs,
-                    ev,
-                );
-            }
-        }
-        // INVARIANT: Never re-credit `run_command` tool responses rejected by `scan_design_tool_calls`, and apply the same `extract_confirmed_screenshot_text` provenance filter to child-transcript prose so fixture read logs never bypass screenshot verification.
-        if !st_type.eq_ignore_ascii_case("USER_INPUT") && !handled_cmd_resp_idxs.contains(&idx) {
-            let confirmed = extract_confirmed_screenshot_text(content, true);
-            if !confirmed.is_empty() {
-                if let Some(img_ts) =
-                    text_has_existing_image_artifact(&confirmed, base_cwd, image_min_ts)
-                {
-                    ev.screenshot_ts = ev.screenshot_ts.max(bounded_image_credit_ts(st_ts, img_ts));
-                }
-            }
-        }
-    }
-}
-
-fn scan_design_gate_evidence(
-    marker: &Value,
-    steps: &[Value],
-    transcript_path: Option<&str>,
-    cand_floor_ts: f64,
-    image_min_ts: f64,
-    base_cwd: &str,
-) -> DesignGateEvidence {
-    let mut ev = DesignGateEvidence::default();
-    let sess = marker.get("session").and_then(Value::as_str).unwrap_or("");
-    let mut subagent_def_writable: HashMap<String, bool> = HashMap::new();
-    let mut design_subagent_cids: HashMap<String, (bool, bool, f64)> = HashMap::new();
-    let mut browser_subagent_cids: HashSet<String> = HashSet::new();
-    let mut spawned_swarm_workers: HashMap<String, SwarmWorkerAuthority> = HashMap::new();
-    let mut board_response_step_indices: HashSet<usize> = HashSet::new();
-    let mut handled_cmd_resp_indices: HashSet<usize> = HashSet::new();
-    let mut pending_board_rows: Vec<(Value, f64)> = Vec::new();
-    let mut pending_subagent_verdicts: Vec<(String, String, f64)> = Vec::new();
-    let mut seen_board_seqs: HashSet<i64> = HashSet::new();
-
-    for (idx, st) in steps.iter().enumerate() {
-        let st_ts = st
-            .get("created_at")
-            .and_then(Value::as_str)
-            .map(rio::parse_iso_ts)
-            .unwrap_or(0.0);
-        if st_ts > 0.0 && st_ts < cand_floor_ts - TS_EPS {
-            continue;
-        }
-        let content = st.get("content").and_then(Value::as_str).unwrap_or("");
-        let st_type = st.get("type").and_then(Value::as_str).unwrap_or("");
-        let st_src = st.get("source").and_then(Value::as_str).unwrap_or("");
-        // INVARIANT: Credit `BROWSER_HOST_FACTS` strictly from host-injected `SYSTEM_MESSAGE` / `SYSTEM` steps carrying a real screenshot artifact, never from arbitrary model prose.
-        if (st_type.eq_ignore_ascii_case("SYSTEM_MESSAGE") || st_src.eq_ignore_ascii_case("SYSTEM"))
-            && browser_host_facts_has_screenshot(content)
-        {
-            ev.screenshot_ts = ev.screenshot_ts.max(if st_ts > 0.0 { st_ts } else { 1.0 });
-        }
-        let st_status = st.get("status").and_then(Value::as_str).unwrap_or("");
-        if !st_status.eq_ignore_ascii_case("ERROR") {
-            if let Some(tcs) = st.get("tool_calls").and_then(Value::as_array) {
-                scan_design_tool_calls(
-                    tcs,
-                    idx,
-                    st_ts,
-                    &steps[idx + 1..],
-                    true,
-                    image_min_ts,
-                    base_cwd,
-                    &mut subagent_def_writable,
-                    &mut design_subagent_cids,
-                    &mut browser_subagent_cids,
-                    &mut spawned_swarm_workers,
-                    &mut board_response_step_indices,
-                    &mut handled_cmd_resp_indices,
-                    &mut ev,
-                );
-            }
-        }
-        // INVARIANT: Never accept self-review verdicts from main-agent `PLANNER_RESPONSE`, user prompts, or injected `SYSTEM_MESSAGE`; read independent verdicts only from verified `read_board`/`swarm_wait` responses, on-disk Swarm board, or tracked read-only subagent outputs.
-        if st_type.eq_ignore_ascii_case("PLANNER_RESPONSE")
-            || st_type.eq_ignore_ascii_case("SYSTEM_MESSAGE")
-            || st_type.eq_ignore_ascii_case("USER_INPUT")
-            || st_src.eq_ignore_ascii_case("MODEL")
-            || st_src.eq_ignore_ascii_case("USER_EXPLICIT")
-        {
-            continue;
-        }
-        let trimmed = content.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if board_response_step_indices.contains(&idx)
-            && trimmed.starts_with('{')
-            && trimmed.contains("\"messages\"")
-        {
-            if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(trimmed) {
-                if let Some(Value::Array(msgs)) = obj.get("messages") {
-                    for m in msgs {
-                        pending_board_rows.push((m.clone(), st_ts));
-                    }
-                }
-            }
-            continue;
-        }
-        if !browser_subagent_cids.is_empty()
-            && browser_subagent_cids
-                .iter()
-                .any(|cid| trimmed.contains(cid.as_str()))
-        {
-            let confirmed = extract_confirmed_screenshot_text(trimmed, true);
-            if !confirmed.is_empty() {
-                if let Some(img_ts) =
-                    text_has_existing_image_artifact(&confirmed, base_cwd, image_min_ts)
-                {
-                    ev.screenshot_ts = ev.screenshot_ts.max(bounded_image_credit_ts(st_ts, img_ts));
-                }
-            }
-        }
-        let has_design_tag = trimmed.contains("VISUAL_REVIEW_VERDICT")
-            || trimmed.contains("UX_REVIEW_VERDICT");
-        if !design_subagent_cids.is_empty()
-            && (has_design_tag
-                || trimmed.contains("VERDICT")
-                || st_type.eq_ignore_ascii_case("SUBAGENT_MESSAGE")
-                || st_src.eq_ignore_ascii_case("SUBAGENT"))
-        {
-            if let Some((cid, _)) = design_subagent_cids
-                .iter()
-                .find(|(cid, _)| trimmed.contains(cid.as_str()))
-            {
-                pending_subagent_verdicts.push((cid.clone(), trimmed.to_string(), st_ts));
-            }
-        }
-    }
-
-    let brain_root = if !sess.is_empty() {
-        let tp_hint = transcript_path.unwrap_or("");
-        Some(
-            rio::swarm_brain_and_cid(tp_hint, sess)
-                .0
-                .unwrap_or_else(|| rio::resolve_brain_root("")),
-        )
-    } else {
-        None
-    };
-
-    if let Some(ref brain_root) = brain_root {
-        let members_map = rio::load_swarm_members(brain_root, sess);
-        for (mname, mval) in &members_map {
-            let low = mname.trim().to_ascii_lowercase();
-            let ws = mval
-                .get("workspace")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim()
-                .to_ascii_lowercase();
-            let mrole = mval
-                .get("role")
-                .or_else(|| mval.get("agent_type"))
-                .or_else(|| mval.get("type_name"))
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            let explicit_writable = mval.get("writable").and_then(Value::as_bool) == Some(true)
-                || mval.get("read_only").and_then(Value::as_bool) == Some(false)
-                || matches!(ws.as_str(), "share" | "branch")
-                || mrole.contains("builder")
-                || mrole.contains("author")
-                || mrole.contains("implementer");
-            let mcid = mval
-                .get("conversation_id")
-                .or_else(|| mval.get("conversationId"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let m_tp = (!mcid.is_empty()).then(|| rio::member_transcript_path(brain_root, mcid));
-            let wrote_files = m_tp
-                .as_ref()
-                .is_some_and(|p| child_transcript_has_write_activity(p));
-            let created_ts = mval
-                .get("created_at")
-                .and_then(Value::as_str)
-                .map(rio::parse_iso_ts)
-                .unwrap_or(0.0);
-            let mbrief = mval
-                .get("brief")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| {
-                    m_tp.as_ref()
-                        .map(|p| child_transcript_first_user_input(p))
-                        .unwrap_or_default()
-                });
-            let ent = spawned_swarm_workers.entry(low).or_default();
-            if !mcid.is_empty() && ent.cid.is_empty() {
-                ent.cid = mcid.to_string();
-            }
-            if created_ts > 0.0 {
-                ent.launched_ts = ent.launched_ts.max(created_ts);
-            }
-            if explicit_writable || wrote_files {
-                ent.tainted_writer = true;
-                ent.is_ro_reviewer = false;
-            } else {
-                let is_design_name = design_reviewer_name_re().is_match(mname);
-                let (is_ux, is_uiux) = is_ux_and_uiux_role(&format!("{} {}", mname, mbrief));
-                if !ent.is_ro_reviewer
-                    && is_design_name
-                    && (mval.get("read_only").and_then(Value::as_bool) == Some(true)
-                        || brief_is_readonly_design_review(&mbrief))
-                {
-                    ent.is_ro_reviewer = true;
-                }
-                ent.is_ux = ent.is_ux || is_ux;
-                ent.is_uiux = ent.is_uiux || is_uiux;
-                ent.is_browser_qa = ent.is_browser_qa || browser_qa_worker_name_re().is_match(mname);
-            }
-            if !ent.tainted_writer && ent.is_browser_qa {
-                if let Some(ref p) = m_tp {
-                    scan_child_transcript_screenshots(
-                        p,
-                        cand_floor_ts,
-                        image_min_ts,
-                        base_cwd,
-                        &mut ev,
-                    );
-                }
-            }
-        }
-        for ent in spawned_swarm_workers.values_mut() {
-            if !ent.tainted_writer && !ent.cid.is_empty() {
-                let m_tp = rio::member_transcript_path(brain_root, &ent.cid);
-                if child_transcript_has_write_activity(&m_tp) {
-                    ent.tainted_writer = true;
-                    ent.is_ro_reviewer = false;
-                }
-            }
-        }
-        for row in cwg_common::read_swarm_board_tail(brain_root, sess) {
-            pending_board_rows.push((row, 0.0));
-        }
-    }
-
-    for ent in spawned_swarm_workers.values() {
-        if ent.is_ro_reviewer
-            && !ent.tainted_writer
-            && ent.is_ux
-            && (ent.launched_ts <= 0.0 || ent.launched_ts >= cand_floor_ts - TS_EPS)
-        {
-            ev.ux_seen = true;
-            ev.ux_launched_ts = ev
-                .ux_launched_ts
-                .max(if ent.launched_ts > 0.0 { ent.launched_ts } else { 1.0 });
-        }
-    }
-
-    for (row, fb_ts) in &pending_board_rows {
-        record_design_board_row(
-            row,
-            *fb_ts,
-            cand_floor_ts,
-            image_min_ts,
-            base_cwd,
-            &spawned_swarm_workers,
-            &mut seen_board_seqs,
-            &mut ev,
-        );
-    }
-
-    let mut tainted_subagents: HashSet<String> = HashSet::new();
-    if let Some(ref brain_root) = brain_root {
-        for bcid in &browser_subagent_cids {
-            let sub_tp = rio::member_transcript_path(brain_root, bcid);
-            scan_child_transcript_screenshots(
-                &sub_tp,
-                cand_floor_ts,
-                image_min_ts,
-                base_cwd,
-                &mut ev,
-            );
-        }
-        for (cid, &(is_ux, is_uiux, launched_ts)) in &design_subagent_cids {
-            let sub_tp = rio::member_transcript_path(brain_root, cid);
-            if sub_tp.is_file() && child_transcript_has_write_activity(&sub_tp) {
-                tainted_subagents.insert(cid.clone());
-                continue;
-            }
-            if is_ux {
-                ev.ux_seen = true;
-                ev.ux_launched_ts = ev.ux_launched_ts.max(launched_ts);
-            }
-            if !sub_tp.is_file() {
-                continue;
-            }
-            let sub_tp_str = sub_tp.to_string_lossy();
-            let (chunks, _, _) = extract_subagent_timed_chunks(Some(&sub_tp_str), sess);
-            for ch in chunks {
-                if ch.ts > 0.0 && ch.ts < cand_floor_ts - TS_EPS {
-                    continue;
-                }
-                record_design_verdicts(&ch.text, ch.ts, true, is_ux, is_uiux, &mut ev);
-            }
-        }
-    } else {
-        for &(is_ux, _, launched_ts) in design_subagent_cids.values() {
-            if is_ux {
-                ev.ux_seen = true;
-                ev.ux_launched_ts = ev.ux_launched_ts.max(launched_ts);
-            }
-        }
-    }
-
-    for (cid, text, st_ts) in &pending_subagent_verdicts {
-        if tainted_subagents.contains(cid) {
-            continue;
-        }
-        if let Some(&(is_ux, is_uiux, _)) = design_subagent_cids.get(cid) {
-            record_design_verdicts(text, *st_ts, true, is_ux, is_uiux, &mut ev);
-        }
-    }
-
-    ev
-}
 
 pub fn validate_candidate_closure(input: CandidateClosureInput<'_>) -> (bool, String) {
     validate_candidate_closure_inner(input, None)
@@ -8966,7 +6913,7 @@ fn validate_candidate_closure_inner(
             } else {
                 cwd.as_str()
             };
-            let dev = scan_design_gate_evidence(
+            let dev = crate::design_gate::scan_design_gate_evidence(
                 marker,
                 steps.unwrap_or(&[]),
                 transcript_path,
@@ -8979,7 +6926,7 @@ fn validate_candidate_closure_inner(
                 return (
                     false,
                     format!(
-                        "Design Gate: visual UI/design files changed ({}) without confirmed live browser/Playwright/DevTools screenshot evidence; capture desktop+mobile (and supported light/dark) screenshots and run independent read-only visual review (`VISUAL_REVIEW_VERDICT: APPROVED`) before closing",
+                        "Design Gate: visual UI/design files changed ({}) without confirmed screenshot evidence; capture screenshots via `browser` (`BROWSER_HOST_FACTS`), `playwright`/`chrome-devtools` screenshot MCP tools, or register CLI screenshots with `carbon-stack design-gate record-screenshot --session <id> --path <img.png>`, then obtain independent read-only `VISUAL_REVIEW_VERDICT: APPROVED`",
                         dshown
                     ),
                 );
@@ -9045,6 +6992,9 @@ fn validate_candidate_closure_inner(
                     "Design Gate: independent UX approval predates the latest visual UI/design edit; re-verify and obtain a fresh `UX_REVIEW_VERDICT: APPROVED`"
                         .to_string(),
                 );
+            }
+            if let Err(bind_err) = dev.check_visual_binding(design_freshness_floor) {
+                return (false, bind_err);
             }
         }
     }
@@ -11442,6 +9392,7 @@ fn retire_candidate_checked(input: RetireCandidateInput<'_>) -> bool {
     let _ = rio::write_json(state_file, &Value::Object(state.clone()));
     cwg_common::clear_claim(session);
     cwg_common::clear_swarm_rounds(session);
+    crate::design_gate::clear_evidence(session);
     true
 }
 
@@ -23663,11 +21614,28 @@ mod tests {
                 "needs_review": false,
             })
         };
+        let setup_swarm_brain = |td: &TempEnvDir, sess: &str, members: Value, transcripts: &[(&str, &str)]| -> String {
+            let brain = td.path.join("brain");
+            let parent_tp = rio::member_transcript_path(&brain, sess);
+            fs::create_dir_all(parent_tp.parent().unwrap()).unwrap();
+            fs::write(&parent_tp, "").unwrap();
+            let sdir = rio::swarm_dir(&brain, sess);
+            fs::create_dir_all(&sdir).unwrap();
+            rio::write_json(&sdir.join("members.json"), &json!({"members": members})).unwrap();
+            for (cid, body) in transcripts {
+                let ctp = rio::member_transcript_path(&brain, cid);
+                fs::create_dir_all(ctp.parent().unwrap()).unwrap();
+                fs::write(&ctp, body).unwrap();
+            }
+            parent_tp.to_string_lossy().into_owned()
+        };
+
         let rcp_std = cwg_common::parse_terminal_receipt("[gate] verified: STANDARD; ok");
         let checks_ok = ChecksEvidence::default();
         let sub_empty = SubagentEvidence::default();
         let sw_empty = SwarmEvidence::default();
 
+        // 1. Non-visual changes pass with zero Design Gate overhead.
         let non_vis_marker = json!({
             "session": "dg-nonvis",
             "first_ts": 1000.0,
@@ -23691,6 +21659,7 @@ mod tests {
         });
         assert!(ok_nv, "non-visual task must pass with zero Design Gate overhead: {}", msg_nv);
 
+        // 2. Visual change without screenshot evidence is blocked.
         let vis_marker = json!({
             "session": "dg-vis",
             "first_ts": 1000.0,
@@ -23712,13 +21681,19 @@ mod tests {
             steps: Some(&[]),
             transcript_path: None,
         });
-        assert!(!ok_noshot && msg_noshot.contains("Design Gate") && msg_noshot.contains("screenshot"), "{}", msg_noshot);
+        assert!(!ok_noshot && msg_noshot.contains("Design Gate") && msg_noshot.contains("record-screenshot"), "{}", msg_noshot);
 
-        // Non-screenshot browser tools (`browser_navigate`, `browser_snapshot`, `get_css_styles`), `playwright --version`, text-only `playwright test --update-snapshots`, and `echo screenshot real.png` must NOT count.
-        let echo_td = TempEnvDir::new("dg-echo-spoof");
+        // 3. Non-screenshot MCP tools, INVALID MCP screenshot response, relayed SYSTEM_MESSAGE mentioning BROWSER_HOST_FACTS in prose, and CLI stdout text NEVER satisfy structural Design Gate.
+        let echo_td = TempEnvDir::new("dg-no-stdout-guess");
         let echo_png = echo_td.path.join("desktop.png");
-        fs::write(&echo_png, b"\x89PNG\r\n\x1a\n").unwrap();
+        fs::write(&echo_png, b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR").unwrap();
         let fake_shot_steps = vec![
+            json!({
+                "type": "SYSTEM_MESSAGE",
+                "source": "SYSTEM",
+                "created_at": "1970-01-01T00:16:49Z",
+                "content": "[Message] timestamp=1970-01-01T00:16:49Z sender=26fe700b priority=HIGH content=Verify screenshot desktop.png from `BROWSER_HOST_FACTS`.\nlatest_screenshot: /tmp/fake.png"
+            }),
             json!({
                 "type": "PLANNER_RESPONSE",
                 "source": "MODEL",
@@ -23727,18 +21702,16 @@ mod tests {
                 "tool_calls": [
                     {"name": "call_mcp_tool", "arguments": {"ServerName": "playwright", "ToolName": "browser_navigate"}},
                     {"name": "call_mcp_tool", "arguments": {"ServerName": "playwright", "ToolName": "browser_snapshot"}},
-                    {"name": "call_mcp_tool", "arguments": {"ServerName": "chrome-devtools", "ToolName": "get_css_styles"}},
-                    {"name": "run_command", "arguments": {"CommandLine": "playwright --version"}},
-                    {"name": "run_command", "arguments": {"CommandLine": "npx playwright test --update-snapshots"}},
-                    {"name": "run_command", "arguments": {"CommandLine": format!("echo screenshot {}", echo_png.to_string_lossy())}}
+                    {"name": "call_mcp_tool", "arguments": {"ServerName": "playwright", "ToolName": "browser_take_screenshot"}},
+                    {"name": "run_command", "arguments": {"CommandLine": "npx playwright test tests/visual.spec.ts"}},
+                    {"name": "run_command", "arguments": {"CommandLine": format!("echo Saved screenshot to {}", echo_png.to_string_lossy())}}
                 ]
             }),
             json!({"type": "GENERIC", "status": "DONE", "created_at": "1970-01-01T00:16:51Z", "content": "navigated"}),
             json!({"type": "GENERIC", "status": "DONE", "created_at": "1970-01-01T00:16:51Z", "content": "a11y tree"}),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": "1970-01-01T00:16:51Z", "content": "styles"}),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": "1970-01-01T00:16:51Z", "content": "Version 1.50.0\nCommand exited with code 0"}),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": "1970-01-01T00:16:51Z", "content": "Updated aria-snapshot.txt\nCommand exited with code 0"}),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": "1970-01-01T00:16:51Z", "content": format!("screenshot {}\nCommand exited with code 0", echo_png.to_string_lossy())}),
+            json!({"type": "GENERIC", "status": "INVALID", "error": "invalid arguments", "created_at": "1970-01-01T00:16:51Z", "content": "Error invalid tool call"}),
+            json!({"type": "GENERIC", "status": "DONE", "created_at": "1970-01-01T00:16:51Z", "content": format!("Saved screenshot to {}\nCommand exited with code 0", echo_png.to_string_lossy())}),
+            json!({"type": "GENERIC", "status": "DONE", "created_at": "1970-01-01T00:16:51Z", "content": format!("Saved screenshot to {}\nCommand exited with code 0", echo_png.to_string_lossy())}),
         ];
         let mut ctx_fakeshot = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
         let (ok_fakeshot, msg_fakeshot) = validate_candidate_closure(CandidateClosureInput {
@@ -23752,9 +21725,29 @@ mod tests {
             steps: Some(&fake_shot_steps),
             transcript_path: None,
         });
-        assert!(!ok_fakeshot && msg_fakeshot.contains("screenshot"), "{}", msg_fakeshot);
+        assert!(!ok_fakeshot && msg_fakeshot.contains("screenshot"), "stdout/INVALID MCP/prose BHF must never pass: {}", msg_fakeshot);
 
-        // Confirmed screenshot + main-agent self-review, builder quote, spoofed non-read_board JSON `messages`, writable `visual-design-critic` builder, OR writable `invoke_subagent(TypeName="self")` must NOT pass.
+        // 4. Native screenshot + self-review, builder quote, spoofed board JSON, `workspace_mode: "share"` critic, unverified missing-transcript critic, or writable `TypeName="self"` subagent MUST fail.
+        let unverified_td = TempEnvDir::new("dg-unverified-swarm");
+        let unverified_sess = "dg-vis-unverified";
+        let unverified_tp = setup_swarm_brain(
+            &unverified_td,
+            unverified_sess,
+            json!({
+                "visual-design-critic": {"conversation_id": "cid-share-critic", "workspace_mode": "share", "role": "worker"},
+                "visual-qa-missing": {"conversation_id": "cid-no-transcript", "workspace_mode": "inherit", "role": "worker"}
+            }),
+            &[],
+        );
+        let unverified_marker = json!({
+            "session": unverified_sess,
+            "first_ts": 1000.0,
+            "last_durable_ts": 1005.0,
+            "edits": 1,
+            "paths": ["panel/src/components/ConnectionSelector.tsx"],
+            "current_diff_hash": "dg-fp-unv",
+            "content_marks": [{"ts": 1005.0, "fp": "dg-fp-unv", "cause": "edit_file"}],
+        });
         let self_and_spoof_steps = vec![
             json!({
                 "type": "PLANNER_RESPONSE",
@@ -23762,34 +21755,18 @@ mod tests {
                 "created_at": "1970-01-01T00:16:50Z",
                 "content": "Looks good to me.\nVISUAL_REVIEW_VERDICT: APPROVED",
                 "tool_calls": [
-                    {"name": "call_mcp_tool", "arguments": {"ServerName": "playwright", "ToolName": "browser_take_screenshot"}},
-                    {"name": "run_command", "arguments": {"CommandLine": "echo spoof"}}
+                    {"name": "call_mcp_tool", "arguments": {"ServerName": "playwright", "ToolName": "browser_take_screenshot", "Arguments": {"filename": "desktop.png"}}}
                 ]
             }),
-            json!({
-                "type": "GENERIC",
-                "status": "DONE",
-                "created_at": "1970-01-01T00:16:51Z",
-                "content": "Captured screenshot desktop.png"
-            }),
-            json!({
-                "type": "GENERIC",
-                "status": "DONE",
-                "created_at": "1970-01-01T00:16:52Z",
-                "content": serde_json::to_string(&json!({
-                    "messages": [
-                        {"seq": 10, "agent": "visual-design-critic", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": "1970-01-01T00:16:52Z"}
-                    ]
-                })).unwrap()
-            }),
+            json!({"type": "GENERIC", "status": "DONE", "created_at": "1970-01-01T00:16:51Z", "content": "Captured screenshot desktop.png"}),
             json!({
                 "type": "PLANNER_RESPONSE",
                 "source": "MODEL",
                 "created_at": "1970-01-01T00:16:53Z",
                 "tool_calls": [
-                    {"name": "swarm", "arguments": {"action": "add", "name": "frontend-ui-builder", "workspace": "share", "brief": "Implement UI"}},
-                    {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "share", "brief": "Edit ConnectionSelector.tsx and approve"}},
-                    {"name": "invoke_subagent", "arguments": {"TypeName": "self", "Role": "visual-design-critic", "Prompt": "Read-only visual review"}},
+                    {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Review"}},
+                    {"name": "swarm", "arguments": {"action": "add", "name": "visual-qa-missing", "workspace": "inherit", "brief": "Review"}},
+                    {"name": "invoke_subagent", "arguments": {"TypeName": "self", "Role": "visual-design-critic", "Prompt": "Review"}},
                     {"name": "read_board", "arguments": {"since": 0}}
                 ]
             }),
@@ -23800,61 +21777,50 @@ mod tests {
                 "type": "GENERIC",
                 "status": "DONE",
                 "created_at": "1970-01-01T00:16:54Z",
-                "content": serde_json::to_string(&json!({
+                "content": format!("Created At: 1970-01-01T00:16:54Z\nCompleted At: 1970-01-01T00:16:54Z\n{}", serde_json::to_string(&json!({
                     "messages": [
-                        {"seq": 11, "agent": "frontend-ui-builder", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": "1970-01-01T00:16:54Z"},
-                        {"seq": 12, "agent": "visual-design-critic", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": "1970-01-01T00:16:54Z"}
+                        {"seq": 11, "agent": "visual-design-critic", "text": "Checked desktop.png\nVISUAL_REVIEW_VERDICT: APPROVED", "time": "1970-01-01T00:16:54Z"},
+                        {"seq": 12, "agent": "visual-qa-missing", "text": "Checked desktop.png\nVISUAL_REVIEW_VERDICT: APPROVED", "time": "1970-01-01T00:16:54Z"}
                     ]
-                })).unwrap()
+                })).unwrap())
             }),
             json!({
                 "type": "SUBAGENT_MESSAGE",
                 "source": "SUBAGENT",
                 "created_at": "1970-01-01T00:16:55Z",
-                "content": "from cid-self-spoof: VISUAL_REVIEW_VERDICT: APPROVED"
+                "content": "from cid-self-spoof: Checked desktop.png\nVISUAL_REVIEW_VERDICT: APPROVED"
             }),
         ];
         let mut ctx_self = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
         let (ok_self, msg_self) = validate_candidate_closure(CandidateClosureInput {
             receipt: rcp_std.as_ref(),
-            marker_in: &vis_marker,
+            marker_in: &unverified_marker,
             checks_ev: &checks_ok,
             sub_ev: &sub_empty,
             swarm_ev: &sw_empty,
             codex_reviews: &[],
             ctx: Some(&mut ctx_self),
             steps: Some(&self_and_spoof_steps),
-            transcript_path: None,
+            transcript_path: Some(&unverified_tp),
         });
-        assert!(!ok_self && msg_self.contains("self-review or builder quotes are not accepted"), "{}", msg_self);
+        assert!(!ok_self && msg_self.contains("self-review or builder quotes are not accepted"), "share workspace_mode & missing-transcript worker must fail: {}", msg_self);
 
-        // Swarm worker spawned with read-only brief whose child transcript actually ran `edit_file` MUST be disqualified.
+        // 5. Swarm critic in `workspace_mode: "inherit"` whose child transcript actually ran `edit_file` MUST be disqualified factually.
         let taint_td = TempEnvDir::new("dg-tainted-critic");
-        let taint_brain = taint_td.path.join("brain");
         let taint_sess = "dg-vis-taint";
-        let taint_parent_tp = rio::member_transcript_path(&taint_brain, taint_sess);
-        fs::create_dir_all(taint_parent_tp.parent().unwrap()).unwrap();
-        fs::write(&taint_parent_tp, "").unwrap();
-        let taint_child_tp = rio::member_transcript_path(&taint_brain, "cid-tainted-critic");
-        fs::create_dir_all(taint_child_tp.parent().unwrap()).unwrap();
-        fs::write(
-            &taint_child_tp,
-            serde_json::to_string(&json!({
-                "type": "PLANNER_RESPONSE",
-                "source": "MODEL",
-                "created_at": "1970-01-01T00:16:52Z",
-                "tool_calls": [{"name": "edit_file", "arguments": {"Path": "ConnectionSelector.tsx"}}]
-            }))
-            .unwrap(),
-        )
+        let taint_edit_jsonl = serde_json::to_string(&json!({
+            "type": "PLANNER_RESPONSE",
+            "source": "MODEL",
+            "created_at": "1970-01-01T00:16:52Z",
+            "tool_calls": [{"name": "edit_file", "arguments": {"Path": "ConnectionSelector.tsx"}}]
+        }))
         .unwrap();
-        let taint_swarm_dir = rio::swarm_dir(&taint_brain, taint_sess);
-        fs::create_dir_all(&taint_swarm_dir).unwrap();
-        rio::write_json(
-            &taint_swarm_dir.join("members.json"),
-            &json!({"members": {"visual-design-critic": {"conversation_id": "cid-tainted-critic", "workspace": "inherit", "role": "worker"}}}),
-        )
-        .unwrap();
+        let taint_tp_str = setup_swarm_brain(
+            &taint_td,
+            taint_sess,
+            json!({"visual-design-critic": {"conversation_id": "cid-tainted-critic", "workspace_mode": "inherit", "read_only": true}}),
+            &[("cid-tainted-critic", &taint_edit_jsonl)],
+        );
         let taint_marker = json!({
             "session": taint_sess,
             "first_ts": 1000.0,
@@ -23875,7 +21841,7 @@ mod tests {
                 "source": "MODEL",
                 "created_at": "1970-01-01T00:16:51Z",
                 "tool_calls": [
-                    {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Read-only visual QA review of screenshots; do not edit files"}},
+                    {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Check desktop.png"}},
                     {"name": "read_board", "arguments": {"since": 0}}
                 ]
             }),
@@ -23885,14 +21851,11 @@ mod tests {
                 "status": "DONE",
                 "created_at": "1970-01-01T00:16:54Z",
                 "content": serde_json::to_string(&json!({
-                    "messages": [
-                        {"seq": 15, "agent": "visual-design-critic", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": "1970-01-01T00:16:54Z"}
-                    ]
+                    "messages": [{"seq": 15, "agent": "visual-design-critic", "text": "Reviewed desktop.png\nVISUAL_REVIEW_VERDICT: APPROVED", "time": "1970-01-01T00:16:54Z"}]
                 })).unwrap()
             }),
         ];
         let mut ctx_taint = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
-        let taint_tp_str = taint_parent_tp.to_string_lossy().into_owned();
         let (ok_taint, msg_taint) = validate_candidate_closure(CandidateClosureInput {
             receipt: rcp_std.as_ref(),
             marker_in: &taint_marker,
@@ -23906,93 +21869,53 @@ mod tests {
         });
         assert!(!ok_taint && msg_taint.contains("VISUAL_REVIEW_VERDICT: APPROVED"), "writer-tainted critic must be disqualified: {}", msg_taint);
 
-        // Coordinator merely mentioning `@ux-adversarial-auditor` in prose must NOT falsely trigger `ux_seen`.
-        let mention_only_steps = vec![
-            json!({
-                "type": "SYSTEM_MESSAGE",
-                "created_at": "1970-01-01T00:16:50Z",
-                "content": "BROWSER_HOST_FACTS:\nlatest_screenshot: /tmp/desktop.png"
-            }),
-            json!({
-                "type": "PLANNER_RESPONSE",
-                "source": "MODEL",
-                "created_at": "1970-01-01T00:16:51Z",
-                "tool_calls": [
-                    {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Read-only visual QA review of screenshots; do not edit files"}},
-                    {"name": "read_board", "arguments": {"since": 0}}
-                ]
-            }),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": "1970-01-01T00:16:52Z", "content": "spawned"}),
-            json!({
-                "type": "GENERIC",
-                "status": "DONE",
-                "created_at": "1970-01-01T00:16:54Z",
-                "content": serde_json::to_string(&json!({
-                    "messages": [
-                        {"seq": 18, "agent": "coordinator", "text": "No need to spawn @ux-adversarial-auditor for minor color polish.", "time": "1970-01-01T00:16:53Z"},
-                        {"seq": 19, "agent": "visual-design-critic", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": "1970-01-01T00:16:54Z"}
-                    ]
-                })).unwrap()
-            }),
-        ];
-        let mut ctx_mention_ok = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
-        let (ok_mention_ok, msg_mention_ok) = validate_candidate_closure(CandidateClosureInput {
-            receipt: rcp_std.as_ref(),
-            marker_in: &vis_marker,
-            checks_ev: &checks_ok,
-            sub_ev: &sub_empty,
-            swarm_ev: &sw_empty,
-            codex_reviews: &[],
-            ctx: Some(&mut ctx_mention_ok),
-            steps: Some(&mention_only_steps),
-            transcript_path: None,
-        });
-        assert!(ok_mention_ok, "coordinator prose mention of @ux must not falsely block: {}", msg_mention_ok);
-
-        // Uncompleted launched UX auditor blocks even when visual reviewer approved.
-        let ux_launched_no_verdict_steps = vec![
-            json!({
-                "type": "SYSTEM_MESSAGE",
-                "created_at": "1970-01-01T00:16:50Z",
-                "content": "BROWSER_HOST_FACTS:\nlatest_screenshot: /tmp/desktop.png"
-            }),
-            json!({
+        // 6. Verified read-only Swarm critic (`workspace_mode: "inherit"` + audited zero-write child transcript reading the screenshot) passes cleanly even with terse brief mentioning "no UX".
+        let ok_sw_td = TempEnvDir::new("dg-ok-swarm");
+        let ok_sw_sess = "dg-vis-ok-sw";
+        let clean_critic_jsonl = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&json!({
                 "type": "PLANNER_RESPONSE",
                 "source": "MODEL",
                 "created_at": "1970-01-01T00:16:52Z",
-                "tool_calls": [
-                    {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Read-only visual QA review of screenshots; do not edit files"}},
-                    {"name": "swarm", "arguments": {"action": "add", "name": "ux-adversarial-auditor", "workspace": "inherit", "brief": "Read-only UX/a11y audit of screenshots; do not edit files"}},
-                    {"name": "read_board", "arguments": {"since": 0}}
-                ]
-            }),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": "1970-01-01T00:16:53Z", "content": "spawned"}),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": "1970-01-01T00:16:53Z", "content": "spawned"}),
-            json!({
+                "tool_calls": [{"name": "read_file", "arguments": {"Path": "/tmp/desktop.png"}}]
+            }))
+            .unwrap(),
+            serde_json::to_string(&json!({
                 "type": "GENERIC",
                 "status": "DONE",
-                "created_at": "1970-01-01T00:16:54Z",
-                "content": serde_json::to_string(&json!({
-                    "messages": [
-                        {"seq": 20, "agent": "visual-design-critic", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": "1970-01-01T00:16:54Z"}
-                    ]
-                })).unwrap()
+                "created_at": "1970-01-01T00:16:53Z",
+                "content": "image loaded"
+            }))
+            .unwrap()
+        );
+        let clean_ux_jsonl = format!(
+            "{}\n",
+            serde_json::to_string(&json!({
+                "type": "USER_INPUT",
+                "created_at": "1970-01-01T00:16:52Z",
+                "content": "Check UX"
+            }))
+            .unwrap()
+        );
+        let ok_sw_tp = setup_swarm_brain(
+            &ok_sw_td,
+            ok_sw_sess,
+            json!({
+                "visual-design-critic": {"conversation_id": "cid-clean-vis", "workspace_mode": "inherit", "role": "worker", "phase": "KILLED", "killed": true},
+                "ux-adversarial-auditor": {"conversation_id": "cid-clean-ux", "workspace_mode": "inherit", "role": "worker", "phase": "KILLED", "killed": true}
             }),
-        ];
-        let mut ctx_ux_pending = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
-        let (ok_ux_pending, msg_ux_pending) = validate_candidate_closure(CandidateClosureInput {
-            receipt: rcp_std.as_ref(),
-            marker_in: &vis_marker,
-            checks_ev: &checks_ok,
-            sub_ev: &sub_empty,
-            swarm_ev: &sw_empty,
-            codex_reviews: &[],
-            ctx: Some(&mut ctx_ux_pending),
-            steps: Some(&ux_launched_no_verdict_steps),
-            transcript_path: None,
+            &[("cid-clean-vis", &clean_critic_jsonl), ("cid-clean-ux", &clean_ux_jsonl)],
+        );
+        let ok_sw_marker = json!({
+            "session": ok_sw_sess,
+            "first_ts": 1000.0,
+            "last_durable_ts": 1005.0,
+            "edits": 1,
+            "paths": ["panel/src/components/ConnectionSelector.tsx"],
+            "current_diff_hash": "dg-fp-oksw",
+            "content_marks": [{"ts": 1005.0, "fp": "dg-fp-oksw", "cause": "edit_file"}],
         });
-        assert!(!ok_ux_pending && msg_ux_pending.contains("UX_REVIEW_VERDICT: APPROVED"), "{}", msg_ux_pending);
-
         let ux_revise_steps = vec![
             json!({
                 "type": "SYSTEM_MESSAGE",
@@ -24004,8 +21927,8 @@ mod tests {
                 "source": "MODEL",
                 "created_at": "1970-01-01T00:16:51Z",
                 "tool_calls": [
-                    {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Read-only visual QA review of screenshots; do not edit files"}},
-                    {"name": "swarm", "arguments": {"action": "add", "name": "ux-adversarial-auditor", "workspace": "inherit", "brief": "Read-only UX/a11y audit of screenshots; do not edit files"}},
+                    {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Check desktop.png"}},
+                    {"name": "swarm", "arguments": {"action": "add", "name": "ux-adversarial-auditor", "workspace": "inherit", "brief": "Check UX"}},
                     {"name": "read_board", "arguments": {"since": 0}}
                 ]
             }),
@@ -24015,25 +21938,25 @@ mod tests {
                 "type": "GENERIC",
                 "status": "DONE",
                 "created_at": "1970-01-01T00:16:55Z",
-                "content": serde_json::to_string(&json!({
+                "content": format!("Created At: 1970-01-01T00:16:55Z\nCompleted At: 1970-01-01T00:16:55Z\n{}", serde_json::to_string(&json!({
                     "messages": [
                         {"seq": 1, "agent": "visual-design-critic", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": "1970-01-01T00:16:54Z"},
                         {"seq": 2, "agent": "ux-adversarial-auditor", "text": "UX_REVIEW_VERDICT: REVISE\n- focus trap broken", "time": "1970-01-01T00:16:55Z"}
                     ]
-                })).unwrap()
+                })).unwrap())
             }),
         ];
         let mut ctx_ux_blk = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
         let (ok_ux_blk, msg_ux_blk) = validate_candidate_closure(CandidateClosureInput {
             receipt: rcp_std.as_ref(),
-            marker_in: &vis_marker,
+            marker_in: &ok_sw_marker,
             checks_ev: &checks_ok,
             sub_ev: &sub_empty,
             swarm_ev: &sw_empty,
             codex_reviews: &[],
             ctx: Some(&mut ctx_ux_blk),
             steps: Some(&ux_revise_steps),
-            transcript_path: None,
+            transcript_path: Some(&ok_sw_tp),
         });
         assert!(!ok_ux_blk && msg_ux_blk.contains("UX_REVIEW_VERDICT: APPROVED"), "{}", msg_ux_blk);
 
@@ -24049,33 +21972,205 @@ mod tests {
             "status": "DONE",
             "created_at": "1970-01-01T00:17:05Z",
             "content": serde_json::to_string(&json!({
-                "messages": [
-                    {"seq": 3, "agent": "ux-adversarial-auditor", "text": "UX_REVIEW_VERDICT: APPROVED", "time": "1970-01-01T00:17:05Z"}
-                ]
+                "messages": [{"seq": 3, "agent": "ux-adversarial-auditor", "text": "UX_REVIEW_VERDICT: APPROVED", "time": "1970-01-01T00:17:05Z"}]
             })).unwrap()
         }));
         let mut ctx_pass = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
         let (ok_pass, msg_pass) = validate_candidate_closure(CandidateClosureInput {
             receipt: rcp_std.as_ref(),
-            marker_in: &vis_marker,
+            marker_in: &ok_sw_marker,
             checks_ev: &checks_ok,
             sub_ev: &sub_empty,
             swarm_ev: &sw_empty,
             codex_reviews: &[],
             ctx: Some(&mut ctx_pass),
             steps: Some(&approved_steps),
+            transcript_path: Some(&ok_sw_tp),
+        });
+        assert!(ok_pass, "visual UI task with BROWSER_HOST_FACTS + audited read-only Swarm visual & UX approvals must pass: {}", msg_pass);
+
+        // 7. Finding #1 & #5: Wrapped `visual-qa-reviewer` invoke_subagent response (`Created At:...` + `logAbsoluteUri`), CLI `record-screenshot` artifact binding, late-screenshot rejection, and tamper rejection.
+        let cli_td = TempEnvDir::new("dg-cli-evidence");
+        let cli_sess = "dg-cli-sess";
+        let cli_png = cli_td.path.join("desktop.png");
+        fs::write(&cli_png, b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR").unwrap();
+        let now_ts = now_sec();
+        let edit_ts = now_ts - 5.0;
+        let cli_marker = json!({
+            "session": cli_sess,
+            "cwd": cli_td.path.to_string_lossy(),
+            "first_ts": now_ts - 10.0,
+            "last_durable_ts": edit_ts,
+            "last_design_edit_ts": edit_ts,
+            "edits": 1,
+            "paths": ["panel/src/components/ConnectionSelector.tsx"],
+            "current_diff_hash": "dg-fp-cli",
+            "content_marks": [{"ts": edit_ts, "fp": "dg-fp-cli", "cause": "edit_file"}],
+        });
+        let rec = crate::design_gate::record_screenshot(
+            cli_sess,
+            &cli_png.to_string_lossy(),
+            Some(&cli_td.path.to_string_lossy()),
+            Some("desktop"),
+            Some("light"),
+            Some("playwright"),
+        )
+        .expect("record_screenshot must accept real PNG");
+        let sha8 = rec["sha256"].as_str().unwrap()[..8].to_string();
+
+        // 7a. Unbound approval (no child `read_file`, no SHA-256 citation) MUST be rejected.
+        let after_iso = crate::win32_sqlite::format_iso_utc(now_ts + 2.0);
+        let sub_tp_file = cli_td.path.join("vqa_sub_transcript.jsonl");
+        fs::write(
+            &sub_tp_file,
+            format!(
+                "{}\n",
+                serde_json::to_string(&json!({
+                    "type": "PLANNER_RESPONSE",
+                    "source": "MODEL",
+                    "created_at": after_iso,
+                    "content": "Looks fine\nVISUAL_REVIEW_VERDICT: APPROVED"
+                }))
+                .unwrap()
+            ),
+        )
+        .unwrap();
+        let sub_uri = format!("file:///{}", sub_tp_file.to_string_lossy().replace('\\', "/"));
+        let wrapped_sub_resp = format!(
+            "Created At: {}\nCompleted At: {}\nLaunched subagent:\n{{\"conversationId\": \"cid-vqa-cli\", \"logAbsoluteUri\": \"{}\"}}",
+            after_iso, after_iso, sub_uri
+        );
+        let cli_vqa_steps = vec![
+            json!({
+                "type": "PLANNER_RESPONSE",
+                "source": "MODEL",
+                "created_at": after_iso,
+                "tool_calls": [
+                    {"name": "invoke_subagent", "arguments": {"TypeName": "visual-qa-reviewer", "Role": "Visual QA Reviewer", "Prompt": "Review desktop.png"}}
+                ]
+            }),
+            json!({"type": "GENERIC", "status": "DONE", "created_at": after_iso, "content": wrapped_sub_resp}),
+        ];
+        let mut ctx_unbound = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
+        let (ok_unbound, msg_unbound) = validate_candidate_closure(CandidateClosureInput {
+            receipt: rcp_std.as_ref(),
+            marker_in: &cli_marker,
+            checks_ev: &checks_ok,
+            sub_ev: &sub_empty,
+            swarm_ev: &sw_empty,
+            codex_reviews: &[],
+            ctx: Some(&mut ctx_unbound),
+            steps: Some(&cli_vqa_steps),
             transcript_path: None,
         });
-        assert!(ok_pass, "visual UI task with screenshot + independent visual & UX approvals must pass: {}", msg_pass);
+        assert!(!ok_unbound && msg_unbound.contains("not bound to the latest verified screenshot"), "unbound approval must be rejected: {}", msg_unbound);
 
-        // Freshness check + external CSS edit recovery: `catch_up_unmeasured_changes` updates BOTH `design_fp` and `last_design_edit_ts` from one consistent snapshot so stale approval blocks and fresh approval unblocks cleanly.
+        // 7b. Approval BEFORE capture/record (parallel stale approval) MUST be rejected.
+        let before_shot_iso = crate::win32_sqlite::format_iso_utc(now_ts - 3.0);
+        fs::write(
+            &sub_tp_file,
+            format!(
+                "{}\n",
+                serde_json::to_string(&json!({
+                    "type": "PLANNER_RESPONSE",
+                    "source": "MODEL",
+                    "created_at": before_shot_iso,
+                    "content": format!("Reviewed sha {}\nVISUAL_REVIEW_VERDICT: APPROVED", sha8)
+                }))
+                .unwrap()
+            ),
+        )
+        .unwrap();
+        let mut ctx_early = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
+        let (ok_early, msg_early) = validate_candidate_closure(CandidateClosureInput {
+            receipt: rcp_std.as_ref(),
+            marker_in: &cli_marker,
+            checks_ev: &checks_ok,
+            sub_ev: &sub_empty,
+            swarm_ev: &sw_empty,
+            codex_reviews: &[],
+            ctx: Some(&mut ctx_early),
+            steps: Some(&cli_vqa_steps),
+            transcript_path: None,
+        });
+        assert!(!ok_early && msg_early.contains("after the last visual approval"), "approval predating latest screenshot must fail: {}", msg_early);
+
+        // 7c. Wrapped `visual-qa-reviewer` reading `desktop.png` via `read_file` after capture and posting `VISUAL_REVIEW_VERDICT: APPROVED` passes end-to-end!
+        let read_iso = crate::win32_sqlite::format_iso_utc(now_ts + 1.5);
+        fs::write(
+            &sub_tp_file,
+            format!(
+                "{}\n{}\n{}\n",
+                serde_json::to_string(&json!({
+                    "type": "PLANNER_RESPONSE",
+                    "source": "MODEL",
+                    "created_at": read_iso,
+                    "tool_calls": [{"name": "read_file", "arguments": {"Path": cli_png.to_string_lossy()}}]
+                }))
+                .unwrap(),
+                serde_json::to_string(&json!({
+                    "type": "GENERIC",
+                    "status": "DONE",
+                    "created_at": read_iso,
+                    "content": "image content"
+                }))
+                .unwrap(),
+                serde_json::to_string(&json!({
+                    "type": "PLANNER_RESPONSE",
+                    "source": "MODEL",
+                    "created_at": after_iso,
+                    "content": "Inspected desktop.png.\nVISUAL_REVIEW_VERDICT: APPROVED"
+                }))
+                .unwrap()
+            ),
+        )
+        .unwrap();
+        let mut ctx_cli_ok = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
+        let (ok_cli, msg_cli) = validate_candidate_closure(CandidateClosureInput {
+            receipt: rcp_std.as_ref(),
+            marker_in: &cli_marker,
+            checks_ev: &checks_ok,
+            sub_ev: &sub_empty,
+            swarm_ev: &sw_empty,
+            codex_reviews: &[],
+            ctx: Some(&mut ctx_cli_ok),
+            steps: Some(&cli_vqa_steps),
+            transcript_path: None,
+        });
+        assert!(ok_cli, "wrapped visual-qa-reviewer inspecting recorded CLI PNG via read_file must pass: {}", msg_cli);
+
+        // 7d. Tampering PNG bytes invalidates SHA-256 verification.
+        fs::write(&cli_png, b"\x89PNG\r\n\x1a\n\x00\x00\x00\rTAMPER").unwrap();
+        let mut ctx_cli_tamper = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
+        let (ok_cli_tamper, msg_cli_tamper) = validate_candidate_closure(CandidateClosureInput {
+            receipt: rcp_std.as_ref(),
+            marker_in: &cli_marker,
+            checks_ev: &checks_ok,
+            sub_ev: &sub_empty,
+            swarm_ev: &sw_empty,
+            codex_reviews: &[],
+            ctx: Some(&mut ctx_cli_tamper),
+            steps: Some(&cli_vqa_steps),
+            transcript_path: None,
+        });
+        assert!(!ok_cli_tamper && msg_cli_tamper.contains("screenshot"), "tampered CLI screenshot must fail: {}", msg_cli_tamper);
+        crate::design_gate::clear_evidence(cli_sess);
+
+        // 8. External CSS edit catch-up invalidates old evidence and unblocks after fresh evidence.
         let ext_td = TempEnvDir::new("dg-ext-css");
+        let ext_sess = "dg-ext";
+        let ext_tp = setup_swarm_brain(
+            &ext_td,
+            ext_sess,
+            json!({"visual-design-critic": {"conversation_id": "cid-ext-vis", "workspace_mode": "inherit", "read_only": true, "phase": "KILLED", "killed": true}}),
+            &[("cid-ext-vis", "")],
+        );
         let css_file = ext_td.path.join("styles.css");
         fs::write(&css_file, ".btn { color: red; }").unwrap();
         let css_s = css_file.to_string_lossy().into_owned();
         let fp1 = cwg_common::content_fingerprint(std::slice::from_ref(&css_s), cwg_common::MAX_FINGERPRINT_FILE_BYTES);
         let ext_marker = json!({
-            "session": "dg-ext",
+            "session": ext_sess,
             "cwd": ext_td.path.to_string_lossy(),
             "first_ts": 1000.0,
             "last_ts": 1005.0,
@@ -24101,7 +22196,7 @@ mod tests {
             codex_reviews: &[],
             ctx: Some(&mut ctx_stale_ui),
             steps: Some(&approved_steps),
-            transcript_path: None,
+            transcript_path: Some(&ext_tp),
         });
         assert!(!ok_stale_ui && msg_stale_ui.contains("predates the latest visual UI/design edit"), "{}", msg_stale_ui);
 
@@ -24116,7 +22211,7 @@ mod tests {
                 "source": "MODEL",
                 "created_at": "1970-01-01T00:17:41Z",
                 "tool_calls": [
-                    {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Read-only visual QA review of updated CSS screenshots; do not edit files"}},
+                    {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Visual check v2"}},
                     {"name": "read_board", "arguments": {"since": 0}}
                 ]
             }),
@@ -24126,9 +22221,7 @@ mod tests {
                 "status": "DONE",
                 "created_at": "1970-01-01T00:17:45Z",
                 "content": serde_json::to_string(&json!({
-                    "messages": [
-                        {"seq": 50, "agent": "visual-design-critic", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": "1970-01-01T00:17:45Z"}
-                    ]
+                    "messages": [{"seq": 50, "agent": "visual-design-critic", "text": "Reviewed /tmp/desktop-v2.png\nVISUAL_REVIEW_VERDICT: APPROVED", "time": "1970-01-01T00:17:45Z"}]
                 })).unwrap()
             }),
         ];
@@ -24142,788 +22235,11 @@ mod tests {
             codex_reviews: &[],
             ctx: Some(&mut ctx_fresh_ui),
             steps: Some(&fresh_after_ext_steps),
-            transcript_path: None,
+            transcript_path: Some(&ext_tp),
         });
         assert!(ok_fresh_ui, "fresh screenshot+approval after external CSS catch-up must unblock cleanly: {}", msg_fresh_ui);
 
-        // Hydrogen `browser-qa` worker returning a real existing screenshot artifact path on disk + CLI `playwright screenshot` with real PNG artifact ARE credited.
-        let shot_td = TempEnvDir::new("dg-hydrogen-shot");
-        let real_png = shot_td.path.join("desktop.png");
-        fs::write(&real_png, b"\x89PNG\r\n\x1a\n").unwrap();
-        let hydrogen_steps = vec![
-            json!({
-                "type": "PLANNER_RESPONSE",
-                "source": "MODEL",
-                "created_at": "1970-01-01T00:16:50Z",
-                "tool_calls": [
-                    {"name": "swarm", "arguments": {"action": "add", "name": "browser-qa", "workspace": "inherit", "brief": "Capture desktop and mobile screenshots"}},
-                    {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Read-only visual QA review of screenshots; do not edit files"}},
-                    {"name": "read_board", "arguments": {"since": 0}}
-                ]
-            }),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": "1970-01-01T00:16:51Z", "content": "spawned"}),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": "1970-01-01T00:16:51Z", "content": "spawned"}),
-            json!({
-                "type": "GENERIC",
-                "status": "DONE",
-                "created_at": "1970-01-01T00:16:55Z",
-                "content": serde_json::to_string(&json!({
-                    "messages": [
-                        {"seq": 40, "agent": "browser-qa", "text": format!("Captured desktop screenshot: {}", real_png.to_string_lossy()), "time": "1970-01-01T00:16:54Z"},
-                        {"seq": 41, "agent": "visual-design-critic", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": "1970-01-01T00:16:55Z"}
-                    ]
-                })).unwrap()
-            }),
-        ];
-        let mut ctx_h2 = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
-        let (ok_h2, msg_h2) = validate_candidate_closure(CandidateClosureInput {
-            receipt: rcp_std.as_ref(),
-            marker_in: &vis_marker,
-            checks_ev: &checks_ok,
-            sub_ev: &sub_empty,
-            swarm_ev: &sw_empty,
-            codex_reviews: &[],
-            ctx: Some(&mut ctx_h2),
-            steps: Some(&hydrogen_steps),
-            transcript_path: None,
-        });
-        assert!(ok_h2, "Hydrogen browser-qa real screenshot path must be credited: {}", msg_h2);
-
-        let cli_real_png_steps = vec![
-            json!({
-                "type": "PLANNER_RESPONSE",
-                "source": "MODEL",
-                "created_at": "1970-01-01T00:16:50Z",
-                "tool_calls": [
-                    {"name": "run_command", "arguments": {"CommandLine": format!("npx playwright screenshot http://localhost:3000 {}", real_png.to_string_lossy())}},
-                    {"name": "invoke_subagent", "arguments": {"TypeName": "visual-qa-reviewer", "Role": "Visual QA Reviewer", "Prompt": "Read-only visual review"}}
-                ]
-            }),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": "1970-01-01T00:16:51Z", "content": format!("Saved screenshot to {}\nCommand exited with code 0", real_png.to_string_lossy())}),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": "1970-01-01T00:16:51Z", "content": "{\"conversationId\":\"cid-vqa-ok\"}"}),
-            json!({
-                "type": "SUBAGENT_MESSAGE",
-                "source": "SUBAGENT",
-                "created_at": "1970-01-01T00:16:54Z",
-                "content": "cid-vqa-ok\nVISUAL_REVIEW_VERDICT: APPROVED"
-            }),
-        ];
-        let mut ctx_cli_ok = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
-        let (ok_cli, msg_cli) = validate_candidate_closure(CandidateClosureInput {
-            receipt: rcp_std.as_ref(),
-            marker_in: &vis_marker,
-            checks_ev: &checks_ok,
-            sub_ev: &sub_empty,
-            swarm_ev: &sw_empty,
-            codex_reviews: &[],
-            ctx: Some(&mut ctx_cli_ok),
-            steps: Some(&cli_real_png_steps),
-            transcript_path: None,
-        });
-        assert!(ok_cli, "playwright screenshot with real PNG + visual-qa-reviewer subagent must pass: {}", msg_cli);
-
-        // #4: `odiff` diffing existing PNGs and CLI referencing a pre-edit PNG (`mtime < design_freshness_floor`) must NOT count as fresh screenshots.
-        let now_ts = now_sec();
-        let pre_edit_png = shot_td.path.join("pre_edit_baseline.png");
-        fs::write(&pre_edit_png, b"\x89PNG\r\n\x1a\n").unwrap();
-        let future_edit_ts = now_ts + 30.0;
-        let fresh_ts_marker = json!({
-            "session": "dg-odiff-preedit",
-            "first_ts": now_ts - 10.0,
-            "last_durable_ts": future_edit_ts,
-            "last_design_edit_ts": future_edit_ts,
-            "edits": 1,
-            "paths": ["panel/src/components/ConnectionSelector.tsx"],
-            "current_diff_hash": "dg-fp-odiff",
-            "content_marks": [{"ts": future_edit_ts, "fp": "dg-fp-odiff", "cause": "edit_file"}],
-        });
-        let checks_future_ok = ChecksEvidence {
-            latest_pass_ts: future_edit_ts + 2.0,
-            checks_count: 1,
-            passed_count: 1,
-            ..Default::default()
-        };
-        let odiff_steps = vec![
-            json!({
-                "type": "PLANNER_RESPONSE",
-                "source": "MODEL",
-                "created_at": "2099-01-01T00:00:10Z",
-                "tool_calls": [
-                    {"name": "run_command", "arguments": {"CommandLine": format!("odiff {} {} {}", pre_edit_png.to_string_lossy(), real_png.to_string_lossy(), shot_td.path.join("diff.png").to_string_lossy())}},
-                    {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Read-only visual review of the latest edit. Do not modify files."}},
-                    {"name": "read_board", "arguments": {"since": 0}}
-                ]
-            }),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": "2099-01-01T00:00:11Z", "content": "Command exited with code 0"}),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": "2099-01-01T00:00:11Z", "content": "spawned"}),
-            json!({
-                "type": "GENERIC",
-                "status": "DONE",
-                "created_at": "2099-01-01T00:00:15Z",
-                "content": serde_json::to_string(&json!({
-                    "messages": [
-                        {"seq": 60, "agent": "visual-design-critic", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": "2099-01-01T00:00:15Z"}
-                    ]
-                })).unwrap()
-            }),
-        ];
-        let mut ctx_odiff = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
-        let (ok_odiff, msg_odiff) = validate_candidate_closure(CandidateClosureInput {
-            receipt: rcp_std.as_ref(),
-            marker_in: &fresh_ts_marker,
-            checks_ev: &checks_future_ok,
-            sub_ev: &sub_empty,
-            swarm_ev: &sw_empty,
-            codex_reviews: &[],
-            ctx: Some(&mut ctx_odiff),
-            steps: Some(&odiff_steps),
-            transcript_path: None,
-        });
-        assert!(!ok_odiff && msg_odiff.contains("screenshot"), "odiff must NOT satisfy screenshot capture: {}", msg_odiff);
-
-        let pre_edit_cli_steps = vec![
-            json!({
-                "type": "PLANNER_RESPONSE",
-                "source": "MODEL",
-                "created_at": "2099-01-01T00:00:10Z",
-                "tool_calls": [
-                    {"name": "run_command", "arguments": {"CommandLine": format!("npx playwright screenshot http://localhost:3000 {}", pre_edit_png.to_string_lossy())}},
-                    {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Read-only visual review of the latest edit. Do not modify files."}},
-                    {"name": "read_board", "arguments": {"since": 0}}
-                ]
-            }),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": "2099-01-01T00:00:11Z", "content": format!("Using {}\nCommand exited with code 0", pre_edit_png.to_string_lossy())}),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": "2099-01-01T00:00:11Z", "content": "spawned"}),
-            json!({
-                "type": "GENERIC",
-                "status": "DONE",
-                "created_at": "2099-01-01T00:00:15Z",
-                "content": serde_json::to_string(&json!({
-                    "messages": [
-                        {"seq": 61, "agent": "visual-design-critic", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": "2099-01-01T00:00:15Z"}
-                    ]
-                })).unwrap()
-            }),
-        ];
-        let mut ctx_preedit = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
-        let (ok_preedit, msg_preedit) = validate_candidate_closure(CandidateClosureInput {
-            receipt: rcp_std.as_ref(),
-            marker_in: &fresh_ts_marker,
-            checks_ev: &checks_future_ok,
-            sub_ev: &sub_empty,
-            swarm_ev: &sw_empty,
-            codex_reviews: &[],
-            ctx: Some(&mut ctx_preedit),
-            steps: Some(&pre_edit_cli_steps),
-            transcript_path: None,
-        });
-        assert!(!ok_preedit && msg_preedit.contains("screenshot"), "pre-edit PNG must NOT be credited via later CLI exit ts: {}", msg_preedit);
-
-        // #4 (cont.): Plain `playwright test` printing a freshly created pre-launch input PNG (created after edit but 1s before launch) must NOT count as a screenshot capture.
-        let post_edit_input_png = shot_td.path.join("post_edit_fixture.png");
-        fs::write(&post_edit_input_png, b"\x89PNG\r\n\x1a\n").unwrap();
-        let edit_before_png_ts = now_ts - 5.0;
-        let launch_after_png_iso = crate::win32_sqlite::format_iso_utc(now_ts + 2.0);
-        let done_after_png_iso = crate::win32_sqlite::format_iso_utc(now_ts + 3.0);
-        let post_edit_marker = json!({
-            "session": "dg-pw-text-only",
-            "first_ts": now_ts - 10.0,
-            "last_durable_ts": edit_before_png_ts,
-            "last_design_edit_ts": edit_before_png_ts,
-            "edits": 1,
-            "paths": ["panel/src/components/ConnectionSelector.tsx"],
-            "current_diff_hash": "dg-fp-pwtext",
-            "content_marks": [{"ts": edit_before_png_ts, "fp": "dg-fp-pwtext", "cause": "edit_file"}],
-        });
-        let checks_now_ok = ChecksEvidence {
-            latest_pass_ts: now_ts + 1.0,
-            checks_count: 1,
-            passed_count: 1,
-            ..Default::default()
-        };
-        let pw_text_steps = vec![
-            json!({
-                "type": "PLANNER_RESPONSE",
-                "source": "MODEL",
-                "created_at": launch_after_png_iso,
-                "tool_calls": [
-                    {"name": "run_command", "arguments": {"CommandLine": "npx playwright test tests/api.spec.ts"}},
-                    {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Read-only visual review. Do not directly edit files."}},
-                    {"name": "read_board", "arguments": {"since": 0}}
-                ]
-            }),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": done_after_png_iso, "content": format!("Loaded fixture {}\nCommand exited with code 0", post_edit_input_png.to_string_lossy())}),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": done_after_png_iso, "content": "spawned"}),
-            json!({
-                "type": "GENERIC",
-                "status": "DONE",
-                "created_at": done_after_png_iso,
-                "content": serde_json::to_string(&json!({
-                    "messages": [
-                        {"seq": 64, "agent": "visual-design-critic", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": done_after_png_iso}
-                    ]
-                })).unwrap()
-            }),
-        ];
-        let mut ctx_pw_text = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
-        let (ok_pw_text, msg_pw_text) = validate_candidate_closure(CandidateClosureInput {
-            receipt: rcp_std.as_ref(),
-            marker_in: &post_edit_marker,
-            checks_ev: &checks_now_ok,
-            sub_ev: &sub_empty,
-            swarm_ev: &sw_empty,
-            codex_reviews: &[],
-            ctx: Some(&mut ctx_pw_text),
-            steps: Some(&pw_text_steps),
-            transcript_path: None,
-        });
-        assert!(!ok_pw_text && msg_pw_text.contains("screenshot"), "plain playwright test logging pre-launch input PNG must NOT satisfy screenshot capture: {}", msg_pw_text);
-
-        // #4 (cont.): Dedicated `playwright screenshot` referencing a PNG created 2s BEFORE command launch (same era, even after edit) must NOT be credited.
-        let pre_launch_cli_steps = vec![
-            json!({
-                "type": "PLANNER_RESPONSE",
-                "source": "MODEL",
-                "created_at": launch_after_png_iso,
-                "tool_calls": [
-                    {"name": "run_command", "arguments": {"CommandLine": format!("npx playwright screenshot http://localhost:3000 {}", post_edit_input_png.to_string_lossy())}},
-                    {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Read-only visual review. Do not directly edit files."}},
-                    {"name": "read_board", "arguments": {"since": 0}}
-                ]
-            }),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": done_after_png_iso, "content": format!("Saved screenshot to {}\nCommand exited with code 0", post_edit_input_png.to_string_lossy())}),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": done_after_png_iso, "content": "spawned"}),
-            json!({
-                "type": "GENERIC",
-                "status": "DONE",
-                "created_at": done_after_png_iso,
-                "content": serde_json::to_string(&json!({
-                    "messages": [
-                        {"seq": 65, "agent": "visual-design-critic", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": done_after_png_iso}
-                    ]
-                })).unwrap()
-            }),
-        ];
-        let mut ctx_prelaunch = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
-        let (ok_prelaunch, msg_prelaunch) = validate_candidate_closure(CandidateClosureInput {
-            receipt: rcp_std.as_ref(),
-            marker_in: &post_edit_marker,
-            checks_ev: &checks_now_ok,
-            sub_ev: &sub_empty,
-            swarm_ev: &sw_empty,
-            codex_reviews: &[],
-            ctx: Some(&mut ctx_prelaunch),
-            steps: Some(&pre_launch_cli_steps),
-            transcript_path: None,
-        });
-        assert!(!ok_prelaunch && msg_prelaunch.contains("screenshot"), "PNG predating command launch in same wall-clock era must NOT be credited: {}", msg_prelaunch);
-
-        // #4 (cont.): `npx playwright test tests/visual.spec.ts` AND `npm run test:visual` capturing a fresh PNG within the command execution window and reporting `Saved screenshot to ...` MUST pass,
-        // while `npx playwright test tests/api.spec.ts` logging `Loaded screenshot fixture: ...` (even with an in-window mtime!) MUST still be rejected.
-        let in_window_launch_iso = crate::win32_sqlite::format_iso_utc(now_ts - 1.0);
-        let in_window_done_iso = crate::win32_sqlite::format_iso_utc(now_ts + 2.0);
-        let visual_pw_png = shot_td.path.join("visual_spec_shot.png");
-        fs::write(&visual_pw_png, b"\x89PNG\r\n\x1a\n").unwrap();
-        let pw_visual_ok_steps = vec![
-            json!({
-                "type": "PLANNER_RESPONSE",
-                "source": "MODEL",
-                "created_at": in_window_launch_iso,
-                "tool_calls": [
-                    {"name": "run_command", "arguments": {"CommandLine": "npx playwright test tests/visual.spec.ts"}},
-                    {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Read-only visual review. Do not directly edit files."}},
-                    {"name": "read_board", "arguments": {"since": 0}}
-                ]
-            }),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": in_window_done_iso, "content": format!("Saved screenshot to {}\nCommand exited with code 0", visual_pw_png.to_string_lossy())}),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": in_window_done_iso, "content": "spawned"}),
-            json!({
-                "type": "GENERIC",
-                "status": "DONE",
-                "created_at": in_window_done_iso,
-                "content": serde_json::to_string(&json!({
-                    "messages": [
-                        {"seq": 66, "agent": "visual-design-critic", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": in_window_done_iso}
-                    ]
-                })).unwrap()
-            }),
-        ];
-        let mut ctx_pw_vis_ok = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
-        let (ok_pw_vis, msg_pw_vis) = validate_candidate_closure(CandidateClosureInput {
-            receipt: rcp_std.as_ref(),
-            marker_in: &post_edit_marker,
-            checks_ev: &checks_now_ok,
-            sub_ev: &sub_empty,
-            swarm_ev: &sw_empty,
-            codex_reviews: &[],
-            ctx: Some(&mut ctx_pw_vis_ok),
-            steps: Some(&pw_visual_ok_steps),
-            transcript_path: None,
-        });
-        assert!(ok_pw_vis, "npx playwright test tests/visual.spec.ts saving an in-window fresh PNG + independent approval must pass: {}", msg_pw_vis);
-
-        let pw_api_fixture_steps = vec![
-            json!({
-                "type": "PLANNER_RESPONSE",
-                "source": "MODEL",
-                "created_at": in_window_launch_iso,
-                "tool_calls": [
-                    {"name": "run_command", "arguments": {"CommandLine": "npx playwright test tests/api.spec.ts"}},
-                    {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Read-only visual review. Do not directly edit files."}},
-                    {"name": "read_board", "arguments": {"since": 0}}
-                ]
-            }),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": in_window_done_iso, "content": format!("Loaded screenshot fixture: {}\nCommand exited with code 0", visual_pw_png.to_string_lossy())}),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": in_window_done_iso, "content": "spawned"}),
-            json!({
-                "type": "GENERIC",
-                "status": "DONE",
-                "created_at": in_window_done_iso,
-                "content": serde_json::to_string(&json!({
-                    "messages": [
-                        {"seq": 67, "agent": "visual-design-critic", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": in_window_done_iso}
-                    ]
-                })).unwrap()
-            }),
-        ];
-        let mut ctx_pw_fix = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
-        let (ok_pw_fix, msg_pw_fix) = validate_candidate_closure(CandidateClosureInput {
-            receipt: rcp_std.as_ref(),
-            marker_in: &post_edit_marker,
-            checks_ev: &checks_now_ok,
-            sub_ev: &sub_empty,
-            swarm_ev: &sw_empty,
-            codex_reviews: &[],
-            ctx: Some(&mut ctx_pw_fix),
-            steps: Some(&pw_api_fixture_steps),
-            transcript_path: None,
-        });
-        assert!(!ok_pw_fix && msg_pw_fix.contains("screenshot"), "non-visual playwright test logging 'Loaded screenshot fixture' must NOT pass even with in-window mtime: {}", msg_pw_fix);
-
-        let npm_visual_steps = vec![
-            json!({
-                "type": "PLANNER_RESPONSE",
-                "source": "MODEL",
-                "created_at": in_window_launch_iso,
-                "tool_calls": [
-                    {"name": "run_command", "arguments": {"CommandLine": "npm run test:visual"}},
-                    {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Read-only visual review. Do not directly edit files."}},
-                    {"name": "read_board", "arguments": {"since": 0}}
-                ]
-            }),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": in_window_done_iso, "content": format!("Captured screenshot -> {}\nCommand exited with code 0", visual_pw_png.to_string_lossy())}),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": in_window_done_iso, "content": "spawned"}),
-            json!({
-                "type": "GENERIC",
-                "status": "DONE",
-                "created_at": in_window_done_iso,
-                "content": serde_json::to_string(&json!({
-                    "messages": [
-                        {"seq": 68, "agent": "visual-design-critic", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": in_window_done_iso}
-                    ]
-                })).unwrap()
-            }),
-        ];
-        let mut ctx_npm_vis = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
-        let (ok_npm_vis, msg_npm_vis) = validate_candidate_closure(CandidateClosureInput {
-            receipt: rcp_std.as_ref(),
-            marker_in: &post_edit_marker,
-            checks_ev: &checks_now_ok,
-            sub_ev: &sub_empty,
-            swarm_ev: &sw_empty,
-            codex_reviews: &[],
-            ctx: Some(&mut ctx_npm_vis),
-            steps: Some(&npm_visual_steps),
-            transcript_path: None,
-        });
-        assert!(ok_npm_vis, "npm run test:visual capturing an in-window fresh PNG + independent approval must pass: {}", msg_npm_vis);
-
-        // #4 (cont.): Output dirs containing `input` (e.g. `test-results/form-input/actual.png`) and verbose `pytest -v` visual runs must pass, while `fixtures/form.png` must still be rejected.
-        let form_input_dir = shot_td.path.join("test-results").join("form-input");
-        fs::create_dir_all(&form_input_dir).unwrap();
-        let form_input_png = form_input_dir.join("actual.png");
-        fs::write(&form_input_png, b"\x89PNG\r\n\x1a\n").unwrap();
-        let fixtures_dir = shot_td.path.join("fixtures");
-        fs::create_dir_all(&fixtures_dir).unwrap();
-        let fixture_png = fixtures_dir.join("form.png");
-        fs::write(&fixture_png, b"\x89PNG\r\n\x1a\n").unwrap();
-        let form_input_steps = vec![
-            json!({
-                "type": "PLANNER_RESPONSE",
-                "source": "MODEL",
-                "created_at": in_window_launch_iso,
-                "tool_calls": [
-                    {"name": "run_command", "arguments": {"CommandLine": "python -m pytest -v tests/visual_form.py"}},
-                    {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Read-only visual review. Do not directly edit files."}},
-                    {"name": "read_board", "arguments": {"since": 0}}
-                ]
-            }),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": in_window_done_iso, "content": format!("{}\nCommand exited with code 0", form_input_png.to_string_lossy())}),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": in_window_done_iso, "content": "spawned"}),
-            json!({
-                "type": "GENERIC",
-                "status": "DONE",
-                "created_at": in_window_done_iso,
-                "content": serde_json::to_string(&json!({
-                    "messages": [
-                        {"seq": 69, "agent": "visual-design-critic", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": in_window_done_iso}
-                    ]
-                })).unwrap()
-            }),
-        ];
-        let mut ctx_form_in = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
-        let (ok_form_in, msg_form_in) = validate_candidate_closure(CandidateClosureInput {
-            receipt: rcp_std.as_ref(),
-            marker_in: &post_edit_marker,
-            checks_ev: &checks_now_ok,
-            sub_ev: &sub_empty,
-            swarm_ev: &sw_empty,
-            codex_reviews: &[],
-            ctx: Some(&mut ctx_form_in),
-            steps: Some(&form_input_steps),
-            transcript_path: None,
-        });
-        assert!(ok_form_in, "pytest -v visual test writing test-results/form-input/actual.png must pass: {}", msg_form_in);
-
-        let fixture_dir_steps = vec![
-            json!({
-                "type": "PLANNER_RESPONSE",
-                "source": "MODEL",
-                "created_at": in_window_launch_iso,
-                "tool_calls": [
-                    {"name": "run_command", "arguments": {"CommandLine": "npx playwright test tests/api.spec.ts"}},
-                    {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Read-only visual review. Do not directly edit files."}},
-                    {"name": "read_board", "arguments": {"since": 0}}
-                ]
-            }),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": in_window_done_iso, "content": format!("Saved -> {}\nCommand exited with code 0", fixture_png.to_string_lossy())}),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": in_window_done_iso, "content": "spawned"}),
-            json!({
-                "type": "GENERIC",
-                "status": "DONE",
-                "created_at": in_window_done_iso,
-                "content": serde_json::to_string(&json!({
-                    "messages": [
-                        {"seq": 70, "agent": "visual-design-critic", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": in_window_done_iso}
-                    ]
-                })).unwrap()
-            }),
-        ];
-        let mut ctx_fix_dir = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
-        let (ok_fix_dir, msg_fix_dir) = validate_candidate_closure(CandidateClosureInput {
-            receipt: rcp_std.as_ref(),
-            marker_in: &post_edit_marker,
-            checks_ev: &checks_now_ok,
-            sub_ev: &sub_empty,
-            swarm_ev: &sw_empty,
-            codex_reviews: &[],
-            ctx: Some(&mut ctx_fix_dir),
-            steps: Some(&fixture_dir_steps),
-            transcript_path: None,
-        });
-        assert!(!ok_fix_dir && msg_fix_dir.contains("screenshot"), "fixtures/form.png path must be rejected as input fixture: {}", msg_fix_dir);
-
-        // Round 1 #7: Standard test runners (`npm test`, `pytest -q`) producing fresh confirmed screenshot output MUST pass, while non-visual upload/fixture logs from `npm test` MUST still fail.
-        for runner_cmd in ["npm test", "pytest -q"] {
-            let runner_ok_steps = vec![
-                json!({
-                    "type": "PLANNER_RESPONSE",
-                    "source": "MODEL",
-                    "created_at": in_window_launch_iso,
-                    "tool_calls": [
-                        {"name": "run_command", "arguments": {"CommandLine": runner_cmd}},
-                        {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Read-only visual review. Do not directly edit files."}},
-                        {"name": "read_board", "arguments": {"since": 0}}
-                    ]
-                }),
-                json!({"type": "GENERIC", "status": "DONE", "created_at": in_window_done_iso, "content": format!("Saved screenshot to {}\nCommand exited with code 0", visual_pw_png.to_string_lossy())}),
-                json!({"type": "GENERIC", "status": "DONE", "created_at": in_window_done_iso, "content": "spawned"}),
-                json!({
-                    "type": "GENERIC",
-                    "status": "DONE",
-                    "created_at": in_window_done_iso,
-                    "content": serde_json::to_string(&json!({
-                        "messages": [
-                            {"seq": 71, "agent": "visual-design-critic", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": in_window_done_iso}
-                        ]
-                    })).unwrap()
-                }),
-            ];
-            let mut ctx_run_ok = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
-            let (ok_run, msg_run) = validate_candidate_closure(CandidateClosureInput {
-                receipt: rcp_std.as_ref(),
-                marker_in: &post_edit_marker,
-                checks_ev: &checks_now_ok,
-                sub_ev: &sub_empty,
-                swarm_ev: &sw_empty,
-                codex_reviews: &[],
-                ctx: Some(&mut ctx_run_ok),
-                steps: Some(&runner_ok_steps),
-                transcript_path: None,
-            });
-            assert!(ok_run, "`{}` saving a confirmed fresh screenshot must pass: {}", runner_cmd, msg_run);
-        }
-
-        let npm_nonvis_upload_steps = vec![
-            json!({
-                "type": "PLANNER_RESPONSE",
-                "source": "MODEL",
-                "created_at": in_window_launch_iso,
-                "tool_calls": [
-                    {"name": "run_command", "arguments": {"CommandLine": "npm test"}},
-                    {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Read-only visual review. Do not directly edit files."}},
-                    {"name": "read_board", "arguments": {"since": 0}}
-                ]
-            }),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": in_window_done_iso, "content": format!("Created upload sample {}\nCommand exited with code 0", visual_pw_png.to_string_lossy())}),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": in_window_done_iso, "content": "spawned"}),
-            json!({
-                "type": "GENERIC",
-                "status": "DONE",
-                "created_at": in_window_done_iso,
-                "content": serde_json::to_string(&json!({
-                    "messages": [
-                        {"seq": 72, "agent": "visual-design-critic", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": in_window_done_iso}
-                    ]
-                })).unwrap()
-            }),
-        ];
-        let mut ctx_npm_nonvis = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
-        let (ok_npm_nonvis, msg_npm_nonvis) = validate_candidate_closure(CandidateClosureInput {
-            receipt: rcp_std.as_ref(),
-            marker_in: &post_edit_marker,
-            checks_ev: &checks_now_ok,
-            sub_ev: &sub_empty,
-            swarm_ev: &sw_empty,
-            codex_reviews: &[],
-            ctx: Some(&mut ctx_npm_nonvis),
-            steps: Some(&npm_nonvis_upload_steps),
-            transcript_path: None,
-        });
-        assert!(!ok_npm_nonvis && msg_npm_nonvis.contains("screenshot"), "generic npm test creating non-visual PNG without screenshot signal must NOT pass: {}", msg_npm_nonvis);
-
-        // Round 1 #8: Child browser transcript logging `Loaded screenshot fixture: fixtures/form.png` must NOT bypass the provenance filter on step re-scan.
-        let child_brain = TempEnvDir::new("dg-child-fixture-brain");
-        let parent_sess = "dg-parent-child-fix";
-        let child_cid = "cid-browser-fix-only";
-        let parent_tp = rio::member_transcript_path(&child_brain.path, parent_sess);
-        let child_tp = rio::member_transcript_path(&child_brain.path, child_cid);
-        fs::create_dir_all(parent_tp.parent().unwrap()).unwrap();
-        fs::create_dir_all(child_tp.parent().unwrap()).unwrap();
-        fs::write(&parent_tp, "").unwrap();
-        let child_lines = [
-            json!({
-                "type": "PLANNER_RESPONSE",
-                "source": "MODEL",
-                "created_at": in_window_launch_iso,
-                "tool_calls": [
-                    {"name": "run_command", "arguments": {"CommandLine": "npx playwright test tests/api.spec.ts"}}
-                ]
-            }),
-            json!({
-                "type": "GENERIC",
-                "status": "DONE",
-                "created_at": in_window_done_iso,
-                "content": format!("Loaded screenshot fixture: {}\nCommand exited with code 0", fixture_png.to_string_lossy())
-            }),
-        ]
-        .iter()
-        .map(|v| serde_json::to_string(v).unwrap())
-        .collect::<Vec<String>>()
-        .join("\n");
-        fs::write(&child_tp, format!("{}\n", child_lines)).unwrap();
-        let child_fix_marker = json!({
-            "session": parent_sess,
-            "first_ts": now_ts - 10.0,
-            "last_durable_ts": edit_before_png_ts,
-            "last_design_edit_ts": edit_before_png_ts,
-            "edits": 1,
-            "paths": ["panel/src/components/ConnectionSelector.tsx"],
-            "current_diff_hash": "dg-fp-childfix",
-            "content_marks": [{"ts": edit_before_png_ts, "fp": "dg-fp-childfix", "cause": "edit_file"}],
-        });
-        let child_fix_steps = vec![
-            json!({
-                "type": "PLANNER_RESPONSE",
-                "source": "MODEL",
-                "created_at": in_window_launch_iso,
-                "tool_calls": [
-                    {"name": "invoke_subagent", "arguments": {"TypeName": "browser", "Role": "Browser QA", "Prompt": "Check UI"}},
-                    {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Read-only visual review. Do not directly edit files."}},
-                    {"name": "read_board", "arguments": {"since": 0}}
-                ]
-            }),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": in_window_done_iso, "content": format!("{{\"conversationId\":\"{}\"}}", child_cid)}),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": in_window_done_iso, "content": "spawned"}),
-            json!({
-                "type": "GENERIC",
-                "status": "DONE",
-                "created_at": in_window_done_iso,
-                "content": serde_json::to_string(&json!({
-                    "messages": [
-                        {"seq": 73, "agent": "visual-design-critic", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": in_window_done_iso}
-                    ]
-                })).unwrap()
-            }),
-        ];
-        let mut ctx_child_fix = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
-        let parent_tp_s = parent_tp.to_string_lossy().into_owned();
-        let (ok_child_fix, msg_child_fix) = validate_candidate_closure(CandidateClosureInput {
-            receipt: rcp_std.as_ref(),
-            marker_in: &child_fix_marker,
-            checks_ev: &checks_now_ok,
-            sub_ev: &sub_empty,
-            swarm_ev: &sw_empty,
-            codex_reviews: &[],
-            ctx: Some(&mut ctx_child_fix),
-            steps: Some(&child_fix_steps),
-            transcript_path: Some(&parent_tp_s),
-        });
-        assert!(!ok_child_fix && msg_child_fix.contains("screenshot"), "child browser transcript logging fixture read must NOT satisfy Design Gate: {}", msg_child_fix);
-
-        // Round 1 #5: Removing the only JSX render from `App.tsx` (`<div />` -> `return null`) in a git repo MUST still keep `App.tsx` in `design_paths`, while a `.tsx` file without JSX both before and after stays zero-overhead.
-        let rm_repo = TempEnvDir::new("dg-render-removal");
-        let rm_repo_s = rm_repo.path.to_string_lossy().into_owned();
-        let (rc_i, _, _) = rio::run_git(&rm_repo_s, &["init", "-q"], 5.0);
-        assert_eq!(rc_i, 0);
-        let _ = rio::run_git(&rm_repo_s, &["config", "user.email", "test@example.com"], 5.0);
-        let _ = rio::run_git(&rm_repo_s, &["config", "user.name", "Test"], 5.0);
-        let app_tsx = rm_repo.path.join("App.tsx");
-        let pure_tsx = rm_repo.path.join("Pure.tsx");
-        fs::write(&app_tsx, "export const App = () => <div>Hello</div>;\n").unwrap();
-        fs::write(&pure_tsx, "export const add = (a: number, b: number) => a + b;\n").unwrap();
-        let _ = rio::run_git(&rm_repo_s, &["add", "App.tsx", "Pure.tsx"], 5.0);
-        let (rc_c, _, _) = rio::run_git(&rm_repo_s, &["commit", "-q", "-m", "init"], 5.0);
-        assert_eq!(rc_c, 0);
-        fs::write(&app_tsx, "export const App = () => null;\n").unwrap();
-        fs::write(&pure_tsx, "export const add = (a: number, b: number) => a + b + 1;\n").unwrap();
-        assert!(
-            cwg_common::is_visual_design_path_with_base(&app_tsx.to_string_lossy(), None, &rm_repo_s),
-            "removing JSX render from committed App.tsx (`<div />` -> `return null`) must still trigger Design Gate"
-        );
-        assert!(
-            !cwg_common::is_visual_design_path_with_base(&pure_tsx.to_string_lossy(), None, &rm_repo_s),
-            "pure-logic Pure.tsx without JSX before and after edit must remain zero-overhead"
-        );
-
-        // #5: Read-only critic brief containing adverbial negation ("Do not directly edit files.") and/or noun "latest edit" must NOT be falsely tainted.
-        let noun_edit_steps = vec![
-            json!({
-                "type": "SYSTEM_MESSAGE",
-                "created_at": "1970-01-01T00:16:50Z",
-                "content": "BROWSER_HOST_FACTS:\nlatest_screenshot: /tmp/desktop.png"
-            }),
-            json!({
-                "type": "PLANNER_RESPONSE",
-                "source": "MODEL",
-                "created_at": "1970-01-01T00:16:51Z",
-                "tool_calls": [
-                    {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Read-only visual review of the latest edit. Do not directly edit files."}},
-                    {"name": "read_board", "arguments": {"since": 0}}
-                ]
-            }),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": "1970-01-01T00:16:52Z", "content": "spawned"}),
-            json!({
-                "type": "GENERIC",
-                "status": "DONE",
-                "created_at": "1970-01-01T00:16:54Z",
-                "content": serde_json::to_string(&json!({
-                    "messages": [
-                        {"seq": 62, "agent": "visual-design-critic", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": "1970-01-01T00:16:54Z"}
-                    ]
-                })).unwrap()
-            }),
-        ];
-        let mut ctx_noun_ok = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
-        let (ok_noun, msg_noun) = validate_candidate_closure(CandidateClosureInput {
-            receipt: rcp_std.as_ref(),
-            marker_in: &vis_marker,
-            checks_ev: &checks_ok,
-            sub_ev: &sub_empty,
-            swarm_ev: &sw_empty,
-            codex_reviews: &[],
-            ctx: Some(&mut ctx_noun_ok),
-            steps: Some(&noun_edit_steps),
-            transcript_path: None,
-        });
-        assert!(ok_noun, "read-only brief mentioning noun 'latest edit' must NOT be falsely tainted: {}", msg_noun);
-
-        let ro_mem_td = TempEnvDir::new("dg-ro-mem");
-        let ro_brain = ro_mem_td.path.join("brain");
-        let ro_sess = "dg-ro-mem-sess";
-        let ro_parent_tp = rio::member_transcript_path(&ro_brain, ro_sess);
-        fs::create_dir_all(ro_parent_tp.parent().unwrap()).unwrap();
-        fs::write(&ro_parent_tp, "").unwrap();
-        let ro_child_tp = rio::member_transcript_path(&ro_brain, "cid-ro-critic");
-        fs::create_dir_all(ro_child_tp.parent().unwrap()).unwrap();
-        fs::write(&ro_child_tp, "").unwrap();
-        let ro_swarm_dir = rio::swarm_dir(&ro_brain, ro_sess);
-        fs::create_dir_all(&ro_swarm_dir).unwrap();
-        rio::write_json(
-            &ro_swarm_dir.join("members.json"),
-            &json!({"members": {"visual-design-critic": {"conversation_id": "cid-ro-critic", "workspace": "inherit", "read_only": true, "killed": true}}}),
-        )
-        .unwrap();
-        let ro_marker = json!({
-            "session": ro_sess,
-            "first_ts": 1000.0,
-            "last_durable_ts": 1005.0,
-            "edits": 1,
-            "paths": ["panel/src/components/ConnectionSelector.tsx"],
-            "current_diff_hash": "dg-fp-romem",
-            "content_marks": [{"ts": 1005.0, "fp": "dg-fp-romem", "cause": "edit_file"}],
-        });
-        let ro_terse_steps = vec![
-            json!({
-                "type": "SYSTEM_MESSAGE",
-                "created_at": "1970-01-01T00:16:50Z",
-                "content": "BROWSER_HOST_FACTS:\nlatest_screenshot: /tmp/desktop.png"
-            }),
-            json!({
-                "type": "PLANNER_RESPONSE",
-                "source": "MODEL",
-                "created_at": "1970-01-01T00:16:51Z",
-                "tool_calls": [
-                    {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Check desktop.png (never write code or directly edit files)"}},
-                    {"name": "read_board", "arguments": {"since": 0}}
-                ]
-            }),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": "1970-01-01T00:16:52Z", "content": "spawned"}),
-            json!({
-                "type": "GENERIC",
-                "status": "DONE",
-                "created_at": "1970-01-01T00:16:54Z",
-                "content": serde_json::to_string(&json!({
-                    "messages": [
-                        {"seq": 63, "agent": "visual-design-critic", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": "1970-01-01T00:16:54Z"}
-                    ]
-                })).unwrap()
-            }),
-            json!({
-                "type": "PLANNER_RESPONSE",
-                "source": "MODEL",
-                "created_at": "1970-01-01T00:16:55Z",
-                "tool_calls": [
-                    {"name": "swarm", "arguments": {"action": "kill", "name": "visual-design-critic"}}
-                ]
-            }),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": "1970-01-01T00:16:56Z", "content": "killed"}),
-        ];
-        let ro_tp_str = ro_parent_tp.to_string_lossy().into_owned();
-        let mut ctx_romem = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
-        let (ok_romem, msg_romem) = validate_candidate_closure(CandidateClosureInput {
-            receipt: rcp_std.as_ref(),
-            marker_in: &ro_marker,
-            checks_ev: &checks_ok,
-            sub_ev: &sub_empty,
-            swarm_ev: &sw_empty,
-            codex_reviews: &[],
-            ctx: Some(&mut ctx_romem),
-            steps: Some(&ro_terse_steps),
-            transcript_path: Some(&ro_tp_str),
-        });
-        assert!(ok_romem, "members.json read_only=true with non-writing brief and zero child writes must pass: {}", msg_romem);
-
+        // 9. Opt-out `design_gate: false` passes with zero requirements.
         let mut ctx_optout = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], Some(disabled_pol));
         let (ok_optout, msg_optout) = validate_candidate_closure(CandidateClosureInput {
             receipt: rcp_std.as_ref(),
@@ -24938,8 +22254,8 @@ mod tests {
         });
         assert!(ok_optout, "design_gate=false opt-out must pass: {}", msg_optout);
 
-        // Round 2 #5: Creating a brand-new pure logic `NewPure.tsx` via `PreToolUse`+`write_file`+`PostToolUse` must NOT falsely latch `previs-` / trigger Design Gate, whereas editing an existing visual `App.tsx` (`<div />` -> `return null`) MUST latch.
-        let r2_proj = shot_td.path.join("r2-previs-proj");
+        // 10. `NewPure.tsx` vs existing visual `App.tsx` latch check (until Stage 2 replaces TS/JSX lexer).
+        let r2_proj = cli_td.path.join("r2-previs-proj");
         fs::create_dir_all(&r2_proj).unwrap();
         let new_pure_tsx = r2_proj.join("NewPure.tsx");
         let new_pure_s = new_pure_tsx.to_string_lossy().into_owned();
@@ -24961,17 +22277,6 @@ mod tests {
             "brand-new pure-logic NewPure.tsx must NOT latch into latched_design_paths: {:?}",
             m_new_pure
         );
-        assert_eq!(
-            m_new_pure.get("last_design_edit_ts").and_then(Value::as_f64).unwrap_or(0.0),
-            0.0,
-            "brand-new pure-logic NewPure.tsx must keep last_design_edit_ts=0"
-        );
-        let ctx_new_pure = cwg_common::resolve_candidate_context(&m_new_pure, false);
-        assert!(
-            ctx_new_pure["design_paths"].as_array().is_some_and(|a| a.is_empty()),
-            "brand-new pure-logic NewPure.tsx must produce empty design_paths: {:?}",
-            ctx_new_pure
-        );
 
         let app_tsx = r2_proj.join("App.tsx");
         let app_tsx_s = app_tsx.to_string_lossy().into_owned();
@@ -24991,548 +22296,6 @@ mod tests {
             ctx_strip_jsx["design_paths"].as_array().is_some_and(|a| !a.is_empty()),
             "stripping JSX from existing visual App.tsx must latch and keep App.tsx in design_paths: {:?}",
             ctx_strip_jsx
-        );
-
-        // Round 2 #7: PowerShell quoted & path-qualified test runners and dedicated capture CLIs MUST be recognized, while quoted version/echo commands stay rejected.
-        assert_eq!(
-            classify_design_capture_cmd("& 'C:/tools/playwright.cmd' --version"),
-            DesignCaptureCmdKind::None
-        );
-        assert_eq!(
-            classify_design_capture_cmd("& 'C:/tools/playwright.cmd' -v"),
-            DesignCaptureCmdKind::None
-        );
-        assert_eq!(
-            classify_design_capture_cmd("& 'C:/tools/pytest.exe' -V"),
-            DesignCaptureCmdKind::None
-        );
-        assert_eq!(
-            classify_design_capture_cmd("Set-Location C:\\repo; echo \"npx playwright test\""),
-            DesignCaptureCmdKind::None
-        );
-        for ps_cmd in [
-            "& 'C:/tools/npm.cmd' test",
-            "& \"C:\\Program Files\\nodejs\\npm.cmd\" run test:visual",
-            "& 'C:/venv/Scripts/pytest.exe' -q",
-            "& 'C:/venv/Scripts/pytest.exe' -v",
-            "pwsh -NoProfile -Command \"& 'C:/tools/npm.cmd' test\"",
-        ] {
-            let ps_steps = vec![
-                json!({
-                    "type": "PLANNER_RESPONSE",
-                    "source": "MODEL",
-                    "created_at": in_window_launch_iso,
-                    "tool_calls": [
-                        {"name": "run_command", "arguments": {"CommandLine": ps_cmd}},
-                        {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Read-only visual review. Do not directly edit files."}},
-                        {"name": "read_board", "arguments": {"since": 0}}
-                    ]
-                }),
-                json!({"type": "GENERIC", "status": "DONE", "created_at": in_window_done_iso, "content": format!("Saved screenshot to {}\nCommand exited with code 0", visual_pw_png.to_string_lossy())}),
-                json!({"type": "GENERIC", "status": "DONE", "created_at": in_window_done_iso, "content": "spawned"}),
-                json!({
-                    "type": "GENERIC",
-                    "status": "DONE",
-                    "created_at": in_window_done_iso,
-                    "content": serde_json::to_string(&json!({
-                        "messages": [
-                            {"seq": 75, "agent": "visual-design-critic", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": in_window_done_iso}
-                        ]
-                    })).unwrap()
-                }),
-            ];
-            let mut ctx_ps = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
-            let (ok_ps, msg_ps) = validate_candidate_closure(CandidateClosureInput {
-                receipt: rcp_std.as_ref(),
-                marker_in: &post_edit_marker,
-                checks_ev: &checks_now_ok,
-                sub_ev: &sub_empty,
-                swarm_ev: &sw_empty,
-                codex_reviews: &[],
-                ctx: Some(&mut ctx_ps),
-                steps: Some(&ps_steps),
-                transcript_path: None,
-            });
-            assert!(ok_ps, "PowerShell quoted runner `{}` saving a fresh screenshot must pass: {}", ps_cmd, msg_ps);
-        }
-
-        // Round 2 #8: Non-visual files created under `test-results/` (`test-results/form-upload/input.png`, `test-results/form-upload/avatar.png`, `test-results/actual-upload/avatar.png`) must NEVER pass under `npm test` OR `npx playwright test`, while genuine Playwright visual artifacts (`test-results/form-input/actual.png`, `test-results/home/test-failed-1.png`) MUST pass.
-        let tr_upload_dir = shot_td.path.join("test-results").join("form-upload");
-        let tr_actual_dir = shot_td.path.join("test-results").join("actual-upload");
-        let tr_home_dir = shot_td.path.join("test-results").join("home");
-        fs::create_dir_all(&tr_upload_dir).unwrap();
-        fs::create_dir_all(&tr_actual_dir).unwrap();
-        fs::create_dir_all(&tr_home_dir).unwrap();
-        let tr_input_png = tr_upload_dir.join("input.png");
-        let tr_avatar_png = tr_upload_dir.join("avatar.png");
-        let tr_dir_trick_png = tr_actual_dir.join("avatar.png");
-        let tr_failed_png = tr_home_dir.join("test-failed-1.png");
-        for p in [&tr_input_png, &tr_avatar_png, &tr_dir_trick_png, &tr_failed_png] {
-            fs::write(p, b"\x89PNG\r\n\x1a\n").unwrap();
-        }
-        let r2_now_ts = now_sec();
-        let r2_launch_iso = crate::win32_sqlite::format_iso_utc(r2_now_ts - 1.0);
-        let r2_done_iso = crate::win32_sqlite::format_iso_utc(r2_now_ts + 2.0);
-        for (cmd_s, bad_png) in [
-            ("npm test", &tr_input_png),
-            ("npm test", &tr_avatar_png),
-            ("npm test", &tr_dir_trick_png),
-            ("npx playwright test tests/upload.spec.ts", &tr_input_png),
-            ("npx playwright test tests/upload.spec.ts", &tr_avatar_png),
-        ] {
-            let bad_steps = vec![
-                json!({
-                    "type": "PLANNER_RESPONSE",
-                    "source": "MODEL",
-                    "created_at": r2_launch_iso,
-                    "tool_calls": [
-                        {"name": "run_command", "arguments": {"CommandLine": cmd_s}},
-                        {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Read-only visual review. Do not directly edit files."}},
-                        {"name": "read_board", "arguments": {"since": 0}}
-                    ]
-                }),
-                json!({"type": "GENERIC", "status": "DONE", "created_at": r2_done_iso, "content": format!("Created upload sample {}\nCommand exited with code 0", bad_png.to_string_lossy())}),
-                json!({"type": "GENERIC", "status": "DONE", "created_at": r2_done_iso, "content": "spawned"}),
-                json!({
-                    "type": "GENERIC",
-                    "status": "DONE",
-                    "created_at": r2_done_iso,
-                    "content": serde_json::to_string(&json!({
-                        "messages": [
-                            {"seq": 76, "agent": "visual-design-critic", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": r2_done_iso}
-                        ]
-                    })).unwrap()
-                }),
-            ];
-            let mut ctx_bad = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
-            let (ok_bad, msg_bad) = validate_candidate_closure(CandidateClosureInput {
-                receipt: rcp_std.as_ref(),
-                marker_in: &post_edit_marker,
-                checks_ev: &checks_now_ok,
-                sub_ev: &sub_empty,
-                swarm_ev: &sw_empty,
-                codex_reviews: &[],
-                ctx: Some(&mut ctx_bad),
-                steps: Some(&bad_steps),
-                transcript_path: None,
-            });
-            assert!(
-                !ok_bad && msg_bad.contains("screenshot"),
-                "`{}` logging non-visual `{}` must NOT satisfy screenshot capture: {}",
-                cmd_s,
-                bad_png.display(),
-                msg_bad
-            );
-        }
-        fs::write(&form_input_png, b"\x89PNG\r\n\x1a\n").unwrap();
-        let r2_good_now_ts = now_sec();
-        let r2_good_launch_iso = crate::win32_sqlite::format_iso_utc(r2_good_now_ts - 1.0);
-        let r2_good_done_iso = crate::win32_sqlite::format_iso_utc(r2_good_now_ts + 2.0);
-        for good_png in [&form_input_png, &tr_failed_png] {
-            let good_steps = vec![
-                json!({
-                    "type": "PLANNER_RESPONSE",
-                    "source": "MODEL",
-                    "created_at": r2_good_launch_iso,
-                    "tool_calls": [
-                        {"name": "run_command", "arguments": {"CommandLine": "npm test"}},
-                        {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Read-only visual review. Do not directly edit files."}},
-                        {"name": "read_board", "arguments": {"since": 0}}
-                    ]
-                }),
-                json!({"type": "GENERIC", "status": "DONE", "created_at": r2_good_done_iso, "content": format!("{}\nCommand exited with code 0", good_png.to_string_lossy())}),
-                json!({"type": "GENERIC", "status": "DONE", "created_at": r2_good_done_iso, "content": "spawned"}),
-                json!({
-                    "type": "GENERIC",
-                    "status": "DONE",
-                    "created_at": r2_good_done_iso,
-                    "content": serde_json::to_string(&json!({
-                        "messages": [
-                            {"seq": 77, "agent": "visual-design-critic", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": r2_good_done_iso}
-                        ]
-                    })).unwrap()
-                }),
-            ];
-            let mut ctx_good = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
-            let (ok_good, msg_good) = validate_candidate_closure(CandidateClosureInput {
-                receipt: rcp_std.as_ref(),
-                marker_in: &post_edit_marker,
-                checks_ev: &checks_now_ok,
-                sub_ev: &sub_empty,
-                swarm_ev: &sw_empty,
-                codex_reviews: &[],
-                ctx: Some(&mut ctx_good),
-                steps: Some(&good_steps),
-                transcript_path: None,
-            });
-            assert!(
-                ok_good,
-                "`npm test` emitting Playwright visual artifact `{}` must pass: {}",
-                good_png.display(),
-                msg_good
-            );
-        }
-
-        // Round 3 #4/#7: Package-manager exec/dlx wrappers (`npm exec -- playwright test`, `pnpm exec playwright test`, `yarn exec playwright test`, `bun x playwright test`, `npm --prefix web exec -- playwright test`, `pnpm dlx playwright screenshot`) MUST be classified accurately, while wrapped `--version` / `echo` remain rejected.
-        assert_eq!(
-            classify_design_capture_cmd("npm exec -- playwright test"),
-            DesignCaptureCmdKind::GenericTestRunner
-        );
-        assert_eq!(
-            classify_design_capture_cmd("pnpm exec playwright test"),
-            DesignCaptureCmdKind::GenericTestRunner
-        );
-        assert_eq!(
-            classify_design_capture_cmd("yarn exec playwright test"),
-            DesignCaptureCmdKind::GenericTestRunner
-        );
-        assert_eq!(
-            classify_design_capture_cmd("bun x playwright test"),
-            DesignCaptureCmdKind::GenericTestRunner
-        );
-        assert_eq!(
-            classify_design_capture_cmd("npm --prefix web exec -- playwright test"),
-            DesignCaptureCmdKind::GenericTestRunner
-        );
-        assert_eq!(
-            classify_design_capture_cmd("pnpm dlx playwright screenshot http://localhost:3000 out.png"),
-            DesignCaptureCmdKind::DedicatedCapture
-        );
-        assert_eq!(
-            classify_design_capture_cmd("npm exec -- playwright --version"),
-            DesignCaptureCmdKind::None
-        );
-        assert_eq!(
-            classify_design_capture_cmd("pnpm exec playwright -v"),
-            DesignCaptureCmdKind::None
-        );
-        assert_eq!(
-            classify_design_capture_cmd("npm exec -- echo \"playwright screenshot out.png\""),
-            DesignCaptureCmdKind::None
-        );
-        let r3_shots_dir = shot_td.path.join("screenshots");
-        fs::create_dir_all(&r3_shots_dir).unwrap();
-        let r3_desktop_png = r3_shots_dir.join("desktop.png");
-        fs::write(&r3_desktop_png, b"\x89PNG\r\n\x1a\n").unwrap();
-        fs::write(&tr_avatar_png, b"\x89PNG\r\n\x1a\n").unwrap();
-        let r3_now_ts = now_sec();
-        let r3_launch_iso = crate::win32_sqlite::format_iso_utc(r3_now_ts - 1.0);
-        let r3_done_iso = crate::win32_sqlite::format_iso_utc(r3_now_ts + 2.0);
-        for wrap_cmd in ["npm exec -- playwright test", "pnpm exec playwright test"] {
-            let wrap_steps = vec![
-                json!({
-                    "type": "PLANNER_RESPONSE",
-                    "source": "MODEL",
-                    "created_at": r3_launch_iso,
-                    "tool_calls": [
-                        {"name": "run_command", "arguments": {"CommandLine": wrap_cmd}},
-                        {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Read-only visual review. Do not directly edit files."}},
-                        {"name": "read_board", "arguments": {"since": 0}}
-                    ]
-                }),
-                json!({"type": "GENERIC", "status": "DONE", "created_at": r3_done_iso, "content": format!("Saved screenshot to {}\nCommand exited with code 0", r3_desktop_png.to_string_lossy())}),
-                json!({"type": "GENERIC", "status": "DONE", "created_at": r3_done_iso, "content": "spawned"}),
-                json!({
-                    "type": "GENERIC",
-                    "status": "DONE",
-                    "created_at": r3_done_iso,
-                    "content": serde_json::to_string(&json!({
-                        "messages": [
-                            {"seq": 78, "agent": "visual-design-critic", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": r3_done_iso}
-                        ]
-                    })).unwrap()
-                }),
-            ];
-            let mut ctx_wrap = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
-            let (ok_wrap, msg_wrap) = validate_candidate_closure(CandidateClosureInput {
-                receipt: rcp_std.as_ref(),
-                marker_in: &post_edit_marker,
-                checks_ev: &checks_now_ok,
-                sub_ev: &sub_empty,
-                swarm_ev: &sw_empty,
-                codex_reviews: &[],
-                ctx: Some(&mut ctx_wrap),
-                steps: Some(&wrap_steps),
-                transcript_path: None,
-            });
-            assert!(ok_wrap, "`{}` saving confirmed screenshot must pass: {}", wrap_cmd, msg_wrap);
-        }
-
-        // Round 3/4 #4/#7: Package-manager exec/dlx wrappers with working-directory flags (`pnpm --dir web exec playwright test`, `npm --prefix web exec -- playwright test`, `cd web; npm test`) MUST resolve relative screenshot artifacts inside the subcommand's effective directory (`<repo>/web/...`) even when the file does not exist in repo root.
-        let mono_root = TempEnvDir::new("dg-r4-monorepo");
-        let web_pkg = mono_root.path.join("web");
-        let web_tr_dir = web_pkg.join("test-results").join("form-input");
-        fs::create_dir_all(&web_tr_dir).unwrap();
-        let web_actual_png = web_tr_dir.join("actual.png");
-        fs::write(&web_actual_png, b"\x89PNG\r\n\x1a\n").unwrap();
-        let r4_cwd_now_ts = now_sec();
-        let r4_cwd_launch_iso = crate::win32_sqlite::format_iso_utc(r4_cwd_now_ts - 1.0);
-        let r4_cwd_done_iso = crate::win32_sqlite::format_iso_utc(r4_cwd_now_ts + 2.0);
-        let mono_root_s = mono_root.path.to_string_lossy().into_owned();
-        for dir_cmd in [
-            "pnpm --dir web exec playwright test",
-            "pnpm -C web exec playwright test",
-            "npm --prefix web exec -- playwright test",
-            "yarn --cwd web exec playwright test",
-            "cd web; npm test",
-            "pnpm --dir admin exec playwright test; pnpm --dir web exec playwright test",
-            "cd admin; npm test; cd ../web; npm test",
-        ] {
-            let dir_steps = vec![
-                json!({
-                    "type": "PLANNER_RESPONSE",
-                    "source": "MODEL",
-                    "created_at": r4_cwd_launch_iso,
-                    "tool_calls": [
-                        {"name": "run_command", "arguments": {"CommandLine": dir_cmd, "Cwd": mono_root_s}},
-                        {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Read-only visual review. Do not directly edit files."}},
-                        {"name": "read_board", "arguments": {"since": 0}}
-                    ]
-                }),
-                json!({"type": "GENERIC", "status": "DONE", "created_at": r4_cwd_done_iso, "content": "Saved screenshot to test-results/form-input/actual.png\nCommand exited with code 0"}),
-                json!({"type": "GENERIC", "status": "DONE", "created_at": r4_cwd_done_iso, "content": "spawned"}),
-                json!({
-                    "type": "GENERIC",
-                    "status": "DONE",
-                    "created_at": r4_cwd_done_iso,
-                    "content": serde_json::to_string(&json!({
-                        "messages": [
-                            {"seq": 80, "agent": "visual-design-critic", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": r4_cwd_done_iso}
-                        ]
-                    })).unwrap()
-                }),
-            ];
-            let mut ctx_dir = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
-            let (ok_dir, msg_dir) = validate_candidate_closure(CandidateClosureInput {
-                receipt: rcp_std.as_ref(),
-                marker_in: &post_edit_marker,
-                checks_ev: &checks_now_ok,
-                sub_ev: &sub_empty,
-                swarm_ev: &sw_empty,
-                codex_reviews: &[],
-                ctx: Some(&mut ctx_dir),
-                steps: Some(&dir_steps),
-                transcript_path: None,
-            });
-            assert!(
-                ok_dir,
-                "`{}` resolving relative `test-results/form-input/actual.png` inside `web/` must pass: {}",
-                dir_cmd,
-                msg_dir
-            );
-        }
-
-        // Round 3/4 #5/#8: `npm test -- --output <png>` MUST require positive, non-negated capture confirmation bound to that exact file (rejecting `No screenshot was saved`, `Screenshot was not saved: desktop.png`, `0 screenshots captured`, path-less `Saved screenshot`, and unconfirmed non-visual files).
-        for (out_cmd, out_stdout, expect_ok, label) in [
-            (
-                format!("npm test -- --output {}", tr_avatar_png.to_string_lossy()),
-                "1 passed\nCommand exited with code 0".to_string(),
-                false,
-                "npm test -- --output avatar.png without capture confirmation",
-            ),
-            (
-                format!("npm test -- --output {}", tr_avatar_png.to_string_lossy()),
-                format!("Saved screenshot for header\nCreated upload sample {}\nCommand exited with code 0", tr_avatar_png.to_string_lossy()),
-                false,
-                "npm test -- --output avatar.png with unrelated screenshot line and non-visual upload log",
-            ),
-            (
-                format!("npm test -- --output {}", r3_desktop_png.to_string_lossy()),
-                "1 passed\nCommand exited with code 0".to_string(),
-                false,
-                "npm test -- --output screenshots/desktop.png without capture log",
-            ),
-            (
-                format!("npm test -- --output {}", r3_desktop_png.to_string_lossy()),
-                "No screenshot was saved\nCommand exited with code 0".to_string(),
-                false,
-                "npm test -- --output screenshots/desktop.png with negated 'No screenshot was saved'",
-            ),
-            (
-                format!("npm test -- --output {}", r3_desktop_png.to_string_lossy()),
-                format!("No screenshot was saved: {}\nCommand exited with code 0", r3_desktop_png.to_string_lossy()),
-                false,
-                "npm test -- --output screenshots/desktop.png with negated path line",
-            ),
-            (
-                format!("npm test -- --output {}", r3_desktop_png.to_string_lossy()),
-                "Screenshot was not saved: desktop.png\nCommand exited with code 0".to_string(),
-                false,
-                "npm test -- --output screenshots/desktop.png with 'Screenshot was not saved'",
-            ),
-            (
-                format!("npm test -- --output {}", r3_desktop_png.to_string_lossy()),
-                "Saved screenshot\nCommand exited with code 0".to_string(),
-                false,
-                "npm test -- --output screenshots/desktop.png with path-less 'Saved screenshot' must require file-bound confirmation",
-            ),
-            (
-                format!("npm test -- --output {}", tr_avatar_png.to_string_lossy()),
-                "Saved screenshot: avatar.png\nCommand exited with code 0".to_string(),
-                true,
-                "npm test -- --output avatar.png with positive per-file screenshot confirmation",
-            ),
-            (
-                format!("npm test -- --output {}", r3_desktop_png.to_string_lossy()),
-                "Saved screenshot: desktop.png\nCommand exited with code 0".to_string(),
-                true,
-                "npm test -- --output screenshots/desktop.png with positive per-file screenshot confirmation",
-            ),
-        ] {
-            let out_steps = vec![
-                json!({
-                    "type": "PLANNER_RESPONSE",
-                    "source": "MODEL",
-                    "created_at": r3_launch_iso,
-                    "tool_calls": [
-                        {"name": "run_command", "arguments": {"CommandLine": out_cmd}},
-                        {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Read-only visual review. Do not directly edit files."}},
-                        {"name": "read_board", "arguments": {"since": 0}}
-                    ]
-                }),
-                json!({"type": "GENERIC", "status": "DONE", "created_at": r3_done_iso, "content": out_stdout}),
-                json!({"type": "GENERIC", "status": "DONE", "created_at": r3_done_iso, "content": "spawned"}),
-                json!({
-                    "type": "GENERIC",
-                    "status": "DONE",
-                    "created_at": r3_done_iso,
-                    "content": serde_json::to_string(&json!({
-                        "messages": [
-                            {"seq": 79, "agent": "visual-design-critic", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": r3_done_iso}
-                        ]
-                    })).unwrap()
-                }),
-            ];
-            let mut ctx_out = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
-            let (ok_out, msg_out) = validate_candidate_closure(CandidateClosureInput {
-                receipt: rcp_std.as_ref(),
-                marker_in: &post_edit_marker,
-                checks_ev: &checks_now_ok,
-                sub_ev: &sub_empty,
-                swarm_ev: &sw_empty,
-                codex_reviews: &[],
-                ctx: Some(&mut ctx_out),
-                steps: Some(&out_steps),
-                transcript_path: None,
-            });
-            assert_eq!(ok_out, expect_ok, "{}: {}", label, msg_out);
-        }
-
-        // Closure Pass 1/2 #3/#8: Localized UTF-8 (Cyrillic) `--output screenshots/Главная.png` compared against `Saved screenshot: screenshots/Мобильная-Главная.png` must NEVER panic on UTF-8 char boundaries and must reject non-matching filenames while accepting exact matches.
-        let cyr_main_png = r3_shots_dir.join("Главная.png");
-        fs::write(&cyr_main_png, b"\x89PNG\r\n\x1a\n").unwrap();
-        let shot_td_s = shot_td.path.to_string_lossy().into_owned();
-        assert!(
-            !output_target_confirmed_in_stdout(
-                "Saved screenshot: screenshots/Мобильная-Главная.png",
-                "screenshots/Главная.png",
-                &shot_td_s
-            ),
-            "partial Cyrillic suffix match (`Мобильная-Главная.png` vs `Главная.png`) must return false without UTF-8 panic"
-        );
-        assert!(
-            !output_target_confirmed_in_stdout(
-                "Saved screenshot: other/Главная.png",
-                "screenshots/Главная.png",
-                &shot_td_s
-            ),
-            "different directory `other/Главная.png` must not match `screenshots/Главная.png`"
-        );
-        assert!(
-            output_target_confirmed_in_stdout(
-                "Saved screenshot: screenshots/Главная.png",
-                "screenshots/Главная.png",
-                &shot_td_s
-            ),
-            "exact localized relative path `screenshots/Главная.png` must match"
-        );
-        assert!(
-            output_target_confirmed_in_stdout(
-                "Saved screenshot: Главная.png",
-                "screenshots/Главная.png",
-                &shot_td_s
-            ),
-            "exact bare localized filename `Главная.png` must match"
-        );
-
-        // Closure Pass 2/2 #3/#8: Paths in Windows/POSIX directories containing spaces (`Client Portal/screenshots/desktop.png`, `"screenshots/my shot.png"`) MUST extract intact and match relative `--output`, while a different spaced directory (`Other Portal`) MUST still fail.
-        let spaced_root = TempEnvDir::new("dg-spaced");
-        let client_portal = spaced_root.path.join("Client Portal");
-        let client_shots = client_portal.join("screenshots");
-        fs::create_dir_all(&client_shots).unwrap();
-        let client_desktop_png = client_shots.join("desktop.png");
-        fs::write(&client_desktop_png, b"\x89PNG\r\n\x1a\n").unwrap();
-        let client_portal_s = client_portal.to_string_lossy().into_owned();
-        let client_desktop_fwd = client_desktop_png.to_string_lossy().replace('\\', "/");
-        assert!(
-            output_target_confirmed_in_stdout(
-                &format!("Saved screenshot: {}", client_desktop_fwd),
-                "screenshots/desktop.png",
-                &client_portal_s
-            ),
-            "Windows path with spaces (`{}`) must confirm relative `--output screenshots/desktop.png`",
-            client_desktop_fwd
-        );
-        assert!(
-            !output_target_confirmed_in_stdout(
-                "Saved screenshot: C:/work/Other Portal/screenshots/desktop.png",
-                "screenshots/desktop.png",
-                "C:/work/Client Portal"
-            ),
-            "different spaced directory `Other Portal` must NOT confirm `Client Portal` target"
-        );
-        assert!(
-            output_target_confirmed_in_stdout(
-                "Saved screenshot: /Users/Jane Doe/Client Portal/screenshots/desktop.png",
-                "screenshots/desktop.png",
-                "/Users/Jane Doe/Client Portal"
-            ),
-            "POSIX path with spaces after delimiter must confirm relative `--output screenshots/desktop.png`"
-        );
-        let sp_now = now_sec();
-        let sp_launch_iso = crate::win32_sqlite::format_iso_utc(sp_now - 1.0);
-        let sp_done_iso = crate::win32_sqlite::format_iso_utc(sp_now + 2.0);
-        let sp_steps = vec![
-            json!({
-                "type": "PLANNER_RESPONSE",
-                "source": "MODEL",
-                "created_at": sp_launch_iso,
-                "tool_calls": [
-                    {"name": "run_command", "arguments": {"CommandLine": "npm test -- --output screenshots/desktop.png", "Cwd": client_portal_s}},
-                    {"name": "swarm", "arguments": {"action": "add", "name": "visual-design-critic", "workspace": "inherit", "brief": "Read-only visual review. Do not directly edit files."}},
-                    {"name": "read_board", "arguments": {"since": 0}}
-                ]
-            }),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": sp_done_iso, "content": format!("Saved screenshot: {}\nCommand exited with code 0", client_desktop_fwd)}),
-            json!({"type": "GENERIC", "status": "DONE", "created_at": sp_done_iso, "content": "spawned"}),
-            json!({
-                "type": "GENERIC",
-                "status": "DONE",
-                "created_at": sp_done_iso,
-                "content": serde_json::to_string(&json!({
-                    "messages": [
-                        {"seq": 81, "agent": "visual-design-critic", "text": "VISUAL_REVIEW_VERDICT: APPROVED", "time": sp_done_iso}
-                    ]
-                })).unwrap()
-            }),
-        ];
-        let mut ctx_sp = mk_ctx(vec!["panel/src/components/ConnectionSelector.tsx"], None);
-        let (ok_sp, msg_sp) = validate_candidate_closure(CandidateClosureInput {
-            receipt: rcp_std.as_ref(),
-            marker_in: &post_edit_marker,
-            checks_ev: &checks_now_ok,
-            sub_ev: &sub_empty,
-            swarm_ev: &sw_empty,
-            codex_reviews: &[],
-            ctx: Some(&mut ctx_sp),
-            steps: Some(&sp_steps),
-            transcript_path: None,
-        });
-        assert!(
-            ok_sp,
-            "npm test -- --output screenshots/desktop.png inside spaced Windows dir `{}` must pass end-to-end: {}",
-            client_portal_s,
-            msg_sp
         );
     }
 
