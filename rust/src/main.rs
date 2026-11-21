@@ -19,6 +19,7 @@ pub mod stack_doctor;
 pub mod swarm_cache;
 pub mod swarm_ctl;
 pub mod tokenade_hook;
+pub mod tsx_ast;
 pub mod win32_sqlite;
 pub mod worktree_guard;
 

@@ -3855,6 +3855,87 @@ pub fn enforcement_state_path(session: &str) -> PathBuf {
     gate_subdir(&["states"]).join(format!("{}.json", session))
 }
 
+pub fn pending_visual_edits_path(session: &str) -> PathBuf {
+    gate_subdir(&["visual-pending"]).join(format!("{}.json", rio::safe_key(session, "default")))
+}
+
+fn pending_visual_edits_lock_path(session: &str) -> PathBuf {
+    gate_subdir(&["visual-pending"]).join(format!("{}.lock", rio::safe_key(session, "default")))
+}
+
+pub fn record_pending_visual_edit(session: &str, call_key: &str, raw_path: &str) {
+    // INVARIANT: Persist PreToolUse Oxc AST visual-edit facts in a dedicated per-session locked file (`gate/visual-pending/<session>.json`) isolated from `Stop`'s enforcement-state rewrites, aborting if the lock cannot be acquired (never writing unlocked).
+    if session.trim().is_empty() || call_key.trim().is_empty() || raw_path.trim().is_empty() {
+        return;
+    }
+    let norm = rio::normalize_path(raw_path);
+    if norm.is_empty() {
+        return;
+    }
+    let pfile = pending_visual_edits_path(session);
+    rio::with_file_lock(&pending_visual_edits_lock_path(session), 3.0, 15.0, |locked| {
+        if !locked {
+            return;
+        }
+        let mut map = match rio::read_json(&pfile) {
+            Some(Value::Object(m)) => m,
+            _ => Map::new(),
+        };
+        while map.len() >= 32 {
+            let Some(oldest_k) = map
+                .iter()
+                .min_by(|a, b| {
+                    val_to_f64(a.1.get("ts")).total_cmp(&val_to_f64(b.1.get("ts")))
+                })
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            map.remove(&oldest_k);
+        }
+        map.insert(
+            call_key.to_string(),
+            json!({ "path": norm, "ts": now_sec() }),
+        );
+        let _ = rio::write_json(&pfile, &Value::Object(map));
+    });
+}
+
+pub fn take_pending_visual_edit(session: &str, call_key: &str) -> Option<String> {
+    if session.trim().is_empty() || call_key.trim().is_empty() {
+        return None;
+    }
+    let pfile = pending_visual_edits_path(session);
+    if !pfile.is_file() {
+        return None;
+    }
+    rio::with_file_lock(&pending_visual_edits_lock_path(session), 3.0, 15.0, |locked| {
+        if !locked {
+            return None;
+        }
+        let Some(Value::Object(mut map)) = rio::read_json(&pfile) else {
+            return None;
+        };
+        let popped = map
+            .remove(call_key)
+            .and_then(|v| {
+                v.get("path")
+                    .and_then(Value::as_str)
+                    .or_else(|| v.as_str())
+                    .map(str::to_string)
+            })
+            .filter(|s| !s.is_empty());
+        if popped.is_some() {
+            if map.is_empty() {
+                let _ = fs::remove_file(&pfile);
+            } else {
+                let _ = rio::write_json(&pfile, &Value::Object(map));
+            }
+        }
+        popped
+    })
+}
+
 pub fn checks_ledger_path(session: &str) -> PathBuf {
     gate_subdir(&["checks"]).join(format!("{}.jsonl", session))
 }
@@ -5372,1094 +5453,6 @@ pub fn format_last_basenames(paths: &[String], limit: usize) -> String {
         .join(", ")
 }
 
-fn skip_balanced_ts_generics(b: &[u8], start: usize) -> Option<usize> {
-    if b.get(start) != Some(&b'<') {
-        return None;
-    }
-    let mut i = start + 1;
-    let mut depth = 1usize;
-    while i < b.len() {
-        match b[i] {
-            b'\'' | b'"' => {
-                let q = b[i];
-                i += 1;
-                while i < b.len() {
-                    if b[i] == b'\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if b[i] == q {
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            b'<' => {
-                depth += 1;
-                i += 1;
-            }
-            b'>' => {
-                depth -= 1;
-                i += 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            b';' => return None,
-            _ => i += 1,
-        }
-    }
-    None
-}
-
-fn is_jsx_tag_start(ch: u8) -> bool {
-    ch.is_ascii_alphabetic() || ch == b'_' || ch == b'$'
-}
-
-fn is_jsx_tag_char(ch: u8) -> bool {
-    ch.is_ascii_alphanumeric() || matches!(ch, b'_' | b'$' | b'.' | b':' | b'-')
-}
-
-fn parse_jsx_closing_tag(b: &[u8], lt_pos: usize) -> Option<(&[u8], usize)> {
-    if b.get(lt_pos) != Some(&b'<') || b.get(lt_pos + 1) != Some(&b'/') {
-        return None;
-    }
-    let mut i = lt_pos + 2;
-    if i >= b.len() {
-        return None;
-    }
-    if b[i] == b'>' {
-        return Some((&b[i..i], i + 1));
-    }
-    if !is_jsx_tag_start(b[i]) {
-        return None;
-    }
-    let name_start = i;
-    while i < b.len() && is_jsx_tag_char(b[i]) {
-        i += 1;
-    }
-    let name = &b[name_start..i];
-    while i < b.len() && b[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    if b.get(i) == Some(&b'>') {
-        Some((name, i + 1))
-    } else {
-        None
-    }
-}
-
-fn try_match_jsx_closing_tag(b: &[u8], lt_pos: usize) -> bool {
-    parse_jsx_closing_tag(b, lt_pos).is_some()
-}
-
-enum JsxOpenTag<'a> {
-    SelfClosing(usize),
-    Opening { name: &'a [u8], after_gt: usize },
-}
-
-fn try_parse_jsx_opening_tag(b: &[u8], lt_pos: usize) -> Option<JsxOpenTag<'_>> {
-    if b.get(lt_pos) != Some(&b'<') {
-        return None;
-    }
-    if b.get(lt_pos + 1) == Some(&b'>') {
-        return Some(JsxOpenTag::Opening {
-            name: &b[lt_pos..lt_pos],
-            after_gt: lt_pos + 2,
-        });
-    }
-    let mut i = lt_pos + 1;
-    if i >= b.len() || !is_jsx_tag_start(b[i]) {
-        return None;
-    }
-    let name_start = i;
-    while i < b.len() && is_jsx_tag_char(b[i]) {
-        i += 1;
-    }
-    let name = &b[name_start..i];
-    let mut ws_after_name = false;
-    while i < b.len() && b[i].is_ascii_whitespace() {
-        ws_after_name = true;
-        i += 1;
-    }
-    if i >= b.len() {
-        return None;
-    }
-    // INVARIANT: Reject TypeScript generic parameter lists (`<T,>`, `<T extends X>`, `<T = Default>`) before scanning JSX attributes.
-    if b[i] == b',' || b[i] == b'=' {
-        return None;
-    }
-    if ws_after_name && b[i..].starts_with(b"extends") {
-        let after_ext = b.get(i + 7).copied().unwrap_or(b' ');
-        if !after_ext.is_ascii_alphanumeric() && after_ext != b'_' {
-            return None;
-        }
-    }
-    if b[i] == b'<' {
-        let after_gen = skip_balanced_ts_generics(b, i)?;
-        i = after_gen;
-        ws_after_name = false;
-        while i < b.len() && b[i].is_ascii_whitespace() {
-            ws_after_name = true;
-            i += 1;
-        }
-        if i >= b.len() {
-            return None;
-        }
-    }
-    if b[i] == b'/' && b.get(i + 1) == Some(&b'>') {
-        return Some(JsxOpenTag::SelfClosing(i + 2));
-    }
-    if b[i] == b'>' {
-        return Some(JsxOpenTag::Opening {
-            name,
-            after_gt: i + 1,
-        });
-    }
-    if !ws_after_name {
-        return None;
-    }
-    let mut brace_depth = 0usize;
-    while i < b.len() {
-        match b[i] {
-            b'\'' | b'"' => {
-                let q = b[i];
-                i += 1;
-                while i < b.len() {
-                    if b[i] == b'\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if b[i] == q {
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            b'`' if brace_depth > 0 => {
-                i += 1;
-                while i < b.len() {
-                    if b[i] == b'\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if b[i] == b'`' {
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            b'/' if brace_depth > 0 && b.get(i + 1) == Some(&b'/') => {
-                i += 2;
-                while i < b.len() && b[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if brace_depth > 0 && b.get(i + 1) == Some(&b'*') => {
-                i += 2;
-                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
-                    i += 1;
-                }
-                i = (i + 2).min(b.len());
-            }
-            b'{' => {
-                brace_depth += 1;
-                i += 1;
-            }
-            b'}' => {
-                if brace_depth == 0 {
-                    return None;
-                }
-                brace_depth -= 1;
-                i += 1;
-            }
-            b'/' if brace_depth == 0 && b.get(i + 1) == Some(&b'>') => {
-                return Some(JsxOpenTag::SelfClosing(i + 2));
-            }
-            b'>' if brace_depth == 0 => {
-                return Some(JsxOpenTag::Opening {
-                    name,
-                    after_gt: i + 1,
-                });
-            }
-            b';' if brace_depth == 0 => return None,
-            b'&' if brace_depth == 0 && b.get(i + 1) == Some(&b'&') => return None,
-            b'|' if brace_depth == 0 && b.get(i + 1) == Some(&b'|') => return None,
-            b'=' if brace_depth == 0 && b.get(i + 1) == Some(&b'>') => return None,
-            _ => i += 1,
-        }
-    }
-    None
-}
-
-fn skip_jsx_expr_container(b: &[u8], lbrace_pos: usize, depth: usize) -> Option<usize> {
-    if depth >= 16 || b.get(lbrace_pos) != Some(&b'{') {
-        return None;
-    }
-    let mut i = lbrace_pos + 1;
-    let mut braces = 1usize;
-    let mut prev_can_precede_jsx = true;
-    let mut tpl_stack: Vec<usize> = Vec::new();
-    while i < b.len() {
-        let c = b[i];
-        if c.is_ascii_whitespace() {
-            i += 1;
-            continue;
-        }
-        if c == b'/' && b.get(i + 1) == Some(&b'/') {
-            i += 2;
-            while i < b.len() && b[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if c == b'/' && b.get(i + 1) == Some(&b'*') {
-            i += 2;
-            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
-                i += 1;
-            }
-            i = (i + 2).min(b.len());
-            continue;
-        }
-        if c == b'\'' || c == b'"' {
-            i += 1;
-            while i < b.len() {
-                if b[i] == b'\\' {
-                    i += 2;
-                    continue;
-                }
-                if b[i] == c {
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            prev_can_precede_jsx = false;
-            continue;
-        }
-        if c == b'`' {
-            i += 1;
-            while i < b.len() {
-                if b[i] == b'\\' {
-                    i += 2;
-                    continue;
-                }
-                if b[i] == b'$' && b.get(i + 1) == Some(&b'{') {
-                    tpl_stack.push(braces);
-                    braces += 1;
-                    i += 2;
-                    prev_can_precede_jsx = true;
-                    break;
-                }
-                if b[i] == b'`' {
-                    i += 1;
-                    prev_can_precede_jsx = false;
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        if c == b'/' && prev_can_precede_jsx {
-            i += 1;
-            let mut in_class = false;
-            while i < b.len() && b[i] != b'\n' {
-                if b[i] == b'\\' {
-                    i += 2;
-                    continue;
-                }
-                if b[i] == b'[' {
-                    in_class = true;
-                } else if b[i] == b']' {
-                    in_class = false;
-                } else if b[i] == b'/' && !in_class {
-                    i += 1;
-                    while i < b.len() && b[i].is_ascii_alphabetic() {
-                        i += 1;
-                    }
-                    break;
-                }
-                i += 1;
-            }
-            prev_can_precede_jsx = false;
-            continue;
-        }
-        if c == b'{' {
-            braces += 1;
-            prev_can_precede_jsx = true;
-            i += 1;
-            continue;
-        }
-        if c == b'}' {
-            braces -= 1;
-            if braces == 0 {
-                return Some(i + 1);
-            }
-            if tpl_stack.last().copied() == Some(braces) {
-                tpl_stack.pop();
-                i += 1;
-                while i < b.len() {
-                    if b[i] == b'\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if b[i] == b'$' && b.get(i + 1) == Some(&b'{') {
-                        tpl_stack.push(braces);
-                        braces += 1;
-                        i += 2;
-                        prev_can_precede_jsx = true;
-                        break;
-                    }
-                    if b[i] == b'`' {
-                        i += 1;
-                        prev_can_precede_jsx = false;
-                        break;
-                    }
-                    i += 1;
-                }
-                continue;
-            }
-            prev_can_precede_jsx = false;
-            i += 1;
-            continue;
-        }
-        if c == b'<' && prev_can_precede_jsx {
-            if let Some(end) = skip_jsx_element(b, i, depth + 1) {
-                i = end;
-                prev_can_precede_jsx = false;
-                continue;
-            }
-            prev_can_precede_jsx = true;
-            i += 1;
-            continue;
-        }
-        if c.is_ascii_alphabetic() || c == b'_' || c == b'$' {
-            let start = i;
-            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$') {
-                i += 1;
-            }
-            let w = &b[start..i];
-            prev_can_precede_jsx = matches!(
-                w,
-                b"return" | b"yield" | b"await" | b"throw" | b"case" | b"default" | b"else" | b"do" | b"of" | b"in"
-            );
-            continue;
-        }
-        if c.is_ascii_digit() {
-            while i < b.len() && (b[i].is_ascii_alphanumeric() || matches!(b[i], b'.' | b'_')) {
-                i += 1;
-            }
-            prev_can_precede_jsx = false;
-            continue;
-        }
-        if c == b'=' && b.get(i + 1) == Some(&b'>') {
-            prev_can_precede_jsx = true;
-            i += 2;
-            continue;
-        }
-        prev_can_precede_jsx = !matches!(c, b')' | b']');
-        i += 1;
-    }
-    None
-}
-
-fn js_line_terminator_len_at(b: &[u8], i: usize) -> usize {
-    match b.get(i) {
-        Some(&b'\n') | Some(&b'\r') => 1,
-        Some(&0xE2)
-            if b.get(i + 1) == Some(&0x80)
-                && matches!(b.get(i + 2), Some(&0xA8) | Some(&0xA9)) =>
-        {
-            3
-        }
-        _ => 0,
-    }
-}
-
-fn slice_has_js_line_terminator(slice: &[u8]) -> bool {
-    let mut k = 0usize;
-    while k < slice.len() {
-        let lt = js_line_terminator_len_at(slice, k);
-        if lt > 0 {
-            return true;
-        }
-        k += 1;
-    }
-    false
-}
-
-fn skip_js_comment(b: &[u8], i: usize) -> Option<(usize, bool)> {
-    if b.get(i) != Some(&b'/') {
-        return None;
-    }
-    match b.get(i + 1) {
-        Some(&b'/') => {
-            let mut j = i + 2;
-            while j < b.len() && js_line_terminator_len_at(b, j) == 0 {
-                j += 1;
-            }
-            Some((j, false))
-        }
-        Some(&b'*') => {
-            let mut j = i + 2;
-            while j + 1 < b.len() && !(b[j] == b'*' && b[j + 1] == b'/') {
-                j += 1;
-            }
-            let body_end = j.min(b.len());
-            let had_lt = slice_has_js_line_terminator(&b[i + 2..body_end]);
-            Some(((j + 2).min(b.len()), had_lt))
-        }
-        _ => None,
-    }
-}
-
-fn skip_ts_same_line_ws_and_comments(b: &[u8], mut i: usize) -> Option<usize> {
-    // INVARIANT: TypeScript enforces `[no LineTerminator here]` after contextual `interface`/`type` keywords; multi-line comments containing a line terminator (`/*\n*/`) violate this and abort type-declaration skipping.
-    while i < b.len() {
-        if matches!(b[i], b' ' | b'\t') {
-            i += 1;
-            continue;
-        }
-        if let Some((next_i, had_lt)) = skip_js_comment(b, i) {
-            if had_lt || b.get(i + 1) == Some(&b'/') {
-                return None;
-            }
-            i = next_i;
-            continue;
-        }
-        break;
-    }
-    Some(i)
-}
-
-fn scan_js_ident_end(b: &[u8], mut i: usize) -> usize {
-    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$') {
-        i += 1;
-    }
-    i
-}
-
-fn skip_js_string_or_template(b: &[u8], start: usize) -> usize {
-    skip_js_string_or_template_depth(b, start, 0)
-}
-
-fn skip_js_string_or_template_depth(b: &[u8], start: usize, depth: usize) -> usize {
-    let q = b[start];
-    let mut i = start + 1;
-    while i < b.len() {
-        if b[i] == b'\\' {
-            i += 2;
-            continue;
-        }
-        if q == b'`' && depth < 16 && b[i] == b'$' && b.get(i + 1) == Some(&b'{') {
-            i += 2;
-            let mut braces = 1usize;
-            while i < b.len() && braces > 0 {
-                let c = b[i];
-                if matches!(c, b'\'' | b'"' | b'`') {
-                    i = skip_js_string_or_template_depth(b, i, depth + 1);
-                    continue;
-                }
-                if let Some((next_i, _)) = skip_js_comment(b, i) {
-                    i = next_i;
-                    continue;
-                }
-                if c == b'{' {
-                    braces += 1;
-                } else if c == b'}' {
-                    braces -= 1;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        if b[i] == q {
-            return i + 1;
-        }
-        i += 1;
-    }
-    b.len()
-}
-
-fn looks_like_ts_generic_call_sig(b: &[u8], after_gt: usize) -> bool {
-    let mut i = after_gt;
-    while i < b.len() && b[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    if b.get(i) != Some(&b'(') {
-        return false;
-    }
-    i += 1;
-    let mut paren_depth = 1usize;
-    let mut brace_depth = 0usize;
-    let mut bracket_depth = 0usize;
-    let mut saw_param_colon = false;
-    let mut saw_non_ws = false;
-    while i < b.len() && paren_depth > 0 {
-        let c = b[i];
-        if let Some((next_i, _)) = skip_js_comment(b, i) {
-            i = next_i;
-            continue;
-        }
-        if matches!(c, b'\'' | b'"' | b'`') {
-            saw_non_ws = true;
-            i = skip_js_string_or_template(b, i);
-            continue;
-        }
-        if !c.is_ascii_whitespace() && c != b')' {
-            saw_non_ws = true;
-        }
-        match c {
-            b'(' => paren_depth += 1,
-            b')' => paren_depth -= 1,
-            b'{' => brace_depth += 1,
-            b'}' => brace_depth = brace_depth.saturating_sub(1),
-            b'[' => bracket_depth += 1,
-            b']' => bracket_depth = bracket_depth.saturating_sub(1),
-            b':' if paren_depth == 1 && brace_depth == 0 && bracket_depth == 0 => {
-                saw_param_colon = true;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    if paren_depth != 0 {
-        return false;
-    }
-    while i < b.len() && b[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    if b.get(i) == Some(&b'=') && b.get(i + 1) == Some(&b'>') {
-        return true;
-    }
-    b.get(i) == Some(&b':') && (saw_param_colon || !saw_non_ws)
-}
-
-fn skip_ts_interface_decl(b: &[u8], after_kw: usize) -> Option<usize> {
-    let mut i = skip_ts_same_line_ws_and_comments(b, after_kw)?;
-    if i >= b.len() || !is_jsx_tag_start(b[i]) {
-        return None;
-    }
-    i = scan_js_ident_end(b, i);
-    while i < b.len() {
-        let c = b[i];
-        if let Some((next_i, _)) = skip_js_comment(b, i) {
-            i = next_i;
-            continue;
-        }
-        if matches!(c, b'\'' | b'"' | b'`') {
-            i = skip_js_string_or_template(b, i);
-            continue;
-        }
-        if c == b';' {
-            return None;
-        }
-        if c == b'{' {
-            let mut depth = 1usize;
-            i += 1;
-            while i < b.len() && depth > 0 {
-                let ch = b[i];
-                if let Some((next_i, _)) = skip_js_comment(b, i) {
-                    i = next_i;
-                    continue;
-                }
-                if matches!(ch, b'\'' | b'"' | b'`') {
-                    i = skip_js_string_or_template(b, i);
-                    continue;
-                }
-                if ch == b'{' {
-                    depth += 1;
-                } else if ch == b'}' {
-                    depth -= 1;
-                }
-                i += 1;
-            }
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
-fn peek_next_non_ws_comment(b: &[u8], mut i: usize) -> usize {
-    while i < b.len() {
-        if b[i].is_ascii_whitespace() {
-            i += 1;
-            continue;
-        }
-        let lt = js_line_terminator_len_at(b, i);
-        if lt > 0 {
-            i += lt;
-            continue;
-        }
-        if let Some((next_i, _)) = skip_js_comment(b, i) {
-            i = next_i;
-            continue;
-        }
-        break;
-    }
-    i
-}
-
-fn is_ts_type_continuation_at(b: &[u8], pos: usize) -> bool {
-    let Some(&ch) = b.get(pos) else {
-        return false;
-    };
-    if matches!(ch, b'|' | b'&' | b'?' | b':' | b'.') {
-        return true;
-    }
-    if ch == b'=' && b.get(pos + 1) == Some(&b'>') {
-        return true;
-    }
-    if ch == b'[' {
-        // INVARIANT: Treat `[` on a new line as an array-type continuation only for `[]` so subsequent array-literal statements like `[1, 2].map(...)` are never swallowed.
-        let mut j = pos + 1;
-        while j < b.len() && matches!(b[j], b' ' | b'\t') {
-            j += 1;
-        }
-        return b.get(j) == Some(&b']');
-    }
-    if ch.is_ascii_alphabetic() {
-        let end = scan_js_ident_end(b, pos);
-        return matches!(&b[pos..end], b"extends" | b"is" | b"in");
-    }
-    false
-}
-
-fn skip_ts_type_alias_decl(b: &[u8], after_kw: usize) -> Option<usize> {
-    let mut i = skip_ts_same_line_ws_and_comments(b, after_kw)?;
-    if i >= b.len() || !is_jsx_tag_start(b[i]) {
-        return None;
-    }
-    i = scan_js_ident_end(b, i);
-    i = peek_next_non_ws_comment(b, i);
-    if i < b.len() && b[i] == b'<' {
-        i = skip_balanced_ts_generics(b, i)?;
-        i = peek_next_non_ws_comment(b, i);
-    }
-    if b.get(i) != Some(&b'=') || b.get(i + 1) == Some(&b'=') || b.get(i + 1) == Some(&b'>') {
-        return None;
-    }
-    i += 1;
-    // INVARIANT: Track TypeScript type-expression completeness (`expecting_type_operand`) at nesting depth 0 so ASI terminates the type alias at any line terminator (including `\n`, `\r`, U+2028/U+2029, or multi-line `/*\n*/` comments) after a complete type atom unless the next non-comment token is an actual TypeScript type continuation (`|`, `&`, `?`, `:`, `=>`, `.`, `[]`, `extends`, `is`, `in`), never swallowing subsequent statements like `root.render(<App />)` or `export const View = () => <div />`.
-    let mut brace_d = 0usize;
-    let mut paren_d = 0usize;
-    let mut brack_d = 0usize;
-    let mut angle_d = 0usize;
-    let mut expecting_type_operand = true;
-    while i < b.len() {
-        let c = b[i];
-        let at_top = brace_d == 0 && paren_d == 0 && brack_d == 0 && angle_d == 0;
-        if let Some((next_i, had_lt)) = skip_js_comment(b, i) {
-            if at_top && had_lt && !expecting_type_operand {
-                let next_pos = peek_next_non_ws_comment(b, next_i);
-                if next_pos >= b.len() || !is_ts_type_continuation_at(b, next_pos) {
-                    return Some(next_pos);
-                }
-                i = next_pos;
-                continue;
-            }
-            i = next_i;
-            continue;
-        }
-        if at_top {
-            let lt_len = js_line_terminator_len_at(b, i);
-            if lt_len > 0 {
-                if !expecting_type_operand {
-                    let next_pos = peek_next_non_ws_comment(b, i + lt_len);
-                    if next_pos >= b.len() || !is_ts_type_continuation_at(b, next_pos) {
-                        return Some(next_pos);
-                    }
-                    i = next_pos;
-                    continue;
-                }
-                i += lt_len;
-                continue;
-            }
-        }
-        if matches!(c, b'\'' | b'"' | b'`') {
-            i = skip_js_string_or_template(b, i);
-            if at_top {
-                expecting_type_operand = false;
-            }
-            continue;
-        }
-        if c == b'=' && b.get(i + 1) == Some(&b'>') {
-            if at_top {
-                expecting_type_operand = true;
-            }
-            i += 2;
-            continue;
-        }
-        match c {
-            b'{' => {
-                brace_d += 1;
-                i += 1;
-            }
-            b'}' => {
-                if brace_d == 0 {
-                    return Some(i);
-                }
-                brace_d -= 1;
-                if brace_d == 0 && paren_d == 0 && brack_d == 0 && angle_d == 0 {
-                    expecting_type_operand = false;
-                }
-                i += 1;
-            }
-            b'(' => {
-                paren_d += 1;
-                i += 1;
-            }
-            b')' => {
-                paren_d = paren_d.saturating_sub(1);
-                if brace_d == 0 && paren_d == 0 && brack_d == 0 && angle_d == 0 {
-                    expecting_type_operand = false;
-                }
-                i += 1;
-            }
-            b'[' => {
-                brack_d += 1;
-                i += 1;
-            }
-            b']' => {
-                brack_d = brack_d.saturating_sub(1);
-                if brace_d == 0 && paren_d == 0 && brack_d == 0 && angle_d == 0 {
-                    expecting_type_operand = false;
-                }
-                i += 1;
-            }
-            b'<' => {
-                angle_d += 1;
-                i += 1;
-            }
-            b'>' => {
-                angle_d = angle_d.saturating_sub(1);
-                if brace_d == 0 && paren_d == 0 && brack_d == 0 && angle_d == 0 {
-                    expecting_type_operand = false;
-                }
-                i += 1;
-            }
-            b';' if at_top => {
-                return Some(i + 1);
-            }
-            b'|' | b'&' | b'?' | b':' | b'.' | b'+' | b'-' if at_top => {
-                expecting_type_operand = true;
-                i += 1;
-            }
-            _ if at_top && is_jsx_tag_start(c) => {
-                let start = i;
-                i = scan_js_ident_end(b, i);
-                expecting_type_operand = matches!(
-                    &b[start..i],
-                    b"keyof"
-                        | b"typeof"
-                        | b"readonly"
-                        | b"unique"
-                        | b"infer"
-                        | b"new"
-                        | b"abstract"
-                        | b"asserts"
-                        | b"extends"
-                        | b"is"
-                        | b"in"
-                );
-            }
-            _ if at_top && c.is_ascii_digit() => {
-                while i < b.len() && (b[i].is_ascii_alphanumeric() || matches!(b[i], b'.' | b'_'))
-                {
-                    i += 1;
-                }
-                expecting_type_operand = false;
-            }
-            _ => i += 1,
-        }
-    }
-    Some(i)
-}
-
-fn skip_jsx_element(b: &[u8], lt_pos: usize, depth: usize) -> Option<usize> {
-    if depth >= 16 {
-        return None;
-    }
-    match try_parse_jsx_opening_tag(b, lt_pos)? {
-        JsxOpenTag::SelfClosing(end) => Some(end),
-        JsxOpenTag::Opening { name, after_gt } => {
-            if depth == 0 && !name.is_empty() && looks_like_ts_generic_call_sig(b, after_gt) {
-                return None;
-            }
-            // INVARIANT: Inside JSXText children, quotes (`'`, `"`) are literal text (so `<p>Don't stop</p>` never opens a JS string), while bare `>` and `}` are illegal per the JSX grammar (immediately rejecting TypeScript generic call signatures like `type Mapper = <T>(v: T) => T; const s = "</T>";`).
-            let mut i = after_gt;
-            while i < b.len() {
-                match b[i] {
-                    b'{' => {
-                        i = skip_jsx_expr_container(b, i, depth + 1)?;
-                    }
-                    b'}' | b'>' => return None,
-                    b'<' => {
-                        if b.get(i + 1) == Some(&b'/') {
-                            let (close_name, after_close) = parse_jsx_closing_tag(b, i)?;
-                            if close_name != name {
-                                return None;
-                            }
-                            if depth == 0 {
-                                if let Some(&nxt) = b.get(after_close) {
-                                    if matches!(nxt, b'"' | b'\'' | b'`')
-                                        || nxt.is_ascii_alphanumeric()
-                                        || nxt == b'_'
-                                        || nxt == b'$'
-                                    {
-                                        return None;
-                                    }
-                                }
-                                let mut k = after_close;
-                                while k < b.len() && matches!(b[k], b' ' | b'\t') {
-                                    k += 1;
-                                }
-                                if matches!(b.get(k), Some(b'"' | b'\'' | b'`')) {
-                                    return None;
-                                }
-                            }
-                            return Some(after_close);
-                        }
-                        i = skip_jsx_element(b, i, depth + 1)?;
-                    }
-                    _ => i += 1,
-                }
-            }
-            None
-        }
-    }
-}
-
-pub(crate) fn tsx_source_has_jsx(src: &str) -> bool {
-    // INVARIANT: Lexer-aware scan skips comments, strings, regexes, raw template text, and TypeScript `type`/`interface` declarations so HTML/closing-tag strings inside TS types never false-trigger while generic JSX, JSXText with apostrophes, fragments, and `createElement`/`jsx` calls are accurately detected.
-    let b = src.as_bytes();
-    let mut i = 0usize;
-    let mut prev_can_precede_jsx = true;
-    let mut at_decl_start = true;
-    let mut brace_depth = 0usize;
-    let mut template_brace_stack: Vec<usize> = Vec::new();
-
-    while i < b.len() {
-        let c = b[i];
-        let lt_len = js_line_terminator_len_at(b, i);
-        if lt_len > 0 {
-            at_decl_start = true;
-            i += lt_len;
-            continue;
-        }
-        if c.is_ascii_whitespace() {
-            i += 1;
-            continue;
-        }
-        if let Some((next_i, had_lt)) = skip_js_comment(b, i) {
-            if had_lt {
-                at_decl_start = true;
-            }
-            i = next_i;
-            continue;
-        }
-        if c == b'\'' || c == b'"' {
-            i += 1;
-            while i < b.len() {
-                if b[i] == b'\\' {
-                    i += 2;
-                    continue;
-                }
-                if b[i] == c {
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            prev_can_precede_jsx = false;
-            at_decl_start = false;
-            continue;
-        }
-        if c == b'`' {
-            i += 1;
-            while i < b.len() {
-                if b[i] == b'\\' {
-                    i += 2;
-                    continue;
-                }
-                if b[i] == b'$' && b.get(i + 1) == Some(&b'{') {
-                    template_brace_stack.push(brace_depth);
-                    brace_depth += 1;
-                    i += 2;
-                    prev_can_precede_jsx = true;
-                    at_decl_start = false;
-                    break;
-                }
-                if b[i] == b'`' {
-                    i += 1;
-                    prev_can_precede_jsx = false;
-                    at_decl_start = false;
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        if c == b'/' && prev_can_precede_jsx {
-            i += 1;
-            let mut in_class = false;
-            while i < b.len() && b[i] != b'\n' {
-                if b[i] == b'\\' {
-                    i += 2;
-                    continue;
-                }
-                if b[i] == b'[' {
-                    in_class = true;
-                } else if b[i] == b']' {
-                    in_class = false;
-                } else if b[i] == b'/' && !in_class {
-                    i += 1;
-                    while i < b.len() && b[i].is_ascii_alphabetic() {
-                        i += 1;
-                    }
-                    break;
-                }
-                i += 1;
-            }
-            prev_can_precede_jsx = false;
-            at_decl_start = false;
-            continue;
-        }
-        if c == b'{' {
-            brace_depth += 1;
-            prev_can_precede_jsx = true;
-            at_decl_start = true;
-            i += 1;
-            continue;
-        }
-        if c == b'}' {
-            brace_depth = brace_depth.saturating_sub(1);
-            if template_brace_stack.last().copied() == Some(brace_depth) {
-                template_brace_stack.pop();
-                i += 1;
-                while i < b.len() {
-                    if b[i] == b'\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if b[i] == b'$' && b.get(i + 1) == Some(&b'{') {
-                        template_brace_stack.push(brace_depth);
-                        brace_depth += 1;
-                        i += 2;
-                        prev_can_precede_jsx = true;
-                        at_decl_start = false;
-                        break;
-                    }
-                    if b[i] == b'`' {
-                        i += 1;
-                        prev_can_precede_jsx = false;
-                        at_decl_start = false;
-                        break;
-                    }
-                    i += 1;
-                }
-                continue;
-            }
-            prev_can_precede_jsx = false;
-            at_decl_start = true;
-            i += 1;
-            continue;
-        }
-        if c == b'<' {
-            if try_match_jsx_closing_tag(b, i) {
-                return true;
-            }
-            if prev_can_precede_jsx && skip_jsx_element(b, i, 0).is_some() {
-                return true;
-            }
-            prev_can_precede_jsx = true;
-            at_decl_start = false;
-            i += 1;
-            continue;
-        }
-        if c.is_ascii_alphabetic() || c == b'_' || c == b'$' {
-            let start = i;
-            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$') {
-                i += 1;
-            }
-            let word = &src[start..i];
-            if at_decl_start {
-                if word == "interface" {
-                    if let Some(end) = skip_ts_interface_decl(b, i) {
-                        i = end;
-                        prev_can_precede_jsx = true;
-                        at_decl_start = true;
-                        continue;
-                    }
-                } else if word == "type" {
-                    if let Some(end) = skip_ts_type_alias_decl(b, i) {
-                        i = end;
-                        prev_can_precede_jsx = true;
-                        at_decl_start = true;
-                        continue;
-                    }
-                }
-            }
-            if matches!(word, "createElement" | "jsx" | "jsxs") {
-                let mut j = i;
-                while j < b.len() && b[j].is_ascii_whitespace() {
-                    j += 1;
-                }
-                if b.get(j) == Some(&b'(') {
-                    return true;
-                }
-            }
-            prev_can_precede_jsx = matches!(
-                word,
-                "return"
-                    | "yield"
-                    | "await"
-                    | "throw"
-                    | "case"
-                    | "default"
-                    | "else"
-                    | "do"
-                    | "of"
-                    | "in"
-                    | "export"
-            );
-            at_decl_start = matches!(word, "export" | "declare" | "default");
-            continue;
-        }
-        if c.is_ascii_digit() {
-            while i < b.len() && (b[i].is_ascii_alphanumeric() || matches!(b[i], b'.' | b'_')) {
-                i += 1;
-            }
-            prev_can_precede_jsx = false;
-            at_decl_start = false;
-            continue;
-        }
-        if c == b'=' && b.get(i + 1) == Some(&b'>') {
-            prev_can_precede_jsx = true;
-            at_decl_start = false;
-            i += 2;
-            continue;
-        }
-        prev_can_precede_jsx = !matches!(c, b')' | b']');
-        at_decl_start = c == b';';
-        i += 1;
-    }
-    false
-}
-
-fn tsx_file_has_visual_jsx(raw_path: &str) -> Option<bool> {
-    let p = Path::new(raw_path);
-    let meta = fs::metadata(p).ok()?;
-    if !meta.is_file() || meta.len() > 262_144 {
-        return None;
-    }
-    let text = fs::read_to_string(p).ok()?;
-    Some(tsx_source_has_jsx(&text))
-}
 
 pub(crate) fn flutter_widget_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -6526,7 +5519,7 @@ fn git_head_file_has_visual_content(raw_path: &str, base_root: &str, ext: &str) 
         return None;
     }
     if ext == "tsx" || ext == "jsx" {
-        Some(tsx_source_has_jsx(&out))
+        crate::tsx_ast::source_has_visual_ui_checked(&out, ext == "tsx")
     } else if ext == "dart" {
         Some(flutter_widget_re().is_match(&out))
     } else {
@@ -6662,6 +5655,87 @@ fn relative_path_for_design_check(norm: &str, base_root: &str) -> String {
     norm.to_string()
 }
 
+const NON_VISUAL_DIRS: &[&str] = &[
+    "/__tests__/",
+    "/__mocks__/",
+    "/tests/",
+    "/test/",
+    "/e2e/",
+    "/fixtures/",
+    "/test_utils/",
+    "/dist/",
+    "/build/",
+    "/.next/",
+    "/node_modules/",
+    "/target/",
+    "/.generated/",
+    "/api/",
+    "/services/",
+    "/service/",
+    "/hooks/",
+    "/store/",
+    "/stores/",
+    "/state/",
+    "/types/",
+    "/models/",
+    "/schemas/",
+    "/utils/",
+    "/helpers/",
+    "/formatters/",
+    "/parsers/",
+    "/validators/",
+    "/mappers/",
+    "/selectors/",
+    "/clients/",
+    "/adapters/",
+    "/serializers/",
+    "/converters/",
+    "/transformers/",
+    "/domain/",
+    "/repositories/",
+    "/usecases/",
+    "/use_cases/",
+    "/queries/",
+    "/mutations/",
+    "/constants/",
+    "/config/",
+    "/middleware/",
+    "/server/",
+    "/backend/",
+    "/migrations/",
+    "/sql/",
+    "/infra/",
+    "/deploy/",
+    "/scripts/",
+    "/cli/",
+];
+
+pub fn is_visual_ast_eligible_path(path: &str, base_root: &str) -> bool {
+    let raw = path.trim();
+    if raw.is_empty() || raw == SHELL_MUTATION_SENTINEL {
+        return false;
+    }
+    let norm = rio::normalize_path(raw);
+    let rel_norm = relative_path_for_design_check(&norm, base_root);
+    let low = rel_norm.to_lowercase();
+    let fname = low.rsplit('/').next().unwrap_or("");
+    if fname.is_empty()
+        || fname.contains(".test.")
+        || fname.contains(".spec.")
+        || fname.contains(".stories.")
+        || fname.ends_with("_test.dart")
+        || fname.ends_with(".g.dart")
+        || fname.ends_with(".freezed.dart")
+    {
+        return false;
+    }
+    let padded = format!("/{}/", low.trim_matches('/'));
+    if NON_VISUAL_DIRS.iter().any(|seg| padded.contains(seg)) {
+        return false;
+    }
+    true
+}
+
 fn is_visual_design_path_with_globs(
     path: &str,
     pol_root: &str,
@@ -6742,60 +5816,6 @@ fn is_visual_design_path_with_globs(
         e
     };
     // INVARIANT: Strictly exclude tests, stories, generated artifacts, and non-visual logic/backend/CLI/infra/API paths so Design Gate imposes zero overhead outside visual UI/design edits.
-    const NON_VISUAL_DIRS: &[&str] = &[
-        "/__tests__/",
-        "/__mocks__/",
-        "/tests/",
-        "/test/",
-        "/e2e/",
-        "/fixtures/",
-        "/test_utils/",
-        "/dist/",
-        "/build/",
-        "/.next/",
-        "/node_modules/",
-        "/target/",
-        "/.generated/",
-        "/api/",
-        "/services/",
-        "/service/",
-        "/hooks/",
-        "/store/",
-        "/stores/",
-        "/state/",
-        "/types/",
-        "/models/",
-        "/schemas/",
-        "/utils/",
-        "/helpers/",
-        "/formatters/",
-        "/parsers/",
-        "/validators/",
-        "/mappers/",
-        "/selectors/",
-        "/clients/",
-        "/adapters/",
-        "/serializers/",
-        "/converters/",
-        "/transformers/",
-        "/domain/",
-        "/repositories/",
-        "/usecases/",
-        "/use_cases/",
-        "/queries/",
-        "/mutations/",
-        "/constants/",
-        "/config/",
-        "/middleware/",
-        "/server/",
-        "/backend/",
-        "/migrations/",
-        "/sql/",
-        "/infra/",
-        "/deploy/",
-        "/scripts/",
-        "/cli/",
-    ];
     let padded = format!("/{}/", low.trim_matches('/'));
     if NON_VISUAL_DIRS.iter().any(|seg| padded.contains(seg)) {
         return false;
@@ -6804,15 +5824,15 @@ fn is_visual_design_path_with_globs(
         return true;
     }
     if ext == "tsx" || ext == "jsx" {
-        // INVARIANT: Consider both post-edit disk content AND pre-edit git `HEAD` content so removing JSX render (`<div />` -> `return null`) still triggers Design Gate while files without JSX before and after stay zero-overhead.
-        let cur_has_jsx = tsx_file_has_visual_jsx(raw);
-        if cur_has_jsx == Some(true) {
+        // INVARIANT: Consider both post-edit disk content AND pre-edit git `HEAD` content via real Oxc AST (JSX + React/`jsx-runtime` element calls) so removing UI render still triggers Design Gate while pure-logic files stay zero-overhead.
+        let cur_has_visual = crate::tsx_ast::file_has_visual_ui(raw);
+        if cur_has_visual == Some(true) {
             return true;
         }
         if git_head_file_has_visual_content(raw, glob_root, ext) == Some(true) {
             return true;
         }
-        return cur_has_jsx.unwrap_or(true);
+        return cur_has_visual.unwrap_or(true);
     }
     if ext != "dart" {
         return true;
@@ -6890,38 +5910,6 @@ fn is_visual_design_path_with_globs(
     git_head_file_has_visual_content(raw, glob_root, ext).unwrap_or(false)
 }
 
-pub fn existing_file_has_confirmed_visual_content(path: &str, base_root: &str) -> bool {
-    // INVARIANT: Strict pre-edit check for `PreToolUse` — returns `true` ONLY when `path` already exists on disk AND contains confirmed visual JSX/Flutter widget markup (never `unwrap_or(true)` for non-existent brand-new files like `write_file("Pure.tsx")`).
-    let raw = path.trim();
-    if raw.is_empty() || !Path::new(raw).is_file() {
-        return false;
-    }
-    let ext = Path::new(raw)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if !matches!(ext.as_str(), "tsx" | "jsx" | "dart") {
-        return false;
-    }
-    let norm = rio::normalize_path(raw);
-    let rel_norm = relative_path_for_design_check(&norm, base_root);
-    let low = rel_norm.to_lowercase();
-    let fname = low.rsplit('/').next().unwrap_or("");
-    if fname.is_empty()
-        || fname.contains(".test.")
-        || fname.contains(".spec.")
-        || fname.contains(".stories.")
-        || fname.ends_with("_test.dart")
-    {
-        return false;
-    }
-    if ext == "tsx" || ext == "jsx" {
-        return is_visual_design_path_with_base(raw, None, base_root)
-            && tsx_file_has_visual_jsx(raw) == Some(true);
-    }
-    is_visual_design_path_with_base(raw, None, base_root)
-}
 
 pub fn is_visual_design_path_with_base(
     path: &str,
@@ -9819,50 +8807,50 @@ mod tests {
         assert!(!is_visual_design_path("src/formatters/formatMoney.tsx", None));
 
         // Syntactic TSX/JSX detection: generic JSX components and JSXText with apostrophes pass; HTML strings, templates, and TS generic arrows/call signatures stay non-visual.
-        assert!(tsx_source_has_jsx("export const L = ({ items }: any) => <List<User> items={items} />;"));
-        assert!(tsx_source_has_jsx("export const T = () => <Table<Record<string, User[]>> />;"));
-        assert!(tsx_source_has_jsx("export const U = () => <_Button />;"));
-        assert!(tsx_source_has_jsx("export const D = () => <$Icon size={16} />;"));
-        assert!(tsx_source_has_jsx("export const F = () => <><span>ok</span></>;"));
-        assert!(tsx_source_has_jsx("export const Label = () => <p>Don't stop</p>;"));
-        assert!(tsx_source_has_jsx("export const Note = () => <p>(note): Don't stop</p>;"));
-        assert!(tsx_source_has_jsx("export const Msg = ({ ok }: any) => <div>{ok ? \"can't\" : 'won\\'t'} Don't stop</div>;"));
-        assert!(tsx_source_has_jsx("export const Btn = () => <_Button>Don't click</_Button>;"));
-        assert!(tsx_source_has_jsx("export const Frag = () => <>Don't stop</>;"));
-        assert!(tsx_source_has_jsx("export const Nested = ({ items }: any) => <Card>Don't forget {items.map((x: any) => <span>Can't</span>)}</Card>;"));
-        assert!(tsx_source_has_jsx("export type Props = { x: string }\nexport const AfterType = () => <p>Don't stop</p>;"));
-        assert!(tsx_source_has_jsx("type Props = { label: string }\nroot.render(<App />)"));
-        assert!(tsx_source_has_jsx("type Props = { label: string }\n// mount app\nroot.render(<App />)"));
-        assert!(tsx_source_has_jsx("export type Lit = <T>(x: \"</T> \") => T\nroot.render(<App />)"));
-        assert!(tsx_source_has_jsx("type A = string\n(<p>Don't stop</p>)"));
-        assert!(tsx_source_has_jsx("type A = Record<string, string>\nrender(<p>Don't stop</p>)"));
-        assert!(tsx_source_has_jsx("type Tpl = `a${`b`}c`\nroot.render(<App />)"));
-        assert!(tsx_source_has_jsx("type Props = { label: string }\n[1, 2].map((n) => <li key={n}>{n}</li>)"));
-        assert!(tsx_source_has_jsx("class W { type\n  el = <App />\n}"));
-        assert!(tsx_source_has_jsx("class W { interface\n  el = <App />\n}"));
-        assert!(tsx_source_has_jsx("type Props = object /*\n*/export const View = () => <div />"));
-        assert!(tsx_source_has_jsx("class W { type /*\n*/ el = <App />\n}"));
-        assert!(tsx_source_has_jsx("type Props = object /*\r*/export const View = () => <div />"));
-        assert!(!tsx_source_has_jsx("type /* ok */ Lit = <T>(x: \"</T> \") => T"));
-        assert!(!tsx_source_has_jsx("type Multi = { a: string } /*\n*/ | <T>(x: \"</T> \") => T"));
-        assert!(!tsx_source_has_jsx(r#"export const html = "<div>hello</div>";"#));
-        assert!(!tsx_source_has_jsx("export const tpl = (x: string) => `<span>${x}</span>`;"));
-        assert!(!tsx_source_has_jsx("export type Mapper = <T>(value: T) => T;"));
-        assert!(!tsx_source_has_jsx(r#"export type Mapper = <T>(value: T) => T; const s = "</T>";"#));
-        assert!(!tsx_source_has_jsx(r#"export type Lit = <T>(x: "</T>") => T;"#));
-        assert!(!tsx_source_has_jsx(r#"export type LitSpaced = <T>(x: "</T> ") => T;"#));
-        assert!(!tsx_source_has_jsx("export type MultilineFn = <T>(\n  x: \"</T> \"\n) =>\n  T"));
-        assert!(!tsx_source_has_jsx("export type MultilineUnion =\n  | <T>(x: \"</T> \") => T\n  | <U>(y: \"</U> \") => U"));
-        assert!(!tsx_source_has_jsx("export type MultilineCond<T> = T\n  extends string\n  ? <U>(x: \"</U> \") => U\n  : never"));
-        assert!(!tsx_source_has_jsx(r#"export const fnAnn: <T>(x: "</T> ") => T = (x) => x;"#));
-        assert!(!tsx_source_has_jsx("export const fnTpl: <T>(x: `</T>\n`) => T = (x) => x;"));
-        assert!(!tsx_source_has_jsx("export interface Fn { map: <T>(value: T) => T; }"));
-        assert!(!tsx_source_has_jsx(r#"export interface Fn { <T>(value: "</T> "): T; }"#));
-        assert!(!tsx_source_has_jsx(r#"export interface Fn { <T>(value: T): T; } const s = "</T>";"#));
-        assert!(!tsx_source_has_jsx("export const id = <T,>(x: T): T => x;"));
-        assert!(!tsx_source_has_jsx("export const pick = <T extends object>(x: T): Array<T> => [x];"));
-        assert!(!tsx_source_has_jsx("export const rx = (x: number) => x < /abc/.source.length;"));
-        assert!(!tsx_source_has_jsx("// <div /> commented out\nexport const cmp = (a: number, b: number) => a < b && b > 0;"));
+        assert!(crate::tsx_ast::tsx_source_has_jsx("export const L = ({ items }: any) => <List<User> items={items} />;"));
+        assert!(crate::tsx_ast::tsx_source_has_jsx("export const T = () => <Table<Record<string, User[]>> />;"));
+        assert!(crate::tsx_ast::tsx_source_has_jsx("export const U = () => <_Button />;"));
+        assert!(crate::tsx_ast::tsx_source_has_jsx("export const D = () => <$Icon size={16} />;"));
+        assert!(crate::tsx_ast::tsx_source_has_jsx("export const F = () => <><span>ok</span></>;"));
+        assert!(crate::tsx_ast::tsx_source_has_jsx("export const Label = () => <p>Don't stop</p>;"));
+        assert!(crate::tsx_ast::tsx_source_has_jsx("export const Note = () => <p>(note): Don't stop</p>;"));
+        assert!(crate::tsx_ast::tsx_source_has_jsx("export const Msg = ({ ok }: any) => <div>{ok ? \"can't\" : 'won\\'t'} Don't stop</div>;"));
+        assert!(crate::tsx_ast::tsx_source_has_jsx("export const Btn = () => <_Button>Don't click</_Button>;"));
+        assert!(crate::tsx_ast::tsx_source_has_jsx("export const Frag = () => <>Don't stop</>;"));
+        assert!(crate::tsx_ast::tsx_source_has_jsx("export const Nested = ({ items }: any) => <Card>Don't forget {items.map((x: any) => <span>Can't</span>)}</Card>;"));
+        assert!(crate::tsx_ast::tsx_source_has_jsx("export type Props = { x: string }\nexport const AfterType = () => <p>Don't stop</p>;"));
+        assert!(crate::tsx_ast::tsx_source_has_jsx("type Props = { label: string }\nroot.render(<App />)"));
+        assert!(crate::tsx_ast::tsx_source_has_jsx("type Props = { label: string }\n// mount app\nroot.render(<App />)"));
+        assert!(crate::tsx_ast::tsx_source_has_jsx("export type Lit = <T>(x: \"</T> \") => T\nroot.render(<App />)"));
+        assert!(crate::tsx_ast::tsx_source_has_jsx("type A = string\n(<p>Don't stop</p>)"));
+        assert!(crate::tsx_ast::tsx_source_has_jsx("type A = Record<string, string>\nrender(<p>Don't stop</p>)"));
+        assert!(crate::tsx_ast::tsx_source_has_jsx("type Tpl = `a${`b`}c`\nroot.render(<App />)"));
+        assert!(crate::tsx_ast::tsx_source_has_jsx("type Props = { label: string }\n[1, 2].map((n) => <li key={n}>{n}</li>)"));
+        assert!(crate::tsx_ast::tsx_source_has_jsx("class W { type\n  el = <App />\n}"));
+        assert!(crate::tsx_ast::tsx_source_has_jsx("class W { interface\n  el = <App />\n}"));
+        assert!(crate::tsx_ast::tsx_source_has_jsx("type Props = object /*\n*/export const View = () => <div />"));
+        assert!(crate::tsx_ast::tsx_source_has_jsx("class W { type /*\n*/ el = <App />\n}"));
+        assert!(crate::tsx_ast::tsx_source_has_jsx("type Props = object /*\r*/export const View = () => <div />"));
+        assert!(!crate::tsx_ast::tsx_source_has_jsx("type /* ok */ Lit = <T>(x: \"</T> \") => T"));
+        assert!(!crate::tsx_ast::tsx_source_has_jsx("type Multi = { a: string } /*\n*/ | <T>(x: \"</T> \") => T"));
+        assert!(!crate::tsx_ast::tsx_source_has_jsx(r#"export const html = "<div>hello</div>";"#));
+        assert!(!crate::tsx_ast::tsx_source_has_jsx("export const tpl = (x: string) => `<span>${x}</span>`;"));
+        assert!(!crate::tsx_ast::tsx_source_has_jsx("export type Mapper = <T>(value: T) => T;"));
+        assert!(!crate::tsx_ast::tsx_source_has_jsx(r#"export type Mapper = <T>(value: T) => T; const s = "</T>";"#));
+        assert!(!crate::tsx_ast::tsx_source_has_jsx(r#"export type Lit = <T>(x: "</T>") => T;"#));
+        assert!(!crate::tsx_ast::tsx_source_has_jsx(r#"export type LitSpaced = <T>(x: "</T> ") => T;"#));
+        assert!(!crate::tsx_ast::tsx_source_has_jsx("export type MultilineFn = <T>(\n  x: \"</T> \"\n) =>\n  T"));
+        assert!(!crate::tsx_ast::tsx_source_has_jsx("export type MultilineUnion =\n  | <T>(x: \"</T> \") => T\n  | <U>(y: \"</U> \") => U"));
+        assert!(!crate::tsx_ast::tsx_source_has_jsx("export type MultilineCond<T> = T\n  extends string\n  ? <U>(x: \"</U> \") => U\n  : never"));
+        assert!(!crate::tsx_ast::tsx_source_has_jsx(r#"export const fnAnn: <T>(x: "</T> ") => T = (x) => x;"#));
+        assert!(!crate::tsx_ast::tsx_source_has_jsx("export const fnTpl: <T>(x: `</T>\n`) => T = (x) => x;"));
+        assert!(!crate::tsx_ast::tsx_source_has_jsx("export interface Fn { map: <T>(value: T) => T; }"));
+        assert!(!crate::tsx_ast::tsx_source_has_jsx(r#"export interface Fn { <T>(value: "</T> "): T; }"#));
+        assert!(!crate::tsx_ast::tsx_source_has_jsx(r#"export interface Fn { <T>(value: T): T; } const s = "</T>";"#));
+        assert!(!crate::tsx_ast::tsx_source_has_jsx("export const id = <T,>(x: T): T => x;"));
+        assert!(!crate::tsx_ast::tsx_source_has_jsx("export const pick = <T extends object>(x: T): Array<T> => [x];"));
+        assert!(!crate::tsx_ast::tsx_source_has_jsx("export const rx = (x: number) => x < /abc/.source.length;"));
+        assert!(!crate::tsx_ast::tsx_source_has_jsx("// <div /> commented out\nexport const cmp = (a: number, b: number) => a < b && b > 0;"));
 
         let td_path = std::env::temp_dir().join(format!(
             "cwg-common-dg-test-{}",

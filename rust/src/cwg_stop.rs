@@ -9381,7 +9381,8 @@ fn retire_candidate_checked(input: RetireCandidateInput<'_>) -> bool {
     state.insert("waits".to_string(), json!(0));
     state.insert("total_waits".to_string(), json!(0));
     state.insert("notify_reminders".to_string(), json!(0));
-    state.insert("closed_ts".to_string(), json!(now_sec()));
+    let closed_ts = now_sec();
+    state.insert("closed_ts".to_string(), json!(closed_ts));
     state.insert(
         "last_receipt".to_string(),
         Value::String(receipt_summary.to_string()),
@@ -22254,8 +22255,13 @@ mod tests {
         });
         assert!(ok_optout, "design_gate=false opt-out must pass: {}", msg_optout);
 
-        // 10. `NewPure.tsx` vs existing visual `App.tsx` latch check (until Stage 2 replaces TS/JSX lexer).
-        let r2_proj = cli_td.path.join("r2-previs-proj");
+        // 10. Real Oxc AST full-file classification (zero `previs-*.json` files):
+        // (a) brand-new pure-logic `NewPure.tsx` stays non-visual;
+        // (b) `write_file` overwriting existing working-tree `App.tsx` (`<div />` -> `return null`) latches cleanly;
+        // (c) `edit_file` replacing unbalanced fragment (`  return <Panel />;\n}`) latches cleanly;
+        // (d) `edit_file` replacing `<Panel />` inside a template literal string stays non-visual;
+        // (e) `React.createElement` component triggers Design Gate; `Card.test.tsx` never latches.
+        let r2_proj = cli_td.path.join("r2-oxc-proj");
         fs::create_dir_all(&r2_proj).unwrap();
         let new_pure_tsx = r2_proj.join("NewPure.tsx");
         let new_pure_s = new_pure_tsx.to_string_lossy().into_owned();
@@ -22263,10 +22269,10 @@ mod tests {
         let pre_new_pure = json!({
             "session_id": sess_new_pure,
             "cwd": r2_proj.to_string_lossy(),
-            "toolCall": {"name": "write_file", "args": {"Path": new_pure_s, "Content": "export const id = <T>(x: T): T => x;\n"}},
+            "toolCall": {"name": "write_file", "args": {"Path": new_pure_s, "Content": "export const id = <T,>(x: T): T => x;\n"}},
         });
         cwg_mark::record_pre_tool_use(&pre_new_pure);
-        fs::write(&new_pure_tsx, "export const id = <T>(x: T): T => x;\n").unwrap();
+        fs::write(&new_pure_tsx, "export const id = <T,>(x: T): T => x;\n").unwrap();
         cwg_mark::record_post_tool_use(&pre_new_pure).unwrap();
         let m_new_pure = cwg_common::read_marker_with_pending(sess_new_pure).expect("marker for NewPure.tsx");
         assert!(
@@ -22278,24 +22284,189 @@ mod tests {
             m_new_pure
         );
 
+        // (b) `write_file` overwrite stripping JSX from existing working-tree App.tsx latches via PreToolUse full-file Oxc AST.
         let app_tsx = r2_proj.join("App.tsx");
         let app_tsx_s = app_tsx.to_string_lossy().into_owned();
         fs::write(&app_tsx, "export const App = () => <div className=\"hero\">Hi</div>;\n").unwrap();
-        let sess_strip_jsx = "dg-r2-strip-jsx";
-        let pre_strip_jsx = json!({
-            "session_id": sess_strip_jsx,
+        let sess_write_strip = "dg-r2-write-strip-jsx";
+        let write_strip_payload = json!({
+            "session_id": sess_write_strip,
             "cwd": r2_proj.to_string_lossy(),
-            "toolCall": {"name": "edit_file", "args": {"Path": app_tsx_s}},
+            "toolCall": {
+                "name": "write_file",
+                "args": {"Path": app_tsx_s, "Overwrite": true, "Content": "export const App = () => null;\n"}
+            },
         });
-        cwg_mark::record_pre_tool_use(&pre_strip_jsx);
+        cwg_mark::record_pre_tool_use(&write_strip_payload);
         fs::write(&app_tsx, "export const App = () => null;\n").unwrap();
-        cwg_mark::record_post_tool_use(&pre_strip_jsx).unwrap();
-        let m_strip_jsx = cwg_common::read_marker_with_pending(sess_strip_jsx).expect("marker for App.tsx");
-        let ctx_strip_jsx = cwg_common::resolve_candidate_context(&m_strip_jsx, false);
+        cwg_mark::record_post_tool_use(&write_strip_payload).unwrap();
+        let m_write_strip = cwg_common::read_marker_with_pending(sess_write_strip).expect("marker for App.tsx");
+        let ctx_write_strip = cwg_common::resolve_candidate_context(&m_write_strip, false);
         assert!(
-            ctx_strip_jsx["design_paths"].as_array().is_some_and(|a| !a.is_empty()),
-            "stripping JSX from existing visual App.tsx must latch and keep App.tsx in design_paths: {:?}",
-            ctx_strip_jsx
+            ctx_write_strip["design_paths"].as_array().is_some_and(|a| !a.is_empty()),
+            "write_file stripping JSX from existing working-tree App.tsx must latch cleanly without previs-*.json: {:?}",
+            ctx_write_strip
+        );
+
+        // (c) `edit_file` replacing unbalanced fragment (`  return <Panel />;\n}`) latches via full-file Oxc AST span overlap.
+        let panel_tsx = r2_proj.join("Panel.tsx");
+        let panel_tsx_s = panel_tsx.to_string_lossy().into_owned();
+        fs::write(&panel_tsx, "export function PanelView() {\n  return <Panel />;\n}\n").unwrap();
+        let sess_unbal = "dg-r2-unbal-edit";
+        let unbal_payload = json!({
+            "session_id": sess_unbal,
+            "cwd": r2_proj.to_string_lossy(),
+            "toolCall": {
+                "name": "edit_file",
+                "args": {
+                    "Path": panel_tsx_s,
+                    "Target": "  return <Panel />;\n}",
+                    "Replacement": "  return null;\n}"
+                }
+            },
+        });
+        cwg_mark::record_pre_tool_use(&unbal_payload);
+        fs::write(&panel_tsx, "export function PanelView() {\n  return null;\n}\n").unwrap();
+        cwg_mark::record_post_tool_use(&unbal_payload).unwrap();
+        let m_unbal = cwg_common::read_marker_with_pending(sess_unbal).expect("marker for Panel.tsx");
+        let ctx_unbal = cwg_common::resolve_candidate_context(&m_unbal, false);
+        assert!(
+            ctx_unbal["design_paths"].as_array().is_some_and(|a| !a.is_empty()),
+            "edit_file replacing unbalanced JSX fragment must latch via full-file AST span overlap: {:?}",
+            ctx_unbal
+        );
+
+        // (d) `edit_file` replacing `<Panel />` inside a template literal string stays non-visual (zero false positive!).
+        let docs_tsx = r2_proj.join("DocsSnippet.tsx");
+        let docs_tsx_s = docs_tsx.to_string_lossy().into_owned();
+        fs::write(&docs_tsx, "export const sample = `<Panel />`;\n").unwrap();
+        let sess_tpl = "dg-r2-tpl-literal";
+        let tpl_payload = json!({
+            "session_id": sess_tpl,
+            "cwd": r2_proj.to_string_lossy(),
+            "toolCall": {
+                "name": "edit_file",
+                "args": {
+                    "Path": docs_tsx_s,
+                    "Target": "<Panel />",
+                    "Replacement": "<Other />"
+                }
+            },
+        });
+        cwg_mark::record_pre_tool_use(&tpl_payload);
+        fs::write(&docs_tsx, "export const sample = `<Other />`;\n").unwrap();
+        cwg_mark::record_post_tool_use(&tpl_payload).unwrap();
+        let m_tpl = cwg_common::read_marker_with_pending(sess_tpl).expect("marker for DocsSnippet.tsx");
+        let ctx_tpl = cwg_common::resolve_candidate_context(&m_tpl, false);
+        assert!(
+            ctx_tpl["design_paths"].as_array().is_some_and(|a| a.is_empty()),
+            "replacing <Panel /> inside template literal must NOT trigger Design Gate: {:?}",
+            ctx_tpl
+        );
+
+        // (e) `React.createElement` component triggers Design Gate; `Card.test.tsx` never latches.
+        let ce_tsx = r2_proj.join("Badge.tsx");
+        fs::write(&ce_tsx, "import React from 'react';\nexport const Badge = () => React.createElement('span', null, 'ok');\n").unwrap();
+        assert!(
+            cwg_common::is_visual_design_path_with_base(&ce_tsx.to_string_lossy(), None, &r2_proj.to_string_lossy()),
+            "React.createElement component must be classified as visual UI"
+        );
+        let card_test = r2_proj.join("Card.test.tsx");
+        let card_test_s = card_test.to_string_lossy().into_owned();
+        fs::write(&card_test, "export const t = () => <Card />;\n").unwrap();
+        let sess_test_tsx = "dg-r2-test-tsx";
+        let test_tsx_payload = json!({
+            "session_id": sess_test_tsx,
+            "cwd": r2_proj.to_string_lossy(),
+            "toolCall": {
+                "name": "edit_file",
+                "args": {
+                    "Path": card_test_s,
+                    "Target": "<Card />",
+                    "Replacement": "null"
+                }
+            },
+        });
+        cwg_mark::record_pre_tool_use(&test_tsx_payload);
+        fs::write(&card_test, "export const t = () => null;\n").unwrap();
+        cwg_mark::record_post_tool_use(&test_tsx_payload).unwrap();
+        let m_test_tsx = cwg_common::read_marker_with_pending(sess_test_tsx).expect("marker for Card.test.tsx");
+        let ctx_test_tsx = cwg_common::resolve_candidate_context(&m_test_tsx, false);
+        assert!(
+            ctx_test_tsx["design_paths"].as_array().is_some_and(|a| a.is_empty()),
+            "removing JSX from Card.test.tsx must NOT trigger Design Gate: {:?}",
+            ctx_test_tsx
+        );
+
+        // (f) `replace_file_content` and `multi_replace_file_content` go through standard EDIT_TOOLS + PreToolUse/PostToolUse, and an unrelated Stop rewrite of enforcement state NEVER clobbers an in-flight PreToolUse pending visual edit!
+        let rfc_tsx = r2_proj.join("RfcPanel.tsx");
+        let rfc_tsx_s = rfc_tsx.to_string_lossy().into_owned();
+        fs::write(&rfc_tsx, "export const Rfc = () => <section>ok</section>;\n").unwrap();
+        let sess_rfc = "dg-r2-rfc-and-mrfc";
+        let rfc_payload = json!({
+            "session_id": sess_rfc,
+            "cwd": r2_proj.to_string_lossy(),
+            "toolCall": {
+                "name": "replace_file_content",
+                "args": {
+                    "TargetFile": rfc_tsx_s,
+                    "TargetContent": "<section>ok</section>",
+                    "ReplacementContent": "null"
+                }
+            },
+        });
+        cwg_mark::record_pre_tool_use(&rfc_payload);
+        // Simulate real Stop retiring a prior candidate (`retire_candidate_checked`) right between `PreToolUse` and `PostToolUse`: in-flight `pending_visual_edits` MUST survive until its own `PostToolUse` pops it!
+        let rfc_mfile = cwg_common::marker_path(sess_rfc);
+        let rfc_sfile = cwg_common::enforcement_state_path(sess_rfc);
+        let prior_m = json!({"session": sess_rfc, "first_ts": 100.0, "last_ts": 101.0, "paths": []});
+        let _ = rio::write_json(&rfc_mfile, &prior_m);
+        let mut rfc_state = Map::new();
+        assert!(retire_candidate_checked(RetireCandidateInput {
+            session: sess_rfc,
+            marker_file: &rfc_mfile,
+            state_file: &rfc_sfile,
+            state: &mut rfc_state,
+            receipt_summary: "verified: STANDARD; prior",
+            expected_marker: Some(&prior_m),
+            expected_stats: None,
+            consumed_pending_ids: &[],
+            allow_unhashed: true,
+        }));
+        fs::write(&rfc_tsx, "export const Rfc = () => null;\n").unwrap();
+        cwg_mark::record_post_tool_use(&rfc_payload).unwrap();
+        let m_rfc = cwg_common::read_marker_with_pending(sess_rfc).expect("marker for replace_file_content");
+        let ctx_rfc = cwg_common::resolve_candidate_context(&m_rfc, false);
+        assert!(
+            ctx_rfc["design_paths"].as_array().is_some_and(|a| !a.is_empty()),
+            "replace_file_content removing JSX must latch even when a prior candidate closes between PreToolUse and PostToolUse: {:?}",
+            ctx_rfc
+        );
+
+        let mrfc_tsx = r2_proj.join("MultiPanel.tsx");
+        let mrfc_tsx_s = mrfc_tsx.to_string_lossy().into_owned();
+        fs::write(&mrfc_tsx, "export const M = () => <aside>hi</aside>;\n").unwrap();
+        let sess_mrfc = "dg-r2-multi-rfc";
+        let mrfc_payload = json!({
+            "session_id": sess_mrfc,
+            "cwd": r2_proj.to_string_lossy(),
+            "toolCall": {
+                "name": "multi_replace_file_content",
+                "args": {
+                    "TargetFile": mrfc_tsx_s,
+                    "ReplacementChunks": [{"TargetContent": "<aside>hi</aside>", "ReplacementContent": "null"}]
+                }
+            },
+        });
+        cwg_mark::record_pre_tool_use(&mrfc_payload);
+        fs::write(&mrfc_tsx, "export const M = () => null;\n").unwrap();
+        cwg_mark::record_post_tool_use(&mrfc_payload).unwrap();
+        let m_mrfc = cwg_common::read_marker_with_pending(sess_mrfc).expect("marker for multi_replace_file_content");
+        let ctx_mrfc = cwg_common::resolve_candidate_context(&m_mrfc, false);
+        assert!(
+            ctx_mrfc["design_paths"].as_array().is_some_and(|a| !a.is_empty()),
+            "multi_replace_file_content removing JSX must latch cleanly: {:?}",
+            ctx_mrfc
         );
     }
 

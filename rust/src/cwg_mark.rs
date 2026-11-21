@@ -10,7 +10,13 @@ use crate::cwg_common;
 use crate::rio::{self, json_truthy, meta_mtime_ns, sha256_hex};
 use crate::win32_sqlite::{is_link_or_junction, now_sec, run_command_with_job};
 
-pub const EDIT_TOOLS: &[&str] = &["edit_file", "write_file"];
+pub const EDIT_TOOLS: &[&str] = &[
+    "edit_file",
+    "write_file",
+    "replace_file_content",
+    "multi_replace_file_content",
+    "write_to_file",
+];
 pub const SHELL_TOOLS: &[&str] = &["run_command"];
 pub const CHECK_KIND_BG_LAUNCH: &str = "bg_launch";
 pub const CHECK_KIND_CHECK: &str = "check";
@@ -2324,11 +2330,91 @@ fn resolve_known_or_git_root(known_git_root: Option<&str>, eff_cwd: &str) -> Str
     }
 }
 
+fn extract_replaced_targets<'a>(args: &'a Map<String, Value>) -> Vec<&'a str> {
+    let mut targets: Vec<&'a str> = Vec::new();
+    for key in ["Target", "TargetContent", "old_string", "old_str"] {
+        if let Some(s) = args.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            targets.push(s);
+        }
+    }
+    if let Some(chunks) = args.get("ReplacementChunks").and_then(Value::as_array) {
+        for ch in chunks {
+            if let Some(s) = ch
+                .get("TargetContent")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                targets.push(s);
+            }
+        }
+    }
+    targets
+}
+
+fn pre_edit_touches_visual_content(
+    target_path: &str,
+    cwd: &str,
+    tool_name: &str,
+    args: &Map<String, Value>,
+) -> bool {
+    // INVARIANT: Evaluate full-file pre-edit AST BEFORE mutation (`write_file` overwrite or targeted `edit_file`/`replace_file_content`/`multi_replace_file_content` overlapping a real JSX/React/Flutter UI node) on eligible visual paths only (never `.test.tsx`, `hooks/`, `api/`, or non-existent files).
+    if !cwg_common::is_visual_ast_eligible_path(target_path, cwd) {
+        return false;
+    }
+    let p = Path::new(target_path);
+    if !p.is_file() {
+        return false;
+    }
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !matches!(ext.as_str(), "tsx" | "jsx" | "dart") {
+        return false;
+    }
+    if tool_name == "write_file" && json_truthy(args.get("Append")) {
+        return false;
+    }
+    let targets = if tool_name == "write_file" || tool_name == "write_to_file" {
+        Vec::new()
+    } else {
+        extract_replaced_targets(args)
+    };
+    if ext == "dart" {
+        let Ok(raw) = fs::read_to_string(p) else {
+            return false;
+        };
+        let norm_src = raw.replace("\r\n", "\n");
+        let re = cwg_common::flutter_widget_re();
+        let spans: Vec<(usize, usize)> = re
+            .find_iter(&norm_src)
+            .map(|m| (m.start(), m.end()))
+            .collect();
+        if spans.is_empty() {
+            return false;
+        }
+        if targets.is_empty() {
+            return true;
+        }
+        return targets.iter().any(|t| {
+            let nt = t.replace("\r\n", "\n");
+            !nt.is_empty()
+                && norm_src.match_indices(&nt).any(|(s, m)| {
+                    let e = s + m.len();
+                    spans.iter().any(|&(ns, ne)| ns < e && s < ne)
+                })
+        });
+    }
+    crate::tsx_ast::pre_edit_file_touches_visual_ui(target_path, &targets)
+}
+
 #[derive(Copy, Clone)]
 struct CandidateMarkerUpdate<'a> {
     session: &'a str,
     cwd: &'a str,
     durable_new_paths: &'a [String],
+    latch_visual_paths: &'a [String],
     operational_mutation: bool,
     changed_lines_delta: i64,
     shell_durable_edit: bool,
@@ -2372,6 +2458,7 @@ fn update_candidate_marker_unlocked(
         session,
         cwd,
         durable_new_paths,
+        latch_visual_paths,
         operational_mutation,
         changed_lines_delta,
         shell_durable_edit,
@@ -2540,14 +2627,8 @@ fn update_candidate_marker_unlocked(
                 }
             }
         }
-        if let Some(ckey) = pre_marker_call_key {
-            let pv_path = cwg_common::snapshot_path(session, &format!("previs-{}", ckey));
-            if let Some(pv_val) = rio::read_json(&pv_path) {
-                let _ = fs::remove_file(&pv_path);
-                if let Some(p) = pv_val.get("path").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-                    cwg_common::latch_design_paths_in_marker(&mut marker, &[p.to_string()]);
-                }
-            }
+        if !latch_visual_paths.is_empty() {
+            cwg_common::latch_design_paths_in_marker(&mut marker, latch_visual_paths);
         }
         if changed_fp || added_new_path || !shell_durable_edit {
             refresh_design_edit_fields(&mut marker, &durable_new_paths, now);
@@ -3995,22 +4076,20 @@ pub fn record_pre_tool_use(payload: &Value) {
         if !rio::is_subagent_session(tp, None) {
             let session = rio::session_key(payload);
             let cwd = rio::effective_cwd(payload);
-            let edit_path = tc
-                .and_then(|m| m.get("args"))
-                .and_then(|v| v.as_object())
-                .and_then(|a| a.get("Path").or_else(|| a.get("path")))
+            let args_map = tc.and_then(|m| m.get("args")).and_then(|v| v.as_object());
+            let edit_path = args_map
+                .and_then(|a| {
+                    a.get("Path")
+                        .or_else(|| a.get("path"))
+                        .or_else(|| a.get("TargetFile"))
+                })
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty());
             let edit_key = edit_tool_call_key(payload, tc, tool_name, &cwd, edit_path);
             latch_live_simplify_if_ready(&session, tp, edit_path, &cwd, &edit_key);
-            if let Some(ep) = edit_path {
-                let low = ep.to_ascii_lowercase();
-                if (low.ends_with(".tsx") || low.ends_with(".jsx") || low.ends_with(".dart"))
-                    && cwg_common::existing_file_has_confirmed_visual_content(ep, &cwd)
-                {
-                    // INVARIANT: Record pre-edit visual status ONLY for existing files with confirmed visual content before `edit_file`/`write_file` mutates disk so removing all JSX/Widget markup (`<div />` -> `return null`) still triggers Design Gate without falsely latching brand-new pure-logic `.tsx` files.
-                    let pv_path = cwg_common::snapshot_path(&session, &format!("previs-{}", edit_key));
-                    let _ = rio::write_json(&pv_path, &json!({ "path": rio::normalize_path(ep) }));
+            if let (Some(ep), Some(amap)) = (edit_path, args_map) {
+                if pre_edit_touches_visual_content(ep, &cwd, tool_name, amap) {
+                    cwg_common::record_pending_visual_edit(&session, &edit_key, ep);
                 }
             }
         }
@@ -4116,17 +4195,29 @@ pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
 
     if is_edit {
         let is_sub = rio::is_subagent_session(tp, None);
+        let target_path = args
+            .get("Path")
+            .or_else(|| args.get("path"))
+            .or_else(|| args.get("TargetFile"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let cwd = rio::effective_cwd(payload);
+        let edit_call_key = if !is_sub && !target_path.is_empty() {
+            edit_tool_call_key(payload, tc, tool_name, &cwd, Some(target_path))
+        } else {
+            String::new()
+        };
+        let pre_visual_latch = if !edit_call_key.is_empty() {
+            cwg_common::take_pending_visual_edit(&session, &edit_call_key)
+        } else {
+            None
+        };
         if failed {
             if !is_sub {
                 let _ = cwg_common::clear_pre_marker_verified_simplify(&session);
             }
             return Ok(());
         }
-        let target_path = args
-            .get("Path")
-            .or_else(|| args.get("path"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
         if target_path.is_empty() {
             if !is_sub {
                 let _ = cwg_common::clear_pre_marker_verified_simplify(&session);
@@ -4141,7 +4232,6 @@ pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
             }
             return Ok(());
         }
-        let cwd = rio::effective_cwd(payload);
         if cwg_common::is_scratch_or_ephemeral(target_path, art_dir, &wps, &cwd) {
             if !is_sub {
                 let _ = cwg_common::clear_pre_marker_verified_simplify(&session);
@@ -4151,8 +4241,8 @@ pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
         if is_sub {
             return Ok(());
         }
-        let edit_call_key = edit_tool_call_key(payload, tc, tool_name, &cwd, Some(target_path));
         let target_vec = vec![target_path.to_string()];
+        let latch_vec: Vec<String> = pre_visual_latch.into_iter().collect();
         cwg_common::publish_claim(&session, &target_vec, false, &cwd);
         let base_name = Path::new(target_path)
             .file_name()
@@ -4163,6 +4253,7 @@ pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
             session: &session,
             cwd: &cwd,
             durable_new_paths: &target_vec,
+            latch_visual_paths: &latch_vec,
             operational_mutation: false,
             changed_lines_delta: estimate_changed_lines(tool_name, args),
             shell_durable_edit: false,
@@ -4442,6 +4533,7 @@ pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
             session: &session,
             cwd: marker_cwd,
             durable_new_paths: &changed_paths,
+            latch_visual_paths: &[],
             operational_mutation: false,
             changed_lines_delta: 10,
             shell_durable_edit: true,
@@ -4485,6 +4577,7 @@ pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
                 session: &session,
                 cwd: marker_cwd,
                 durable_new_paths: &[],
+                latch_visual_paths: &[],
                 operational_mutation: true,
                 changed_lines_delta: 0,
                 shell_durable_edit: false,
@@ -5054,6 +5147,7 @@ mod tests {
                 session: sess_p,
                 cwd: &tmp_home_str,
                 durable_new_paths: &f_vec,
+                latch_visual_paths: &[],
                 operational_mutation: false,
                 changed_lines_delta: 1,
                 shell_durable_edit: false,
@@ -5073,6 +5167,7 @@ mod tests {
                 session: sess_p,
                 cwd: &tmp_home_str,
                 durable_new_paths: &f_vec,
+                latch_visual_paths: &[],
                 operational_mutation: false,
                 changed_lines_delta: 1,
                 shell_durable_edit: false,
