@@ -898,6 +898,31 @@ pub fn read_checks_evidence_with_steps(
     ev
 }
 
+fn extract_generic_step_result(g_st: &Value) -> (String, String, ParsedTs) {
+    let mut g_txt = val_to_str(g_st.get("content"));
+    let g_err = val_to_str(g_st.get("error")).trim().to_string();
+    if !g_err.is_empty() && !g_txt.contains(&g_err) {
+        if g_txt.is_empty() {
+            g_txt = g_err;
+        } else {
+            g_txt = format!("{}\n{}", g_txt, g_err).trim().to_string();
+        }
+    }
+    let g_status = val_to_str(g_st.get("status"));
+    let g_pt = g_st
+        .get("created_at")
+        .and_then(|v| v.as_str())
+        .map(parse_iso_ts_meta)
+        .unwrap_or_default();
+    (g_status, g_txt, g_pt)
+}
+
+fn step_has_truncated_content(step: &Value) -> bool {
+    step.get("truncated_fields")
+        .and_then(|v| v.as_array())
+        .map_or(false, |arr| arr.iter().any(|x| x.as_str() == Some("content")))
+}
+
 fn collect_generic_results(steps: &[Value], planner_idx: usize) -> Vec<(String, String, ParsedTs)> {
     let mut g_cur = planner_idx + 1;
     let mut out = Vec::new();
@@ -906,22 +931,7 @@ fn collect_generic_results(steps: &[Value], planner_idx: usize) -> Vec<(String, 
         if g_st.get("type").and_then(|v| v.as_str()) != Some("GENERIC") {
             break;
         }
-        let mut g_txt = val_to_str(g_st.get("content"));
-        let g_err = val_to_str(g_st.get("error")).trim().to_string();
-        if !g_err.is_empty() && !g_txt.contains(&g_err) {
-            if g_txt.is_empty() {
-                g_txt = g_err;
-            } else {
-                g_txt = format!("{}\n{}", g_txt, g_err).trim().to_string();
-            }
-        }
-        let g_status = val_to_str(g_st.get("status"));
-        let g_pt = g_st
-            .get("created_at")
-            .and_then(|v| v.as_str())
-            .map(parse_iso_ts_meta)
-            .unwrap_or_default();
-        out.push((g_status, g_txt, g_pt));
+        out.push(extract_generic_step_result(g_st));
         g_cur += 1;
     }
     out
@@ -1868,6 +1878,22 @@ fn is_modern_review_cap_marker(marker: &Value) -> bool {
         .is_some_and(|n| n >= MAX_REVIEW_ROUNDS as u64)
 }
 
+fn swarm_call_needs_full_content(tc: &Value) -> bool {
+    let Some(args) = tc.get("args").and_then(|v| v.as_object()) else {
+        return false;
+    };
+    let act = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    matches!(act, "models" | "add" | "model")
+        || args
+            .get("model")
+            .and_then(|v| v.as_str())
+            .is_some_and(|m| !m.trim().is_empty())
+}
+
 fn recover_compact_swarm_steps(
     tp: &str,
     tail_idx: i64,
@@ -1878,6 +1904,9 @@ fn recover_compact_swarm_steps(
     mut on_swarm_res: impl FnMut(&mut SwarmEvidence, &Value, &str, &str, ParsedTs, f64, Option<usize>, bool),
 ) -> Vec<Value> {
     let compact_steps = rio::read_compact_transcript_steps(tp, 16000);
+    // INVARIANT: Compact `transcript.jsonl` truncates `content` around ~4 KiB, chopping off the trailing `"quotas"` block of `swarm(action="models", all=true)`. Scan compact steps once, collect contiguous truncated swarm result `step_index`es, hydrate them in one streaming pass over `transcript_full.jsonl`, and dispatch cleanly.
+    let mut matched_calls: Vec<(usize, usize, Option<usize>, f64)> = Vec::new();
+    let mut wanted_full_indices: HashSet<i64> = HashSet::new();
     for (p_idx, p_st) in compact_steps.iter().enumerate() {
         let Some(s_idx) = p_st.get("step_index").and_then(|v| v.as_i64()) else {
             continue;
@@ -1885,7 +1914,7 @@ fn recover_compact_swarm_steps(
         if s_idx <= 0 || s_idx >= tail_idx {
             continue;
         }
-        let p_source = val_to_str(p_st.get("source"));
+        let p_source = p_st.get("source").and_then(|v| v.as_str()).unwrap_or("");
         if p_source == "SYSTEM" {
             let sys_pt = p_st
                 .get("created_at")
@@ -1903,15 +1932,6 @@ fn recover_compact_swarm_steps(
         {
             continue;
         }
-        let p_call_ts = p_st
-            .get("created_at")
-            .and_then(|v| v.as_str())
-            .map(rio::parse_iso_ts)
-            .unwrap_or(0.0);
-        let is_models_lead_in = is_models_lead_in_ts(p_call_ts, first_ts, models_floor_ts);
-        if p_call_ts > 0.0 && p_call_ts < first_ts - 2.0 && !is_models_lead_in {
-            continue;
-        }
         let Some(p_tcs) = p_st.get("tool_calls").and_then(|v| v.as_array()) else {
             continue;
         };
@@ -1921,7 +1941,24 @@ fn recover_compact_swarm_steps(
         {
             continue;
         }
-        let p_gen = collect_generic_results(&compact_steps, p_idx);
+        let p_call_ts = p_st
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .map(rio::parse_iso_ts)
+            .unwrap_or(0.0);
+        let is_models_lead_in = is_models_lead_in_ts(p_call_ts, first_ts, models_floor_ts);
+        if p_call_ts > 0.0 && p_call_ts < first_ts - 2.0 && !is_models_lead_in {
+            continue;
+        }
+        let mut gen_len = 0usize;
+        while compact_steps
+            .get(p_idx + 1 + gen_len)
+            .and_then(|s| s.get("type"))
+            .and_then(|v| v.as_str())
+            == Some("GENERIC")
+        {
+            gen_len += 1;
+        }
         for (p_pos, p_tc) in p_tcs.iter().enumerate() {
             if p_tc.get("name").and_then(|v| v.as_str()) != Some("swarm") {
                 continue;
@@ -1929,17 +1966,56 @@ fn recover_compact_swarm_steps(
             if is_models_lead_in && !is_swarm_models_call(p_tc) {
                 continue;
             }
-            let (g_status, blob, g_pt) = p_gen
-                .get(p_pos)
-                .map(|(st, b, pt)| (st.as_str(), b.as_str(), *pt))
-                .unwrap_or(("", "", ParsedTs::default()));
-            let has_content_trunc = compact_steps
-                .get(p_idx + 1 + p_pos)
-                .and_then(|s| s.get("truncated_fields"))
-                .and_then(|v| v.as_array())
-                .map_or(false, |arr| arr.iter().any(|x| x.as_str() == Some("content")));
-            on_swarm_res(ev, p_tc, g_status, blob, g_pt, p_call_ts, None, !has_content_trunc);
+            let g_pos = (p_pos < gen_len).then_some(p_idx + 1 + p_pos);
+            if let Some(gi) = g_pos {
+                let g_st = &compact_steps[gi];
+                if step_has_truncated_content(g_st) && swarm_call_needs_full_content(p_tc) {
+                    if let Some(g_idx) = g_st.get("step_index").and_then(|v| v.as_i64()) {
+                        wanted_full_indices.insert(g_idx);
+                    }
+                }
+            }
+            matched_calls.push((p_idx, p_pos, g_pos, p_call_ts));
         }
+    }
+    let full_by_idx = if wanted_full_indices.is_empty() {
+        HashMap::new()
+    } else {
+        rio::read_full_transcript_steps_by_indices(tp, &wanted_full_indices)
+    };
+    for (p_idx, p_pos, g_pos, p_call_ts) in matched_calls {
+        let p_tc = &compact_steps[p_idx]["tool_calls"][p_pos];
+        let ((g_status, blob, g_pt), content_complete) = if let Some(gi) = g_pos {
+            let compact_g_st = &compact_steps[gi];
+            let has_compact_trunc = step_has_truncated_content(compact_g_st);
+            let hydrated = has_compact_trunc
+                .then(|| compact_g_st.get("step_index").and_then(|v| v.as_i64()))
+                .flatten()
+                .and_then(|g_idx| full_by_idx.get(&g_idx));
+            if let Some(full_st) = hydrated {
+                (
+                    extract_generic_step_result(full_st),
+                    !step_has_truncated_content(full_st),
+                )
+            } else {
+                (
+                    extract_generic_step_result(compact_g_st),
+                    !has_compact_trunc,
+                )
+            }
+        } else {
+            ((String::new(), String::new(), ParsedTs::default()), true)
+        };
+        on_swarm_res(
+            ev,
+            p_tc,
+            g_status.as_str(),
+            blob.as_str(),
+            g_pt,
+            p_call_ts,
+            None,
+            content_complete,
+        );
     }
     compact_steps
 }
@@ -2706,13 +2782,22 @@ pub fn scan_swarm_activity_with_reset(input: SwarmScanInput<'_>) -> SwarmEvidenc
     } else {
         Vec::new()
     };
-    let hist_mark_fps: Vec<String> = marker
+    // INVARIANT: Keep `(ts, Option<fp>)` entries intact (including `None` for unmeasured `fp: null` marks) so historical direct-reading verdicts are checked strictly against the mark active at `hist_ev.end_ts` rather than accepting stale hashes from earlier measured snapshots.
+    let hist_marks: Vec<(f64, Option<String>)> = marker
         .and_then(|m| m.get("content_marks"))
         .and_then(Value::as_array)
         .map(|arr| {
             arr.iter()
-                .filter_map(|it| it.get("fp").and_then(Value::as_str).map(str::to_string))
-                .filter(|s| !s.is_empty())
+                .map(|it| {
+                    let ts = val_to_f64(it.get("ts"));
+                    let fp = it
+                        .get("fp")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                    (ts, fp)
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -4097,17 +4182,29 @@ pub fn scan_swarm_activity_with_reset(input: SwarmScanInput<'_>) -> SwarmEvidenc
                         SpanTier::Allowed(cur_simp_tier)
                     }
                 };
+                let span_byte_bounds = |s_idx: usize| -> (usize, usize) {
+                    // INVARIANT: Partition `all_joined` disjointly at exact verdict byte boundaries so a `DIFF_HASH` after an earlier verdict (`CLEAN` -> `DIFF_HASH: H1` -> `ACTIONABLE_FIXES`, whether in separate messages or one single post) belongs exclusively to the preceding verdict span and can never credit a later unhashed verdict.
+                    let owned_start = if s_idx == 0 { 0 } else { all_spans[s_idx].0 };
+                    let owned_end = all_spans
+                        .get(s_idx + 1)
+                        .map_or(all_joined.len(), |s| s.0);
+                    (owned_start, owned_end)
+                };
                 let mut hist_span: Option<(usize, bool, &'static str)> = None;
-                for (s_idx, &(_, end_msg, is_clean)) in span_bounds.iter().enumerate() {
+                let mut hist_span_meta: Option<(usize, usize, usize, usize, usize)> = None;
+                for (s_idx, &(start_msg, end_msg, is_clean)) in span_bounds.iter().enumerate() {
+                    let (b_start, b_end) = span_byte_bounds(s_idx);
                     match span_tier_at(s_idx) {
                         SpanTier::Allowed(tier) => {
                             hist_span = Some((end_msg, is_clean, tier));
+                            hist_span_meta = Some((s_idx, b_start, b_end, start_msg, end_msg));
                         }
                         SpanTier::Ambiguous if !is_clean => {
                             // INVARIANT: Preserve fail-closed revokers (`ACTIONABLE_FIXES` /
                             // `FINDINGS_REPORTED`) with an empty tier (`""`) only when the model
                             // epoch is ambiguous/in-flight — never for definitively non-simplify models.
                             hist_span = Some((end_msg, false, ""));
+                            hist_span_meta = Some((s_idx, b_start, b_end, start_msg, end_msg));
                         }
                         SpanTier::Ambiguous | SpanTier::Disallowed => {}
                     }
@@ -4156,8 +4253,59 @@ pub fn scan_swarm_activity_with_reset(input: SwarmScanInput<'_>) -> SwarmEvidenc
                         all_msgs_fresh_and_hash_ok = false;
                     }
                 }
+                let check_span_byte_hashes = |s_idx: usize,
+                                              byte_start: usize,
+                                              byte_end: usize,
+                                              span_msgs: std::ops::RangeInclusive<usize>,
+                                              fresh_only_non_span: bool,
+                                              hashes: &[String]|
+                 -> (bool, bool) {
+                    let (mut any_match, mut any_mismatch) = (false, false);
+                    for j in 0..k {
+                        let m_start = if j == 0 { 0 } else { ends[j - 1] + 2 };
+                        let m_end = ends[j];
+                        let lo = byte_start.max(m_start);
+                        let hi = byte_end.min(m_end);
+                        if lo >= hi {
+                            continue;
+                        }
+                        if fresh_only_non_span
+                            && !span_msgs.contains(&j)
+                            && (msg_in_any_span[j] || !msg_is_fresh[j])
+                        {
+                            continue;
+                        }
+                        if !fresh_only_non_span
+                            && !span_msgs.contains(&j)
+                            && msg_in_any_span[j]
+                        {
+                            continue;
+                        }
+                        let (m_ok, m_bad) =
+                            cwg_common::check_diff_hashes_any(&all_joined[lo..hi], hashes);
+                        any_match |= m_ok;
+                        any_mismatch |= m_bad;
+                    }
+                    // INVARIANT (`4t7`): Trailing non-verdict messages immediately following a multi-verdict message must still propagate fail-closed `any_mismatch` to every verdict span ending in that message without granting positive `any_match` across span boundaries.
+                    let end_m = *span_msgs.end();
+                    let next_m_start = span_bounds[s_idx + 1..]
+                        .iter()
+                        .find(|s| s.0 > end_m)
+                        .map_or(k, |s| s.0);
+                    for j in (end_m + 1)..next_m_start {
+                        if msg_in_any_span[j] || (fresh_only_non_span && !msg_is_fresh[j]) {
+                            continue;
+                        }
+                        let (_, m_bad) =
+                            cwg_common::check_diff_hashes_any(win_annotated[j].text, hashes);
+                        any_mismatch |= m_bad;
+                    }
+                    (any_match, any_mismatch)
+                };
                 let mut last_fresh_span: Option<(usize, bool, &'static str)> = None;
                 let mut last_fresh_window: Option<(usize, usize, usize, usize)> = None;
+                let mut last_fresh_bytes: Option<(usize, usize, usize, usize, usize)> = None;
+                let mut last_fresh_hash_verified = !enforce_hash_check || !require_explicit_hash_match;
                 for (s_idx, &(start_msg, end_msg, is_clean)) in span_bounds.iter().enumerate() {
                     let span_fresh_ok = if is_clean {
                         (start_msg..=end_msg).all(|i| msg_is_fresh[i])
@@ -4169,25 +4317,23 @@ pub fn scan_swarm_activity_with_reset(input: SwarmScanInput<'_>) -> SwarmEvidenc
                     if !span_fresh_ok {
                         continue;
                     }
-                    let prev_end = span_bounds[..s_idx]
-                        .iter()
-                        .rev()
-                        .find(|s| s.1 < start_msg)
-                        .map_or(0, |s| s.1 + 1);
-                    let next_start = span_bounds[s_idx + 1..]
+                    let (b_start, b_end) = span_byte_bounds(s_idx);
+                    let owned_msg_start = if s_idx == 0 { 0 } else { start_msg };
+                    let next_msg_start = span_bounds[s_idx + 1..]
                         .iter()
                         .find(|s| s.0 > end_msg)
                         .map_or(k, |s| s.0);
+                    let mut span_hash_verified =
+                        !enforce_hash_check || !require_explicit_hash_match;
                     if enforce_hash_check {
-                        let (mut any_match, mut any_mismatch) = (false, false);
-                        for j in prev_end..next_start {
-                            if (start_msg..=end_msg).contains(&j)
-                                || (!msg_in_any_span[j] && msg_is_fresh[j])
-                            {
-                                any_match |= msg_hash_flags[j].0;
-                                any_mismatch |= msg_hash_flags[j].1;
-                            }
-                        }
+                        let (any_match, any_mismatch) = check_span_byte_hashes(
+                            s_idx,
+                            b_start,
+                            b_end,
+                            start_msg..=end_msg,
+                            true,
+                            &accepted_hashes,
+                        );
                         let hash_rejected = if is_clean {
                             any_mismatch || (require_explicit_hash_match && !any_match)
                         } else {
@@ -4196,6 +4342,9 @@ pub fn scan_swarm_activity_with_reset(input: SwarmScanInput<'_>) -> SwarmEvidenc
                         if hash_rejected {
                             continue;
                         }
+                        if require_explicit_hash_match {
+                            span_hash_verified = any_match && !any_mismatch;
+                        }
                     }
                     match span_tier_at(s_idx) {
                         SpanTier::Allowed(tier) => {
@@ -4203,11 +4352,17 @@ pub fn scan_swarm_activity_with_reset(input: SwarmScanInput<'_>) -> SwarmEvidenc
                                 seen_fresh_clean = true;
                             }
                             last_fresh_span = Some((end_msg, is_clean, tier));
-                            last_fresh_window = Some((prev_end, start_msg, end_msg, next_start));
+                            last_fresh_window =
+                                Some((owned_msg_start, start_msg, end_msg, next_msg_start));
+                            last_fresh_bytes = Some((s_idx, b_start, b_end, start_msg, end_msg));
+                            last_fresh_hash_verified = span_hash_verified;
                         }
                         SpanTier::Ambiguous if !is_clean => {
                             last_fresh_span = Some((end_msg, false, ""));
-                            last_fresh_window = Some((prev_end, start_msg, end_msg, next_start));
+                            last_fresh_window =
+                                Some((owned_msg_start, start_msg, end_msg, next_msg_start));
+                            last_fresh_bytes = Some((s_idx, b_start, b_end, start_msg, end_msg));
+                            last_fresh_hash_verified = false;
                         }
                         SpanTier::Ambiguous | SpanTier::Disallowed => {}
                     }
@@ -4273,47 +4428,78 @@ pub fn scan_swarm_activity_with_reset(input: SwarmScanInput<'_>) -> SwarmEvidenc
                             ev.multi_lens_spoof_ts = sev.end_ts;
                         }
                     } else if enforce_hash_check && require_explicit_hash_match {
-                        for cand_h in &accepted_hashes {
-                            if !ev.live_verified_simplify_hashes.contains(cand_h)
-                                && win_annotated.iter().any(|item| {
-                                    cwg_common::check_diff_hashes_any(
-                                        item.text,
-                                        std::slice::from_ref(cand_h),
+                        if !last_fresh_hash_verified {
+                            // INVARIANT: Preserve an unhashed fresh `ACTIONABLE_FIXES` in `simplify_events` solely as a revoker of earlier `CLEAN`, while marking the window unverified so it cannot credit a required lens under active `swarm-cache prepare`.
+                            ev.unverified_simplify_windows
+                                .insert((hist_ev.worker_ord, hist_ev.win_ord));
+                        } else {
+                            for cand_h in &accepted_hashes {
+                                if !ev.live_verified_simplify_hashes.contains(cand_h)
+                                    && last_fresh_bytes.is_some_and(
+                                        |(f_sidx, b_start, b_end, s_msg, e_msg)| {
+                                            check_span_byte_hashes(
+                                                f_sidx,
+                                                b_start,
+                                                b_end,
+                                                s_msg..=e_msg,
+                                                true,
+                                                std::slice::from_ref(cand_h),
+                                            )
+                                            .0
+                                        },
                                     )
-                                    .0
-                                })
-                            {
-                                ev.live_verified_simplify_hashes.push(cand_h.clone());
+                                {
+                                    ev.live_verified_simplify_hashes.push(cand_h.clone());
+                                }
                             }
                         }
                     }
                     simplify_events.push(sev);
                 } else if enforce_hash_check {
-                    let post_edit_superseded = !has_unmeasured_mark
-                        && marker_last_durable_ts > hist_ev.end_ts + TS_EPS;
+                    let post_edit_superseded = marker_last_durable_ts > hist_ev.end_ts + TS_EPS;
+                    // INVARIANT: Scope historical `DIFF_HASH` validation strictly to the selected verdict's disjoint byte slice (`hist_span_meta`) so a later unhashed `ACTIONABLE_FIXES` cannot inherit an earlier `CLEAN` span's `DIFF_HASH` even inside the same message.
+                    let (h_sidx, h_b_start, h_b_end, h_start_msg, h_end_msg) = hist_span_meta
+                        .unwrap_or((
+                            span_bounds.len().saturating_sub(1),
+                            0,
+                            all_joined.len(),
+                            0,
+                            k.saturating_sub(1),
+                        ));
                     let hist_hash_ok = if require_explicit_hash_match {
                         !hist_prep_hashes.is_empty() && {
-                            let (mut h_match, mut h_mismatch) = (false, false);
-                            for item in &win_annotated {
-                                let (m_ok, m_bad) = cwg_common::check_diff_hashes_any(
-                                    item.text,
-                                    &hist_prep_hashes,
-                                );
-                                h_match |= m_ok;
-                                h_mismatch |= m_bad;
-                            }
+                            let (h_match, h_mismatch) = check_span_byte_hashes(
+                                h_sidx,
+                                h_b_start,
+                                h_b_end,
+                                h_start_msg..=h_end_msg,
+                                false,
+                                &hist_prep_hashes,
+                            );
                             h_match && !h_mismatch
                         }
-                    } else if !hist_mark_fps.is_empty() {
-                        let mut any_bad = false;
-                        for item in &win_annotated {
-                            let (_, m_bad) =
-                                cwg_common::check_diff_hashes_any(item.text, &hist_mark_fps);
-                            any_bad |= m_bad;
-                        }
-                        !any_bad
                     } else {
-                        true
+                        let mut active_mark: Option<(f64, Option<&str>)> = None;
+                        for (mts, mfp) in &hist_marks {
+                            if *mts <= hist_ev.end_ts + TS_EPS
+                                && active_mark.map_or(true, |(best_ts, _)| *mts >= best_ts)
+                            {
+                                active_mark = Some((*mts, mfp.as_deref()));
+                            }
+                        }
+                        let active_fps: Vec<String> = active_mark
+                            .and_then(|(_, fp)| fp.map(str::to_string))
+                            .into_iter()
+                            .collect();
+                        let (_, any_bad) = check_span_byte_hashes(
+                            h_sidx,
+                            h_b_start,
+                            h_b_end,
+                            h_start_msg..=h_end_msg,
+                            false,
+                            &active_fps,
+                        );
+                        !any_bad
                     };
                     if !(post_edit_superseded && hist_hash_ok) {
                         ev.unverified_simplify_windows
@@ -19384,6 +19570,744 @@ mod tests {
                 );
             }
         }
+
+        match prev_home {
+            Some(v) => std::env::set_var("CARBON_STACK_HOME", v),
+            None => std::env::remove_var("CARBON_STACK_HOME"),
+        }
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_anom_82fa8544_uncovered_full_prepare_and_truncated_models_recovery() {
+        let _guard = crate::win32_sqlite::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!(
+            "cwg-anom-82fa8544-{}-{}",
+            std::process::id(),
+            (now_sec() * 1000.0) as u64
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        let shome = tmp.join("stack_home");
+        let brain = tmp.join("brain");
+        let repo = tmp.join("repo");
+        fs::create_dir_all(repo.join("rust/src")).unwrap();
+        let prev_home = std::env::var("CARBON_STACK_HOME").ok();
+        std::env::set_var("CARBON_STACK_HOME", &shome);
+
+        let repo_str = rio::normalize_path(&repo.to_string_lossy());
+        let run_git = |args: &[&str]| {
+            let (rc, out, err) = rio::run_git(&repo_str, args, 10.0);
+            assert_eq!(rc, 0, "git {:?} failed: {} {}", args, out, err);
+        };
+        run_git(&["init"]);
+        run_git(&["config", "user.email", "t@example.com"]);
+        run_git(&["config", "user.name", "Test"]);
+        let src_file = repo.join("rust/src/auth.rs");
+        fs::write(&src_file, "pub fn v() -> i32 { 1 }\n").unwrap();
+        run_git(&["add", "."]);
+        run_git(&["commit", "-m", "init"]);
+
+        // Mutate tracked HIGH file + an external file outside git_root so full-repo prepare fails uncovered.
+        fs::write(&src_file, "pub fn v() -> i32 { 2 }\n").unwrap();
+        let outside_file = tmp.join("outside_notes.rs");
+        fs::write(&outside_file, "pub fn ext() {}\n").unwrap();
+        let src_norm = rio::normalize_path(&src_file.to_string_lossy());
+        let out_norm = rio::normalize_path(&outside_file.to_string_lossy());
+
+        let sess = "sess-anom-82fa8544";
+        let skey = rio::safe_key(sess, "default");
+        let mpath = cwg_common::marker_path(&skey);
+        let t_first = rio::parse_iso_ts("2026-11-21T04:00:00Z");
+        let t_prep = rio::parse_iso_ts("2026-11-21T04:01:00Z");
+        let t_models = rio::parse_iso_ts("2026-11-21T04:02:00Z");
+        let t_sim_start = rio::parse_iso_ts("2026-11-21T04:03:00Z");
+        let t_edit_post = rio::parse_iso_ts("2026-11-21T04:05:00Z");
+        let iso = |ts: f64| crate::win32_sqlite::format_iso_utc(ts);
+
+        let m_init = json!({
+            "session": sess,
+            "git_root": repo_str,
+            "cwd": repo_str,
+            "first_ts": t_first,
+            "last_ts": t_first + 5.0,
+            "last_durable_ts": t_first + 5.0,
+            "round_start_msg_id": 0,
+            "edits": 2,
+            "risk": "HIGH",
+            "paths": [src_norm.clone(), out_norm.clone()],
+            "current_diff_hash": "",
+            "content_marks": [
+                {"ts": t_first + 2.0, "fp": "aaaa111122223333", "cause": "edit_file"},
+                {"ts": t_first + 5.0, "fp": Value::Null, "cause": "stop_catchup_unmeasured_edit"}
+            ],
+            "gate_max_review_rounds": cwg_common::MAX_ORDINARY_REVIEW_ROUNDS,
+        });
+        rio::write_json(&mpath, &m_init).unwrap();
+
+        // 1) Fresh full-repo `swarm-cache prepare` (paths: &[]) fails uncovered WITHOUT poisoning marker/rounds.json, and explicitly reports `direct_read_allowed: true`.
+        let prep_fail = crate::swarm_cache::prepare_round(crate::swarm_cache::PrepareRoundInput {
+            session: sess,
+            cwd: &repo_str,
+            brain_root: &brain,
+            label: "simplify",
+            ttl_seconds: 270,
+            paths: &[],
+            reset: false,
+            now_ts: Some(t_prep),
+        });
+        assert_eq!(prep_fail["ok"], json!(false));
+        assert_eq!(prep_fail["candidate_diff_covered"], json!(false));
+        assert_eq!(prep_fail["direct_read_allowed"], json!(true));
+        assert_eq!(prep_fail["error"], json!("partial_or_uncovered_candidate_diff"));
+        let m_after_prep = rio::read_json(&mpath).unwrap();
+        assert!(
+            !cwg_common::marker_has_prepare_cycle(Some(&m_after_prep)),
+            "fresh full-repo uncovered prepare must not stamp swarm_prepare_cycle_ts"
+        );
+        assert!(
+            !cwg_common::swarm_rounds_path(&skey).exists(),
+            "fresh full-repo uncovered prepare must not poison swarm_rounds/<session>.json"
+        );
+        let (req_after, _) = cwg_common::swarm_prepare_hash_policy(sess, Some(&m_after_prep), "");
+        assert!(
+            !req_after,
+            "fresh full-repo uncovered prepare must keep require_explicit_hash_match=false for direct file reading"
+        );
+
+        // 2) Truncated compact transcript.jsonl (`swarm(action="models", all=true)` quotas chopped off) hydrated from sibling transcript_full.jsonl.
+        let compact_models_step = json!({
+            "step_index": 5,
+            "source": "MODEL",
+            "type": "GENERIC",
+            "status": "DONE",
+            "created_at": iso(t_models + 1.0),
+            "content": "{\"models\":[\"claude-sonnet-5-5-high\",\"gemini-4-neon-xhigh\"]...TRUNCATED",
+            "truncated_fields": ["content"]
+        });
+        let full_models_step = json!({
+            "step_index": 5,
+            "source": "MODEL",
+            "type": "GENERIC",
+            "status": "DONE",
+            "created_at": iso(t_models + 1.0),
+            "content": "{\"models\":[\"claude-sonnet-5-5-high\",\"gemini-4-neon-xhigh\"],\"quotas\":{\"claude-sonnet-5-5-high\":{\"quota_remaining\":\"0%\"},\"gemini-4-neon-xhigh\":{\"quota_remaining\":\"90%\"}}}"
+        });
+        let models_call_step = json!({
+            "step_index": 4,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "created_at": iso(t_models),
+            "tool_calls": [{"name": "swarm", "args": {"action": "models", "all": true}}]
+        });
+        let compact_tx = format!("{}\n{}\n", models_call_step, compact_models_step);
+        let full_tx = format!("{}\n{}\n", models_call_step, full_models_step);
+
+        let tp_full = setup_neon_session_env(
+            &brain,
+            sess,
+            &full_tx,
+            json!({
+                "members": {
+                    "simplify-reuse": {"role": "worker", "conversation_id": "cid-82f-r", "model": cwg_common::NEON_XHIGH_MODEL, "killed": true},
+                    "simplify-quality": {"role": "worker", "conversation_id": "cid-82f-q", "model": cwg_common::NEON_XHIGH_MODEL, "killed": true},
+                    "simplify-efficiency": {"role": "worker", "conversation_id": "cid-82f-e", "model": cwg_common::NEON_XHIGH_MODEL, "killed": true},
+                }
+            }),
+            &[
+                json!({"seq": 1, "agent": "coordinator", "time": iso(t_sim_start), "text": "@simplify-reuse direct review"}),
+                json!({"seq": 2, "agent": "coordinator", "time": iso(t_sim_start + 1.0), "text": "@simplify-quality direct review"}),
+                json!({"seq": 3, "agent": "coordinator", "time": iso(t_sim_start + 2.0), "text": "@simplify-efficiency direct review"}),
+                json!({"seq": 4, "agent": "simplify-reuse", "time": iso(t_sim_start + 20.0), "text": "@coordinator\nSIMPLIFY_LENS: REUSE\nSIMPLIFY_VERDICT: ACTIONABLE_FIXES"}),
+                json!({"seq": 5, "agent": "simplify-quality", "time": iso(t_sim_start + 25.0), "text": "@coordinator\nSIMPLIFY_LENS: QUALITY\nSIMPLIFY_VERDICT: ACTIONABLE_FIXES"}),
+                json!({"seq": 6, "agent": "simplify-efficiency", "time": iso(t_sim_start + 30.0), "text": "@coordinator\nSIMPLIFY_LENS: EFFICIENCY\nSIMPLIFY_VERDICT: ACTIONABLE_FIXES"}),
+            ],
+            &[
+                ("cid-82f-r", &[json!({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": iso(t_sim_start)})]),
+                ("cid-82f-q", &[json!({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": iso(t_sim_start + 1.0)})]),
+                ("cid-82f-e", &[json!({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": iso(t_sim_start + 2.0)})]),
+            ],
+        );
+        fs::write(tp_full.with_file_name("transcript.jsonl"), &compact_tx).unwrap();
+        let tp_full_str = tp_full.to_string_lossy().into_owned();
+
+        // 3) Post-simplify durable edit (still unmeasured `fp: null`) + 4 ordinary rounds (ESCALATE) + research + 2/2 closure BLOCKED -> `[gate] draft-blocked` accepted!
+        let mut m_post = m_after_prep.clone();
+        m_post["last_ts"] = json!(t_edit_post);
+        m_post["last_durable_ts"] = json!(t_edit_post);
+        m_post["content_marks"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"ts": t_edit_post, "fp": Value::Null, "cause": "edit_file"}));
+        rio::write_json(&mpath, &m_post).unwrap();
+
+        // Simulate >4000-step eviction so `recover_compact_swarm_steps` must hydrate step 5 from `transcript_full.jsonl`.
+        let tail_steps = vec![
+            json!({"step_index": 5000, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": iso(t_edit_post + 45.0), "tool_calls": [{"name": "search_web", "args": {"query": "wechat runtime"}}]}),
+            json!({"step_index": 5001, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": iso(t_edit_post + 46.0), "content": "docs"}),
+        ];
+        let sw_ev = scan_swarm_activity_with_reset(SwarmScanInput {
+            steps: &tail_steps,
+            transcript_path: Some(&tp_full_str),
+            first_ts: t_first,
+            round_start_msg_id: 0,
+            current_diff_hash: "",
+            cwd: &repo_str,
+            research_reset_ts: 0.0,
+            research_reset_seq: 0,
+            marker: Some(&m_post),
+        });
+        assert!(
+            sw_ev.sonnet_issue_verified,
+            "truncated compact models(all=true) must hydrate quotas from transcript_full.jsonl"
+        );
+        assert!(
+            sw_ev.unverified_simplify_windows.is_empty(),
+            "direct file-reading ACTIONABLE_FIXES after fresh uncovered full-repo prepare + unmeasured post-edit must remain verified: {:?}",
+            sw_ev.unverified_simplify_windows
+        );
+
+        let reviews = vec![
+            json!({"review_id": "cwg-82f-1", "kind": "ordinary", "verdict": "REVISE", "engine": "codex", "xhigh": false, "launch_ts": t_edit_post + 10.0, "verdict_ts": t_edit_post + 11.0}),
+            json!({"review_id": "cwg-82f-2", "kind": "ordinary", "verdict": "REVISE", "engine": "codex", "xhigh": false, "launch_ts": t_edit_post + 20.0, "verdict_ts": t_edit_post + 21.0}),
+            json!({"review_id": "cwg-82f-3", "kind": "ordinary", "verdict": "REVISE", "engine": "codex", "xhigh": false, "launch_ts": t_edit_post + 30.0, "verdict_ts": t_edit_post + 31.0}),
+            json!({"review_id": "cwg-82f-4", "kind": "ordinary", "verdict": "ESCALATE", "engine": "codex", "xhigh": false, "launch_ts": t_edit_post + 40.0, "verdict_ts": t_edit_post + 41.0}),
+            json!({"review_id": "cwg-82f-c1", "kind": "closure", "verdict": "BLOCKED", "engine": "codex", "xhigh": false, "launch_ts": t_edit_post + 50.0, "verdict_ts": t_edit_post + 51.0}),
+            json!({"review_id": "cwg-82f-c2", "kind": "closure", "verdict": "BLOCKED", "engine": "codex", "xhigh": false, "launch_ts": t_edit_post + 60.0, "verdict_ts": t_edit_post + 61.0}),
+        ];
+        let chk_ok = ChecksEvidence {
+            checks_count: 1,
+            passed_count: 1,
+            latest_pass_ts: t_edit_post + 5.0,
+            ..Default::default()
+        };
+        let rcp_draft = cwg_common::parse_terminal_receipt(
+            "[gate] draft-blocked: 2/2 closure passes blocked after 4 ordinary rounds",
+        )
+        .unwrap();
+        let (ok_draft, why_draft) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_draft),
+            marker_in: &m_post,
+            checks_ev: &chk_ok,
+            sub_ev: &SubagentEvidence::default(),
+            swarm_ev: &sw_ev,
+            codex_reviews: &reviews,
+            ctx: None,
+            steps: Some(&tail_steps),
+            transcript_path: Some(&tp_full_str),
+        });
+        assert!(
+            ok_draft && why_draft == "draft-blocked",
+            "anom-82fa8544 flow must accept terminal [gate] draft-blocked: ({}, {})",
+            ok_draft,
+            why_draft
+        );
+
+        // 4) Security counter-check (Codex #1): stale DIFF_HASH from an earlier measured mark (`aaaa111122223333`) superseded by `fp: null` before simplify must still be rejected.
+        let bpath = rio::swarm_dir(&brain, sess).join("board.jsonl");
+        let btxt = fs::read_to_string(&bpath).unwrap().replace(
+            "SIMPLIFY_LENS: REUSE\\nSIMPLIFY_VERDICT: ACTIONABLE_FIXES",
+            "SIMPLIFY_LENS: REUSE\\nSIMPLIFY_VERDICT: ACTIONABLE_FIXES\\nDIFF_HASH: aaaa111122223333",
+        );
+        fs::write(&bpath, btxt).unwrap();
+        let sw_forged = scan_swarm_activity_with_reset(SwarmScanInput {
+            steps: &tail_steps,
+            transcript_path: Some(&tp_full_str),
+            first_ts: t_first,
+            round_start_msg_id: 0,
+            current_diff_hash: "",
+            cwd: &repo_str,
+            research_reset_ts: 0.0,
+            research_reset_seq: 0,
+            marker: Some(&m_post),
+        });
+        assert!(
+            !sw_forged.unverified_simplify_windows.is_empty(),
+            "stale DIFF_HASH from an earlier measured mark must fail closed when unmeasured fp:null was active at verdict time"
+        );
+
+        // 5) Security counter-check (Codex #2): fresh full-repo covered `prepare` hitting a `swarm_rounds` write failure must NOT leave `swarm_prepare_cycle_ts` stamped on marker.
+        let sess_rw = "sess-anom-82f-rounds-lock";
+        let skey_rw = rio::safe_key(sess_rw, "default");
+        let mpath_rw = cwg_common::marker_path(&skey_rw);
+        let rpath_rw = cwg_common::swarm_rounds_path(&skey_rw);
+        let fp_src = cwg_common::content_fingerprint(
+            &[src_norm.clone()],
+            cwg_common::MAX_FINGERPRINT_FILE_BYTES,
+        );
+        rio::write_json(
+            &mpath_rw,
+            &json!({
+                "session": sess_rw,
+                "git_root": repo_str,
+                "cwd": repo_str,
+                "first_ts": t_first,
+                "last_ts": t_first + 5.0,
+                "last_durable_ts": t_first + 5.0,
+                "edits": 1,
+                "risk": "HIGH",
+                "paths": [src_norm.clone()],
+                "current_diff_hash": fp_src,
+                "content_marks": [{"ts": t_first + 5.0, "fp": fp_src, "cause": "edit_file"}],
+            }),
+        )
+        .unwrap();
+        rio::write_json(
+            &rpath_rw,
+            &json!({"session": sess_rw, "marker_first_ts": 1.0, "lanes": {}}),
+        )
+        .unwrap();
+        let prep_rw = {
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                let pinned = fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(0x0000_0001)
+                    .open(&rpath_rw)
+                    .unwrap();
+                let res = crate::swarm_cache::prepare_round(crate::swarm_cache::PrepareRoundInput {
+                    session: sess_rw,
+                    cwd: &repo_str,
+                    brain_root: &brain,
+                    label: "simplify",
+                    ttl_seconds: 270,
+                    paths: &[],
+                    reset: false,
+                    now_ts: Some(t_prep),
+                });
+                drop(pinned);
+                res
+            }
+            #[cfg(unix)]
+            {
+                fs::remove_file(&rpath_rw).unwrap();
+                fs::create_dir_all(&rpath_rw).unwrap();
+                let res = crate::swarm_cache::prepare_round(crate::swarm_cache::PrepareRoundInput {
+                    session: sess_rw,
+                    cwd: &repo_str,
+                    brain_root: &brain,
+                    label: "simplify",
+                    ttl_seconds: 270,
+                    paths: &[],
+                    reset: false,
+                    now_ts: Some(t_prep),
+                });
+                let _ = fs::remove_dir_all(&rpath_rw);
+                res
+            }
+        };
+        assert_eq!(prep_rw["ok"], json!(false));
+        assert!(
+            !cwg_common::marker_has_prepare_cycle(rio::read_json(&mpath_rw).as_ref()),
+            "failed rounds.json commit on fresh full-repo prepare must not leave swarm_prepare_cycle_ts stamped on marker"
+        );
+        let _ = fs::remove_file(&rpath_rw);
+
+        // 6) Contract counter-checks (Codex #3 & #4): partial `--paths` prepare returns `direct_read_allowed: false`; under active `prepare`, fresh `ACTIONABLE_FIXES` without `DIFF_HASH` revokes earlier `CLEAN` without crediting lenses.
+        let sess_af = "sess-anom-82f-unhashed-af";
+        let skey_af = rio::safe_key(sess_af, "default");
+        let mpath_af = cwg_common::marker_path(&skey_af);
+        rio::write_json(
+            &mpath_af,
+            &json!({
+                "session": sess_af,
+                "git_root": repo_str,
+                "cwd": repo_str,
+                "first_ts": t_first,
+                "last_ts": t_first + 5.0,
+                "last_durable_ts": t_first + 5.0,
+                "edits": 1,
+                "risk": "HIGH",
+                "paths": [src_norm.clone()],
+                "current_diff_hash": fp_src,
+                "content_marks": [{"ts": t_first + 5.0, "fp": fp_src, "cause": "edit_file"}],
+            }),
+        )
+        .unwrap();
+        let prep_af_ok = crate::swarm_cache::prepare_round(crate::swarm_cache::PrepareRoundInput {
+            session: sess_af,
+            cwd: &repo_str,
+            brain_root: &brain,
+            label: "simplify",
+            ttl_seconds: 270,
+            paths: &[],
+            reset: false,
+            now_ts: Some(t_prep),
+        });
+        assert_eq!(prep_af_ok["ok"], json!(true));
+        let prep_af_dh = val_to_str(prep_af_ok.get("current_diff_hash"));
+        let prep_af_partial =
+            crate::swarm_cache::prepare_round(crate::swarm_cache::PrepareRoundInput {
+                session: sess_af,
+                cwd: &repo_str,
+                brain_root: &brain,
+                label: "simplify",
+                ttl_seconds: 270,
+                paths: &["rust/src/auth.rs".to_string()],
+                reset: false,
+                now_ts: Some(t_prep + 5.0),
+            });
+        assert_eq!(prep_af_partial["ok"], json!(false));
+        assert_eq!(prep_af_partial["direct_read_allowed"], json!(false));
+        let m_af = rio::read_json(&mpath_af).unwrap();
+        let tp_af = setup_neon_session_env(
+            &brain,
+            sess_af,
+            "",
+            json!({
+                "members": {
+                    "simplify-reuse": {"role": "worker", "conversation_id": "cid-af-r", "model": cwg_common::SONNET_HIGH_MODEL, "killed": true},
+                    "simplify-quality": {"role": "worker", "conversation_id": "cid-af-q", "model": cwg_common::SONNET_HIGH_MODEL, "killed": true},
+                    "simplify-efficiency": {"role": "worker", "conversation_id": "cid-af-e", "model": cwg_common::SONNET_HIGH_MODEL, "killed": true},
+                }
+            }),
+            &[
+                json!({"seq": 1, "agent": "coordinator", "time": iso(t_sim_start), "text": format!("@simplify-reuse @simplify-quality @simplify-efficiency DIFF_HASH: {}", prep_af_dh)}),
+                json!({"seq": 2, "agent": "simplify-reuse", "time": iso(t_sim_start + 5.0), "text": "@coordinator\nSIMPLIFY_LENS: REUSE\nSIMPLIFY_VERDICT: CLEAN"}),
+                json!({"seq": 3, "agent": "simplify-reuse", "time": iso(t_sim_start + 6.0), "text": format!("DIFF_HASH: {}", prep_af_dh)}),
+                json!({"seq": 4, "agent": "simplify-reuse", "time": iso(t_sim_start + 8.0), "text": "@coordinator\nSIMPLIFY_LENS: REUSE\nSIMPLIFY_VERDICT: ACTIONABLE_FIXES"}),
+                json!({"seq": 5, "agent": "simplify-quality", "time": iso(t_sim_start + 10.0), "text": "@coordinator\nSIMPLIFY_LENS: QUALITY\nSIMPLIFY_VERDICT: ACTIONABLE_FIXES"}),
+                json!({"seq": 6, "agent": "simplify-efficiency", "time": iso(t_sim_start + 12.0), "text": "@coordinator\nSIMPLIFY_LENS: EFFICIENCY\nSIMPLIFY_VERDICT: ACTIONABLE_FIXES"}),
+            ],
+            &[
+                ("cid-af-r", &[json!({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": iso(t_sim_start)})]),
+                ("cid-af-q", &[json!({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": iso(t_sim_start)})]),
+                ("cid-af-e", &[json!({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": iso(t_sim_start)})]),
+            ],
+        );
+        let tp_af_str = tp_af.to_string_lossy().into_owned();
+        let sw_af = scan_swarm_activity_with_reset(SwarmScanInput {
+            steps: &[],
+            transcript_path: Some(&tp_af_str),
+            first_ts: t_first,
+            round_start_msg_id: 0,
+            current_diff_hash: &fp_src,
+            cwd: &repo_str,
+            research_reset_ts: 0.0,
+            research_reset_seq: 0,
+            marker: Some(&m_af),
+        });
+        assert!(
+            !sw_af.sonnet_lenses.contains_key("reuse"),
+            "unhashed ACTIONABLE_FIXES must still revoke earlier CLEAN on reuse lens"
+        );
+        assert!(
+            !has_completed_candidate_simplify(sess_af, &m_af, &tp_af_str),
+            "unhashed fresh ACTIONABLE_FIXES must not credit required lenses under active swarm-cache prepare"
+        );
+
+        // 7) Codex R2/R3 #4: after a real post-simplify edit changes `current_diff_hash` and `round_start_msg_id` (forcing the historical branch with `simplify_current_history` empty), an unhashed `ACTIONABLE_FIXES` following `CLEAN` + standalone `DIFF_HASH: H1` in the same window must NOT borrow `H1`.
+        fs::write(&src_file, "pub fn v() -> i32 { 3 }\n").unwrap();
+        let fp_after_af = cwg_common::content_fingerprint(
+            &[src_norm.clone()],
+            cwg_common::MAX_FINGERPRINT_FILE_BYTES,
+        );
+        let mut m_af_post = m_af.clone();
+        m_af_post["last_ts"] = json!(t_edit_post);
+        m_af_post["last_durable_ts"] = json!(t_edit_post);
+        m_af_post["round_start_msg_id"] = json!(6);
+        m_af_post["current_diff_hash"] = json!(fp_after_af);
+        m_af_post["content_marks"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"ts": t_edit_post, "fp": fp_after_af, "cause": "edit_file"}));
+        m_af_post["simplify_verified_latched"] = json!({
+            "candidate_first_ts": t_first,
+            "reset_epoch": 0,
+            "verified_ts": t_sim_start + 6.5,
+            "verified_hashes": [prep_af_dh.clone()],
+        });
+        rio::write_json(&mpath_af, &m_af_post).unwrap();
+        let sw_af_hist = scan_swarm_activity_with_reset(SwarmScanInput {
+            steps: &[],
+            transcript_path: Some(&tp_af_str),
+            first_ts: t_first,
+            round_start_msg_id: 6,
+            current_diff_hash: &fp_after_af,
+            cwd: &repo_str,
+            research_reset_ts: 0.0,
+            research_reset_seq: 0,
+            marker: Some(&m_af_post),
+        });
+        assert!(
+            sw_af_hist
+                .simplify_current_history
+                .as_ref()
+                .map_or(true, Vec::is_empty),
+            "post-edit fixture must exercise historical branch (fresh simplify_current_history must be empty)"
+        );
+        assert!(
+            !sw_af_hist.unverified_simplify_windows.is_empty(),
+            "historical unhashed ACTIONABLE_FIXES must not borrow standalone DIFF_HASH from earlier CLEAN in the same window"
+        );
+        assert!(
+            !has_completed_candidate_simplify(sess_af, &m_af_post, &tp_af_str),
+            "post-edit historical unhashed ACTIONABLE_FIXES after latched CLEAN + standalone DIFF_HASH must stay unverified"
+        );
+
+        // 7b) Codex R4 #4: two verdicts inside ONE single message (`CLEAN\nDIFF_HASH: H1\nACTIONABLE_FIXES`) must not let ACTIONABLE_FIXES borrow CLEAN's DIFF_HASH on either live or post-edit historical paths.
+        let bpath_af = rio::swarm_dir(&brain, sess_af).join("board.jsonl");
+        let single_msg_board = [
+            json!({"seq": 1, "agent": "coordinator", "time": iso(t_sim_start), "text": format!("@simplify-reuse @simplify-quality @simplify-efficiency DIFF_HASH: {}", prep_af_dh)}),
+            json!({"seq": 2, "agent": "simplify-reuse", "time": iso(t_sim_start + 5.0), "text": format!("@coordinator\nSIMPLIFY_LENS: REUSE\nSIMPLIFY_VERDICT: CLEAN\nDIFF_HASH: {}\nSIMPLIFY_VERDICT: ACTIONABLE_FIXES", prep_af_dh)}),
+            json!({"seq": 3, "agent": "simplify-quality", "time": iso(t_sim_start + 10.0), "text": format!("@coordinator\nSIMPLIFY_LENS: QUALITY\nSIMPLIFY_VERDICT: CLEAN\nDIFF_HASH: {}", prep_af_dh)}),
+            json!({"seq": 4, "agent": "simplify-efficiency", "time": iso(t_sim_start + 12.0), "text": format!("@coordinator\nSIMPLIFY_LENS: EFFICIENCY\nSIMPLIFY_VERDICT: CLEAN\nDIFF_HASH: {}", prep_af_dh)}),
+        ];
+        write_jsonl_lines(&bpath_af, &single_msg_board);
+        fs::write(&src_file, "pub fn v() -> i32 { 2 }\n").unwrap();
+        rio::write_json(&mpath_af, &m_af).unwrap();
+        let sw_single_live = scan_swarm_activity_with_reset(SwarmScanInput {
+            steps: &[],
+            transcript_path: Some(&tp_af_str),
+            first_ts: t_first,
+            round_start_msg_id: 0,
+            current_diff_hash: &fp_src,
+            cwd: &repo_str,
+            research_reset_ts: 0.0,
+            research_reset_seq: 0,
+            marker: Some(&m_af),
+        });
+        assert!(
+            !sw_single_live.sonnet_lenses.contains_key("reuse")
+                && !sw_single_live.unverified_simplify_windows.is_empty(),
+            "single-message CLEAN + DIFF_HASH + unhashed ACTIONABLE_FIXES must stay unverified live"
+        );
+        assert!(
+            !has_completed_candidate_simplify(sess_af, &m_af, &tp_af_str),
+            "single-message CLEAN + DIFF_HASH + unhashed ACTIONABLE_FIXES must not satisfy live simplify"
+        );
+        fs::write(&src_file, "pub fn v() -> i32 { 3 }\n").unwrap();
+        rio::write_json(&mpath_af, &m_af_post).unwrap();
+        let sw_single_hist = scan_swarm_activity_with_reset(SwarmScanInput {
+            steps: &[],
+            transcript_path: Some(&tp_af_str),
+            first_ts: t_first,
+            round_start_msg_id: 6,
+            current_diff_hash: &fp_after_af,
+            cwd: &repo_str,
+            research_reset_ts: 0.0,
+            research_reset_seq: 0,
+            marker: Some(&m_af_post),
+        });
+        assert!(
+            !sw_single_hist.unverified_simplify_windows.is_empty()
+                && !has_completed_candidate_simplify(sess_af, &m_af_post, &tp_af_str),
+            "single-message CLEAN + DIFF_HASH + unhashed ACTIONABLE_FIXES must stay unverified historically"
+        );
+        fs::write(&src_file, "pub fn v() -> i32 { 2 }\n").unwrap();
+
+        // 8) Codex R2/R3/R4 #2: marker persistence failure on fresh full-repo `prepare` must fail before touching `rounds.json` (`DELETE | GENERIC_WRITE` on Windows for both 0x1 and 0x3, non-root `0o444` on Unix), and even an orphaned `require_marker_cycle_ts` rounds.json left by a dual-lock rollback failure must stay inactive until `marker` commits.
+        let sess_mp = "sess-anom-82f-marker-lock";
+        let skey_mp = rio::safe_key(sess_mp, "default");
+        let mpath_mp = cwg_common::marker_path(&skey_mp);
+        let rpath_mp = cwg_common::swarm_rounds_path(&skey_mp);
+        rio::write_json(
+            &mpath_mp,
+            &json!({
+                "session": sess_mp,
+                "git_root": repo_str,
+                "cwd": repo_str,
+                "first_ts": t_first,
+                "last_ts": t_first + 5.0,
+                "last_durable_ts": t_first + 5.0,
+                "edits": 1,
+                "risk": "HIGH",
+                "paths": [src_norm.clone()],
+                "current_diff_hash": fp_src,
+                "content_marks": [{"ts": t_first + 5.0, "fp": fp_src, "cause": "edit_file"}],
+            }),
+        )
+        .unwrap();
+        assert!(!rpath_mp.exists());
+        #[cfg(windows)]
+        let share_modes: &[u32] = &[0x0000_0001, 0x0000_0003];
+        #[cfg(unix)]
+        let share_modes: &[u32] = &[0];
+        for &mode_val in share_modes {
+            let prep_mp_opt: Option<Value> = {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::OpenOptionsExt;
+                    let pinned = fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(mode_val)
+                        .open(&mpath_mp)
+                        .unwrap();
+                    let res =
+                        crate::swarm_cache::prepare_round(crate::swarm_cache::PrepareRoundInput {
+                            session: sess_mp,
+                            cwd: &repo_str,
+                            brain_root: &brain,
+                            label: "simplify",
+                            ttl_seconds: 270,
+                            paths: &[],
+                            reset: false,
+                            now_ts: Some(t_prep),
+                        });
+                    drop(pinned);
+                    Some(res)
+                }
+                #[cfg(unix)]
+                {
+                    let _ = mode_val;
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut perms = fs::metadata(&mpath_mp).unwrap().permissions();
+                    let orig_mode = perms.mode();
+                    perms.set_mode(0o444);
+                    fs::set_permissions(&mpath_mp, perms).unwrap();
+                    // WORKAROUND: Skip `0o444` DAC write-denial check under root / `CAP_DAC_OVERRIDE` where open(O_WRONLY) succeeds regardless of file mode.
+                    let dac_enforced = fs::OpenOptions::new().write(true).open(&mpath_mp).is_err();
+                    let res = if dac_enforced {
+                        Some(crate::swarm_cache::prepare_round(
+                            crate::swarm_cache::PrepareRoundInput {
+                                session: sess_mp,
+                                cwd: &repo_str,
+                                brain_root: &brain,
+                                label: "simplify",
+                                ttl_seconds: 270,
+                                paths: &[],
+                                reset: false,
+                                now_ts: Some(t_prep),
+                            },
+                        ))
+                    } else {
+                        None
+                    };
+                    let mut restore = fs::metadata(&mpath_mp).unwrap().permissions();
+                    restore.set_mode(orig_mode);
+                    let _ = fs::set_permissions(&mpath_mp, restore);
+                    res
+                }
+            };
+            if let Some(prep_mp) = prep_mp_opt {
+                assert_eq!(prep_mp["ok"], json!(false));
+                assert_eq!(prep_mp["direct_read_allowed"], json!(true));
+                assert!(
+                    val_to_str(prep_mp.get("error")).starts_with("marker_persist_failed:"),
+                    "marker write failure (mode={}) must surface marker_persist_failed: {:?}",
+                    mode_val,
+                    prep_mp
+                );
+                assert!(
+                    !rpath_mp.exists(),
+                    "marker_persist_failed (mode={}) on fresh full-repo prepare must leave no rounds.json on disk",
+                    mode_val
+                );
+                assert!(
+                    !cwg_common::swarm_prepare_hash_policy(
+                        sess_mp,
+                        rio::read_json(&mpath_mp).as_ref(),
+                        &fp_src
+                    )
+                    .0,
+                    "failed fresh prepare (mode={}) must keep require_explicit_hash_match=false",
+                    mode_val
+                );
+            }
+        }
+        // Cross-platform (including root/CAP_DAC_OVERRIDE) 2-phase commit proof: an orphaned `rounds.json` carrying `require_marker_cycle_ts` without a committed `marker.swarm_prepare_cycle_ts` must neither require `DIFF_HASH`, expose its `tree_oid`, nor reject `fp_src` after a `HEAD` shift (`git commit --allow-empty`).
+        let live_tree_mp = rio::capture_worktree_tree_oid(&repo_str, 10.0);
+        let live_head_mp = rio::git_head_oid(&repo_str);
+        rio::write_json(
+            &rpath_mp,
+            &json!({
+                "session": sess_mp,
+                "marker_first_ts": t_first,
+                "require_marker_cycle_ts": t_first,
+                "seen_heads": { rio::fold_path(&repo_str): [live_head_mp] },
+                "lanes": {
+                    format!("{}|simplify", rio::fold_path(&repo_str)): [{
+                        "round": 1,
+                        "head_oid": live_head_mp,
+                        "tree_oid": live_tree_mp,
+                        "diff_hash": fp_src,
+                        "unfiltered_tree_match": true,
+                        "paths": []
+                    }]
+                }
+            }),
+        )
+        .unwrap();
+        let m_mp_disk = rio::read_json(&mpath_mp);
+        let (req_uncom, acc_uncom) =
+            cwg_common::swarm_prepare_hash_policy(sess_mp, m_mp_disk.as_ref(), &fp_src);
+        assert!(
+            !req_uncom && acc_uncom == vec![fp_src.clone()],
+            "uncommitted require_marker_cycle_ts rounds.json must neither require DIFF_HASH nor expose tree_oid {}: ({}, {:?})",
+            live_tree_mp,
+            req_uncom,
+            acc_uncom
+        );
+        run_git(&["commit", "--allow-empty", "-m", "shift head without changing candidate"]);
+        let (req_uncom_head, acc_uncom_head) =
+            cwg_common::swarm_prepare_hash_policy(sess_mp, m_mp_disk.as_ref(), &fp_src);
+        assert!(
+            !req_uncom_head && acc_uncom_head == vec![fp_src.clone()],
+            "uncommitted require_marker_cycle_ts rounds.json must not trigger require_head_bound or reject direct-read fp after HEAD shift: ({}, {:?})",
+            req_uncom_head,
+            acc_uncom_head
+        );
+        let _ = fs::remove_file(&rpath_mp);
+
+        // 9) Codex R2 #3: pre-existing `marker_first_ts: 0` rounds.json on disk must yield `direct_read_allowed: false` matching gate policy.
+        let sess_pm = "sess-anom-82f-premarker-rounds";
+        let skey_pm = rio::safe_key(sess_pm, "default");
+        let mpath_pm = cwg_common::marker_path(&skey_pm);
+        let rpath_pm = cwg_common::swarm_rounds_path(&skey_pm);
+        rio::write_json(
+            &mpath_pm,
+            &json!({
+                "session": sess_pm,
+                "git_root": repo_str,
+                "cwd": repo_str,
+                "first_ts": t_first,
+                "last_ts": t_first + 5.0,
+                "last_durable_ts": t_first + 5.0,
+                "edits": 2,
+                "risk": "HIGH",
+                "paths": [src_norm.clone(), out_norm.clone()],
+                "current_diff_hash": "",
+                "content_marks": [{"ts": t_first + 5.0, "fp": Value::Null, "cause": "edit_file"}],
+            }),
+        )
+        .unwrap();
+        rio::write_json(
+            &rpath_pm,
+            &json!({
+                "session": sess_pm,
+                "marker_first_ts": 0.0,
+                "lanes": {
+                    format!("{}|simplify", rio::fold_path(&repo_str)): [{
+                        "round": 1,
+                        "tree_oid": "1111111111111111111111111111111111111111",
+                        "paths": []
+                    }]
+                }
+            }),
+        )
+        .unwrap();
+        let prep_pm = crate::swarm_cache::prepare_round(crate::swarm_cache::PrepareRoundInput {
+            session: sess_pm,
+            cwd: &repo_str,
+            brain_root: &brain,
+            label: "simplify",
+            ttl_seconds: 270,
+            paths: &[],
+            reset: false,
+            now_ts: Some(t_prep),
+        });
+        assert_eq!(prep_pm["ok"], json!(false));
+        assert_eq!(
+            prep_pm["direct_read_allowed"],
+            json!(false),
+            "pre-existing marker_first_ts=0 rounds.json requires DIFF_HASH in gate and must report direct_read_allowed=false"
+        );
+        assert!(
+            cwg_common::swarm_prepare_hash_policy(sess_pm, rio::read_json(&mpath_pm).as_ref(), "").0,
+            "gate policy must match direct_read_allowed=false"
+        );
 
         match prev_home {
             Some(v) => std::env::set_var("CARBON_STACK_HOME", v),

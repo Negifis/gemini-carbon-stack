@@ -1578,12 +1578,37 @@ pub fn cycle_ts_mismatch(a: f64, b: f64) -> bool {
     a > 0.0 && b > 0.0 && (a - b).abs() > SWARM_ROUNDS_TS_TOLERANCE_SEC
 }
 
-fn has_active_rounds_in_doc(rounds_doc: &Map<String, Value>, marker: Option<&Value>) -> bool {
+fn is_uncommitted_rounds_doc(
+    rounds_doc: &Map<String, Value>,
+    marker: Option<&Value>,
+    skey: Option<&str>,
+    disk_marker_cache: &mut Option<Option<Value>>,
+) -> bool {
+    if val_to_f64(rounds_doc.get("require_marker_cycle_ts")) <= 0.0 {
+        return false;
+    }
+    if marker_has_prepare_cycle(marker) {
+        return false;
+    }
+    if let Some(sk) = skey {
+        if cached_disk_cycle_marker(sk, marker, disk_marker_cache).is_some() {
+            return false;
+        }
+    }
+    marker.is_some()
+}
+
+pub fn has_active_rounds_in_doc(rounds_doc: &Map<String, Value>, marker: Option<&Value>) -> bool {
     if let Some(m) = marker {
         if cycle_ts_mismatch(
             marker_cycle_first_ts(m),
             val_to_f64(rounds_doc.get("marker_first_ts")),
         ) {
+            return false;
+        }
+        // INVARIANT: A fresh full-repo `prepare` tags its newly written `rounds.json` with `require_marker_cycle_ts` so if `marker` commit and `rounds.json` rollback both fail under concurrent Windows locks, the uncommitted `rounds.json` never imposes a phantom `DIFF_HASH` requirement while `marker` lacks `swarm_prepare_cycle_ts`.
+        let mut no_cache = None;
+        if is_uncommitted_rounds_doc(rounds_doc, Some(m), None, &mut no_cache) {
             return false;
         }
     }
@@ -1866,6 +1891,10 @@ fn collect_accepted_hashes_from_doc(
     let marker_first_ts = marker_cycle_first_ts(m);
     let prev_mts = val_to_f64(doc.get("marker_first_ts"));
     let is_pre_marker_probe = json_truthy(m.get("pre_marker_probe"));
+    // INVARIANT: Ignore uncommitted `require_marker_cycle_ts` `rounds.json` (failed `marker` commit + rollback) in accepted-hash collection as well so it neither exposes its `tree_oid` nor triggers `require_head_bound` after a later `HEAD` shift.
+    if is_uncommitted_rounds_doc(doc, marker, Some(skey), disk_marker_cache) {
+        return out;
+    }
     // INVARIANT: Fail closed (`Vec::new()`) when the marker cycle ran `prepare` and `rounds.json` holds a mismatched or missing `marker_first_ts` (e.g. failed write), while keeping pre-marker `prev_mts <= 0.0` unbound from `tree_oid` except during an in-memory `pre_marker_probe` verification.
     if marker_first_ts > 0.0 {
         let mts_mismatch = cycle_ts_mismatch(prev_mts, marker_first_ts);
@@ -2078,6 +2107,21 @@ fn collect_accepted_hashes_from_doc(
     out
 }
 
+pub fn rounds_doc_requires_explicit_hash(
+    marker: Option<&Value>,
+    rpath: &Path,
+    loaded: Option<&Value>,
+) -> bool {
+    if marker_has_prepare_cycle(marker) {
+        return true;
+    }
+    match loaded {
+        Some(Value::Object(rounds_doc)) => has_active_rounds_in_doc(rounds_doc, marker),
+        Some(_) => true,
+        None => rpath.exists(),
+    }
+}
+
 fn resolve_prepare_req(
     skey: &str,
     marker: Option<&Value>,
@@ -2085,15 +2129,8 @@ fn resolve_prepare_req(
     loaded: Option<&Value>,
     disk_marker_cache: &mut Option<Option<Value>>,
 ) -> bool {
-    if marker_has_prepare_cycle(marker) {
-        return true;
-    }
-    let active_in_rounds = match loaded {
-        Some(Value::Object(rounds_doc)) => has_active_rounds_in_doc(rounds_doc, marker),
-        Some(_) => return true,
-        None => rpath.exists(),
-    };
-    active_in_rounds || cached_disk_cycle_marker(skey, marker, disk_marker_cache).is_some()
+    rounds_doc_requires_explicit_hash(marker, rpath, loaded)
+        || cached_disk_cycle_marker(skey, marker, disk_marker_cache).is_some()
 }
 
 pub fn swarm_prepare_hash_policy(
@@ -5578,7 +5615,9 @@ pub fn has_unbound_pre_marker_simplify_rounds(session: &str) -> bool {
     let Some(doc) = rio::read_json(&swarm_rounds_path(&skey)) else {
         return false;
     };
-    if val_to_f64(doc.get("marker_first_ts")) > 0.0 {
+    if val_to_f64(doc.get("marker_first_ts")) > 0.0
+        || val_to_f64(doc.get("require_marker_cycle_ts")) > 0.0
+    {
         return false;
     }
     doc.get("lanes")

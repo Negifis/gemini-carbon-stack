@@ -1,7 +1,7 @@
 use regex::Regex;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
@@ -745,8 +745,7 @@ pub fn read_json(path: &Path) -> Option<Value> {
     serde_json::from_str(stripped).ok()
 }
 
-pub fn write_json(path: &Path, data: &Value) -> Result<(), String> {
-    let payload = serde_json::to_string_pretty(data).map_err(|e| e.to_string())?;
+pub fn write_atomic_bytes(path: &Path, payload: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -778,7 +777,7 @@ pub fn write_json(path: &Path, data: &Value) -> Result<(), String> {
         }
     }
     let mut fh = tmp_file.ok_or_else(|| "failed to allocate temp file".to_string())?;
-    let write_res = fh.write_all(payload.as_bytes()).and_then(|_| fh.flush());
+    let write_res = fh.write_all(payload).and_then(|_| fh.flush());
     drop(fh);
     if let Err(e) = write_res {
         let _ = fs::remove_file(&tmp_path);
@@ -797,6 +796,11 @@ pub fn write_json(path: &Path, data: &Value) -> Result<(), String> {
     }
     let _ = fs::remove_file(&tmp_path);
     Err(last_err)
+}
+
+pub fn write_json(path: &Path, data: &Value) -> Result<(), String> {
+    let payload = serde_json::to_string_pretty(data).map_err(|e| e.to_string())?;
+    write_atomic_bytes(path, payload.as_bytes())
 }
 
 pub fn append_jsonl(path: &Path, record: &Value, max_bytes: u64) -> Result<(), String> {
@@ -1284,6 +1288,90 @@ pub fn read_compact_transcript_steps(transcript_path: &str, max_lines: usize) ->
     }
     let tp = Path::new(transcript_path).with_file_name("transcript.jsonl");
     read_decoded_transcript(&tp, max_lines)
+}
+
+fn parse_step_index_after_key(after_key: &str) -> Option<i64> {
+    let num_start = after_key.trim_start().strip_prefix(':')?.trim_start();
+    let digits_len = num_start
+        .bytes()
+        .take_while(|b| b.is_ascii_digit() || *b == b'-')
+        .count();
+    if digits_len == 0 {
+        return None;
+    }
+    num_start[..digits_len].parse::<i64>().ok()
+}
+
+fn line_matches_wanted_step_index(line: &str, wanted: &HashSet<i64>) -> bool {
+    let needle = "\"step_index\"";
+    // INVARIANT: Antigravity JSONL emits `"step_index"` as the leading key; test it in O(1) first so multi-MB non-matching lines never scan `content` payloads.
+    if let Some(after_brace) = line.trim_start().strip_prefix('{') {
+        if let Some(after_key) = after_brace.trim_start().strip_prefix(needle) {
+            if let Some(idx) = parse_step_index_after_key(after_key) {
+                return wanted.contains(&idx);
+            }
+        }
+    }
+    let mut rest = line;
+    while let Some(pos) = rest.find(needle) {
+        rest = &rest[pos + needle.len()..];
+        if let Some(idx) = parse_step_index_after_key(rest) {
+            if wanted.contains(&idx) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn read_full_transcript_steps_by_indices(
+    transcript_path: &str,
+    wanted: &HashSet<i64>,
+) -> HashMap<i64, Value> {
+    // INVARIANT: Stream sibling `transcript_full.jsonl` in O(1) memory only for exact `step_index` entries whose compact `transcript.jsonl` `content` was truncated (e.g. `swarm(action="models", all=true)` quotas > 4 KiB).
+    let mut out = HashMap::new();
+    if transcript_path.is_empty() || wanted.is_empty() {
+        return out;
+    }
+    let orig = Path::new(transcript_path);
+    let sibling_full = orig.with_file_name("transcript_full.jsonl");
+    let full_tp = if sibling_full.is_file() {
+        sibling_full
+    } else if orig.file_name().and_then(|s| s.to_str()) != Some("transcript.jsonl")
+        && orig.is_file()
+    {
+        orig.to_path_buf()
+    } else {
+        return out;
+    };
+    let Ok(fh) = File::open(&full_tp) else {
+        return out;
+    };
+    let mut reader = BufReader::with_capacity(64 * 1024, fh);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let line = String::from_utf8_lossy(&buf);
+                if !line_matches_wanted_step_index(&line, wanted) {
+                    continue;
+                }
+                if let Ok(val) = serde_json::from_str::<Value>(line.trim()) {
+                    if let Some(idx) = val.get("step_index").and_then(Value::as_i64) {
+                        if wanted.contains(&idx) {
+                            out.insert(idx, val);
+                            if out.len() == wanted.len() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 pub fn read_transcript_head(transcript_path: &str, head_lines: usize) -> Vec<Value> {

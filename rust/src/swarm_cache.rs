@@ -561,6 +561,7 @@ struct SyncDiffResult {
     incremental_diff_path: String,
     incremental_stat: String,
     text_covered: Option<bool>,
+    wrote_full: bool,
 }
 
 struct RoundSyncInput<'a> {
@@ -714,6 +715,7 @@ fn sync_round_diffs(input: RoundSyncInput<'_>) -> Result<SyncDiffResult, String>
             incremental_diff_path: String::new(),
             incremental_stat: String::new(),
             text_covered,
+            wrote_full: need_full,
         });
     };
 
@@ -754,6 +756,7 @@ fn sync_round_diffs(input: RoundSyncInput<'_>) -> Result<SyncDiffResult, String>
             incremental_diff_path: inc_diff_path,
             incremental_stat,
             text_covered,
+            wrote_full: need_full,
         });
     }
 
@@ -812,6 +815,7 @@ fn sync_round_diffs(input: RoundSyncInput<'_>) -> Result<SyncDiffResult, String>
         incremental_diff_path: inc_diff_path,
         incremental_stat,
         text_covered,
+        wrote_full: need_full,
     })
 }
 
@@ -907,11 +911,28 @@ fn marker_cycle_or_reset_mismatch(
         || (cwg_common::last_research_reset_ts(cur_m) - expected_rr_ts).abs() > cwg_common::TS_EPS
 }
 
+fn stamp_marker_prepare_cycle_ts(obj: &mut Map<String, Value>, cycle_ts: f64, fallback_ts: f64) {
+    let prev_prep = val_to_f64(obj.get("swarm_prepare_cycle_ts"));
+    let stamp_ts = if cycle_ts > 0.0 {
+        cycle_ts
+    } else {
+        fallback_ts.max(1.0)
+    };
+    if prev_prep <= 0.0 || (cycle_ts > 0.0 && cwg_common::cycle_ts_mismatch(prev_prep, stamp_ts)) {
+        obj.insert("swarm_prepare_cycle_ts".to_string(), json!(stamp_ts));
+        obj.insert(
+            "swarm_prepare_repo_state".to_string(),
+            Value::Object(Map::new()),
+        );
+    }
+}
+
 fn sync_marker_under_lock(
     skey: &str,
     mfile: &Path,
     folded_git_root: &str,
     now_ts: Option<f64>,
+    stamp_prepare_cycle: bool,
 ) -> Result<(Option<Value>, bool), String> {
     with_locked_marker(skey, mfile, |raw_m, merged_opt, consumed_ids| {
         let Some(merged) = merged_opt else {
@@ -927,22 +948,11 @@ fn sync_marker_under_lock(
             merged
         };
         let had_prior_cycle_prepare = cwg_common::marker_has_prepare_cycle(Some(&caught));
-        if cwg_common::is_active_marker(&caught) {
+        if stamp_prepare_cycle && cwg_common::is_active_marker(&caught) {
             let cycle_ts = cwg_common::marker_cycle_first_ts(&caught);
-            let stamp_ts = if cycle_ts > 0.0 {
-                cycle_ts
-            } else {
-                now_ts.unwrap_or_else(now_sec).max(1.0)
-            };
+            let fallback_ts = now_ts.unwrap_or_else(now_sec);
             if let Some(obj) = caught.as_object_mut() {
-                let prev_prep = val_to_f64(obj.get("swarm_prepare_cycle_ts"));
-                if prev_prep <= 0.0 || cwg_common::cycle_ts_mismatch(prev_prep, stamp_ts) {
-                    obj.insert("swarm_prepare_cycle_ts".to_string(), json!(stamp_ts));
-                    obj.insert(
-                        "swarm_prepare_repo_state".to_string(),
-                        Value::Object(Map::new()),
-                    );
-                }
+                stamp_marker_prepare_cycle_ts(obj, cycle_ts, fallback_ts);
             }
         }
         if !consumed_ids.is_empty() || Some(&caught) != raw_m.as_ref() {
@@ -970,6 +980,47 @@ struct MarkerRepoPrepUpdate<'a> {
     seen_heads: &'a [String],
     seen_fp_trees: &'a [String],
     snapshot_bound_required: bool,
+    fallback_stamp_ts: f64,
+}
+
+fn remove_file_with_retry(path: &Path) -> Result<(), String> {
+    let mut last_err = String::new();
+    for attempt in 0..5 {
+        match fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                last_err = e.to_string();
+                std::thread::sleep(std::time::Duration::from_millis(10 * (attempt + 1)));
+            }
+        }
+    }
+    Err(last_err)
+}
+
+fn check_marker_replaceable(mfile: &Path) -> Result<(), String> {
+    if !mfile.exists() {
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // INVARIANT: Request `DELETE | GENERIC_WRITE` on Windows so handles lacking `FILE_SHARE_DELETE` (e.g. `share_mode(0x3)`) fail before `rounds.json` is written rather than only during `fs::rename`.
+        const DELETE_AND_GENERIC_WRITE: u32 = 0x0001_0000 | 0x4000_0000;
+        fs::OpenOptions::new()
+            .access_mode(DELETE_AND_GENERIC_WRITE)
+            .open(mfile)
+            .map(|_| ())
+            .map_err(|e| format!("marker_persist_failed:{}", e))
+    }
+    #[cfg(not(windows))]
+    {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(mfile)
+            .map(|_| ())
+            .map_err(|e| format!("marker_persist_failed:{}", e))
+    }
 }
 
 fn commit_rounds_under_marker_lock(
@@ -1018,7 +1069,7 @@ fn persist_marker_repo_prepare_state(
             {
                 return Err("concurrent_worktree_mutation".to_string());
             }
-            if !persist_write {
+            if !persist_write && cwg_common::marker_has_prepare_cycle(Some(&cur_m)) {
                 commit_rounds_under_marker_lock(rounds_file, rounds_doc)?;
                 return Ok(Some(cur_m));
             }
@@ -1039,9 +1090,11 @@ fn persist_marker_repo_prepare_state(
             (cur_m, consumed_ids)
         };
 
+        let cycle_ts = cwg_common::marker_cycle_first_ts(&next_m);
         let Some(obj) = next_m.as_object_mut() else {
             return Err("concurrent_worktree_mutation".to_string());
         };
+        stamp_marker_prepare_cycle_ts(obj, cycle_ts, upd.fallback_stamp_ts);
         let rs_map = ensure_object_mut(obj, "swarm_prepare_repo_state");
         let prev_count = rs_map
             .get(upd.folded_git_root)
@@ -1057,13 +1110,35 @@ fn persist_marker_repo_prepare_state(
                 "snapshot_bound_required": upd.snapshot_bound_required,
             }),
         );
+        // INVARIANT: Pre-verify `mfile` replaceability (`DELETE | GENERIC_WRITE` on Windows) before committing `rounds.json`, then snapshot prior `rounds.json` bytes, commit `rounds.json`, and persist `marker` under `marker_lock_path`. If `marker` persistence still fails, retry atomic rollback of `rounds.json` and surface any rollback error instead of ignoring it.
+        check_marker_replaceable(upd.mfile)?;
+        let prev_rounds_bytes = if rounds_doc.is_some() && rounds_file.exists() {
+            match fs::read(rounds_file) {
+                Ok(b) => Some(b),
+                Err(err) => return Err(format!("swarm_rounds_read_failed:{}", err)),
+            }
+        } else {
+            None
+        };
+        commit_rounds_under_marker_lock(rounds_file, rounds_doc)?;
         if let Err(err) = rio::write_json(upd.mfile, &next_m) {
+            if rounds_doc.is_some() {
+                let rollback_res = match prev_rounds_bytes {
+                    Some(prev) => rio::write_atomic_bytes(rounds_file, &prev),
+                    None => remove_file_with_retry(rounds_file),
+                };
+                if let Err(rb_err) = rollback_res {
+                    return Err(format!(
+                        "marker_persist_failed:{};rounds_rollback_failed:{}",
+                        err, rb_err
+                    ));
+                }
+            }
             return Err(format!("marker_persist_failed:{}", err));
         }
         if !ack_ids.is_empty() {
             cwg_common::ack_pending_marker_deltas(upd.skey, &ack_ids);
         }
-        commit_rounds_under_marker_lock(rounds_file, rounds_doc)?;
         Ok(Some(next_m))
     })
 }
@@ -1221,6 +1296,17 @@ struct UncoveredFailInput<'a> {
     marker_upd: Option<MarkerRepoPrepUpdate<'a>>,
 }
 
+fn uncovered_prepare_error_json(cur_tree_oid: &str, direct_read_allowed: bool) -> Value {
+    json!({
+        "ok": false,
+        "candidate_diff_covered": false,
+        "direct_read_allowed": direct_read_allowed,
+        "current_diff_hash": "",
+        "current_tree_oid": cur_tree_oid,
+        "error": "partial_or_uncovered_candidate_diff",
+    })
+}
+
 fn record_uncovered_and_fail(
     state: &mut Map<String, Value>,
     inp: UncoveredFailInput<'_>,
@@ -1259,6 +1345,7 @@ fn record_uncovered_and_fail(
             return json!({
                 "ok": false,
                 "candidate_diff_covered": false,
+                "direct_read_allowed": false,
                 "current_diff_hash": "",
                 "current_tree_oid": inp.cur_tree_oid,
                 "error": err,
@@ -1269,13 +1356,7 @@ fn record_uncovered_and_fail(
             "error": err,
         });
     }
-    json!({
-        "ok": false,
-        "candidate_diff_covered": false,
-        "current_diff_hash": "",
-        "current_tree_oid": inp.cur_tree_oid,
-        "error": "partial_or_uncovered_candidate_diff",
-    })
+    uncovered_prepare_error_json(inp.cur_tree_oid, false)
 }
 
 struct PrepareLockedCtx<'a> {
@@ -1302,16 +1383,21 @@ fn prepare_round_locked(ctx: PrepareLockedCtx<'_>) -> Value {
     let mut snapshot_pair: Option<(Option<Value>, String, String, String, bool, Vec<String>)> =
         None;
     for _attempt in 0..2 {
-        let (synced_marker, had_prior) =
-            match sync_marker_under_lock(skey, &mfile, folded_git_root, input.now_ts) {
-                Ok(pair) => pair,
-                Err(err) => {
-                    return json!({
-                        "ok": false,
-                        "error": err,
-                    });
-                }
-            };
+        let (synced_marker, had_prior) = match sync_marker_under_lock(
+            skey,
+            &mfile,
+            folded_git_root,
+            input.now_ts,
+            !rel_paths.is_empty(),
+        ) {
+            Ok(pair) => pair,
+            Err(err) => {
+                return json!({
+                    "ok": false,
+                    "error": err,
+                });
+            }
+        };
         initial_had_cycle_prepare.get_or_insert(had_prior);
 
         let same_repo_active = synced_marker
@@ -1394,7 +1480,6 @@ fn prepare_round_locked(ctx: PrepareLockedCtx<'_>) -> Value {
         .as_deref()
         .map(format_crlf_notes)
         .unwrap_or_default();
-    let raw_wt_digest = rio::capture_worktree_raw_digest(git_root, 15.0);
     let marker_first_ts = marker.as_ref().map_or(0.0, cwg_common::marker_cycle_first_ts);
 
     let rounds_file = cwg_common::swarm_rounds_path(skey);
@@ -1405,13 +1490,22 @@ fn prepare_round_locked(ctx: PrepareLockedCtx<'_>) -> Value {
             "error": "swarm_rounds_read_failed",
         });
     }
+    let disk_requires_explicit_hash = cwg_common::rounds_doc_requires_explicit_hash(
+        marker.as_ref(),
+        &rounds_file,
+        loaded_state.as_ref(),
+    );
     let mut state: Map<String, Value> = match loaded_state {
         Some(Value::Object(map))
             if map.get("session").and_then(|v| v.as_str()) == Some(input.session) =>
         {
             let prev_mts = val_to_f64(map.get("marker_first_ts"));
-            if marker_first_ts > 0.0
-                && (prev_mts <= 0.0 || cwg_common::cycle_ts_mismatch(prev_mts, marker_first_ts))
+            let uncommitted_prev = val_to_f64(map.get("require_marker_cycle_ts")) > 0.0
+                && !initial_had_cycle_prepare.unwrap_or(false);
+            if uncommitted_prev
+                || (marker_first_ts > 0.0
+                    && (prev_mts <= 0.0
+                        || cwg_common::cycle_ts_mismatch(prev_mts, marker_first_ts)))
             {
                 let mut fresh = Map::new();
                 fresh.insert(
@@ -1469,6 +1563,7 @@ fn prepare_round_locked(ctx: PrepareLockedCtx<'_>) -> Value {
         seen_heads: &prov.seen_heads,
         seen_fp_trees: &prov.seen_fp_trees,
         snapshot_bound_required: prov.require_snapshot_bound,
+        fallback_stamp_ts: now,
     });
 
     let mut seen_heads_updated = false;
@@ -1495,9 +1590,17 @@ fn prepare_round_locked(ctx: PrepareLockedCtx<'_>) -> Value {
         }
     }
 
-    if has_any_active_marker && !full_candidate_covered {
-        return record_uncovered_and_fail(
-            &mut state,
+    let has_existing_cycle_prepare = initial_had_cycle_prepare.unwrap_or(false)
+        || disk_requires_explicit_hash
+        || cwg_common::has_active_rounds_in_doc(&state, marker.as_ref());
+    // INVARIANT: Only latch `uncovered_prepare` / `swarm_prepare_cycle_ts` when the caller requested a partial `--paths` slice or the cycle already had a prior `prepare` round; a fresh full-repo `prepare` that emits zero diff artifacts must stay cleanly eligible for direct file-reading simplify.
+    let latch_uncovered_failure = !rel_paths.is_empty() || has_existing_cycle_prepare;
+    let fail_uncovered = |st: &mut Map<String, Value>| -> Value {
+        if !latch_uncovered_failure {
+            return uncovered_prepare_error_json(&cur_tree_oid, true);
+        }
+        record_uncovered_and_fail(
+            st,
             UncoveredFailInput {
                 skey,
                 mfile: &mfile,
@@ -1507,8 +1610,14 @@ fn prepare_round_locked(ctx: PrepareLockedCtx<'_>) -> Value {
                 cur_tree_oid: &cur_tree_oid,
                 marker_upd,
             },
-        );
+        )
+    };
+
+    if has_any_active_marker && !full_candidate_covered {
+        return fail_uncovered(&mut state);
     }
+
+    let raw_wt_digest = rio::capture_worktree_raw_digest(git_root, 15.0);
 
     let recorded_lane_diff_hash = if full_candidate_covered {
         same_repo_diff_hash.clone()
@@ -1674,18 +1783,7 @@ fn prepare_round_locked(ctx: PrepareLockedCtx<'_>) -> Value {
     }) {
         Ok(res) => res,
         Err(err) if err == "uncovered_binary_diff" && has_any_active_marker => {
-            return record_uncovered_and_fail(
-                &mut state,
-                UncoveredFailInput {
-                    skey,
-                    mfile: &mfile,
-                    rounds_file: &rounds_file,
-                    marker_first_ts,
-                    expected_rr_ts: marker_rr_ts,
-                    cur_tree_oid: &cur_tree_oid,
-                    marker_upd,
-                },
-            );
+            return fail_uncovered(&mut state);
         }
         Err(err) => {
             return json!({
@@ -1715,11 +1813,17 @@ fn prepare_round_locked(ctx: PrepareLockedCtx<'_>) -> Value {
         || seen_heads_updated
         || snapshot_bound_updated
         || pre_marker_cov_updated;
+    let cleanup_fresh_diffs = |res: &SyncDiffResult| {
+        if !has_existing_cycle_prepare && res.wrote_full && !res.full_diff_path.is_empty() {
+            let _ = fs::remove_file(&res.full_diff_path);
+        }
+    };
     let marker_rps_missing =
         cwg_common::active_cycle_repo_prepare_state(marker.as_ref(), folded_git_root).is_none();
     if rio::git_head_oid(git_root) != raw_head
         || rio::capture_worktree_tree_oid(git_root, 15.0) != cur_tree_oid
     {
+        cleanup_fresh_diffs(&diff_res);
         return json!({
             "ok": false,
             "error": "concurrent_worktree_mutation",
@@ -1728,6 +1832,17 @@ fn prepare_round_locked(ctx: PrepareLockedCtx<'_>) -> Value {
     let rounds_doc_opt = if state_mutated {
         ensure_object_mut(&mut state, "lanes").insert(lane_key, Value::Array(history));
         stamp_rounds_marker_ts(&mut state, marker_first_ts);
+        if marker_upd.is_some() && !has_existing_cycle_prepare {
+            // INVARIANT: Bind brand-new full-repo `rounds.json` to `marker` commit (`swarm_prepare_cycle_ts`) so a simultaneous dual-file rollback failure cannot leave an active round without a committed marker.
+            let commit_ts = if marker_first_ts > 0.0 {
+                marker_first_ts
+            } else {
+                now.max(1.0)
+            };
+            state.insert("require_marker_cycle_ts".to_string(), json!(commit_ts));
+        } else {
+            state.remove("require_marker_cycle_ts");
+        }
         Some(Value::Object(state))
     } else {
         None
@@ -1744,8 +1859,17 @@ fn prepare_round_locked(ctx: PrepareLockedCtx<'_>) -> Value {
                 marker = updated_m;
             }
             Err(err) => {
+                cleanup_fresh_diffs(&diff_res);
+                let disk_m = rio::read_json(&mfile);
+                let direct_read_allowed = !cwg_common::swarm_prepare_hash_policy(
+                    input.session,
+                    disk_m.as_ref(),
+                    "",
+                )
+                .0;
                 return json!({
                     "ok": false,
+                    "direct_read_allowed": direct_read_allowed,
                     "error": err,
                 });
             }
@@ -1756,6 +1880,7 @@ fn prepare_round_locked(ctx: PrepareLockedCtx<'_>) -> Value {
         }
         commit_rounds_under_marker_lock(&rounds_file, rounds_doc_opt.as_ref())
     }) {
+        cleanup_fresh_diffs(&diff_res);
         return json!({
             "ok": false,
             "error": err,
@@ -3114,6 +3239,7 @@ mod tests {
             seen_heads: &seen_h,
             seen_fp_trees: &seen_t,
             snapshot_bound_required: false,
+            fallback_stamp_ts: 1005.0,
         };
         assert!(persist_marker_repo_prepare_state(
             upd,
