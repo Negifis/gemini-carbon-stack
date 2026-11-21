@@ -340,7 +340,7 @@ fn simplify_template_pair_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"(?i)(?:(?:\*{1,2}|__|`)\s*){0,2}SIMPLIFY_(?:VERDICT|LENS)(?:(?:\*{1,2}|__|`)\s*){0,2}\s*:\s*(?:(?:\*{1,2}|__|`)\s*){0,2}(?:CLEAN|FINDINGS_REPORTED|ACTIONABLE_FIXES|REUSE|QUALITY|EFFICIENCY|ALL|COMBINED)(?:(?:\*{1,2}|__|`)\s*){0,2}\s*(?:\(|,|\||/)?\s*(?:\bor\b|\bили\b|\|)\s*(?:(?:\*{1,2}|__|`)\s*){0,2}SIMPLIFY_(?:VERDICT|LENS)(?:(?:\*{1,2}|__|`)\s*){0,2}\s*:\s*(?:(?:\*{1,2}|__|`)\s*){0,2}(?:CLEAN|FINDINGS_REPORTED|ACTIONABLE_FIXES|REUSE|QUALITY|EFFICIENCY|ALL|COMBINED)(?:(?:\*{1,2}|__|`)\s*){0,2}\)?",
+            r"(?i)(?:(?:\*{1,2}|__|`)\s*){0,2}(?:SIMPLIFY_LENS|(?:SIMPLIFY_)?VERDICT)(?:(?:\*{1,2}|__|`)\s*){0,2}\s*:\s*(?:(?:\*{1,2}|__|`)\s*){0,2}(?:CLEAN|FINDINGS_REPORTED|ACTIONABLE_FIXES|REUSE|QUALITY|EFFICIENCY|ALL|COMBINED)(?:(?:\*{1,2}|__|`)\s*){0,2}\s*(?:\(|,|\||/)?\s*(?:\bor\b|\bили\b|\|)\s*(?:(?:\*{1,2}|__|`)\s*){0,2}(?:SIMPLIFY_LENS|(?:SIMPLIFY_)?VERDICT)(?:(?:\*{1,2}|__|`)\s*){0,2}\s*:\s*(?:(?:\*{1,2}|__|`)\s*){0,2}(?:CLEAN|FINDINGS_REPORTED|ACTIONABLE_FIXES|REUSE|QUALITY|EFFICIENCY|ALL|COMBINED)(?:(?:\*{1,2}|__|`)\s*){0,2}\)?",
         )
         .expect("simplify_template_pair_re")
     })
@@ -352,9 +352,22 @@ fn simplify_verdict_core_re() -> &'static Regex {
         // INVARIANT: Leading markdown wrappers allow only horizontal whitespace (`[ \t]*`) so a
         // prior message's closing `**` never spans `\n\n` into the next message's verdict tag.
         Regex::new(
-            r"(?i)(?:(?:\*{1,2}|__|`)[ \t]*){0,2}SIMPLIFY_VERDICT(?:(?:\*{1,2}|__|`)\s*){0,2}\s*:\s*(?:(?:\*{1,2}|__|`)\s*){0,2}(CLEAN|FINDINGS_REPORTED|ACTIONABLE_FIXES)",
+            r"(?i)(?:(?:\*{1,2}|__|`)[ \t]*){0,2}(?:SIMPLIFY_)?VERDICT(?:(?:\*{1,2}|__|`)\s*){0,2}\s*:\s*(?:(?:\*{1,2}|__|`)\s*){0,2}(CLEAN|FINDINGS_REPORTED|ACTIONABLE_FIXES)",
         )
         .expect("simplify_verdict_core_re")
+    })
+}
+
+fn simplify_prose_audit_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // INVARIANT: Strictly advisory fallback (`FINDINGS_REPORTED`, never `CLEAN`) for completed
+        // simplify worker posts that open with `@coordinator [done] ... findings:` + structured items
+        // without repeating an explicit `SIMPLIFY_VERDICT:` line (`anom-3e5cd389`).
+        Regex::new(
+            r"(?im)^[ \t]*(?:@[A-Za-z0-9_-]+[ \t]+)*\[(?:done|complete|completed)\][ \t]+(?:(?:(?:\*{1,2}|__|`)[ \t]*){0,2}(?:SIMPLIFY_LENS\s*:\s*(?:REUSE|QUALITY|EFFICIENCY|ALL|COMBINED)|(?:reuse|quality|efficiency|simplify)(?:[ \t]+(?:review|lens|audit))?)[ \t]+(?:findings|review|audit|report|issues|результаты|замечания)|(?:findings|review[ \t]+findings|audit[ \t]+findings|замечания|аудит[ \t]+заверш[её]н))\s*:?[ \t]*\r?\n[ \t]*(?:[-*+]|\d+[.)])[ \t]+\S",
+        )
+        .expect("simplify_prose_audit_re")
     })
 }
 
@@ -383,7 +396,7 @@ fn simplify_alt_tail_re() -> &'static Regex {
     RE.get_or_init(|| {
         // WORKAROUND: Emulates Python negative lookahead `_SIMPLIFY_ALT_TAIL` and `/(?!/)` without lookaround.
         Regex::new(
-            r"(?i)\A\s*(?:(?:\*{1,2}|__|`)\s*){0,2}(?:\||/(?:[^/]|\z)|\(?\s*\b(?:or|или)\b\s+(?:(?:(?:\*{1,2}|__|`)\s*){0,2}SIMPLIFY_(?:VERDICT|LENS)(?:(?:\*{1,2}|__|`)\s*){0,2}\s*:\s*(?:(?:\*{1,2}|__|`)\s*){0,2})?(?:CLEAN|FINDINGS_REPORTED|ACTIONABLE_FIXES|REUSE|QUALITY|EFFICIENCY|ALL|COMBINED)\b|,\s*(?:(?:\*{1,2}|__|`)\s*){0,2}(?:(?:or|или)\b\s+)?(?:CLEAN|FINDINGS_REPORTED|ACTIONABLE_FIXES|REUSE|QUALITY|EFFICIENCY|ALL|COMBINED)\b)",
+            r"(?i)\A\s*(?:(?:\*{1,2}|__|`)\s*){0,2}(?:\||/(?:[^/]|\z)|\(?\s*\b(?:or|или)\b\s+(?:(?:(?:\*{1,2}|__|`)\s*){0,2}(?:SIMPLIFY_LENS|(?:SIMPLIFY_)?VERDICT)(?:(?:\*{1,2}|__|`)\s*){0,2}\s*:\s*(?:(?:\*{1,2}|__|`)\s*){0,2})?(?:CLEAN|FINDINGS_REPORTED|ACTIONABLE_FIXES|REUSE|QUALITY|EFFICIENCY|ALL|COMBINED)\b|,\s*(?:(?:\*{1,2}|__|`)\s*){0,2}(?:(?:or|или)\b\s+)?(?:CLEAN|FINDINGS_REPORTED|ACTIONABLE_FIXES|REUSE|QUALITY|EFFICIENCY|ALL|COMBINED)\b)",
         )
         .expect("simplify_alt_tail_re")
     })
@@ -409,7 +422,7 @@ fn flash_model_re() -> &'static Regex {
 fn compact_simplify_worker_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"(?i)^simp-(?:reuse|quality|efficiency|efficie|all)(?:$|[-_][a-z0-9._-]*$)")
+        Regex::new(r"(?i)^simp-(?:reuse|qual(?:ity)?|eff(?:icie(?:ncy)?)?|all)(?:$|[-_][a-z0-9._-]*$)")
             .expect("compact_simplify_worker_re")
     })
 }
@@ -464,9 +477,25 @@ fn is_simplify_line_prefix_clean(prefix: &str) -> bool {
             continue;
         }
         let rest = &b[i..];
+        if let Some(tag_len) = [
+            b"[done]".as_slice(),
+            b"[complete]".as_slice(),
+            b"[completed]".as_slice(),
+        ]
+        .iter()
+        .find(|&&t| {
+            rest.get(..t.len()).map_or(false, |h| h.eq_ignore_ascii_case(t))
+                && rest.get(t.len()).map_or(true, |c| c.is_ascii_whitespace())
+        })
+        .map(|t| t.len())
+        {
+            i += tag_len;
+            continue;
+        }
         let key_len = [
             b"SIMPLIFY_LENS".as_slice(),
             b"SIMPLIFY_VERDICT".as_slice(),
+            b"VERDICT".as_slice(),
             b"DIFF_HASH".as_slice(),
         ]
         .iter()
@@ -598,12 +627,22 @@ fn for_each_simplify_tag_match<'a>(
     }
 }
 
-fn find_simplify_verdict_spans_cleaned(cleaned: &str) -> Vec<(usize, usize, bool)> {
+fn find_simplify_explicit_verdict_spans_cleaned(cleaned: &str) -> Vec<(usize, usize, bool)> {
     let mut out = Vec::new();
     for_each_simplify_tag_match(simplify_verdict_core_re(), cleaned, |s, e, val| {
         out.push((s, e, val.eq_ignore_ascii_case("CLEAN")));
         true
     });
+    out
+}
+
+fn find_simplify_verdict_spans_cleaned(cleaned: &str) -> Vec<(usize, usize, bool)> {
+    let mut out = find_simplify_explicit_verdict_spans_cleaned(cleaned);
+    if out.is_empty() {
+        if let Some(m) = simplify_prose_audit_re().find(cleaned) {
+            out.push((m.start(), m.end(), false));
+        }
+    }
     out
 }
 
@@ -2285,8 +2324,24 @@ pub fn simplify_lens_from_worker_name(name: &str) -> String {
             return lens.to_string();
         }
     }
-    if low.contains("efficie") && is_simplify_worker_name(&low) {
-        return "efficiency".to_string();
+    if is_simplify_worker_name(&low) {
+        if low.contains("efficie")
+            || low.starts_with("simp-eff")
+            || low.contains("-eff-")
+            || low.ends_with("-eff")
+            || low.contains("_eff_")
+            || low.ends_with("_eff")
+        {
+            return "efficiency".to_string();
+        }
+        if low.starts_with("simp-qual")
+            || low.contains("-qual-")
+            || low.ends_with("-qual")
+            || low.contains("_qual_")
+            || low.ends_with("_qual")
+        {
+            return "quality".to_string();
+        }
     }
     String::new()
 }
@@ -2327,11 +2382,45 @@ pub fn parse_simplify_lens_flags(text: &str) -> (bool, bool) {
 }
 
 pub fn parse_simplify_window_spans(text: &str) -> (Vec<(usize, usize, bool)>, bool, bool) {
-    let cleaned = mask_simplify_template_pairs(text);
-    let spans = find_simplify_verdict_spans_cleaned(&cleaned);
+    parse_simplify_window_spans_messages(&[text])
+}
+
+pub fn parse_simplify_window_spans_messages(
+    messages: &[&str],
+) -> (Vec<(usize, usize, bool)>, bool, bool) {
+    if messages.is_empty() {
+        return (Vec::new(), false, false);
+    }
+    let total_len: usize =
+        messages.iter().map(|m| m.len()).sum::<usize>() + messages.len().saturating_sub(1) * 2;
+    let mut joined = String::with_capacity(total_len);
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(messages.len());
+    for (i, msg) in messages.iter().enumerate() {
+        if i > 0 {
+            joined.push_str("\n\n");
+        }
+        let start = joined.len();
+        joined.push_str(msg);
+        ranges.push((start, joined.len()));
+    }
+    let cleaned = mask_simplify_template_pairs(&joined);
+    let mut spans = find_simplify_explicit_verdict_spans_cleaned(&cleaned);
+    // INVARIANT: Detect prose simplify findings per individual uncovered message so a later prose findings report after an earlier `CLEAN` verdict revokes `CLEAN` and participates in chronological & `DIFF_HASH` checks.
+    for &(msg_start, msg_end) in &ranges {
+        let covered_by_explicit = spans
+            .iter()
+            .any(|&(ms, me, _)| ms < msg_end && me > msg_start);
+        if covered_by_explicit {
+            continue;
+        }
+        if let Some(m) = simplify_prose_audit_re().find(&cleaned[msg_start..msg_end]) {
+            spans.push((msg_start + m.start(), msg_start + m.end(), false));
+        }
+    }
     if spans.is_empty() {
         return (spans, false, false);
     }
+    spans.sort_by_key(|&(ms, me, _)| (ms, me));
     let (has_combined, multi_lens_spoof) = extract_simplify_lens_flags_cleaned(&cleaned);
     (spans, has_combined, multi_lens_spoof)
 }
@@ -2357,7 +2446,11 @@ pub fn parse_simplify_verdict(text: &str, default_lens: Option<&str>) -> Value {
         last_verdict = Some(val);
         true
     });
-    let verdict = last_verdict.map(|s| s.to_uppercase()).unwrap_or_default();
+    let verdict = match last_verdict {
+        Some(s) => s.to_uppercase(),
+        None if simplify_prose_audit_re().is_match(&cleaned) => "FINDINGS_REPORTED".to_string(),
+        None => String::new(),
+    };
     let multi_lens_spoof = !has_combined && unique_lenses.len() > 1;
     let lens = if has_combined {
         "all".to_string()
@@ -3911,6 +4004,9 @@ pub fn default_gate_policy() -> Value {
         "require_simplify_on_standard": false,
         "require_review_on_standard": false,
         "require_tests_on_standard": null,
+        "design_gate": true,
+        "design_include_globs": [],
+        "design_exclude_globs": [],
     })
 }
 
@@ -4011,7 +4107,13 @@ fn parse_gate_policy(root: Option<&Path>, raw: &Map<String, Value>) -> Value {
     if is_valid_risk(&default_risk) {
         policy.insert("default_code_risk".to_string(), Value::String(default_risk));
     }
-    for key in ["low_risk_globs", "high_risk_globs", "xhigh_risk_globs"] {
+    for key in [
+        "low_risk_globs",
+        "high_risk_globs",
+        "xhigh_risk_globs",
+        "design_include_globs",
+        "design_exclude_globs",
+    ] {
         if let Some(Value::Array(arr)) = raw.get(key) {
             let cleaned: Vec<Value> = arr
                 .iter()
@@ -4022,7 +4124,11 @@ fn parse_gate_policy(root: Option<&Path>, raw: &Map<String, Value>) -> Value {
             policy.insert(key.to_string(), Value::Array(cleaned));
         }
     }
-    for key in ["require_simplify_on_standard", "require_review_on_standard"] {
+    for key in [
+        "require_simplify_on_standard",
+        "require_review_on_standard",
+        "design_gate",
+    ] {
         if raw.contains_key(key) {
             policy.insert(key.to_string(), Value::Bool(json_truthy(raw.get(key))));
         }
@@ -4493,6 +4599,46 @@ pub fn sha256_file_bounded(path: &Path, max_bytes: u64) -> Result<Option<(u64, S
     Ok(Some((total, hex::encode(hasher.finalize()))))
 }
 
+fn fingerprint_path_entry(p: &str, max_file_bytes: u64) -> Option<String> {
+    let path_obj = Path::new(p);
+    match fs::symlink_metadata(path_obj) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some("MISSING\0".to_string()),
+        Err(_) => return None,
+        Ok(meta) => {
+            if meta_is_link_or_reparse(&meta) {
+                let tgt = fs::read_link(path_obj)
+                    .map(|t| t.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                return Some(format!("LINK:{}\0", tgt));
+            }
+            if !meta.file_type().is_file() {
+                return Some("NONFILE\0".to_string());
+            }
+        }
+    }
+    let Ok(Some((total_len, blob_hex))) = sha256_file_bounded(path_obj, max_file_bytes) else {
+        return None;
+    };
+    Some(format!("BLOB:{}:{}\0", total_len, blob_hex))
+}
+
+fn digest_from_entries(dpaths: &[String], entries: &HashMap<String, Option<String>>) -> String {
+    if dpaths.is_empty() {
+        return "empty".to_string();
+    }
+    let mut hasher = Sha256::new();
+    for p in dpaths {
+        let key = rio::fold_path(p);
+        let Some(Some(entry)) = entries.get(&key) else {
+            return String::new();
+        };
+        hasher.update(key.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(entry.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
 pub fn content_fingerprint(paths: &[String], max_file_bytes: u64) -> String {
     // SAFETY: Require full-file SHA-256 within `max_file_bytes`; if any file exceeds the read budget or fails to hash, return `""` (`fp: null`) so `is_review_fresh` and `verified` closure fail closed instead of trusting partial samples.
     let mut dpaths = durable_paths(paths);
@@ -4500,38 +4646,38 @@ pub fn content_fingerprint(paths: &[String], max_file_bytes: u64) -> String {
     if dpaths.is_empty() {
         return "empty".to_string();
     }
-    let mut hasher = Sha256::new();
-    for p in dpaths {
-        let key = rio::fold_path(&p);
-        hasher.update(key.as_bytes());
-        hasher.update(b"\0");
-        let path_obj = Path::new(&p);
-        match fs::symlink_metadata(path_obj) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                hasher.update(b"MISSING\0");
-                continue;
-            }
-            Err(_) => return String::new(),
-            Ok(meta) => {
-                if meta_is_link_or_reparse(&meta) {
-                    let tgt = fs::read_link(path_obj)
-                        .map(|t| t.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    hasher.update(format!("LINK:{}\0", tgt).as_bytes());
-                    continue;
-                }
-                if !meta.file_type().is_file() {
-                    hasher.update(b"NONFILE\0");
-                    continue;
-                }
-            }
+    let mut entries: HashMap<String, Option<String>> = HashMap::with_capacity(dpaths.len());
+    for p in &dpaths {
+        let key = rio::fold_path(p);
+        if !entries.contains_key(&key) {
+            entries.insert(key, fingerprint_path_entry(p, max_file_bytes));
         }
-        let Ok(Some((total_len, blob_hex))) = sha256_file_bounded(path_obj, max_file_bytes) else {
-            return String::new();
-        };
-        hasher.update(format!("BLOB:{}:{}\0", total_len, blob_hex).as_bytes());
     }
-    hex::encode(hasher.finalize())
+    digest_from_entries(&dpaths, &entries)
+}
+
+pub fn content_fingerprints_consistent(
+    all_paths: &[String],
+    subset_paths: &[String],
+    max_file_bytes: u64,
+) -> (String, String) {
+    // INVARIANT: Hash every unique path once into a single snapshot map so overall `all_fp` and visual `design_fp` can never diverge due to a concurrent external write between two separate reads.
+    let mut all_dpaths = durable_paths(all_paths);
+    all_dpaths.sort_by_key(|p| rio::fold_path(p));
+    let mut sub_dpaths = durable_paths(subset_paths);
+    sub_dpaths.sort_by_key(|p| rio::fold_path(p));
+    let mut entries: HashMap<String, Option<String>> =
+        HashMap::with_capacity(all_dpaths.len() + sub_dpaths.len());
+    for p in all_dpaths.iter().chain(sub_dpaths.iter()) {
+        let key = rio::fold_path(p);
+        if !entries.contains_key(&key) {
+            entries.insert(key, fingerprint_path_entry(p, max_file_bytes));
+        }
+    }
+    (
+        digest_from_entries(&all_dpaths, &entries),
+        digest_from_entries(&sub_dpaths, &entries),
+    )
 }
 
 pub fn trim_content_marks(marker: &mut Value, marks: Vec<Value>) {
@@ -5096,6 +5242,27 @@ pub fn resolve_candidate_context(marker: &Value, include_tests: bool) -> Value {
     } else {
         Value::Null
     };
+    let latched_design_fold: HashSet<String> =
+        durable_paths_from_val(marker.get("latched_design_paths"))
+            .into_iter()
+            .map(|p| rio::fold_path(&p))
+            .collect();
+    let design_paths: Vec<String> = items
+        .iter()
+        .filter(|(abs_p, p_pol, _)| {
+            let pol_root = val_to_str(p_pol.get("policy_root"));
+            let base_root = if !pol_root.is_empty() {
+                pol_root
+            } else {
+                git_root_opt.clone().unwrap_or_else(|| cwd.clone())
+            };
+            is_visual_design_path_with_base(abs_p, Some(p_pol), &base_root)
+                || (latched_design_fold.contains(&rio::fold_path(abs_p))
+                    && is_design_gate_enabled(Some(p_pol))
+                    && !is_path_excluded_by_design_globs(abs_p, Some(p_pol), &base_root))
+        })
+        .map(|(abs_p, _, _)| abs_p.clone())
+        .collect();
     let git_root_val = match git_root_opt {
         Some(gr) => Value::String(gr),
         None => Value::Null,
@@ -5105,6 +5272,7 @@ pub fn resolve_candidate_context(marker: &Value, include_tests: bool) -> Value {
         "cwd": cwd,
         "git_root": git_root_val,
         "dpaths": dpaths,
+        "design_paths": design_paths,
         "policy": policy,
         "floor": floor,
         "require_tests": req_tests,
@@ -5137,31 +5305,1684 @@ pub fn receipt_requirements_summary(floor: &str, policy: Option<&Value>, has_tes
         }
         return parts.join(" + ");
     }
-    if floor == "HIGH" {
-        return format!(
-            "decisive test/check execution -> primary independent APPROVED review (`carbon-stack codex-lane review` on `{}` -> {}) -> simplify once (`SIMPLIFY_LENS: ALL` fast-path if <=2 files & <=30 lines, else 3 separate lenses on `{}`, fallback `{}`) -> batch kill workers -> final `--closure` check",
-            CODEX_SOL_MODEL,
-            review_escalation_chain("HIGH"),
-            SONNET_HIGH_MODEL,
-            SIMPLIFY_FALLBACK_MODEL
-        );
-    }
+    let (label, xhigh_flag, closure_flag, codex_model) = if floor == "HIGH" {
+        ("independent", "", "--closure", CODEX_SOL_MODEL)
+    } else {
+        ("XHIGH", " --xhigh", "--xhigh --closure", CODEX_ASTRA_MODEL)
+    };
     format!(
-        "decisive test/check execution -> primary XHIGH APPROVED review (`carbon-stack codex-lane review --xhigh` on `{}` -> {}) -> simplify once (`SIMPLIFY_LENS: ALL` fast-path if <=2 files & <=30 lines, else 3 separate lenses on `{}`, fallback `{}`) -> batch kill workers -> final `--xhigh --closure` check",
-        CODEX_ASTRA_MODEL,
-        review_escalation_chain("XHIGH"),
+        "decisive test/check execution -> simplify once (`SIMPLIFY_LENS: ALL` fast-path if <={} files & <={} lines, else {} separate lenses on `{}`, fallback `{}`) -> batch kill workers -> re-test after edits -> primary {} APPROVED review (1..{} rounds via `carbon-stack codex-lane review{}` on `{}` -> {}; APPROVED closes gate; after Round {} ESCALATE: mandatory research -> fix + re-test -> <={} `{}` passes or 1 `redesign-reset`)",
+        FAST_PATH_MAX_FILES,
+        FAST_PATH_MAX_LINES,
+        SIMPLIFY_LENSES.len(),
         SONNET_HIGH_MODEL,
-        SIMPLIFY_FALLBACK_MODEL
+        SIMPLIFY_FALLBACK_MODEL,
+        label,
+        MAX_ORDINARY_REVIEW_ROUNDS,
+        xhigh_flag,
+        codex_model,
+        review_escalation_chain(floor),
+        MAX_ORDINARY_REVIEW_ROUNDS,
+        MAX_CLOSURE_PASSES_PER_CYCLE,
+        closure_flag
     )
+}
+
+fn matches_server_prefix(s: &str, prefix: &str) -> bool {
+    match s.strip_prefix(prefix) {
+        Some("") => true,
+        Some(rest) => rest.starts_with('_') || rest.starts_with('-'),
+        None => false,
+    }
 }
 
 fn is_research_mcp_server(server_name: &str) -> bool {
     let s = server_name.trim().to_ascii_lowercase();
-    s.starts_with("context7")
-        || s.starts_with("gemini-api")
-        || s.starts_with("google-developer-knowledge")
-        || s.starts_with("v8std")
-        || s.starts_with("notebooklm")
+    const RESEARCH_SERVERS: &[&str] = &[
+        "context7",
+        "gemini-api",
+        "google-developer-knowledge",
+        "v8std",
+        "1c-syntax-helper",
+        "notebooklm",
+        "exa",
+        "deepwiki",
+        "b24-dev-mcp",
+        "fetch",
+        "mobbin",
+    ];
+    RESEARCH_SERVERS
+        .iter()
+        .any(|prefix| matches_server_prefix(&s, prefix))
+}
+
+pub fn is_design_gate_enabled(policy: Option<&Value>) -> bool {
+    policy
+        .and_then(|p| p.get("design_gate"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
+
+pub fn format_last_basenames(paths: &[String], limit: usize) -> String {
+    let start = paths.len().saturating_sub(limit);
+    paths[start..]
+        .iter()
+        .map(|p| p.rsplit('/').next().unwrap_or(p.as_str()))
+        .collect::<Vec<&str>>()
+        .join(", ")
+}
+
+fn skip_balanced_ts_generics(b: &[u8], start: usize) -> Option<usize> {
+    if b.get(start) != Some(&b'<') {
+        return None;
+    }
+    let mut i = start + 1;
+    let mut depth = 1usize;
+    while i < b.len() {
+        match b[i] {
+            b'\'' | b'"' => {
+                let q = b[i];
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == q {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'<' => {
+                depth += 1;
+                i += 1;
+            }
+            b'>' => {
+                depth -= 1;
+                i += 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            b';' => return None,
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn is_jsx_tag_start(ch: u8) -> bool {
+    ch.is_ascii_alphabetic() || ch == b'_' || ch == b'$'
+}
+
+fn is_jsx_tag_char(ch: u8) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, b'_' | b'$' | b'.' | b':' | b'-')
+}
+
+fn parse_jsx_closing_tag(b: &[u8], lt_pos: usize) -> Option<(&[u8], usize)> {
+    if b.get(lt_pos) != Some(&b'<') || b.get(lt_pos + 1) != Some(&b'/') {
+        return None;
+    }
+    let mut i = lt_pos + 2;
+    if i >= b.len() {
+        return None;
+    }
+    if b[i] == b'>' {
+        return Some((&b[i..i], i + 1));
+    }
+    if !is_jsx_tag_start(b[i]) {
+        return None;
+    }
+    let name_start = i;
+    while i < b.len() && is_jsx_tag_char(b[i]) {
+        i += 1;
+    }
+    let name = &b[name_start..i];
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if b.get(i) == Some(&b'>') {
+        Some((name, i + 1))
+    } else {
+        None
+    }
+}
+
+fn try_match_jsx_closing_tag(b: &[u8], lt_pos: usize) -> bool {
+    parse_jsx_closing_tag(b, lt_pos).is_some()
+}
+
+enum JsxOpenTag<'a> {
+    SelfClosing(usize),
+    Opening { name: &'a [u8], after_gt: usize },
+}
+
+fn try_parse_jsx_opening_tag(b: &[u8], lt_pos: usize) -> Option<JsxOpenTag<'_>> {
+    if b.get(lt_pos) != Some(&b'<') {
+        return None;
+    }
+    if b.get(lt_pos + 1) == Some(&b'>') {
+        return Some(JsxOpenTag::Opening {
+            name: &b[lt_pos..lt_pos],
+            after_gt: lt_pos + 2,
+        });
+    }
+    let mut i = lt_pos + 1;
+    if i >= b.len() || !is_jsx_tag_start(b[i]) {
+        return None;
+    }
+    let name_start = i;
+    while i < b.len() && is_jsx_tag_char(b[i]) {
+        i += 1;
+    }
+    let name = &b[name_start..i];
+    let mut ws_after_name = false;
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        ws_after_name = true;
+        i += 1;
+    }
+    if i >= b.len() {
+        return None;
+    }
+    // INVARIANT: Reject TypeScript generic parameter lists (`<T,>`, `<T extends X>`, `<T = Default>`) before scanning JSX attributes.
+    if b[i] == b',' || b[i] == b'=' {
+        return None;
+    }
+    if ws_after_name && b[i..].starts_with(b"extends") {
+        let after_ext = b.get(i + 7).copied().unwrap_or(b' ');
+        if !after_ext.is_ascii_alphanumeric() && after_ext != b'_' {
+            return None;
+        }
+    }
+    if b[i] == b'<' {
+        let after_gen = skip_balanced_ts_generics(b, i)?;
+        i = after_gen;
+        ws_after_name = false;
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            ws_after_name = true;
+            i += 1;
+        }
+        if i >= b.len() {
+            return None;
+        }
+    }
+    if b[i] == b'/' && b.get(i + 1) == Some(&b'>') {
+        return Some(JsxOpenTag::SelfClosing(i + 2));
+    }
+    if b[i] == b'>' {
+        return Some(JsxOpenTag::Opening {
+            name,
+            after_gt: i + 1,
+        });
+    }
+    if !ws_after_name {
+        return None;
+    }
+    let mut brace_depth = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'\'' | b'"' => {
+                let q = b[i];
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == q {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'`' if brace_depth > 0 => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == b'`' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'/' if brace_depth > 0 && b.get(i + 1) == Some(&b'/') => {
+                i += 2;
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if brace_depth > 0 && b.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+            }
+            b'{' => {
+                brace_depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                if brace_depth == 0 {
+                    return None;
+                }
+                brace_depth -= 1;
+                i += 1;
+            }
+            b'/' if brace_depth == 0 && b.get(i + 1) == Some(&b'>') => {
+                return Some(JsxOpenTag::SelfClosing(i + 2));
+            }
+            b'>' if brace_depth == 0 => {
+                return Some(JsxOpenTag::Opening {
+                    name,
+                    after_gt: i + 1,
+                });
+            }
+            b';' if brace_depth == 0 => return None,
+            b'&' if brace_depth == 0 && b.get(i + 1) == Some(&b'&') => return None,
+            b'|' if brace_depth == 0 && b.get(i + 1) == Some(&b'|') => return None,
+            b'=' if brace_depth == 0 && b.get(i + 1) == Some(&b'>') => return None,
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn skip_jsx_expr_container(b: &[u8], lbrace_pos: usize, depth: usize) -> Option<usize> {
+    if depth >= 16 || b.get(lbrace_pos) != Some(&b'{') {
+        return None;
+    }
+    let mut i = lbrace_pos + 1;
+    let mut braces = 1usize;
+    let mut prev_can_precede_jsx = true;
+    let mut tpl_stack: Vec<usize> = Vec::new();
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if c == b'/' && b.get(i + 1) == Some(&b'/') {
+            i += 2;
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'/' && b.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(b.len());
+            continue;
+        }
+        if c == b'\'' || c == b'"' {
+            i += 1;
+            while i < b.len() {
+                if b[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b[i] == c {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            prev_can_precede_jsx = false;
+            continue;
+        }
+        if c == b'`' {
+            i += 1;
+            while i < b.len() {
+                if b[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b[i] == b'$' && b.get(i + 1) == Some(&b'{') {
+                    tpl_stack.push(braces);
+                    braces += 1;
+                    i += 2;
+                    prev_can_precede_jsx = true;
+                    break;
+                }
+                if b[i] == b'`' {
+                    i += 1;
+                    prev_can_precede_jsx = false;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'/' && prev_can_precede_jsx {
+            i += 1;
+            let mut in_class = false;
+            while i < b.len() && b[i] != b'\n' {
+                if b[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b[i] == b'[' {
+                    in_class = true;
+                } else if b[i] == b']' {
+                    in_class = false;
+                } else if b[i] == b'/' && !in_class {
+                    i += 1;
+                    while i < b.len() && b[i].is_ascii_alphabetic() {
+                        i += 1;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            prev_can_precede_jsx = false;
+            continue;
+        }
+        if c == b'{' {
+            braces += 1;
+            prev_can_precede_jsx = true;
+            i += 1;
+            continue;
+        }
+        if c == b'}' {
+            braces -= 1;
+            if braces == 0 {
+                return Some(i + 1);
+            }
+            if tpl_stack.last().copied() == Some(braces) {
+                tpl_stack.pop();
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == b'$' && b.get(i + 1) == Some(&b'{') {
+                        tpl_stack.push(braces);
+                        braces += 1;
+                        i += 2;
+                        prev_can_precede_jsx = true;
+                        break;
+                    }
+                    if b[i] == b'`' {
+                        i += 1;
+                        prev_can_precede_jsx = false;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            prev_can_precede_jsx = false;
+            i += 1;
+            continue;
+        }
+        if c == b'<' && prev_can_precede_jsx {
+            if let Some(end) = skip_jsx_element(b, i, depth + 1) {
+                i = end;
+                prev_can_precede_jsx = false;
+                continue;
+            }
+            prev_can_precede_jsx = true;
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == b'_' || c == b'$' {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$') {
+                i += 1;
+            }
+            let w = &b[start..i];
+            prev_can_precede_jsx = matches!(
+                w,
+                b"return" | b"yield" | b"await" | b"throw" | b"case" | b"default" | b"else" | b"do" | b"of" | b"in"
+            );
+            continue;
+        }
+        if c.is_ascii_digit() {
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || matches!(b[i], b'.' | b'_')) {
+                i += 1;
+            }
+            prev_can_precede_jsx = false;
+            continue;
+        }
+        if c == b'=' && b.get(i + 1) == Some(&b'>') {
+            prev_can_precede_jsx = true;
+            i += 2;
+            continue;
+        }
+        prev_can_precede_jsx = !matches!(c, b')' | b']');
+        i += 1;
+    }
+    None
+}
+
+fn js_line_terminator_len_at(b: &[u8], i: usize) -> usize {
+    match b.get(i) {
+        Some(&b'\n') | Some(&b'\r') => 1,
+        Some(&0xE2)
+            if b.get(i + 1) == Some(&0x80)
+                && matches!(b.get(i + 2), Some(&0xA8) | Some(&0xA9)) =>
+        {
+            3
+        }
+        _ => 0,
+    }
+}
+
+fn slice_has_js_line_terminator(slice: &[u8]) -> bool {
+    let mut k = 0usize;
+    while k < slice.len() {
+        let lt = js_line_terminator_len_at(slice, k);
+        if lt > 0 {
+            return true;
+        }
+        k += 1;
+    }
+    false
+}
+
+fn skip_js_comment(b: &[u8], i: usize) -> Option<(usize, bool)> {
+    if b.get(i) != Some(&b'/') {
+        return None;
+    }
+    match b.get(i + 1) {
+        Some(&b'/') => {
+            let mut j = i + 2;
+            while j < b.len() && js_line_terminator_len_at(b, j) == 0 {
+                j += 1;
+            }
+            Some((j, false))
+        }
+        Some(&b'*') => {
+            let mut j = i + 2;
+            while j + 1 < b.len() && !(b[j] == b'*' && b[j + 1] == b'/') {
+                j += 1;
+            }
+            let body_end = j.min(b.len());
+            let had_lt = slice_has_js_line_terminator(&b[i + 2..body_end]);
+            Some(((j + 2).min(b.len()), had_lt))
+        }
+        _ => None,
+    }
+}
+
+fn skip_ts_same_line_ws_and_comments(b: &[u8], mut i: usize) -> Option<usize> {
+    // INVARIANT: TypeScript enforces `[no LineTerminator here]` after contextual `interface`/`type` keywords; multi-line comments containing a line terminator (`/*\n*/`) violate this and abort type-declaration skipping.
+    while i < b.len() {
+        if matches!(b[i], b' ' | b'\t') {
+            i += 1;
+            continue;
+        }
+        if let Some((next_i, had_lt)) = skip_js_comment(b, i) {
+            if had_lt || b.get(i + 1) == Some(&b'/') {
+                return None;
+            }
+            i = next_i;
+            continue;
+        }
+        break;
+    }
+    Some(i)
+}
+
+fn scan_js_ident_end(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$') {
+        i += 1;
+    }
+    i
+}
+
+fn skip_js_string_or_template(b: &[u8], start: usize) -> usize {
+    skip_js_string_or_template_depth(b, start, 0)
+}
+
+fn skip_js_string_or_template_depth(b: &[u8], start: usize, depth: usize) -> usize {
+    let q = b[start];
+    let mut i = start + 1;
+    while i < b.len() {
+        if b[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if q == b'`' && depth < 16 && b[i] == b'$' && b.get(i + 1) == Some(&b'{') {
+            i += 2;
+            let mut braces = 1usize;
+            while i < b.len() && braces > 0 {
+                let c = b[i];
+                if matches!(c, b'\'' | b'"' | b'`') {
+                    i = skip_js_string_or_template_depth(b, i, depth + 1);
+                    continue;
+                }
+                if let Some((next_i, _)) = skip_js_comment(b, i) {
+                    i = next_i;
+                    continue;
+                }
+                if c == b'{' {
+                    braces += 1;
+                } else if c == b'}' {
+                    braces -= 1;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if b[i] == q {
+            return i + 1;
+        }
+        i += 1;
+    }
+    b.len()
+}
+
+fn looks_like_ts_generic_call_sig(b: &[u8], after_gt: usize) -> bool {
+    let mut i = after_gt;
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if b.get(i) != Some(&b'(') {
+        return false;
+    }
+    i += 1;
+    let mut paren_depth = 1usize;
+    let mut brace_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut saw_param_colon = false;
+    let mut saw_non_ws = false;
+    while i < b.len() && paren_depth > 0 {
+        let c = b[i];
+        if let Some((next_i, _)) = skip_js_comment(b, i) {
+            i = next_i;
+            continue;
+        }
+        if matches!(c, b'\'' | b'"' | b'`') {
+            saw_non_ws = true;
+            i = skip_js_string_or_template(b, i);
+            continue;
+        }
+        if !c.is_ascii_whitespace() && c != b')' {
+            saw_non_ws = true;
+        }
+        match c {
+            b'(' => paren_depth += 1,
+            b')' => paren_depth -= 1,
+            b'{' => brace_depth += 1,
+            b'}' => brace_depth = brace_depth.saturating_sub(1),
+            b'[' => bracket_depth += 1,
+            b']' => bracket_depth = bracket_depth.saturating_sub(1),
+            b':' if paren_depth == 1 && brace_depth == 0 && bracket_depth == 0 => {
+                saw_param_colon = true;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if paren_depth != 0 {
+        return false;
+    }
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if b.get(i) == Some(&b'=') && b.get(i + 1) == Some(&b'>') {
+        return true;
+    }
+    b.get(i) == Some(&b':') && (saw_param_colon || !saw_non_ws)
+}
+
+fn skip_ts_interface_decl(b: &[u8], after_kw: usize) -> Option<usize> {
+    let mut i = skip_ts_same_line_ws_and_comments(b, after_kw)?;
+    if i >= b.len() || !is_jsx_tag_start(b[i]) {
+        return None;
+    }
+    i = scan_js_ident_end(b, i);
+    while i < b.len() {
+        let c = b[i];
+        if let Some((next_i, _)) = skip_js_comment(b, i) {
+            i = next_i;
+            continue;
+        }
+        if matches!(c, b'\'' | b'"' | b'`') {
+            i = skip_js_string_or_template(b, i);
+            continue;
+        }
+        if c == b';' {
+            return None;
+        }
+        if c == b'{' {
+            let mut depth = 1usize;
+            i += 1;
+            while i < b.len() && depth > 0 {
+                let ch = b[i];
+                if let Some((next_i, _)) = skip_js_comment(b, i) {
+                    i = next_i;
+                    continue;
+                }
+                if matches!(ch, b'\'' | b'"' | b'`') {
+                    i = skip_js_string_or_template(b, i);
+                    continue;
+                }
+                if ch == b'{' {
+                    depth += 1;
+                } else if ch == b'}' {
+                    depth -= 1;
+                }
+                i += 1;
+            }
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn peek_next_non_ws_comment(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() {
+        if b[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        let lt = js_line_terminator_len_at(b, i);
+        if lt > 0 {
+            i += lt;
+            continue;
+        }
+        if let Some((next_i, _)) = skip_js_comment(b, i) {
+            i = next_i;
+            continue;
+        }
+        break;
+    }
+    i
+}
+
+fn is_ts_type_continuation_at(b: &[u8], pos: usize) -> bool {
+    let Some(&ch) = b.get(pos) else {
+        return false;
+    };
+    if matches!(ch, b'|' | b'&' | b'?' | b':' | b'.') {
+        return true;
+    }
+    if ch == b'=' && b.get(pos + 1) == Some(&b'>') {
+        return true;
+    }
+    if ch == b'[' {
+        // INVARIANT: Treat `[` on a new line as an array-type continuation only for `[]` so subsequent array-literal statements like `[1, 2].map(...)` are never swallowed.
+        let mut j = pos + 1;
+        while j < b.len() && matches!(b[j], b' ' | b'\t') {
+            j += 1;
+        }
+        return b.get(j) == Some(&b']');
+    }
+    if ch.is_ascii_alphabetic() {
+        let end = scan_js_ident_end(b, pos);
+        return matches!(&b[pos..end], b"extends" | b"is" | b"in");
+    }
+    false
+}
+
+fn skip_ts_type_alias_decl(b: &[u8], after_kw: usize) -> Option<usize> {
+    let mut i = skip_ts_same_line_ws_and_comments(b, after_kw)?;
+    if i >= b.len() || !is_jsx_tag_start(b[i]) {
+        return None;
+    }
+    i = scan_js_ident_end(b, i);
+    i = peek_next_non_ws_comment(b, i);
+    if i < b.len() && b[i] == b'<' {
+        i = skip_balanced_ts_generics(b, i)?;
+        i = peek_next_non_ws_comment(b, i);
+    }
+    if b.get(i) != Some(&b'=') || b.get(i + 1) == Some(&b'=') || b.get(i + 1) == Some(&b'>') {
+        return None;
+    }
+    i += 1;
+    // INVARIANT: Track TypeScript type-expression completeness (`expecting_type_operand`) at nesting depth 0 so ASI terminates the type alias at any line terminator (including `\n`, `\r`, U+2028/U+2029, or multi-line `/*\n*/` comments) after a complete type atom unless the next non-comment token is an actual TypeScript type continuation (`|`, `&`, `?`, `:`, `=>`, `.`, `[]`, `extends`, `is`, `in`), never swallowing subsequent statements like `root.render(<App />)` or `export const View = () => <div />`.
+    let mut brace_d = 0usize;
+    let mut paren_d = 0usize;
+    let mut brack_d = 0usize;
+    let mut angle_d = 0usize;
+    let mut expecting_type_operand = true;
+    while i < b.len() {
+        let c = b[i];
+        let at_top = brace_d == 0 && paren_d == 0 && brack_d == 0 && angle_d == 0;
+        if let Some((next_i, had_lt)) = skip_js_comment(b, i) {
+            if at_top && had_lt && !expecting_type_operand {
+                let next_pos = peek_next_non_ws_comment(b, next_i);
+                if next_pos >= b.len() || !is_ts_type_continuation_at(b, next_pos) {
+                    return Some(next_pos);
+                }
+                i = next_pos;
+                continue;
+            }
+            i = next_i;
+            continue;
+        }
+        if at_top {
+            let lt_len = js_line_terminator_len_at(b, i);
+            if lt_len > 0 {
+                if !expecting_type_operand {
+                    let next_pos = peek_next_non_ws_comment(b, i + lt_len);
+                    if next_pos >= b.len() || !is_ts_type_continuation_at(b, next_pos) {
+                        return Some(next_pos);
+                    }
+                    i = next_pos;
+                    continue;
+                }
+                i += lt_len;
+                continue;
+            }
+        }
+        if matches!(c, b'\'' | b'"' | b'`') {
+            i = skip_js_string_or_template(b, i);
+            if at_top {
+                expecting_type_operand = false;
+            }
+            continue;
+        }
+        if c == b'=' && b.get(i + 1) == Some(&b'>') {
+            if at_top {
+                expecting_type_operand = true;
+            }
+            i += 2;
+            continue;
+        }
+        match c {
+            b'{' => {
+                brace_d += 1;
+                i += 1;
+            }
+            b'}' => {
+                if brace_d == 0 {
+                    return Some(i);
+                }
+                brace_d -= 1;
+                if brace_d == 0 && paren_d == 0 && brack_d == 0 && angle_d == 0 {
+                    expecting_type_operand = false;
+                }
+                i += 1;
+            }
+            b'(' => {
+                paren_d += 1;
+                i += 1;
+            }
+            b')' => {
+                paren_d = paren_d.saturating_sub(1);
+                if brace_d == 0 && paren_d == 0 && brack_d == 0 && angle_d == 0 {
+                    expecting_type_operand = false;
+                }
+                i += 1;
+            }
+            b'[' => {
+                brack_d += 1;
+                i += 1;
+            }
+            b']' => {
+                brack_d = brack_d.saturating_sub(1);
+                if brace_d == 0 && paren_d == 0 && brack_d == 0 && angle_d == 0 {
+                    expecting_type_operand = false;
+                }
+                i += 1;
+            }
+            b'<' => {
+                angle_d += 1;
+                i += 1;
+            }
+            b'>' => {
+                angle_d = angle_d.saturating_sub(1);
+                if brace_d == 0 && paren_d == 0 && brack_d == 0 && angle_d == 0 {
+                    expecting_type_operand = false;
+                }
+                i += 1;
+            }
+            b';' if at_top => {
+                return Some(i + 1);
+            }
+            b'|' | b'&' | b'?' | b':' | b'.' | b'+' | b'-' if at_top => {
+                expecting_type_operand = true;
+                i += 1;
+            }
+            _ if at_top && is_jsx_tag_start(c) => {
+                let start = i;
+                i = scan_js_ident_end(b, i);
+                expecting_type_operand = matches!(
+                    &b[start..i],
+                    b"keyof"
+                        | b"typeof"
+                        | b"readonly"
+                        | b"unique"
+                        | b"infer"
+                        | b"new"
+                        | b"abstract"
+                        | b"asserts"
+                        | b"extends"
+                        | b"is"
+                        | b"in"
+                );
+            }
+            _ if at_top && c.is_ascii_digit() => {
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || matches!(b[i], b'.' | b'_'))
+                {
+                    i += 1;
+                }
+                expecting_type_operand = false;
+            }
+            _ => i += 1,
+        }
+    }
+    Some(i)
+}
+
+fn skip_jsx_element(b: &[u8], lt_pos: usize, depth: usize) -> Option<usize> {
+    if depth >= 16 {
+        return None;
+    }
+    match try_parse_jsx_opening_tag(b, lt_pos)? {
+        JsxOpenTag::SelfClosing(end) => Some(end),
+        JsxOpenTag::Opening { name, after_gt } => {
+            if depth == 0 && !name.is_empty() && looks_like_ts_generic_call_sig(b, after_gt) {
+                return None;
+            }
+            // INVARIANT: Inside JSXText children, quotes (`'`, `"`) are literal text (so `<p>Don't stop</p>` never opens a JS string), while bare `>` and `}` are illegal per the JSX grammar (immediately rejecting TypeScript generic call signatures like `type Mapper = <T>(v: T) => T; const s = "</T>";`).
+            let mut i = after_gt;
+            while i < b.len() {
+                match b[i] {
+                    b'{' => {
+                        i = skip_jsx_expr_container(b, i, depth + 1)?;
+                    }
+                    b'}' | b'>' => return None,
+                    b'<' => {
+                        if b.get(i + 1) == Some(&b'/') {
+                            let (close_name, after_close) = parse_jsx_closing_tag(b, i)?;
+                            if close_name != name {
+                                return None;
+                            }
+                            if depth == 0 {
+                                if let Some(&nxt) = b.get(after_close) {
+                                    if matches!(nxt, b'"' | b'\'' | b'`')
+                                        || nxt.is_ascii_alphanumeric()
+                                        || nxt == b'_'
+                                        || nxt == b'$'
+                                    {
+                                        return None;
+                                    }
+                                }
+                                let mut k = after_close;
+                                while k < b.len() && matches!(b[k], b' ' | b'\t') {
+                                    k += 1;
+                                }
+                                if matches!(b.get(k), Some(b'"' | b'\'' | b'`')) {
+                                    return None;
+                                }
+                            }
+                            return Some(after_close);
+                        }
+                        i = skip_jsx_element(b, i, depth + 1)?;
+                    }
+                    _ => i += 1,
+                }
+            }
+            None
+        }
+    }
+}
+
+pub(crate) fn tsx_source_has_jsx(src: &str) -> bool {
+    // INVARIANT: Lexer-aware scan skips comments, strings, regexes, raw template text, and TypeScript `type`/`interface` declarations so HTML/closing-tag strings inside TS types never false-trigger while generic JSX, JSXText with apostrophes, fragments, and `createElement`/`jsx` calls are accurately detected.
+    let b = src.as_bytes();
+    let mut i = 0usize;
+    let mut prev_can_precede_jsx = true;
+    let mut at_decl_start = true;
+    let mut brace_depth = 0usize;
+    let mut template_brace_stack: Vec<usize> = Vec::new();
+
+    while i < b.len() {
+        let c = b[i];
+        let lt_len = js_line_terminator_len_at(b, i);
+        if lt_len > 0 {
+            at_decl_start = true;
+            i += lt_len;
+            continue;
+        }
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if let Some((next_i, had_lt)) = skip_js_comment(b, i) {
+            if had_lt {
+                at_decl_start = true;
+            }
+            i = next_i;
+            continue;
+        }
+        if c == b'\'' || c == b'"' {
+            i += 1;
+            while i < b.len() {
+                if b[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b[i] == c {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            prev_can_precede_jsx = false;
+            at_decl_start = false;
+            continue;
+        }
+        if c == b'`' {
+            i += 1;
+            while i < b.len() {
+                if b[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b[i] == b'$' && b.get(i + 1) == Some(&b'{') {
+                    template_brace_stack.push(brace_depth);
+                    brace_depth += 1;
+                    i += 2;
+                    prev_can_precede_jsx = true;
+                    at_decl_start = false;
+                    break;
+                }
+                if b[i] == b'`' {
+                    i += 1;
+                    prev_can_precede_jsx = false;
+                    at_decl_start = false;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'/' && prev_can_precede_jsx {
+            i += 1;
+            let mut in_class = false;
+            while i < b.len() && b[i] != b'\n' {
+                if b[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b[i] == b'[' {
+                    in_class = true;
+                } else if b[i] == b']' {
+                    in_class = false;
+                } else if b[i] == b'/' && !in_class {
+                    i += 1;
+                    while i < b.len() && b[i].is_ascii_alphabetic() {
+                        i += 1;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            prev_can_precede_jsx = false;
+            at_decl_start = false;
+            continue;
+        }
+        if c == b'{' {
+            brace_depth += 1;
+            prev_can_precede_jsx = true;
+            at_decl_start = true;
+            i += 1;
+            continue;
+        }
+        if c == b'}' {
+            brace_depth = brace_depth.saturating_sub(1);
+            if template_brace_stack.last().copied() == Some(brace_depth) {
+                template_brace_stack.pop();
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == b'$' && b.get(i + 1) == Some(&b'{') {
+                        template_brace_stack.push(brace_depth);
+                        brace_depth += 1;
+                        i += 2;
+                        prev_can_precede_jsx = true;
+                        at_decl_start = false;
+                        break;
+                    }
+                    if b[i] == b'`' {
+                        i += 1;
+                        prev_can_precede_jsx = false;
+                        at_decl_start = false;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            prev_can_precede_jsx = false;
+            at_decl_start = true;
+            i += 1;
+            continue;
+        }
+        if c == b'<' {
+            if try_match_jsx_closing_tag(b, i) {
+                return true;
+            }
+            if prev_can_precede_jsx && skip_jsx_element(b, i, 0).is_some() {
+                return true;
+            }
+            prev_can_precede_jsx = true;
+            at_decl_start = false;
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == b'_' || c == b'$' {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$') {
+                i += 1;
+            }
+            let word = &src[start..i];
+            if at_decl_start {
+                if word == "interface" {
+                    if let Some(end) = skip_ts_interface_decl(b, i) {
+                        i = end;
+                        prev_can_precede_jsx = true;
+                        at_decl_start = true;
+                        continue;
+                    }
+                } else if word == "type" {
+                    if let Some(end) = skip_ts_type_alias_decl(b, i) {
+                        i = end;
+                        prev_can_precede_jsx = true;
+                        at_decl_start = true;
+                        continue;
+                    }
+                }
+            }
+            if matches!(word, "createElement" | "jsx" | "jsxs") {
+                let mut j = i;
+                while j < b.len() && b[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if b.get(j) == Some(&b'(') {
+                    return true;
+                }
+            }
+            prev_can_precede_jsx = matches!(
+                word,
+                "return"
+                    | "yield"
+                    | "await"
+                    | "throw"
+                    | "case"
+                    | "default"
+                    | "else"
+                    | "do"
+                    | "of"
+                    | "in"
+                    | "export"
+            );
+            at_decl_start = matches!(word, "export" | "declare" | "default");
+            continue;
+        }
+        if c.is_ascii_digit() {
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || matches!(b[i], b'.' | b'_')) {
+                i += 1;
+            }
+            prev_can_precede_jsx = false;
+            at_decl_start = false;
+            continue;
+        }
+        if c == b'=' && b.get(i + 1) == Some(&b'>') {
+            prev_can_precede_jsx = true;
+            at_decl_start = false;
+            i += 2;
+            continue;
+        }
+        prev_can_precede_jsx = !matches!(c, b')' | b']');
+        at_decl_start = c == b';';
+        i += 1;
+    }
+    false
+}
+
+fn tsx_file_has_visual_jsx(raw_path: &str) -> Option<bool> {
+    let p = Path::new(raw_path);
+    let meta = fs::metadata(p).ok()?;
+    if !meta.is_file() || meta.len() > 262_144 {
+        return None;
+    }
+    let text = fs::read_to_string(p).ok()?;
+    Some(tsx_source_has_jsx(&text))
+}
+
+pub(crate) fn flutter_widget_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?:extends\s+(?:Stateless|Stateful|Consumer(?:Stateful)?|Hook(?:Consumer)?|RenderObject)Widget\b|\bWidget\s+build\s*\(\s*BuildContext\b)",
+        )
+        .expect("flutter_widget_re")
+    })
+}
+
+fn file_content_matches_re(raw_path: &str, re: &Regex) -> Option<bool> {
+    let p = Path::new(raw_path);
+    let meta = fs::metadata(p).ok()?;
+    if !meta.is_file() || meta.len() > 262_144 {
+        return None;
+    }
+    let text = fs::read_to_string(p).ok()?;
+    Some(re.is_match(&text))
+}
+
+pub fn sync_design_edit_fields(marker: &mut Value, touched_paths: &[String], now: f64) -> bool {
+    sync_design_edit_fields_with_fp(marker, touched_paths, now, None)
+}
+
+fn git_head_file_has_visual_content(raw_path: &str, base_root: &str, ext: &str) -> Option<bool> {
+    let norm = rio::normalize_path(raw_path);
+    let p = Path::new(&norm);
+    let probe_dir = if p.is_absolute() {
+        p.parent()
+            .map(|d| d.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    } else if !base_root.trim().is_empty() {
+        base_root.trim().to_string()
+    } else {
+        String::new()
+    };
+    if probe_dir.is_empty() {
+        return None;
+    }
+    let git_top = rio::git_toplevel(&probe_dir, false)?;
+    let abs_p = if p.is_absolute() {
+        norm.clone()
+    } else {
+        rio::normalize_path(&Path::new(&git_top).join(&norm).to_string_lossy())
+    };
+    let fold_p = rio::fold_path(&abs_p);
+    let fold_top = rio::fold_path(&git_top);
+    let prefix = format!("{}/", fold_top.trim_end_matches('/'));
+    if !fold_p.starts_with(&prefix) {
+        return None;
+    }
+    let rel = if abs_p.len() == fold_p.len() && abs_p.is_char_boundary(prefix.len()) {
+        &abs_p[prefix.len()..]
+    } else {
+        &fold_p[prefix.len()..]
+    };
+    if rel.is_empty() {
+        return None;
+    }
+    let spec = format!("HEAD:{}", rel);
+    let (rc, out, _) = rio::run_git(&git_top, &["show", &spec], 3.0);
+    if rc != 0 || out.len() > 262_144 {
+        return None;
+    }
+    if ext == "tsx" || ext == "jsx" {
+        Some(tsx_source_has_jsx(&out))
+    } else if ext == "dart" {
+        Some(flutter_widget_re().is_match(&out))
+    } else {
+        None
+    }
+}
+
+pub fn latch_design_paths_in_marker(marker: &mut Value, paths: &[String]) {
+    if paths.is_empty() {
+        return;
+    }
+    let mut existing = durable_paths_from_val(marker.get("latched_design_paths"));
+    let mut seen: HashSet<String> = existing.iter().map(|p| rio::fold_path(p)).collect();
+    let mut changed = false;
+    for p in paths {
+        let norm = rio::normalize_path(p);
+        if norm.is_empty() || norm == SHELL_MUTATION_SENTINEL {
+            continue;
+        }
+        let fold = rio::fold_path(&norm);
+        if seen.insert(fold) {
+            existing.push(norm);
+            changed = true;
+        }
+    }
+    if changed {
+        if let Value::Object(ref mut m) = marker {
+            m.insert(
+                "latched_design_paths".to_string(),
+                Value::Array(existing.into_iter().map(Value::String).collect()),
+            );
+        }
+    }
+}
+
+fn is_path_excluded_by_design_globs(path: &str, policy: Option<&Value>, base_root: &str) -> bool {
+    let excl = policy
+        .map(|p| policy_globs(p, "design_exclude_globs"))
+        .unwrap_or_default();
+    if excl.is_empty() {
+        return false;
+    }
+    let pol_root = policy
+        .map(|p| val_to_str(p.get("policy_root")))
+        .unwrap_or_default();
+    let glob_root = if !pol_root.trim().is_empty() {
+        pol_root.as_str()
+    } else {
+        base_root
+    };
+    match_glob_patterns(&rio::normalize_path(path), &excl, glob_root)
+}
+
+pub fn sync_design_edit_fields_with_fp(
+    marker: &mut Value,
+    touched_paths: &[String],
+    now: f64,
+    precomputed_dfp: Option<&str>,
+) -> bool {
+    let cctx = resolve_candidate_context(marker, false);
+    let design_paths = durable_paths_from_val(cctx.get("design_paths"));
+    if design_paths.is_empty() {
+        return false;
+    }
+    latch_design_paths_in_marker(marker, &design_paths);
+    let cur_dfp = match precomputed_dfp {
+        Some(fp) => fp.to_string(),
+        None => content_fingerprint(&design_paths, MAX_FINGERPRINT_FILE_BYTES),
+    };
+    let prev_dfp = val_to_str(marker.get("design_fp"));
+    let prev_dts = val_to_f64(marker.get("last_design_edit_ts"));
+    let design_fold: HashSet<String> = design_paths.iter().map(|p| rio::fold_path(p)).collect();
+    let touched_design = touched_paths
+        .iter()
+        .any(|p| design_fold.contains(&rio::fold_path(p)));
+    // INVARIANT: Synchronize `design_fp` and `last_design_edit_ts` on hook edits AND external-editor Stop catch-up so stale UI approvals are invalidated without permanently deadlocking after fresh re-capture.
+    let should_bump = prev_dts <= 0.0
+        || (!cur_dfp.is_empty() && cur_dfp != prev_dfp)
+        || (cur_dfp.is_empty() && touched_design);
+    if !should_bump {
+        return false;
+    }
+    if let Value::Object(ref mut m) = marker {
+        m.insert("last_design_edit_ts".to_string(), json!(now.max(prev_dts)));
+        if !cur_dfp.is_empty() {
+            m.insert("design_fp".to_string(), Value::String(cur_dfp));
+        }
+    }
+    true
+}
+
+fn relative_path_for_design_check(norm: &str, base_root: &str) -> String {
+    let fold_p = rio::fold_path(norm);
+    let base_clean = base_root.trim();
+    if !base_clean.is_empty() {
+        let fold_b = rio::fold_path(base_clean);
+        let b_trim = fold_b.trim_end_matches('/');
+        if !b_trim.is_empty() {
+            let prefix = format!("{}/", b_trim);
+            if fold_p.starts_with(&prefix) {
+                return fold_p[prefix.len()..].to_string();
+            }
+        }
+    }
+    let p = Path::new(norm);
+    if p.is_absolute() {
+        if let Some(mut cur) = p.parent() {
+            while !cur.as_os_str().is_empty() {
+                if cur.join(".git").exists()
+                    || cur.join(".agents").exists()
+                    || cur.join("package.json").is_file()
+                    || cur.join("pubspec.yaml").is_file()
+                    || cur.join("Cargo.toml").is_file()
+                {
+                    let root_s = rio::normalize_path(&cur.to_string_lossy());
+                    let fold_r = rio::fold_path(&root_s);
+                    let r_trim = fold_r.trim_end_matches('/');
+                    if !r_trim.is_empty() {
+                        let prefix = format!("{}/", r_trim);
+                        if fold_p.starts_with(&prefix) {
+                            return fold_p[prefix.len()..].to_string();
+                        }
+                    }
+                    break;
+                }
+                match cur.parent() {
+                    Some(next) if next != cur => cur = next,
+                    _ => break,
+                }
+            }
+        }
+    }
+    norm.to_string()
+}
+
+fn is_visual_design_path_with_globs(
+    path: &str,
+    pol_root: &str,
+    base_root: &str,
+    excl_globs: &[String],
+    incl_globs: &[String],
+) -> bool {
+    let raw = path.trim();
+    if raw.is_empty() || raw == SHELL_MUTATION_SENTINEL {
+        return false;
+    }
+    let norm = rio::normalize_path(raw);
+    let glob_root = if !pol_root.trim().is_empty() {
+        pol_root
+    } else {
+        base_root
+    };
+    if !excl_globs.is_empty() && match_glob_patterns(&norm, excl_globs, glob_root) {
+        return false;
+    }
+    if !incl_globs.is_empty() && match_glob_patterns(&norm, incl_globs, glob_root) {
+        return true;
+    }
+    // INVARIANT: Strip the project/repo root before checking directory-segment exclusions so parent directories above the workspace (e.g. `C:/src/cli/panel/Button.tsx`) never suppress Design Gate.
+    let rel_norm = relative_path_for_design_check(&norm, glob_root);
+    let low = rel_norm.to_lowercase();
+    let fname = low.rsplit('/').next().unwrap_or("");
+    if fname.is_empty()
+        || fname.contains(".test.")
+        || fname.contains(".spec.")
+        || fname.contains(".stories.")
+        || fname.ends_with("_test.dart")
+        || fname.ends_with(".g.dart")
+        || fname.ends_with(".freezed.dart")
+    {
+        return false;
+    }
+    let is_token_or_spec = matches!(
+        fname,
+        "design.md"
+            | "tokens.md"
+            | "mood.md"
+            | "voice.md"
+            | "tokens.json"
+            | "tokens.ts"
+            | "tokens.js"
+            | "theme.ts"
+            | "theme.js"
+            | "tailwind.config.js"
+            | "tailwind.config.ts"
+            | "tailwind.config.mjs"
+            | "tailwind.config.cjs"
+    ) || fname.starts_with("design-tokens");
+    let ext = if is_token_or_spec {
+        ""
+    } else {
+        let Some((_, e)) = fname.rsplit_once('.') else {
+            return false;
+        };
+        if !matches!(
+            e,
+            "tsx"
+                | "jsx"
+                | "vue"
+                | "svelte"
+                | "astro"
+                | "css"
+                | "scss"
+                | "sass"
+                | "less"
+                | "styl"
+                | "html"
+                | "htm"
+                | "dart"
+        ) {
+            return false;
+        }
+        e
+    };
+    // INVARIANT: Strictly exclude tests, stories, generated artifacts, and non-visual logic/backend/CLI/infra/API paths so Design Gate imposes zero overhead outside visual UI/design edits.
+    const NON_VISUAL_DIRS: &[&str] = &[
+        "/__tests__/",
+        "/__mocks__/",
+        "/tests/",
+        "/test/",
+        "/e2e/",
+        "/fixtures/",
+        "/test_utils/",
+        "/dist/",
+        "/build/",
+        "/.next/",
+        "/node_modules/",
+        "/target/",
+        "/.generated/",
+        "/api/",
+        "/services/",
+        "/service/",
+        "/hooks/",
+        "/store/",
+        "/stores/",
+        "/state/",
+        "/types/",
+        "/models/",
+        "/schemas/",
+        "/utils/",
+        "/helpers/",
+        "/formatters/",
+        "/parsers/",
+        "/validators/",
+        "/mappers/",
+        "/selectors/",
+        "/clients/",
+        "/adapters/",
+        "/serializers/",
+        "/converters/",
+        "/transformers/",
+        "/domain/",
+        "/repositories/",
+        "/usecases/",
+        "/use_cases/",
+        "/queries/",
+        "/mutations/",
+        "/constants/",
+        "/config/",
+        "/middleware/",
+        "/server/",
+        "/backend/",
+        "/migrations/",
+        "/sql/",
+        "/infra/",
+        "/deploy/",
+        "/scripts/",
+        "/cli/",
+    ];
+    let padded = format!("/{}/", low.trim_matches('/'));
+    if NON_VISUAL_DIRS.iter().any(|seg| padded.contains(seg)) {
+        return false;
+    }
+    if is_token_or_spec {
+        return true;
+    }
+    if ext == "tsx" || ext == "jsx" {
+        // INVARIANT: Consider both post-edit disk content AND pre-edit git `HEAD` content so removing JSX render (`<div />` -> `return null`) still triggers Design Gate while files without JSX before and after stay zero-overhead.
+        let cur_has_jsx = tsx_file_has_visual_jsx(raw);
+        if cur_has_jsx == Some(true) {
+            return true;
+        }
+        if git_head_file_has_visual_content(raw, glob_root, ext) == Some(true) {
+            return true;
+        }
+        return cur_has_jsx.unwrap_or(true);
+    }
+    if ext != "dart" {
+        return true;
+    }
+    const FLUTTER_UI_DIRS: &[&str] = &[
+        "/widgets/",
+        "/screens/",
+        "/pages/",
+        "/views/",
+        "/ui/",
+        "/theme/",
+        "/presentation/",
+        "/components/",
+        "/dialogs/",
+        "/modals/",
+        "/sheets/",
+    ];
+    const FLUTTER_UI_SUFFIXES: &[&str] = &[
+        "_screen.dart",
+        "_page.dart",
+        "_view.dart",
+        "_widget.dart",
+        "_dialog.dart",
+        "_modal.dart",
+        "_sheet.dart",
+        "_card.dart",
+        "_tile.dart",
+        "_button.dart",
+        "_bar.dart",
+        "_nav.dart",
+        "_drawer.dart",
+        "_header.dart",
+        "_footer.dart",
+        "_layout.dart",
+        "_theme.dart",
+        "_styles.dart",
+        "_tokens.dart",
+    ];
+    const FLUTTER_LOGIC_SUFFIXES: &[&str] = &[
+        "_bloc.dart",
+        "_cubit.dart",
+        "_controller.dart",
+        "_provider.dart",
+        "_repository.dart",
+        "_service.dart",
+        "_model.dart",
+        "_state.dart",
+        "_event.dart",
+        "_dto.dart",
+        "_mapper.dart",
+        "_client.dart",
+        "_api.dart",
+        "_usecase.dart",
+        "_use_case.dart",
+        "_datasource.dart",
+        "_data_source.dart",
+        "_validator.dart",
+        "_formatter.dart",
+        "_parser.dart",
+        "_helper.dart",
+        "_util.dart",
+        "_utils.dart",
+    ];
+    if FLUTTER_LOGIC_SUFFIXES.iter().any(|sfx| fname.ends_with(sfx)) {
+        return false;
+    }
+    if FLUTTER_UI_DIRS.iter().any(|seg| padded.contains(seg))
+        || FLUTTER_UI_SUFFIXES.iter().any(|sfx| fname.ends_with(sfx))
+    {
+        return true;
+    }
+    if file_content_matches_re(raw, flutter_widget_re()).unwrap_or(false) {
+        return true;
+    }
+    git_head_file_has_visual_content(raw, glob_root, ext).unwrap_or(false)
+}
+
+pub fn existing_file_has_confirmed_visual_content(path: &str, base_root: &str) -> bool {
+    // INVARIANT: Strict pre-edit check for `PreToolUse` — returns `true` ONLY when `path` already exists on disk AND contains confirmed visual JSX/Flutter widget markup (never `unwrap_or(true)` for non-existent brand-new files like `write_file("Pure.tsx")`).
+    let raw = path.trim();
+    if raw.is_empty() || !Path::new(raw).is_file() {
+        return false;
+    }
+    let ext = Path::new(raw)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !matches!(ext.as_str(), "tsx" | "jsx" | "dart") {
+        return false;
+    }
+    let norm = rio::normalize_path(raw);
+    let rel_norm = relative_path_for_design_check(&norm, base_root);
+    let low = rel_norm.to_lowercase();
+    let fname = low.rsplit('/').next().unwrap_or("");
+    if fname.is_empty()
+        || fname.contains(".test.")
+        || fname.contains(".spec.")
+        || fname.contains(".stories.")
+        || fname.ends_with("_test.dart")
+    {
+        return false;
+    }
+    if ext == "tsx" || ext == "jsx" {
+        return is_visual_design_path_with_base(raw, None, base_root)
+            && tsx_file_has_visual_jsx(raw) == Some(true);
+    }
+    is_visual_design_path_with_base(raw, None, base_root)
+}
+
+pub fn is_visual_design_path_with_base(
+    path: &str,
+    policy: Option<&Value>,
+    base_root: &str,
+) -> bool {
+    if !is_design_gate_enabled(policy) {
+        return false;
+    }
+    let pol_root = policy
+        .map(|p| val_to_str(p.get("policy_root")))
+        .unwrap_or_default();
+    let excl = policy
+        .map(|p| policy_globs(p, "design_exclude_globs"))
+        .unwrap_or_default();
+    let incl = policy
+        .map(|p| policy_globs(p, "design_include_globs"))
+        .unwrap_or_default();
+    is_visual_design_path_with_globs(path, &pol_root, base_root, &excl, &incl)
+}
+
+pub fn is_visual_design_path(path: &str, policy: Option<&Value>) -> bool {
+    is_visual_design_path_with_base(path, policy, "")
+}
+
+pub fn design_gate_paths(paths: &[String], policy: Option<&Value>) -> Vec<String> {
+    if !is_design_gate_enabled(policy) || paths.is_empty() {
+        return Vec::new();
+    }
+    let pol_root = policy
+        .map(|p| val_to_str(p.get("policy_root")))
+        .unwrap_or_default();
+    let excl = policy
+        .map(|p| policy_globs(p, "design_exclude_globs"))
+        .unwrap_or_default();
+    let incl = policy
+        .map(|p| policy_globs(p, "design_include_globs"))
+        .unwrap_or_default();
+    paths
+        .iter()
+        .filter(|p| is_visual_design_path_with_globs(p, &pol_root, "", &excl, &incl))
+        .cloned()
+        .collect()
+}
+
+pub fn has_design_gate_paths(paths: &[String], policy: Option<&Value>) -> bool {
+    if !is_design_gate_enabled(policy) || paths.is_empty() {
+        return false;
+    }
+    let pol_root = policy
+        .map(|p| val_to_str(p.get("policy_root")))
+        .unwrap_or_default();
+    let excl = policy
+        .map(|p| policy_globs(p, "design_exclude_globs"))
+        .unwrap_or_default();
+    let incl = policy
+        .map(|p| policy_globs(p, "design_include_globs"))
+        .unwrap_or_default();
+    paths
+        .iter()
+        .any(|p| is_visual_design_path_with_globs(p, &pol_root, "", &excl, &incl))
 }
 
 fn is_research_shell_cmd(raw_cmd: &str) -> bool {
@@ -5171,7 +6992,7 @@ fn is_research_shell_cmd(raw_cmd: &str) -> bool {
         static RE: OnceLock<Regex> = OnceLock::new();
         RE.get_or_init(|| {
             Regex::new(
-                r"(?i)(?:^|[;&|]\s*|\$null\s*\|\s*)(?:&?\s*['\x22]?[^\s'\x22]*?(?:tokenade(?:\.exe|\.cmd)?\s+(?:search|web)\b|nlm-memory(?:\.cmd|\.exe)?\s+recall\b|jev(?:\.exe|\.cmd)?\s+(?:ask|find)\b))",
+                r"(?i)(?:^|[;&|]\s*|\$null\s*\|\s*)(?:&?\s*['\x22]?[^\s'\x22]*?(?:tokenade(?:\.exe|\.cmd)?\s+(?:search|web)\b|nlm-memory(?:\.cmd|\.exe)?\s+recall\b|jev(?:\.exe|\.cmd)?\s+(?:ask|find)\b|npx(?:\.cmd|\.exe)?\s+(?:-y\s+)?modern-web-guidance(?:@\S+)?\s+(?:search|retrieve)\b))",
             )
             .expect("research_shell_re")
         })
@@ -7931,6 +9752,12 @@ mod tests {
         assert!(is_review_tier_xhigh("REVIEW_TIER: XHIGH"));
         assert!(is_simplify_worker_name("simp-efficie"));
         assert_eq!(simplify_lens_from_worker_name("simp-efficie"), "efficiency");
+        assert!(is_simplify_worker_name("simp-eff-2"));
+        assert_eq!(simplify_lens_from_worker_name("simp-eff-2"), "efficiency");
+        assert!(is_simplify_worker_name("simp-qual-48e3"));
+        assert_eq!(simplify_lens_from_worker_name("simp-qual-48e3"), "quality");
+        assert!(is_simplify_worker_name("simp-reuse-2"));
+        assert_eq!(simplify_lens_from_worker_name("simp-reuse-2"), "reuse");
         assert!(is_simplify_subagent_call("custom:research", "simplify-reuse"));
     }
 
@@ -7940,6 +9767,156 @@ mod tests {
         let parsed_tpl = parse_simplify_verdict(template_only, None);
         assert_eq!(parsed_tpl["verdict"], "");
         assert_eq!(parsed_tpl["clean"], false);
+
+        let bare_verdict_tpl = "Post VERDICT: CLEAN | ACTIONABLE_FIXES or VERDICT: FINDINGS_REPORTED.";
+        assert_eq!(parse_simplify_verdict(bare_verdict_tpl, None)["verdict"], "");
+
+        let review_verdict = "VERDICT: APPROVED\nNo critical defects.";
+        assert_eq!(parse_simplify_verdict(review_verdict, None)["verdict"], "");
+
+        let bare_actionable = "@coordinator\nSIMPLIFY_LENS: QUALITY\nVERDICT: ACTIONABLE_FIXES\n- simplify branch";
+        let parsed_bare = parse_simplify_verdict(bare_actionable, None);
+        assert_eq!(parsed_bare["verdict"], "ACTIONABLE_FIXES");
+        assert_eq!(parsed_bare["clean"], false);
+        assert_eq!(parsed_bare["lens"], "quality");
+
+        let anom_3e5cd389_eff = "@coordinator [done] SIMPLIFY_LENS: EFFICIENCY findings:\n1. `antigravity-tunnels.ps1:51-77` — Serial startup & polling.";
+        let parsed_eff = parse_simplify_verdict(anom_3e5cd389_eff, None);
+        assert_eq!(parsed_eff["verdict"], "FINDINGS_REPORTED");
+        assert_eq!(parsed_eff["clean"], false);
+        assert_eq!(parsed_eff["lens"], "efficiency");
+        assert_eq!(parse_simplify_window_spans(anom_3e5cd389_eff).0.len(), 1);
+
+        let anom_3e5cd389_reuse = "@coordinator [done] SIMPLIFY_LENS: REUSE findings:\n1. `antigravity-tunnels.ps1:17-33` — 7 base SSH flags copy-pasted.";
+        let parsed_reuse = parse_simplify_verdict(anom_3e5cd389_reuse, None);
+        assert_eq!(parsed_reuse["verdict"], "FINDINGS_REPORTED");
+        assert_eq!(parsed_reuse["clean"], false);
+        assert_eq!(parsed_reuse["lens"], "reuse");
+
+        let anom_3e5cd389_qual = "@coordinator [done] Quality review findings:\n- `mcp_config.json` (L255-390): valid JSON.\n- `antigravity-tunnels.ps1:80-85` [HIGH]: check PID.";
+        let parsed_qual = parse_simplify_verdict(anom_3e5cd389_qual, Some("quality"));
+        assert_eq!(parsed_qual["verdict"], "FINDINGS_REPORTED");
+        assert_eq!(parsed_qual["clean"], false);
+        assert_eq!(parsed_qual["lens"], "quality");
+        assert_eq!(parse_simplify_window_spans(anom_3e5cd389_qual).0.len(), 1);
+
+        let clean_then_prose = parse_simplify_window_spans_messages(&[
+            "SIMPLIFY_LENS: QUALITY\nSIMPLIFY_VERDICT: CLEAN",
+            anom_3e5cd389_qual,
+        ]);
+        assert_eq!(clean_then_prose.0.len(), 2);
+        assert!(clean_then_prose.0[0].2);
+        assert!(!clean_then_prose.0[1].2);
+
+        // Design Gate classification: repo-relative path stripping, Flutter feature screens, TSX pure logic vs JSX, multi-root per-file policies.
+        assert!(is_visual_design_path_with_base(
+            "C:/src/cli/panel/Button.tsx",
+            None,
+            "C:/src/cli/panel"
+        ));
+        assert!(is_visual_design_path("lib/features/chat/chat_screen.dart", None));
+        assert!(!is_visual_design_path("lib/features/chat/chat_bloc.dart", None));
+        assert!(!is_visual_design_path("src/formatters/formatMoney.tsx", None));
+
+        // Syntactic TSX/JSX detection: generic JSX components and JSXText with apostrophes pass; HTML strings, templates, and TS generic arrows/call signatures stay non-visual.
+        assert!(tsx_source_has_jsx("export const L = ({ items }: any) => <List<User> items={items} />;"));
+        assert!(tsx_source_has_jsx("export const T = () => <Table<Record<string, User[]>> />;"));
+        assert!(tsx_source_has_jsx("export const U = () => <_Button />;"));
+        assert!(tsx_source_has_jsx("export const D = () => <$Icon size={16} />;"));
+        assert!(tsx_source_has_jsx("export const F = () => <><span>ok</span></>;"));
+        assert!(tsx_source_has_jsx("export const Label = () => <p>Don't stop</p>;"));
+        assert!(tsx_source_has_jsx("export const Note = () => <p>(note): Don't stop</p>;"));
+        assert!(tsx_source_has_jsx("export const Msg = ({ ok }: any) => <div>{ok ? \"can't\" : 'won\\'t'} Don't stop</div>;"));
+        assert!(tsx_source_has_jsx("export const Btn = () => <_Button>Don't click</_Button>;"));
+        assert!(tsx_source_has_jsx("export const Frag = () => <>Don't stop</>;"));
+        assert!(tsx_source_has_jsx("export const Nested = ({ items }: any) => <Card>Don't forget {items.map((x: any) => <span>Can't</span>)}</Card>;"));
+        assert!(tsx_source_has_jsx("export type Props = { x: string }\nexport const AfterType = () => <p>Don't stop</p>;"));
+        assert!(tsx_source_has_jsx("type Props = { label: string }\nroot.render(<App />)"));
+        assert!(tsx_source_has_jsx("type Props = { label: string }\n// mount app\nroot.render(<App />)"));
+        assert!(tsx_source_has_jsx("export type Lit = <T>(x: \"</T> \") => T\nroot.render(<App />)"));
+        assert!(tsx_source_has_jsx("type A = string\n(<p>Don't stop</p>)"));
+        assert!(tsx_source_has_jsx("type A = Record<string, string>\nrender(<p>Don't stop</p>)"));
+        assert!(tsx_source_has_jsx("type Tpl = `a${`b`}c`\nroot.render(<App />)"));
+        assert!(tsx_source_has_jsx("type Props = { label: string }\n[1, 2].map((n) => <li key={n}>{n}</li>)"));
+        assert!(tsx_source_has_jsx("class W { type\n  el = <App />\n}"));
+        assert!(tsx_source_has_jsx("class W { interface\n  el = <App />\n}"));
+        assert!(tsx_source_has_jsx("type Props = object /*\n*/export const View = () => <div />"));
+        assert!(tsx_source_has_jsx("class W { type /*\n*/ el = <App />\n}"));
+        assert!(tsx_source_has_jsx("type Props = object /*\r*/export const View = () => <div />"));
+        assert!(!tsx_source_has_jsx("type /* ok */ Lit = <T>(x: \"</T> \") => T"));
+        assert!(!tsx_source_has_jsx("type Multi = { a: string } /*\n*/ | <T>(x: \"</T> \") => T"));
+        assert!(!tsx_source_has_jsx(r#"export const html = "<div>hello</div>";"#));
+        assert!(!tsx_source_has_jsx("export const tpl = (x: string) => `<span>${x}</span>`;"));
+        assert!(!tsx_source_has_jsx("export type Mapper = <T>(value: T) => T;"));
+        assert!(!tsx_source_has_jsx(r#"export type Mapper = <T>(value: T) => T; const s = "</T>";"#));
+        assert!(!tsx_source_has_jsx(r#"export type Lit = <T>(x: "</T>") => T;"#));
+        assert!(!tsx_source_has_jsx(r#"export type LitSpaced = <T>(x: "</T> ") => T;"#));
+        assert!(!tsx_source_has_jsx("export type MultilineFn = <T>(\n  x: \"</T> \"\n) =>\n  T"));
+        assert!(!tsx_source_has_jsx("export type MultilineUnion =\n  | <T>(x: \"</T> \") => T\n  | <U>(y: \"</U> \") => U"));
+        assert!(!tsx_source_has_jsx("export type MultilineCond<T> = T\n  extends string\n  ? <U>(x: \"</U> \") => U\n  : never"));
+        assert!(!tsx_source_has_jsx(r#"export const fnAnn: <T>(x: "</T> ") => T = (x) => x;"#));
+        assert!(!tsx_source_has_jsx("export const fnTpl: <T>(x: `</T>\n`) => T = (x) => x;"));
+        assert!(!tsx_source_has_jsx("export interface Fn { map: <T>(value: T) => T; }"));
+        assert!(!tsx_source_has_jsx(r#"export interface Fn { <T>(value: "</T> "): T; }"#));
+        assert!(!tsx_source_has_jsx(r#"export interface Fn { <T>(value: T): T; } const s = "</T>";"#));
+        assert!(!tsx_source_has_jsx("export const id = <T,>(x: T): T => x;"));
+        assert!(!tsx_source_has_jsx("export const pick = <T extends object>(x: T): Array<T> => [x];"));
+        assert!(!tsx_source_has_jsx("export const rx = (x: number) => x < /abc/.source.length;"));
+        assert!(!tsx_source_has_jsx("// <div /> commented out\nexport const cmp = (a: number, b: number) => a < b && b > 0;"));
+
+        let td_path = std::env::temp_dir().join(format!(
+            "cwg-common-dg-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&td_path);
+        let mod_a = td_path.join("mod_a");
+        let mod_b = td_path.join("mod_b");
+        fs::create_dir_all(mod_a.join(".agents")).unwrap();
+        fs::create_dir_all(mod_a.join("src")).unwrap();
+        fs::create_dir_all(mod_b.join(".agents")).unwrap();
+        fs::create_dir_all(mod_b.join("src")).unwrap();
+        fs::write(
+            mod_a.join(".agents").join("carbon-gate.json"),
+            r#"{"design_gate": false}"#,
+        )
+        .unwrap();
+        fs::write(
+            mod_b.join(".agents").join("carbon-gate.json"),
+            r#"{"design_gate": true}"#,
+        )
+        .unwrap();
+        let btn_a = mod_a.join("src").join("Button.tsx");
+        let srv_b = mod_b.join("src").join("server.ts");
+        let pure_tsx = mod_b.join("src").join("calc.tsx");
+        let ui_tsx = mod_b.join("src").join("Card.tsx");
+        fs::write(&btn_a, "export const Button = () => <button>Go</button>;").unwrap();
+        fs::write(&srv_b, "export const ok = true;").unwrap();
+        fs::write(&pure_tsx, "export function calc<T>(x: T): T { return x; }").unwrap();
+        fs::write(&ui_tsx, "export const Card = () => <div>Hi</div>;").unwrap();
+        assert!(!is_visual_design_path_with_base(
+            &pure_tsx.to_string_lossy(),
+            None,
+            &mod_b.to_string_lossy()
+        ));
+        assert!(is_visual_design_path_with_base(
+            &ui_tsx.to_string_lossy(),
+            None,
+            &mod_b.to_string_lossy()
+        ));
+        let multi_marker = json!({
+            "cwd": td_path.to_string_lossy(),
+            "paths": [btn_a.to_string_lossy(), srv_b.to_string_lossy()],
+        });
+        let multi_ctx = resolve_candidate_context(&multi_marker, false);
+        assert!(
+            multi_ctx["design_paths"].as_array().unwrap().is_empty(),
+            "multi-root must preserve mod_a design_gate=false: {:?}",
+            multi_ctx["design_paths"]
+        );
+        let _ = fs::remove_dir_all(&td_path);
+
+        let brief_prose_only = "Please post @coordinator [done] Quality review findings:\n- Do not skip checks.";
+        assert_eq!(parse_simplify_verdict(brief_prose_only, Some("quality"))["verdict"], "");
 
         let real_msg = "Checked diff.\n__SIMPLIFY_LENS: EFFICIENCY__\n**SIMPLIFY_VERDICT: CLEAN** // ok";
         let parsed_real = parse_simplify_verdict(real_msg, None);
@@ -9044,5 +11021,53 @@ mod tests {
         assert!(completed_tags.contains(&"cli:research".to_string()));
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_finite_gate_summary_and_expanded_research_mcps() {
+        let high_summary = receipt_requirements_summary("HIGH", None, false);
+        let simplify_pos = high_summary.find("simplify once").expect("simplify in HIGH summary");
+        let review_pos = high_summary
+            .find("primary independent APPROVED review")
+            .expect("review in HIGH summary");
+        assert!(
+            simplify_pos < review_pos,
+            "Finite Gate summary must place simplify before review: {}",
+            high_summary
+        );
+        assert!(high_summary.contains("APPROVED closes gate"));
+        assert!(high_summary.contains("mandatory research -> fix + re-test -> <=2 `--closure` passes"));
+
+        let xhigh_summary = receipt_requirements_summary("XHIGH", None, false);
+        let x_simp = xhigh_summary.find("simplify once").expect("simplify in XHIGH summary");
+        let x_rev = xhigh_summary
+            .find("primary XHIGH APPROVED review")
+            .expect("review in XHIGH summary");
+        assert!(x_simp < x_rev);
+
+        for srv in [
+            "exa",
+            "exa_web_search_exa",
+            "deepwiki",
+            "b24-dev-mcp",
+            "fetch",
+            "fetch_fetch",
+            "1c-syntax-helper",
+            "context7",
+            "context7_context7",
+        ] {
+            assert!(
+                is_research_mcp_server(srv),
+                "expected {} to count as research MCP server",
+                srv
+            );
+        }
+        for non_srv in ["playwright", "gitlab", "example", "exasol", "fetchmail", "codebase-memory"] {
+            assert!(
+                !is_research_mcp_server(non_srv),
+                "expected {} NOT to count as external research MCP server",
+                non_srv
+            );
+        }
     }
 }

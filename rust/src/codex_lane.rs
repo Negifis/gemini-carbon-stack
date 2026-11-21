@@ -29,6 +29,10 @@ pub const REVIEW_VAL_FLAGS: &[&str] = &[
     "--cwd-hex",
     "--summary",
     "--summary-hex",
+    "--intent",
+    "--intent-hex",
+    "--goal",
+    "--goal-hex",
     "--diff-file",
     "--diff-file-hex",
     "--review-id",
@@ -931,13 +935,64 @@ fn thread_state_path_for_lane(
     threads_dir().join(format!("{}-{}.json", root_dig, lane_dig))
 }
 
-fn thread_entry_matches_candidate(entry: &Map<String, Value>, cand_ts: f64, now: f64) -> bool {
+fn handoff_goal_generation_from_map(ho: &Map<String, Value>) -> u64 {
+    ho.get("goal_generation")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| if val_to_str(ho.get("goal")).trim().is_empty() { 0 } else { 1 })
+}
+
+fn goal_ts_diverged(a: f64, b: f64) -> bool {
+    a > 0.0 && b > 0.0 && (a - b).abs() > 1.0
+}
+
+fn current_handoff_goal_epoch(git_root: &str, session: &str, cand_ts: f64) -> (u64, f64) {
+    let Some(Value::Object(ho)) =
+        crate::continuity_hook::load_handoff(git_root, &[], None, session)
+    else {
+        return (0, 0.0);
+    };
+    if crate::continuity_hook::is_closed_status(&val_to_str(ho.get("status"))) {
+        return (0, 0.0);
+    }
+    let (matched, ho_ts, _) = handoff_matches_candidate(&ho, git_root, session, cand_ts);
+    if !matched {
+        return (0, 0.0);
+    }
+    (handoff_goal_generation_from_map(&ho), ho_ts)
+}
+
+fn markerless_goal_epoch(git_root: &str, session: &str, cand_ts: f64) -> (u64, f64) {
+    // INVARIANT: Skip handoff/git probing on `PreToolUse` hot path when an active candidate marker (`cand_ts > 0`) already scopes thread matching.
+    if cand_ts <= 0.0 {
+        current_handoff_goal_epoch(git_root, session, cand_ts)
+    } else {
+        (0, 0.0)
+    }
+}
+
+fn thread_entry_matches_candidate(
+    entry: &Map<String, Value>,
+    cand_ts: f64,
+    now: f64,
+    live_goal_gen: u64,
+    live_goal_ts: f64,
+) -> bool {
     let saved_cand_ts = val_to_f64(entry.get("candidate_first_ts"));
-    // INVARIANT: Bind thread continuity & timeout escalation strictly to the active candidate (`1h` TTL when no marker is open).
+    // INVARIANT: Bind thread continuity & timeout escalation strictly to the active candidate (`1h` TTL + active handoff `goal_generation`/`goal_updated_ts` when no marker is open so a new markerless `--goal` never resumes an older task's review thread or stale business charter).
     if cand_ts > 0.0 {
         (saved_cand_ts - cand_ts).abs() < 1.0
     } else {
-        saved_cand_ts <= 0.0 && (now - val_to_f64(entry.get("updated_ts"))) < 3600.0
+        if !(saved_cand_ts <= 0.0 && (now - val_to_f64(entry.get("updated_ts"))) < 3600.0) {
+            return false;
+        }
+        let saved_gen = entry
+            .get("handoff_goal_generation")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if saved_gen != live_goal_gen {
+            return false;
+        }
+        !goal_ts_diverged(live_goal_ts, val_to_f64(entry.get("handoff_goal_updated_ts")))
     }
 }
 
@@ -1025,12 +1080,14 @@ fn classify_legacy_default_from_raw(
     session: &str,
     git_root: &str,
     cand_ts: f64,
+    live_gen: u64,
+    live_gts: f64,
 ) -> LegacyThreadResolution {
     // INVARIANT: Pure read-only classification of pre-upgrade untyped records (zero disk writes/deletes during reads, preventing write-failure data loss and concurrent TOCTOU clobbers).
     if !is_legacy_untyped_thread(&saved) {
         return LegacyThreadResolution::None;
     }
-    if !thread_entry_matches_candidate(&saved, cand_ts, now_sec()) {
+    if !thread_entry_matches_candidate(&saved, cand_ts, now_sec(), live_gen, live_gts) {
         return LegacyThreadResolution::None;
     }
     let sid = val_to_str(saved.get("session_id")).trim().to_string();
@@ -1149,7 +1206,8 @@ fn classify_legacy_default_thread_state(
     let Some(Value::Object(saved)) = rio::read_json(&default_p) else {
         return LegacyThreadResolution::None;
     };
-    classify_legacy_default_from_raw(saved, session, git_root, cand_ts)
+    let (live_gen, live_gts) = markerless_goal_epoch(git_root, session, cand_ts);
+    classify_legacy_default_from_raw(saved, session, git_root, cand_ts, live_gen, live_gts)
 }
 
 fn match_typed_lane_map(
@@ -1157,8 +1215,12 @@ fn match_typed_lane_map(
     cand_ts: f64,
     req_mdl: &str,
     req_eff: &str,
+    live_goal_gen: u64,
+    live_goal_ts: f64,
 ) -> Option<Map<String, Value>> {
-    if is_legacy_untyped_thread(&saved) || !thread_entry_matches_candidate(&saved, cand_ts, now_sec()) {
+    if is_legacy_untyped_thread(&saved)
+        || !thread_entry_matches_candidate(&saved, cand_ts, now_sec(), live_goal_gen, live_goal_ts)
+    {
         return None;
     }
     let is_xh = json_truthy(saved.get("xhigh"));
@@ -1211,6 +1273,27 @@ pub fn active_thread_state_for_lane(
     effort: &str,
 ) -> Option<Map<String, Value>> {
     let cand_ts = candidate_first_ts_opt.unwrap_or_else(|| candidate_first_ts(session));
+    let (live_goal_gen, live_goal_ts) = markerless_goal_epoch(git_root, session, cand_ts);
+    active_thread_state_for_lane_with_epoch(
+        session,
+        git_root,
+        cand_ts,
+        model,
+        effort,
+        live_goal_gen,
+        live_goal_ts,
+    )
+}
+
+fn active_thread_state_for_lane_with_epoch(
+    session: &str,
+    git_root: &str,
+    cand_ts: f64,
+    model: &str,
+    effort: &str,
+    live_goal_gen: u64,
+    live_goal_ts: f64,
+) -> Option<Map<String, Value>> {
     let rr_ts = session_last_research_reset_ts(session);
     let req_mdl = if model.trim().is_empty() {
         cwg_common::CODEX_SOL_MODEL
@@ -1234,10 +1317,14 @@ pub fn active_thread_state_for_lane(
         None => (None, None),
     };
     let typed_hit = if tpath == default_p {
-        typed_def.and_then(|m| match_typed_lane_map(m, cand_ts, req_mdl, req_eff))
+        typed_def.and_then(|m| {
+            match_typed_lane_map(m, cand_ts, req_mdl, req_eff, live_goal_gen, live_goal_ts)
+        })
     } else {
         rio::read_json(&tpath).and_then(|v| match v {
-            Value::Object(m) => match_typed_lane_map(m, cand_ts, req_mdl, req_eff),
+            Value::Object(m) => {
+                match_typed_lane_map(m, cand_ts, req_mdl, req_eff, live_goal_gen, live_goal_ts)
+            }
             _ => None,
         })
     }
@@ -1248,7 +1335,14 @@ pub fn active_thread_state_for_lane(
     if rr_ts > 0.0 && val_to_f64(def_map.get("updated_ts")) < rr_ts {
         return typed_hit;
     }
-    match classify_legacy_default_from_raw(def_map, session, git_root, cand_ts) {
+    match classify_legacy_default_from_raw(
+        def_map,
+        session,
+        git_root,
+        cand_ts,
+        live_goal_gen,
+        live_goal_ts,
+    ) {
         LegacyThreadResolution::Typed(leg) => {
             let leg_key = review_lane_key(&val_to_str(leg.get("model")), &val_to_str(leg.get("effort")));
             if leg_key == review_lane_key(req_mdl, req_eff) {
@@ -1273,6 +1367,7 @@ pub fn active_thread_state(
 ) -> Option<Map<String, Value>> {
     let cand_ts = candidate_first_ts_opt.unwrap_or_else(|| candidate_first_ts(session));
     let rr_ts = session_last_research_reset_ts(session);
+    let (live_goal_gen, live_goal_ts) = markerless_goal_epoch(git_root, session, cand_ts);
     let now = now_sec();
     let fold_root = rio::fold_path(git_root);
     let root_dig = session_root_digest(session, git_root);
@@ -1309,13 +1404,20 @@ pub fn active_thread_state(
                     continue;
                 }
             }
-            if thread_entry_matches_candidate(&saved, cand_ts, now) {
+            if thread_entry_matches_candidate(&saved, cand_ts, now, live_goal_gen, live_goal_ts) {
                 matched.push(saved);
             }
         }
     }
     if let Some(def_map) = legacy_raw {
-        match classify_legacy_default_from_raw(def_map, session, git_root, cand_ts) {
+        match classify_legacy_default_from_raw(
+            def_map,
+            session,
+            git_root,
+            cand_ts,
+            live_goal_gen,
+            live_goal_ts,
+        ) {
             LegacyThreadResolution::Typed(leg) => {
                 let leg_key = review_lane_key(&val_to_str(leg.get("model")), &val_to_str(leg.get("effort")));
                 let superseded = matched.iter().any(|m| {
@@ -1373,7 +1475,8 @@ fn preserve_or_retire_legacy_on_mutation(
     if !is_legacy_untyped_thread(&raw_def) {
         return true;
     }
-    match classify_legacy_default_from_raw(raw_def, session, git_root, cand_ts) {
+    let (live_gen, live_gts) = markerless_goal_epoch(git_root, session, cand_ts);
+    match classify_legacy_default_from_raw(raw_def, session, git_root, cand_ts, live_gen, live_gts) {
         LegacyThreadResolution::None | LegacyThreadResolution::UnknownPending(_) => {
             if !about_to_overwrite_default {
                 unlink_quiet(&default_p);
@@ -1396,7 +1499,13 @@ fn preserve_or_retire_legacy_on_mutation(
                     .and_then(|v| v.as_object().cloned())
                     .map_or(false, |d| {
                         !is_legacy_untyped_thread(&d)
-                            && thread_entry_matches_candidate(&d, cand_ts, now_sec())
+                            && thread_entry_matches_candidate(
+                                &d,
+                                cand_ts,
+                                now_sec(),
+                                live_gen,
+                                live_gts,
+                            )
                             && val_to_f64(d.get("updated_ts")) >= val_to_f64(leg.get("updated_ts"))
                     });
                 if !has_newer && rio::write_json(&dest_p, &Value::Object(leg)).is_err() {
@@ -1409,41 +1518,89 @@ fn preserve_or_retire_legacy_on_mutation(
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ThreadSaveOutcome {
+    Saved,
+    StaleGoalEpoch,
+    Failed,
+}
+
 fn save_lane_thread_state(
     session: &str,
     git_root: &str,
     cand_first_ts: f64,
     model: &str,
     effort: &str,
-    mut entry: Value,
+    entry: Value,
 ) -> bool {
+    save_lane_thread_state_with_outcome(session, git_root, cand_first_ts, model, effort, entry)
+        == ThreadSaveOutcome::Saved
+}
+
+fn save_lane_thread_state_with_outcome(
+    session: &str,
+    git_root: &str,
+    cand_first_ts: f64,
+    model: &str,
+    effort: &str,
+    mut entry: Value,
+) -> ThreadSaveOutcome {
     let norm_eff = canonical_lane_effort(effort);
-    if let Some(obj) = entry.as_object_mut() {
-        obj.entry("session".to_string())
-            .or_insert_with(|| Value::String(session.to_string()));
-        obj.entry("git_root".to_string())
-            .or_insert_with(|| Value::String(rio::normalize_path(git_root)));
-        obj.entry("candidate_first_ts".to_string())
-            .or_insert_with(|| json!(cand_first_ts));
-        obj.entry("model".to_string())
-            .or_insert_with(|| Value::String(model.to_string()));
-        obj.insert("effort".to_string(), Value::String(norm_eff.clone()));
-    }
+    let has_explicit_goal_epoch = entry
+        .as_object()
+        .is_some_and(|o| o.contains_key("handoff_goal_generation"));
+    let explicit_goal_gen = entry
+        .get("handoff_goal_generation")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let explicit_goal_ts = val_to_f64(entry.get("handoff_goal_updated_ts"));
     let lkey = review_lane_key(model, &norm_eff);
     let tpath = thread_state_path_for_lane(session, git_root, model, &norm_eff);
     let default_p = thread_state_path(session, git_root);
     let new_ts = val_to_f64(entry.get("updated_ts"));
-    let mut persisted = false;
+    let mut outcome = ThreadSaveOutcome::Failed;
     rio::with_file_lock(&thread_lock_path(session, git_root), 5.0, 30.0, |locked| {
         // SAFETY: Fail closed without mutating thread state if the per-session lock could not be acquired.
         if !locked {
             return;
         }
+        let (live_goal_gen, live_goal_ts) =
+            current_handoff_goal_epoch(git_root, session, cand_first_ts);
+        // INVARIANT: Never stamp a review thread launched under Goal A with Goal B's newer `goal_generation`/`goal_updated_ts`; if markerless handoff epoch advanced while Codex ran, abort persisting so Goal B never resumes Goal A's thread.
+        if cand_first_ts <= 0.0
+            && has_explicit_goal_epoch
+            && (explicit_goal_gen != live_goal_gen
+                || goal_ts_diverged(live_goal_ts, explicit_goal_ts))
+        {
+            outcome = ThreadSaveOutcome::StaleGoalEpoch;
+            return;
+        }
+        if let Some(obj) = entry.as_object_mut() {
+            obj.entry("session".to_string())
+                .or_insert_with(|| Value::String(session.to_string()));
+            obj.entry("git_root".to_string())
+                .or_insert_with(|| Value::String(rio::normalize_path(git_root)));
+            obj.entry("candidate_first_ts".to_string())
+                .or_insert_with(|| json!(cand_first_ts));
+            obj.entry("handoff_goal_generation".to_string())
+                .or_insert_with(|| json!(live_goal_gen));
+            obj.entry("handoff_goal_updated_ts".to_string())
+                .or_insert_with(|| json!(live_goal_ts));
+            obj.entry("model".to_string())
+                .or_insert_with(|| Value::String(model.to_string()));
+            obj.insert("effort".to_string(), Value::String(norm_eff.clone()));
+        }
         let has_newer = rio::read_json(&tpath)
             .and_then(|v| v.as_object().cloned())
             .map_or(false, |d| {
                 !is_legacy_untyped_thread(&d)
-                    && thread_entry_matches_candidate(&d, cand_first_ts, now_sec())
+                    && thread_entry_matches_candidate(
+                        &d,
+                        cand_first_ts,
+                        now_sec(),
+                        live_goal_gen,
+                        live_goal_ts,
+                    )
                     && val_to_f64(d.get("updated_ts")) > new_ts
             });
         if has_newer {
@@ -1453,13 +1610,15 @@ fn save_lane_thread_state(
             if !preserve_or_retire_legacy_on_mutation(session, git_root, cand_first_ts, &lkey, true) {
                 return;
             }
-            persisted = rio::write_json(&tpath, &entry).is_ok();
+            if rio::write_json(&tpath, &entry).is_ok() {
+                outcome = ThreadSaveOutcome::Saved;
+            }
         } else if rio::write_json(&tpath, &entry).is_ok() {
             let _ = preserve_or_retire_legacy_on_mutation(session, git_root, cand_first_ts, &lkey, false);
-            persisted = true;
+            outcome = ThreadSaveOutcome::Saved;
         }
     });
-    persisted
+    outcome
 }
 
 fn remove_lane_thread_state(
@@ -3262,6 +3421,235 @@ struct ResumeSessionQuery<'a> {
     effort: &'a str,
 }
 
+fn launch_scope_hash(raw: &str) -> String {
+    let hex = rio::sha256_hex(raw.as_bytes());
+    hex[..12.min(hex.len())].to_string()
+}
+
+fn format_launch_scope_line(session: &str, git_root: &str, goal_gen: u64, goal_ts: f64) -> String {
+    format!(
+        "LAUNCH_SCOPE: sess={} repo={} goal_gen={} goal_ts={:.3}\n",
+        launch_scope_hash(session.trim()),
+        launch_scope_hash(&rio::normalize_path(git_root)),
+        goal_gen,
+        goal_ts
+    )
+}
+
+fn inject_launch_scope_into_prompt(
+    prompt: String,
+    session: &str,
+    git_root: &str,
+    goal_gen: u64,
+    goal_ts: f64,
+) -> String {
+    let scope_line = format_launch_scope_line(session, git_root, goal_gen, goal_ts);
+    if let Some(pos) = prompt.find("ROLE: ") {
+        let mut out = String::with_capacity(prompt.len() + scope_line.len());
+        out.push_str(&prompt[..pos]);
+        out.push_str(&scope_line);
+        out.push_str(&prompt[pos..]);
+        out
+    } else {
+        format!("{}{}", scope_line, prompt)
+    }
+}
+
+fn parse_launch_scope_from_prompt(prompt: &str) -> Option<(String, String, u64, f64)> {
+    for line in prompt.lines().take(6) {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("LAUNCH_SCOPE:") else {
+            continue;
+        };
+        let mut sess = String::new();
+        let mut repo = String::new();
+        let mut goal_gen: Option<u64> = None;
+        let mut goal_ts: Option<f64> = None;
+        for part in rest.split_whitespace() {
+            if let Some(v) = part.strip_prefix("sess=") {
+                sess = v.to_string();
+            } else if let Some(v) = part.strip_prefix("repo=") {
+                repo = v.to_string();
+            } else if let Some(v) = part.strip_prefix("goal_gen=") {
+                goal_gen = v.parse::<u64>().ok();
+            } else if let Some(v) = part.strip_prefix("goal_ts=") {
+                goal_ts = v.parse::<f64>().ok();
+            }
+        }
+        if !sess.is_empty() && !repo.is_empty() {
+            if let (Some(g), Some(t)) = (goal_gen, goal_ts) {
+                return Some((sess, repo, g, t));
+            }
+        }
+    }
+    None
+}
+
+fn parse_review_header_ids_from_prompt(prompt: &str) -> Option<(String, String)> {
+    let mut lines = prompt.lines();
+    let first = lines.next()?.trim();
+    let rid = first.strip_prefix("REVIEW_ID:")?.trim().to_string();
+    let mut nonce = String::new();
+    for line in lines.take(4) {
+        let trimmed = line.trim();
+        if let Some(v) = trimmed.strip_prefix("PACKET_NONCE:") {
+            nonce = v.trim().to_string();
+            break;
+        }
+    }
+    if !rid.is_empty() && !nonce.is_empty() {
+        Some((rid, nonce))
+    } else {
+        None
+    }
+}
+
+fn find_rollout_launch_scope_for_session(sid: &str) -> Option<(String, String, u64, f64)> {
+    let clean_sid = sid.trim();
+    if clean_sid.is_empty() {
+        return None;
+    }
+    let recent = recent_rollout_files(0.0, 60, true);
+    let mut ordered: Vec<&PathBuf> = recent
+        .iter()
+        .filter(|rf| {
+            rf.file_name()
+                .and_then(|n| n.to_str())
+                .map_or(false, |n| n.contains(clean_sid))
+        })
+        .collect();
+    for rf in &recent {
+        if !ordered.contains(&rf) {
+            ordered.push(rf);
+        }
+    }
+    for rf in ordered {
+        let meta = read_rollout_session_meta(rf);
+        if is_subagent_rollout_meta(&meta) {
+            continue;
+        }
+        let id_val = val_to_str(meta.get("id"));
+        let sid_val = val_to_str(meta.get("session_id"));
+        if id_val != clean_sid && sid_val != clean_sid {
+            continue;
+        }
+        let Ok(fh) = fs::File::open(rf) else {
+            return None;
+        };
+        let reader = BufReader::new(fh);
+        let mut saw_task_started = false;
+        for line_res in reader.lines().take(128) {
+            let Ok(line) = line_res else {
+                break;
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(rec) = serde_json::from_str::<Value>(trimmed) else {
+                continue;
+            };
+            let rtype = rec.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let Some(payload) = rec.get("payload").and_then(|v| v.as_object()) else {
+                continue;
+            };
+            if rtype == "event_msg" {
+                let ev_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if ev_type == "task_complete" {
+                    break;
+                }
+                if ev_type == "task_started" {
+                    if saw_task_started {
+                        break;
+                    }
+                    saw_task_started = true;
+                }
+            }
+            if let Some(prompt_txt) = rollout_user_prompt_text(rtype, payload) {
+                // INVARIANT: Real Codex rollouts record harness boilerplate (e.g. `# AGENTS.md instructions`) as `role: "user"` BEFORE the actual review prompt in turn 1; skip non-review user messages and bind strictly to the first origin review prompt carrying `REVIEW_ID` + `PACKET_NONCE` (verifying against `packets/<review_id>.json` when still present on disk).
+                let Some((rid, nonce)) = parse_review_header_ids_from_prompt(&prompt_txt) else {
+                    continue;
+                };
+                if let Some(pkt) = rio::read_json(&packet_path(&rid)) {
+                    let pkt_nonce = val_to_str(pkt.get("packet_nonce"));
+                    if !pkt_nonce.is_empty() && pkt_nonce != nonce {
+                        return None;
+                    }
+                }
+                return parse_launch_scope_from_prompt(&prompt_txt);
+            }
+        }
+        return None;
+    }
+    None
+}
+
+fn is_markerless_explicit_resume_valid_for_goal_epoch(
+    session: &str,
+    git_root: &str,
+    model: &str,
+    effort: &str,
+    explicit_sid: &str,
+    matched_saved: Option<&Map<String, Value>>,
+    live_goal_gen: u64,
+    live_goal_ts: f64,
+) -> bool {
+    // INVARIANT: In markerless mode (`cand_first_ts <= 0`) when a handoff goal epoch is active, an explicit `--resume` thread must be cryptographically/structurally proven to belong to the active `(session, git_root, goal_generation, goal_updated_ts)` — either matching the epoch-validated saved lane thread or matching the `LAUNCH_SCOPE` header recorded in the Codex rollout's origin prompt (never using coarse wall-clock timestamp slack, so a Goal A thread started 0.5s before Goal B can never resume under Goal B while genuine I/O-failure timeout retries within the same goal still succeed).
+    if live_goal_gen == 0 && live_goal_ts <= 0.0 {
+        return true;
+    }
+    let unwrapped = unwrap_primary_session_id(explicit_sid.trim(), 0.0);
+    if unwrapped.is_empty() {
+        return false;
+    }
+    if let Some(st) = matched_saved {
+        let saved_sid = val_to_str(st.get("session_id"));
+        if !saved_sid.is_empty()
+            && (saved_sid == unwrapped || unwrap_primary_session_id(&saved_sid, 0.0) == unwrapped)
+        {
+            return true;
+        }
+    }
+    let req_mdl = if model.trim().is_empty() {
+        cwg_common::CODEX_SOL_MODEL
+    } else {
+        model.trim()
+    };
+    let req_eff = if effort.trim().is_empty() {
+        "high"
+    } else {
+        effort.trim()
+    };
+    for p in [
+        thread_state_path_for_lane(session, git_root, req_mdl, req_eff),
+        thread_state_path(session, git_root),
+    ] {
+        if let Some(Value::Object(raw)) = rio::read_json(&p) {
+            let raw_sid = val_to_str(raw.get("session_id"));
+            if !raw_sid.is_empty()
+                && (raw_sid == unwrapped || unwrap_primary_session_id(&raw_sid, 0.0) == unwrapped)
+            {
+                let saved_gen = raw
+                    .get("handoff_goal_generation")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let saved_gts = val_to_f64(raw.get("handoff_goal_updated_ts"));
+                if saved_gen != live_goal_gen || goal_ts_diverged(live_goal_ts, saved_gts) {
+                    return false;
+                }
+            }
+        }
+    }
+    let Some((r_sess, r_repo, r_gen, r_gts)) = find_rollout_launch_scope_for_session(&unwrapped)
+    else {
+        return false;
+    };
+    r_sess == launch_scope_hash(session.trim())
+        && r_repo == launch_scope_hash(&rio::normalize_path(git_root))
+        && r_gen == live_goal_gen
+        && !goal_ts_diverged(live_goal_ts, r_gts)
+}
+
 fn resolve_resume_session_with_saved(
     query: ResumeSessionQuery<'_>,
     preloaded_saved: Option<Option<&Map<String, Value>>>,
@@ -3286,6 +3674,15 @@ fn resolve_resume_session_with_saved(
         0.0
     };
     let min_since_ts = candidate_first_ts.max(rr_ts);
+    let owned_saved = if preloaded_saved.is_none() {
+        active_thread_state_for_lane(session, git_root, Some(candidate_first_ts), model, effort)
+    } else {
+        None
+    };
+    let saved_ref = match preloaded_saved {
+        Some(s) => s,
+        None => owned_saved.as_ref(),
+    };
     let exp = explicit_resume.trim();
     if !exp.is_empty() {
         let unwrapped = unwrap_primary_session_id(exp, min_since_ts);
@@ -3297,17 +3694,24 @@ fn resolve_resume_session_with_saved(
         {
             return String::new();
         }
+        if candidate_first_ts <= 0.0 {
+            let (live_goal_gen, live_goal_ts) =
+                markerless_goal_epoch(git_root, session, candidate_first_ts);
+            if !is_markerless_explicit_resume_valid_for_goal_epoch(
+                session,
+                git_root,
+                model,
+                effort,
+                &unwrapped,
+                saved_ref,
+                live_goal_gen,
+                live_goal_ts,
+            ) {
+                return String::new();
+            }
+        }
         return unwrapped;
     }
-    let owned_saved = if preloaded_saved.is_none() {
-        active_thread_state_for_lane(session, git_root, Some(candidate_first_ts), model, effort)
-    } else {
-        None
-    };
-    let saved_ref = match preloaded_saved {
-        Some(s) => s,
-        None => owned_saved.as_ref(),
-    };
     if let Some(saved) = saved_ref {
         if rr_ts <= 0.0 || val_to_f64(saved.get("updated_ts")) >= rr_ts {
             let raw_sid = val_to_str(saved.get("session_id"));
@@ -3615,6 +4019,8 @@ struct PromptBuildSpec<'a> {
     review_id: &'a str,
     packet_nonce: &'a str,
     scope_summary: &'a str,
+    business_intent: &'a str,
+    rejected_findings: &'a [Value],
     diff_text: &'a str,
     interdiff_text: &'a str,
     prior_ledger: &'a str,
@@ -3622,6 +4028,390 @@ struct PromptBuildSpec<'a> {
     round_num: usize,
     is_resume: bool,
     is_timeout_resume: bool,
+}
+
+const VALID_DISPOSITION_CATEGORIES: &[&str] = &[
+    "intent-conflict",
+    "accepted-risk",
+    "no-practical-gain",
+    "deferred-improvement",
+];
+
+fn dispositions_state_path(
+    session: &str,
+    git_root: &str,
+    cand_first_ts: f64,
+    thread_sid: &str,
+) -> Option<PathBuf> {
+    let base = session_root_digest(session, git_root);
+    if cand_first_ts > 0.0 {
+        return Some(threads_dir().join(format!("{}.dispositions.json", base)));
+    }
+    let tid = thread_sid.trim();
+    if tid.is_empty() {
+        return None;
+    }
+    // INVARIANT: Key markerless dispositions strictly by the specific Codex thread `session_id` so concurrent Sol (`high`) and Astra (`xhigh`) markerless threads never overwrite or unlink each other's settled ledger.
+    let tid_dig = &sha256_hex(tid.as_bytes())[..16];
+    Some(threads_dir().join(format!("{}.thread-{}.dispositions.json", base, tid_dig)))
+}
+
+fn load_active_dispositions(
+    session: &str,
+    git_root: &str,
+    cand_first_ts: f64,
+    research_reset_ts: f64,
+    active_thread_sid: &str,
+    force_new: bool,
+) -> Vec<Value> {
+    if cand_first_ts <= 0.0 && force_new {
+        return Vec::new();
+    }
+    let Some(path) = dispositions_state_path(session, git_root, cand_first_ts, active_thread_sid)
+    else {
+        return Vec::new();
+    };
+    let Some(Value::Object(obj)) = rio::read_json(&path) else {
+        return Vec::new();
+    };
+    let stored_cts = val_to_f64(obj.get("candidate_first_ts"));
+    let stored_rr = val_to_f64(obj.get("research_reset_ts"));
+    let stored_tsid = val_to_str(obj.get("thread_session_id")).trim().to_string();
+    // INVARIANT: Strictly isolate dispositions to `(candidate_first_ts, research_reset_ts)` for open candidates or to `thread_session_id` for markerless reviews; never cross between marker and markerless runs or across `--new-session`.
+    if cand_first_ts > 0.0 {
+        if stored_cts <= 0.0
+            || (stored_cts - cand_first_ts).abs() > 1.0
+            || (stored_rr - research_reset_ts).abs() > 1.0
+        {
+            return Vec::new();
+        }
+    } else {
+        let cur_tsid = active_thread_sid.trim();
+        if stored_cts > 0.0
+            || cur_tsid.is_empty()
+            || stored_tsid.is_empty()
+            || stored_tsid != cur_tsid
+        {
+            return Vec::new();
+        }
+    }
+    obj.get("items")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn active_markerless_thread_sid(
+    session: &str,
+    git_root: &str,
+    explicit_model: &str,
+    xhigh: bool,
+) -> String {
+    if xhigh || !explicit_model.trim().is_empty() {
+        let effort = if xhigh { "xhigh" } else { "high" };
+        let model = resolve_review_model(explicit_model, xhigh);
+        return active_thread_state_for_lane(session, git_root, Some(0.0), &model, effort)
+            .map(|st| val_to_str(st.get("session_id")).trim().to_string())
+            .unwrap_or_default();
+    }
+    let default_sol = resolve_review_model("", false);
+    if let Some(st) =
+        active_thread_state_for_lane(session, git_root, Some(0.0), &default_sol, "high")
+    {
+        let sid = val_to_str(st.get("session_id")).trim().to_string();
+        if !sid.is_empty() {
+            return sid;
+        }
+    }
+    let fallback_lanes = [
+        (resolve_review_model("", true), "xhigh"),
+        (cwg_common::CODEX_SOL_MODEL.to_string(), "xhigh"),
+    ];
+    let mut best_sid = String::new();
+    let mut best_ts = -1.0f64;
+    for (model, effort) in fallback_lanes {
+        if let Some(st) =
+            active_thread_state_for_lane(session, git_root, Some(0.0), &model, effort)
+        {
+            let sid = val_to_str(st.get("session_id")).trim().to_string();
+            let uts = val_to_f64(st.get("updated_ts"));
+            if !sid.is_empty() && uts >= best_ts {
+                best_ts = uts;
+                best_sid = sid;
+            }
+        }
+    }
+    best_sid
+}
+
+fn format_dispositions_ledger(items: &[Value]) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    let mut lines = Vec::with_capacity(items.len() + 3);
+    lines.push("SUBSTANTIVELY REJECTED / SETTLED FINDINGS (ANTI-BOOMERANG LEDGER — DO NOT RE-RAISE):".to_string());
+    lines.push("The following items were evaluated against BUSINESS_INTENT and substantively disposed. Treat them as SETTLED; do NOT re-raise, rephrase, or escalate them unless a brand-new Class-A defect (crash, data loss, credential leak, or broken requested behavior) appears in newly edited lines of the current interdiff:".to_string());
+    for (idx, it) in items.iter().enumerate() {
+        let cat = val_to_str(it.get("category"));
+        let finding = val_to_str(it.get("finding"));
+        let reason = val_to_str(it.get("reason"));
+        lines.push(format!("{}. [{}] {} — Rationale: {}", idx + 1, cat, finding, reason));
+    }
+    format!("\n{}\n", lines.join("\n"))
+}
+
+fn strip_user_input_envelope(raw: &str) -> String {
+    let mut s = raw.to_string();
+    for (open, close) in [
+        ("<CONTEXT_SUMMARY>", "</CONTEXT_SUMMARY>"),
+        ("<ADDITIONAL_METADATA>", "</ADDITIONAL_METADATA>"),
+        ("<USER_SETTINGS_CHANGE>", "</USER_SETTINGS_CHANGE>"),
+        ("<SYSTEM_MESSAGE>", "</SYSTEM_MESSAGE>"),
+    ] {
+        while let Some(a) = s.find(open) {
+            if let Some(rel_b) = s[a..].find(close) {
+                s.replace_range(a..a + rel_b + close.len(), "");
+            } else {
+                s.truncate(a);
+                break;
+            }
+        }
+    }
+    s = s
+        .replace("<USER_REQUEST>", "")
+        .replace("</USER_REQUEST>", "");
+    // INVARIANT: Preserve line boundaries until after `sanitize_external_charter` strips line-anchored credential assignments (`KEY=VALUE`, `SERVICE_CREDENTIAL=...`).
+    s.lines()
+        .map(str::trim)
+        .filter(|ln| !ln.is_empty())
+        .collect::<Vec<&str>>()
+        .join("\n")
+}
+
+fn operational_followup_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)^(?:(?:ок|окей|да|хорошо|ладно|понял|принято|готово|супер|отлично|давай|продолжай|продолжи|дальше|сделай|выполни|запусти|прогони|проверь|перепроверь|заверш[а-яё]*|закрой|закоммить|коммить|запушь|пуш|push|commit|merge|continue|proceed|go\s+ahead|carry\s+on|run|re-?run|test|verify|finish|complete|close|ship(?:\s+it)?|ok|okay|yes|yep|sure|lgtm|looks\s+good|approved|done|тест[а-яё]*|сборк[а-яё]*|линтер[а-яё]*|проверк[а-яё]*|ревью|гейт[а-яё]*|задач[а-яё]*|работу|изменени[яе]|ветк[а-яё]*|коммит[а-яё]*|всё|все|и|до\s+конца|пожалуйста|tests?|builds?|linters?|checks?|review|gate|task|work|changes?|branch|it|all|and|now|please|pls)(?:$|[\s,.:;!?-]+))+$",
+        )
+        .expect("operational_followup_re")
+    })
+}
+
+fn is_operational_followup(cleaned: &str) -> bool {
+    let trimmed = cleaned.trim();
+    let chars = trimmed.chars().count();
+    if chars < 12 {
+        return true;
+    }
+    if chars <= 140 && operational_followup_re().is_match(trimmed) {
+        return true;
+    }
+    false
+}
+
+fn handoff_matches_candidate(
+    ho: &Map<String, Value>,
+    git_root: &str,
+    session: &str,
+    cand_first_ts: f64,
+) -> (bool, f64, bool) {
+    let ho_sess = val_to_str(ho.get("session")).trim().to_string();
+    if !ho_sess.is_empty() && !session.trim().is_empty() && ho_sess != session.trim() {
+        return (false, 0.0, false);
+    }
+    let ho_branch = ho
+        .get("git")
+        .and_then(|v| v.as_object())
+        .map(|g| val_to_str(g.get("branch")).trim().to_string())
+        .unwrap_or_default();
+    if !ho_branch.is_empty() && !git_root.trim().is_empty() {
+        let (rc, out, _) = rio::run_git(git_root, &["rev-parse", "--abbrev-ref", "HEAD"], 3.0);
+        let cur_branch = out.trim();
+        if rc == 0 && !cur_branch.is_empty() && cur_branch != "HEAD" && cur_branch != ho_branch {
+            return (false, 0.0, false);
+        }
+    }
+    let ho_goal_ts = val_to_f64(ho.get("goal_updated_ts"));
+    let ho_ts = if ho_goal_ts > 0.0 {
+        ho_goal_ts
+    } else {
+        val_to_f64(ho.get("updated_ts"))
+    };
+    let ho_cand_ts = val_to_f64(ho.get("candidate_first_ts"));
+    if cand_first_ts > 0.0 {
+        // INVARIANT: Bind open handoffs strictly to the current candidate (even within the same session/branch) so an older task's handoff never hijacks `BUSINESS_INTENT`.
+        if ho_cand_ts > 0.0 {
+            if (ho_cand_ts - cand_first_ts).abs() > 1.0 {
+                return (false, ho_ts, false);
+            }
+            return (true, ho_ts, true);
+        }
+        if ho_ts <= 0.0 || ho_ts + 300.0 < cand_first_ts {
+            return (false, ho_ts, false);
+        }
+    }
+    (true, ho_ts, false)
+}
+
+fn extract_intent_from_handoff(
+    git_root: &str,
+    session: &str,
+    cand_first_ts: f64,
+) -> (String, bool, f64, bool, u64, f64) {
+    let Some(Value::Object(ho)) =
+        crate::continuity_hook::load_handoff(git_root, &[], None, session)
+    else {
+        return (String::new(), false, 0.0, false, 0, 0.0);
+    };
+    if crate::continuity_hook::is_closed_status(&val_to_str(ho.get("status"))) {
+        return (String::new(), false, 0.0, false, 0, 0.0);
+    }
+    let (matched, ho_ts, exact_cand) =
+        handoff_matches_candidate(&ho, git_root, session, cand_first_ts);
+    let goal = val_to_str(ho.get("goal")).trim().to_string();
+    let goal_gen = if matched {
+        handoff_goal_generation_from_map(&ho)
+    } else {
+        0
+    };
+    let ho_updated_ts = val_to_f64(ho.get("updated_ts")).max(ho_ts);
+    let (decisions, _) = crate::continuity_hook::handoff_constraints(&ho);
+    let acceptance = crate::continuity_hook::handoff_items(&ho, "acceptance_criteria");
+    let mut parts = Vec::new();
+    if !goal.is_empty() {
+        parts.push(format!("Goal: {}", goal));
+    }
+    if !decisions.is_empty() {
+        parts.push(format!("Accepted architecture/decisions: {}", decisions.join("; ")));
+    }
+    if !acceptance.is_empty() {
+        parts.push(format!("Success criteria: {}", acceptance.join("; ")));
+    }
+    let sanitized = crate::carbon_memory::sanitize_external_charter(&parts.join("\n"));
+    (
+        rio::truncate_chars(&sanitized, 1600).to_string(),
+        matched,
+        ho_ts,
+        exact_cand,
+        goal_gen,
+        ho_updated_ts,
+    )
+}
+
+fn extract_intent_from_transcript_with_ts(session: &str, cand_first_ts: f64) -> (String, f64) {
+    if session.trim().is_empty() {
+        return (String::new(), 0.0);
+    }
+    let tp = rio::member_transcript_path(&rio::resolve_brain_root(""), session);
+    if !tp.is_file() {
+        return (String::new(), 0.0);
+    }
+    let steps = rio::read_transcript_steps(&tp.to_string_lossy(), 400);
+    let mut substantive: Vec<(f64, String)> = Vec::new();
+    for st in &steps {
+        let st_type = val_to_str(st.get("type")).to_ascii_uppercase();
+        if st_type != "USER_INPUT" {
+            continue;
+        }
+        let cleaned = strip_user_input_envelope(&val_to_str(st.get("content")));
+        let sanitized_multiline = crate::carbon_memory::sanitize_external_charter(&cleaned);
+        let sanitized = sanitized_multiline
+            .lines()
+            .map(str::trim)
+            .filter(|ln| !ln.is_empty())
+            .collect::<Vec<&str>>()
+            .join(" ");
+        if is_operational_followup(&sanitized) {
+            continue;
+        }
+        let ts = rio::parse_iso_ts(&val_to_str(st.get("created_at")));
+        substantive.push((ts, sanitized));
+    }
+    if substantive.is_empty() {
+        return (String::new(), 0.0);
+    }
+    let anchor_idx = if cand_first_ts > 0.0 && substantive.iter().any(|(ts, _)| *ts > 0.0) {
+        substantive
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, (ts, _))| *ts > 0.0 && *ts <= cand_first_ts + 5.0)
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let primary = &substantive[anchor_idx].1;
+    let latest_idx = substantive.len() - 1;
+    let latest_ts = substantive[latest_idx].0.max(substantive[anchor_idx].0);
+    let combined = if latest_idx > anchor_idx && substantive[latest_idx].1 != *primary {
+        format!(
+            "Original request: {}\nLatest refinement: {}",
+            rio::truncate_chars(primary, 900),
+            rio::truncate_chars(&substantive[latest_idx].1, 450)
+        )
+    } else {
+        primary.clone()
+    };
+    (rio::truncate_chars(&combined, 1400).to_string(), latest_ts)
+}
+
+fn resolve_business_intent(
+    explicit_intent: &str,
+    session: &str,
+    git_root: &str,
+    cand_first_ts: f64,
+    saved_thread: Option<&Map<String, Value>>,
+) -> String {
+    let exp = explicit_intent.trim();
+    if !exp.is_empty() {
+        let redacted = crate::carbon_memory::sanitize_external_charter(exp);
+        return rio::truncate_chars(&redacted, 2000).to_string();
+    }
+    let (ho_intent, ho_matched, ho_ts, exact_cand, ho_goal_gen, ho_updated_ts) =
+        extract_intent_from_handoff(git_root, session, cand_first_ts);
+    if let Some(st) = saved_thread {
+        let saved = val_to_str(st.get("business_intent")).trim().to_string();
+        if !saved.is_empty() {
+            let saved_gen = st
+                .get("handoff_goal_generation")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let saved_goal_ts = val_to_f64(st.get("handoff_goal_updated_ts"));
+            let saved_upd_ts = val_to_f64(st.get("updated_ts"));
+            // INVARIANT: Never reuse a saved thread's `business_intent` when the active handoff advanced `goal_generation` (or changed/updated its goal/decisions after the thread was written), especially across markerless (`cand_first_ts <= 0`) tasks in the same session.
+            let stale_markerless = cand_first_ts <= 0.0
+                && (saved_gen != ho_goal_gen || goal_ts_diverged(ho_ts, saved_goal_ts));
+            let superseded_by_handoff = ho_matched
+                && !ho_intent.is_empty()
+                && ((st.contains_key("handoff_goal_generation") && ho_goal_gen != saved_gen)
+                    || goal_ts_diverged(ho_ts, saved_goal_ts)
+                    || (saved_upd_ts > 0.0 && ho_updated_ts > saved_upd_ts + 0.5));
+            if !stale_markerless && !superseded_by_handoff {
+                let redacted = crate::carbon_memory::sanitize_external_charter(&saved);
+                return rio::truncate_chars(&redacted, 2000).to_string();
+            }
+        }
+    }
+    let (tr_intent, tr_latest_ts) = extract_intent_from_transcript_with_ts(session, cand_first_ts);
+    if ho_matched && !ho_intent.is_empty() {
+        let superseded_by_newer_user_request = !exact_cand
+            && !tr_intent.is_empty()
+            && ho_ts > 0.0
+            && tr_latest_ts > ho_ts + 5.0;
+        if !superseded_by_newer_user_request {
+            return ho_intent;
+        }
+    }
+    if !tr_intent.is_empty() {
+        return tr_intent;
+    }
+    if ho_matched {
+        ho_intent
+    } else {
+        String::new()
+    }
 }
 
 fn build_adversarial_prompt(spec: PromptBuildSpec<'_>) -> String {
@@ -3657,13 +4447,13 @@ Respond in plain text/markdown (not JSON) and conclude with an exact standalone 
 CLOSURE_VALIDATION: READY\n\
 or\n\
 CLOSURE_VALIDATION: BLOCKED\n\
-READY means every prior CRITICAL/HIGH blocker is resolved or not applicable with evidence and no direct recovery regression blocks release. BLOCKED must name the remaining CRITICAL/HIGH blocker with a concrete trigger."
+READY means every prior Class-A CRITICAL/HIGH blocker is resolved or substantively disposed with evidence and no direct recovery regression blocks release. BLOCKED must name the remaining Class-A CRITICAL/HIGH blocker with a concrete file:line trigger and PRESERVES_INTENT: YES."
             .to_string()
     } else if spec.round_num >= max_ord {
         format!(
             "Respond in plain text/markdown (not JSON) and conclude with an exact standalone last line (no trailing prose, no code fences):\n\
 VERDICT: APPROVED\n\
-or (because this is Round {0}/{0} and ordinary budget is spent if CRITICAL/HIGH blockers remain)\n\
+or (because this is Round {0}/{0} and ordinary budget is spent if Class-A CRITICAL/HIGH blockers remain)\n\
 VERDICT: ESCALATE\n\
 Never emit REVISE in Round {0}.",
             max_ord
@@ -3681,12 +4471,23 @@ VERDICT: REVISE"
         "ROUND_MODE: timeout_continuation (same review thread — your previous review turn hit the wall-clock timeout before emitting a final verdict; continue from the context already inspected without starting over, and conclude with your findings and exact standalone verdict line).\n"
     } else if is_delta_scope {
         "ROUND_MODE: delta_interdiff (re-review is strictly scoped to the remediation interdiff and prior blockers, NOT the whole change again:\n\
-- Give each prior blocker disposition: RESOLVED, NOT RESOLVED (with concrete evidence), or REGRESSED. Judge whether the failure scenario is removed, even if implemented differently from your wording.\n\
+- Give each prior blocker disposition: RESOLVED, SETTLED_BY_DISPOSITION, NOT RESOLVED (with concrete evidence), or REGRESSED. Judge whether the failure scenario is removed, even if implemented differently from your wording.\n\
 - Inspect the changes since your last round plus their direct blast radius (callers, callees, contracts).\n\
-- SETTLED-SCOPE FREEZE: Everything examined in earlier rounds that this interdiff does NOT touch is SETTLED. Do NOT re-read settled code and do NOT raise new findings on untouched code, except a brand-new CRITICAL with explicit justification why it was invisible in Round 1.)\n"
+- SETTLED-SCOPE FREEZE: Everything examined in earlier rounds that this interdiff does NOT touch is SETTLED. Do NOT re-read settled code and do NOT raise new findings on untouched code, except a brand-new Class-A CRITICAL with explicit justification why it was invisible in Round 1.)\n"
     } else {
-        "ROUND_MODE: round_1_full_candidate (report every qualifying CRITICAL/HIGH finding in Round 1; never hold findings back for later rounds).\n"
+        "ROUND_MODE: round_1_full_candidate (report every qualifying Class-A CRITICAL/HIGH finding in Round 1; never hold findings back for later rounds).\n"
     };
+
+    let intent_section = if !spec.business_intent.trim().is_empty() {
+        format!(
+            "\nBUSINESS_INTENT & ACCEPTED CAPABILITIES (PRIMARY EVALUATION ANCHOR):\n{}\n",
+            spec.business_intent.trim()
+        )
+    } else {
+        "\nBUSINESS_INTENT & ACCEPTED CAPABILITIES: Infer the user's requested functionality and acceptance criteria from CANDIDATE SUMMARY and the diff; evaluate all findings strictly in service of delivering that capability safely.\n".to_string()
+    };
+
+    let dispositions_section = format_dispositions_ledger(spec.rejected_findings);
 
     let ledger_section = if is_delta_scope && !spec.prior_ledger.trim().is_empty() {
         let trimmed_ledger: String = match spec.prior_ledger.char_indices().nth(12_000) {
@@ -3715,27 +4516,38 @@ VERDICT: REVISE"
     format!(
         "REVIEW_ID: {}\n\
 PACKET_NONCE: {}\n\
-ROLE: Senior Read-Only Adversarial Code Reviewer.\n\
+ROLE: Pragmatic Senior Read-Only Adversarial Code Reviewer.\n\
 {}{}\
-OPERATING STANCE & SEVERITY CALIBRATION (BLOCKING_THRESHOLD = HIGH):\n\
-1. Read-only authorized review: NEVER edit, write, or delete files, and NEVER end with a question. Make reasonable assumptions, state them, and finish with the standalone verdict line.\n\
-2. Adversarial search is the method; deciding whether anything blocks release is the job. A clean, evidence-backed APPROVED is a successful review, not a failed attack.\n\
-3. Severity definitions:\n\
-   - CRITICAL: data loss, security bypass, auth breach, schema corruption.\n\
-   - HIGH: a concrete reachable path to a production failure, cascading breakage, or broken rollback, with a named concrete trigger.\n\
-   - MEDIUM: a real edge case, observability gap, or race under load that does not break normal operation.\n\
-   - LOW / INFO: correctness-adjacent polish or hypothetical concern without a concrete trigger.\n\
-4. ONLY CRITICAL, HIGH, and explicit acceptance-criterion violations block. MEDIUM, LOW, and INFO are non-blocking notes inside an APPROVED verdict. A finding without a concrete trigger is LOW/INFO or nothing at all — do NOT manufacture severity to justify REVISE/BLOCKED. Pre-existing out-of-scope defects carry no severity and never affect the verdict.\n\
-5. Pre-verdict self-check: if no open CRITICAL or HIGH remains and nothing required is missing, emit APPROVED / READY immediately rather than looking for one more reason to hold.\n\
-6. {}\n\n\
-CANDIDATE SUMMARY:\n{}\n{}\n\
+CORE PRINCIPLE (BUSINESS-INTENT PRIORITY):\n\
+Review protects the implementation of business requirements — it NEVER protects the system from the business requirements themselves.\n\
+If the user explicitly requested a capability, your job is to help deliver that capability reliably and safely — NEVER to replace the task with a more restricted alternative.\n\
+\n\
+CONTEXTUAL RISK CALIBRATION & PROPORTIONALITY (BLOCKING_THRESHOLD = HIGH):\n\
+1. Read-only authorized review: NEVER edit, write, or delete files, and NEVER end with a question. Make reasonable assumptions aligned with BUSINESS_INTENT, state them, and finish with the standalone verdict line.\n\
+2. Adversarial search is the method; pragmatic release judgment is the job. A clean, evidence-backed APPROVED is a successful review, not a failed audit.\n\
+3. Classify every potential concern into one of four classes BEFORE assigning severity:\n\
+   - CLASS A (Real Implementation Defects — BLOCKING when CRITICAL/HIGH): concrete reachable bugs, broken requested behavior, credential/secret leaks, broken auth/permission enforcement, unsafe input handling, data/schema corruption, or broken error/rollback paths with a named file:line trigger.\n\
+   - CLASS B (Proportional Safeguards for Requested Capabilities — MUST PRESERVE CAPABILITY): when a requested feature inherently involves external AI/LLM APIs, network-enabled agents, third-party SaaS/webhook/MCP integrations, or production infrastructure/DB/SSH operations, propose ONLY proportional controls that keep the feature working (scoped secrets, timeouts, TLS/signature verification, least-privilege RBAC, audit logs, rate/budget caps, dry-run/confirmations). NEVER demand blocking internet access, forcing local-only models, disabling requested integrations, or removing production operations.\n\
+   - CLASS C (Business-Model Risk or Goal Conflict — NON-BLOCKING): risks inherent to the user's chosen business model or any recommendation that alters requirements, drops a requested workflow, degrades UX, or makes the implementation unfit for BUSINESS_INTENT. NEVER block on Class C; at most mention briefly as INFO inside APPROVED.\n\
+   - CLASS D (Subjective Preferences, Hypothetical Threats & Optional Polish — NON-BLOCKING LOW/INFO): style/architecture preferences, speculative failure chains without a concrete trigger, extra hardening beyond scope, or optional optimizations. NEVER elevate Class D to HIGH/CRITICAL.\n\
+4. Severity definitions (ONLY Class A defects or violated explicit acceptance criteria may be CRITICAL/HIGH):\n\
+   - CRITICAL: data loss, credential exposure, broken access control, schema corruption, or complete failure of the requested core scenario.\n\
+   - HIGH: a concrete, REALISTIC production/user/agent failure, broken requested capability, cascading breakage, or broken rollback with a named file:line trigger AND realistic exploitation/usage path. Synthetic 'adversarial puzzles' (contrived strings, pathological flag permutations, or theoretical regex-breaking inputs with no realistic production trigger) MUST NOT be rated HIGH/CRITICAL — classify them as MEDIUM/LOW (non-blocking) or Class D.\n\
+   - MEDIUM: a real edge case, synthetic/corner-case heuristic bypass, observability gap, or load race that does not break normal operation (non-blocking).\n\
+   - LOW / INFO: polish, optional improvements, or Class C/D notes (non-blocking).\n\
+5. MANDATORY GOAL-CONFLICT & STRUCTURAL-FIX SELF-CHECK: For every blocking CRITICAL/HIGH finding, explicitly verify and state `PRESERVES_INTENT: YES` (confirming your proposed fix preserves all requested capabilities) plus a realistic production trigger and concrete `file:line`. On Round 2+, if a heuristic/regex/time-window check was bypassed, recommend replacing the proof mechanism structurally (parser, explicit metadata, type/DB invariant) rather than adding another example-specific regex patch. Any recommendation that removes or breaks a requested capability is disqualified as a blocker.\n\
+6. Pre-verdict self-check: if no open Class-A CRITICAL/HIGH blocker remains and all requested capabilities work, emit APPROVED / READY immediately rather than searching for another reason to hold. Pre-existing out-of-scope issues never block.\n\
+7. {}\n{}\
+CANDIDATE SUMMARY:\n{}\n{}{}\n\
 {}\n",
         spec.review_id,
         spec.packet_nonce,
         round_header,
         round_mode,
         verdict_rule,
+        intent_section,
         spec.scope_summary,
+        dispositions_section,
         ledger_section,
         primary_diff
     )
@@ -3768,11 +4580,34 @@ fn build_thinking_timeout_payload(
     timeout_sid: &str,
     state_persisted: bool,
 ) -> Value {
+    build_thinking_timeout_payload_with_epoch(
+        review_id,
+        timeout_sec,
+        recommended_timeout,
+        retry_cmd,
+        timeout_sid,
+        state_persisted,
+        false,
+    )
+}
+
+fn build_thinking_timeout_payload_with_epoch(
+    review_id: &str,
+    timeout_sec: i64,
+    recommended_timeout: i64,
+    retry_cmd: &str,
+    timeout_sid: &str,
+    state_persisted: bool,
+    stale_goal_epoch: bool,
+) -> Value {
     let mut payload_to = Map::new();
     payload_to.insert("ok".to_string(), Value::Bool(false));
     payload_to.insert("review_id".to_string(), Value::String(review_id.to_string()));
     payload_to.insert("timed_out".to_string(), Value::Bool(true));
     payload_to.insert("state_persisted".to_string(), Value::Bool(state_persisted));
+    if stale_goal_epoch {
+        payload_to.insert("goal_epoch_changed".to_string(), Value::Bool(true));
+    }
     payload_to.insert(
         "session_continuation_saved".to_string(),
         Value::Bool(state_persisted && !timeout_sid.is_empty()),
@@ -3784,7 +4619,8 @@ fn build_thinking_timeout_payload(
         "error".to_string(),
         Value::String(format!("timeout_after_{}s", timeout_sec)),
     );
-    let effective_retry_cmd = if !state_persisted && !timeout_sid.is_empty() {
+    // INVARIANT: Never emit `--resume <timeout_sid>` in `retry_command` when persistence was rejected because `handoff.goal_generation` changed mid-run; only emit `--resume` on genuine I/O persistence failure within the same goal epoch.
+    let effective_retry_cmd = if !state_persisted && !stale_goal_epoch && !timeout_sid.is_empty() {
         let mut s = retry_cmd.to_string();
         push_cli_flag_val(&mut s, "--resume", timeout_sid);
         s
@@ -3798,7 +4634,11 @@ fn build_thinking_timeout_payload(
     if !state_persisted {
         payload_to.insert(
             "persistence_error".to_string(),
-            Value::String("thread_state_not_saved".to_string()),
+            Value::String(if stale_goal_epoch {
+                "goal_epoch_changed".to_string()
+            } else {
+                "thread_state_not_saved".to_string()
+            }),
         );
     }
     let hint = if state_persisted {
@@ -3813,6 +4653,11 @@ fn build_thinking_timeout_payload(
                 timeout_sec, effective_retry_cmd, recommended_timeout
             )
         }
+    } else if stale_goal_epoch {
+        format!(
+            "Codex did not finish within {}s (thinking timeout, NOT an outage; review round NOT consumed), and the active handoff goal_generation changed while Codex ran, so the superseded thread was NOT saved or resumed. Re-run {} without --timeout or --resume to start a fresh review for the current goal ({}s timeout).",
+            timeout_sec, effective_retry_cmd, recommended_timeout
+        )
     } else if !timeout_sid.is_empty() {
         format!(
             "Codex did not finish within {}s (thinking timeout, NOT an outage; review round NOT consumed), and timeout continuation state could NOT be saved (`state_persisted=false`). Re-run {} without --timeout (uses {}s timeout because escalated state was not persisted); escalating to internal review on a thinking timeout is forbidden.",
@@ -4437,6 +5282,9 @@ fn cmd_research_reset(args: &ResearchResetArgs) -> i32 {
                     cwg_common::ack_pending_marker_deltas(&skey, &consumed_ids);
                 }
                 purge_session_lane_threads_unlocked(&eff_session, &git_root);
+                if let Some(dp) = dispositions_state_path(&eff_session, &git_root, 1.0, "") {
+                    unlink_quiet(&dp);
+                }
                 unlink_quiet(&cwg_common::swarm_rounds_path(&skey));
                 Ok((board_head_seq, reset_entry))
             })
@@ -4526,9 +5374,225 @@ fn try_acquire_review_flight_lock(session: &str, git_root: &str) -> FlightLockRe
     }
 }
 
+struct DisposeArgs {
+    cwd: String,
+    session: String,
+    finding: String,
+    category: String,
+    reason: String,
+    model: String,
+    xhigh: bool,
+    list: bool,
+    clear: bool,
+    pretty: bool,
+}
+
+fn cmd_dispose(args: &DisposeArgs) -> i32 {
+    let cwd_raw = if args.cwd.trim().is_empty() {
+        env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        args.cwd.clone()
+    };
+    let cwd = abs_path_from_str(&cwd_raw).to_string_lossy().into_owned();
+    let git_root = rio::git_toplevel(&cwd, false).unwrap_or_else(|| cwd.clone());
+    let eff_session = if args.session.trim().is_empty() {
+        infer_single_open_session(&cwd)
+    } else {
+        args.session.trim().to_string()
+    };
+    let cand_first_ts = candidate_first_ts(&eff_session);
+    let last_rr_ts = if cand_first_ts > 0.0 {
+        session_last_research_reset_ts(&eff_session)
+    } else {
+        0.0
+    };
+    let active_thread_sid = if cand_first_ts <= 0.0 {
+        active_markerless_thread_sid(&eff_session, &git_root, &args.model, args.xhigh)
+    } else {
+        String::new()
+    };
+    let dpath = dispositions_state_path(&eff_session, &git_root, cand_first_ts, &active_thread_sid);
+
+    if args.list {
+        let items = load_active_dispositions(
+            &eff_session,
+            &git_root,
+            cand_first_ts,
+            last_rr_ts,
+            &active_thread_sid,
+            false,
+        );
+        rio::print_cli_json(
+            &json!({
+                "ok": true,
+                "session": eff_session,
+                "git_root": rio::normalize_path(&git_root),
+                "count": items.len(),
+                "items": items,
+            }),
+            args.pretty,
+        );
+        return 0;
+    }
+
+    if args.clear {
+        let mut cleared = false;
+        rio::with_file_lock(&thread_lock_path(&eff_session, &git_root), 5.0, 30.0, |locked| {
+            if locked {
+                if let Some(ref dp) = dpath {
+                    unlink_quiet(dp);
+                }
+                cleared = true;
+            }
+        });
+        rio::print_cli_json(
+            &json!({
+                "ok": cleared,
+                "cleared": cleared,
+                "session": eff_session,
+                "git_root": rio::normalize_path(&git_root),
+            }),
+            args.pretty,
+        );
+        return if cleared { 0 } else { 2 };
+    }
+
+    let finding = args.finding.trim();
+    let reason = args.reason.trim();
+    let cat = args.category.trim().to_ascii_lowercase();
+    if finding.is_empty() {
+        rio::print_cli_json(
+            &json!({
+                "ok": false,
+                "error": "missing_finding",
+                "hint": "Provide --finding \"<finding summary>\" (or use --list / --clear).",
+            }),
+            args.pretty,
+        );
+        return 2;
+    }
+    if reason.is_empty() {
+        rio::print_cli_json(
+            &json!({
+                "ok": false,
+                "error": "missing_reason",
+                "hint": "Substantive disposition requires --reason explaining why the finding conflicts with BUSINESS_INTENT, is an accepted risk with safeguards, or adds no practical value.",
+            }),
+            args.pretty,
+        );
+        return 2;
+    }
+    if !VALID_DISPOSITION_CATEGORIES.contains(&cat.as_str()) {
+        rio::print_cli_json(
+            &json!({
+                "ok": false,
+                "error": "invalid_category",
+                "category": cat,
+                "allowed": VALID_DISPOSITION_CATEGORIES,
+            }),
+            args.pretty,
+        );
+        return 2;
+    }
+
+    if cand_first_ts <= 0.0 && active_thread_sid.is_empty() {
+        rio::print_cli_json(
+            &json!({
+                "ok": false,
+                "error": "no_active_candidate_or_thread",
+                "hint": "Start a review round or have an active candidate marker before recording a disposition so it stays strictly scoped to that candidate or review thread.",
+            }),
+            args.pretty,
+        );
+        return 2;
+    }
+
+    let finding_clean =
+        rio::truncate_chars(&crate::carbon_memory::redact_secrets(finding), 400).to_string();
+    let reason_clean =
+        rio::truncate_chars(&crate::carbon_memory::redact_secrets(reason), 800).to_string();
+    let norm_key = finding_clean.to_ascii_lowercase();
+    let mut saved_items: Option<Vec<Value>> = None;
+    rio::with_file_lock(&thread_lock_path(&eff_session, &git_root), 5.0, 30.0, |locked| {
+        if !locked {
+            return;
+        }
+        let mut items = load_active_dispositions(
+            &eff_session,
+            &git_root,
+            cand_first_ts,
+            last_rr_ts,
+            &active_thread_sid,
+            false,
+        );
+        let entry = json!({
+            "finding": finding_clean,
+            "category": cat,
+            "reason": reason_clean,
+            "recorded_ts": now_sec(),
+        });
+        if let Some(pos) = items
+            .iter()
+            .position(|it| val_to_str(it.get("finding")).trim().to_ascii_lowercase() == norm_key)
+        {
+            items[pos] = entry;
+        } else {
+            items.push(entry);
+            if items.len() > 32 {
+                let drop_n = items.len() - 32;
+                items.drain(0..drop_n);
+            }
+        }
+        let payload = json!({
+            "session": eff_session,
+            "git_root": rio::normalize_path(&git_root),
+            "candidate_first_ts": cand_first_ts,
+            "research_reset_ts": last_rr_ts,
+            "thread_session_id": active_thread_sid,
+            "updated_ts": now_sec(),
+            "items": items,
+        });
+        if let Some(ref dp) = dpath {
+            if rio::write_json(dp, &payload).is_ok() {
+                saved_items = Some(items);
+            }
+        }
+    });
+
+    match saved_items {
+        Some(items) => {
+            rio::print_cli_json(
+                &json!({
+                    "ok": true,
+                    "session": eff_session,
+                    "git_root": rio::normalize_path(&git_root),
+                    "count": items.len(),
+                    "items": items,
+                }),
+                args.pretty,
+            );
+            0
+        }
+        None => {
+            rio::print_cli_json(
+                &json!({
+                    "ok": false,
+                    "error": "disposition_persist_failed",
+                }),
+                args.pretty,
+            );
+            2
+        }
+    }
+}
+
 struct ReviewArgs {
     cwd: String,
     summary: String,
+    intent: String,
     diff_file: String,
     review_id: String,
     session: String,
@@ -4894,47 +5958,6 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
         );
         return 2;
     }
-    let saved_thread = if args.new_session {
-        None
-    } else {
-        active_thread_state_for_lane(
-            &eff_session,
-            &git_root,
-            Some(cand_first_ts),
-            &eff_model,
-            effort,
-        )
-    };
-    let mut resume_sid = resolve_resume_session_with_saved(
-        ResumeSessionQuery {
-            git_root: &git_root,
-            session: &eff_session,
-            candidate_first_ts: cand_first_ts,
-            explicit_resume: &args.resume,
-            force_new: args.new_session,
-            model: &eff_model,
-            effort,
-        },
-        Some(saved_thread.as_ref()),
-    );
-    if !resume_sid.is_empty()
-        && last_rr_ts > 0.0
-        && !is_post_reset_codex_session_proven(&resume_sid, "", last_rr_ts, cand_first_ts)
-    {
-        if !args.resume.trim().is_empty() {
-            rio::print_cli_json(
-                &json!({
-                    "ok": false,
-                    "error": "pre_research_reset_session_forbidden",
-                    "hint": "Resuming a pre-research-reset or unverified Codex session after research-reset is forbidden; omit --resume so the new cycle starts in a fresh review session.",
-                }),
-                args.pretty,
-            );
-            return 2;
-        }
-        resume_sid.clear();
-    }
-
     let curr_worktree_tree = if args.diff_file.is_empty()
         && !git_root.is_empty()
         && rio::git_toplevel(&git_root, false).is_some()
@@ -4971,32 +5994,160 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
         }
     };
 
-    let prior_ledger = saved_thread
-        .as_ref()
-        .map(|st| val_to_str(st.get("last_review_output")))
-        .unwrap_or_default();
-    let prev_reviewed_tree = saved_thread
-        .as_ref()
-        .map(|st| val_to_str(st.get("last_reviewed_tree_oid")))
-        .unwrap_or_default();
-    // INVARIANT: Diff `prev_reviewed_tree` against `curr_worktree_tree` (`git add -A` temp-index snapshot) so remediation rounds that modify a tracked file AND add a new untracked file include both in `interdiff_text` under `Settled-Scope Freeze`.
-    let interdiff_text = if args.diff_file.is_empty()
-        && !prev_reviewed_tree.is_empty()
-        && cwg_common::is_git_oid(&prev_reviewed_tree)
-    {
-        let (rc_id, id_out, _) = if cwg_common::is_git_oid(&curr_worktree_tree) {
-            rio::run_git(&cwd, &["diff", &prev_reviewed_tree, &curr_worktree_tree], 10.0)
+    // INVARIANT: Capture `(launch_goal_gen, launch_goal_ts)` AFTER git snapshot/diff and bind `saved_thread`, `resume_sid`, `interdiff_text`, `business_intent`, and `prev_markerless_sid` to that single coherent epoch (re-selecting once if markerless handoff drifts mid-prep) so Goal A's thread can never be launched and stamped with Goal B's `goal_generation`.
+    let mut launch_goal_gen = 0u64;
+    let mut launch_goal_ts = 0.0f64;
+    let mut saved_thread: Option<Map<String, Value>> = None;
+    let mut resume_sid = String::new();
+    let mut prior_ledger = String::new();
+    let mut interdiff_text = String::new();
+    let mut business_intent = String::new();
+    let mut prev_markerless_sid = String::new();
+    for pass in 0..2 {
+        let (cur_goal_gen, cur_goal_ts) =
+            current_handoff_goal_epoch(&git_root, &eff_session, cand_first_ts);
+        let (match_goal_gen, match_goal_ts) = if cand_first_ts <= 0.0 {
+            (cur_goal_gen, cur_goal_ts)
         } else {
-            rio::run_git(&cwd, &["diff", &prev_reviewed_tree], 10.0)
+            (0, 0.0)
         };
-        if rc_id == 0 && !id_out.trim().is_empty() {
-            id_out
+        let cur_saved_thread = if args.new_session {
+            None
+        } else {
+            active_thread_state_for_lane_with_epoch(
+                &eff_session,
+                &git_root,
+                cand_first_ts,
+                &eff_model,
+                effort,
+                match_goal_gen,
+                match_goal_ts,
+            )
+        };
+        if !args.resume.trim().is_empty()
+            && !args.new_session
+            && cand_first_ts <= 0.0
+            && (cur_goal_gen > 0 || cur_goal_ts > 0.0)
+            && !is_markerless_explicit_resume_valid_for_goal_epoch(
+                &eff_session,
+                &git_root,
+                &eff_model,
+                effort,
+                args.resume.trim(),
+                cur_saved_thread.as_ref(),
+                cur_goal_gen,
+                cur_goal_ts,
+            )
+        {
+            rio::print_cli_json(
+                &json!({
+                    "ok": false,
+                    "error": "stale_goal_epoch_resume_forbidden",
+                    "hint": "Resuming a Codex session from an earlier or unverified goal_generation is forbidden; omit --resume so the active goal starts in a fresh review session.",
+                }),
+                args.pretty,
+            );
+            return 2;
+        }
+        let mut cur_resume_sid = resolve_resume_session_with_saved(
+            ResumeSessionQuery {
+                git_root: &git_root,
+                session: &eff_session,
+                candidate_first_ts: cand_first_ts,
+                explicit_resume: &args.resume,
+                force_new: args.new_session,
+                model: &eff_model,
+                effort,
+            },
+            Some(cur_saved_thread.as_ref()),
+        );
+        if !cur_resume_sid.is_empty()
+            && last_rr_ts > 0.0
+            && !is_post_reset_codex_session_proven(&cur_resume_sid, "", last_rr_ts, cand_first_ts)
+        {
+            if !args.resume.trim().is_empty() {
+                rio::print_cli_json(
+                    &json!({
+                        "ok": false,
+                        "error": "pre_research_reset_session_forbidden",
+                        "hint": "Resuming a pre-research-reset or unverified Codex session after research-reset is forbidden; omit --resume so the new cycle starts in a fresh review session.",
+                    }),
+                    args.pretty,
+                );
+                return 2;
+            }
+            cur_resume_sid.clear();
+        }
+
+        let cur_prior_ledger = cur_saved_thread
+            .as_ref()
+            .map(|st| val_to_str(st.get("last_review_output")))
+            .unwrap_or_default();
+        let prev_reviewed_tree = cur_saved_thread
+            .as_ref()
+            .map(|st| val_to_str(st.get("last_reviewed_tree_oid")))
+            .unwrap_or_default();
+        // INVARIANT: Diff `prev_reviewed_tree` against `curr_worktree_tree` (`git add -A` temp-index snapshot) so remediation rounds that modify a tracked file AND add a new untracked file include both in `interdiff_text` under `Settled-Scope Freeze`.
+        let cur_interdiff_text = if args.diff_file.is_empty()
+            && !prev_reviewed_tree.is_empty()
+            && cwg_common::is_git_oid(&prev_reviewed_tree)
+        {
+            let (rc_id, id_out, _) = if cwg_common::is_git_oid(&curr_worktree_tree) {
+                rio::run_git(&cwd, &["diff", &prev_reviewed_tree, &curr_worktree_tree], 10.0)
+            } else {
+                rio::run_git(&cwd, &["diff", &prev_reviewed_tree], 10.0)
+            };
+            if rc_id == 0 && !id_out.trim().is_empty() {
+                id_out
+            } else {
+                String::new()
+            }
         } else {
             String::new()
+        };
+        let cur_business_intent = resolve_business_intent(
+            &args.intent,
+            &eff_session,
+            &git_root,
+            cand_first_ts,
+            cur_saved_thread.as_ref(),
+        );
+        // INVARIANT: Never unlink the active markerless thread's Anti-Boomerang disposition registry before a `--new-session` launch succeeds; defer cleanup until the replacement thread commits with a new `session_id`.
+        let cur_prev_markerless_sid: String = if args.new_session && cand_first_ts <= 0.0 {
+            active_thread_state_for_lane_with_epoch(
+                &eff_session,
+                &git_root,
+                0.0,
+                &eff_model,
+                effort,
+                match_goal_gen,
+                match_goal_ts,
+            )
+            .map(|st| val_to_str(st.get("session_id")))
+            .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        launch_goal_gen = cur_goal_gen;
+        launch_goal_ts = cur_goal_ts;
+        saved_thread = cur_saved_thread;
+        resume_sid = cur_resume_sid;
+        prior_ledger = cur_prior_ledger;
+        interdiff_text = cur_interdiff_text;
+        business_intent = cur_business_intent;
+        prev_markerless_sid = cur_prev_markerless_sid;
+
+        if cand_first_ts <= 0.0 && pass == 0 {
+            let (recheck_gen, recheck_ts) =
+                current_handoff_goal_epoch(&git_root, &eff_session, cand_first_ts);
+            if recheck_gen != launch_goal_gen || goal_ts_diverged(recheck_ts, launch_goal_ts) {
+                continue;
+            }
         }
-    } else {
-        String::new()
-    };
+        break;
+    }
+
     let round_num = if phase == "closure" {
         cls_summary.effective_pass_count + 1
     } else {
@@ -5080,18 +6231,36 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
             format!("cwg-{}", random_hex_12())
         };
         let packet_nonce = random_hex_12();
-        let prompt = build_adversarial_prompt(PromptBuildSpec {
-            review_id: &active_review_id,
-            packet_nonce: &packet_nonce,
-            scope_summary: &scope_summary,
-            diff_text: &diff_text,
-            interdiff_text: &interdiff_text,
-            prior_ledger: &prior_ledger,
-            phase,
-            round_num,
-            is_resume: !cur_resume_sid.is_empty(),
-            is_timeout_resume: !cur_resume_sid.is_empty() && is_timeout_continuation,
-        });
+        // INVARIANT: Resolve active dispositions per actual execution attempt so a fallback to a fresh markerless session (`attempt_idx > 0`, `cur_resume_sid == ""`) never inherits a failed prior thread's dispositions.
+        let attempt_force_new = args.new_session || (attempt_idx > 0 && cur_resume_sid.is_empty());
+        let attempt_rejected_findings = load_active_dispositions(
+            &eff_session,
+            &git_root,
+            cand_first_ts,
+            last_rr_ts,
+            cur_resume_sid,
+            attempt_force_new,
+        );
+        let prompt = inject_launch_scope_into_prompt(
+            build_adversarial_prompt(PromptBuildSpec {
+                review_id: &active_review_id,
+                packet_nonce: &packet_nonce,
+                scope_summary: &scope_summary,
+                business_intent: &business_intent,
+                rejected_findings: &attempt_rejected_findings,
+                diff_text: &diff_text,
+                interdiff_text: &interdiff_text,
+                prior_ledger: &prior_ledger,
+                phase,
+                round_num,
+                is_resume: !cur_resume_sid.is_empty(),
+                is_timeout_resume: !cur_resume_sid.is_empty() && is_timeout_continuation,
+            }),
+            &eff_session,
+            &git_root,
+            launch_goal_gen,
+            launch_goal_ts,
+        );
         match reserve_packet_exclusive(
             &active_review_id,
             &prompt,
@@ -5164,7 +6333,7 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
                     }
                 }
                 let next_to = next_timeout_after(eff_timeout as i64);
-                let persisted = save_lane_thread_state(
+                let save_outcome = save_lane_thread_state_with_outcome(
                     &eff_session,
                     &git_root,
                     cand_first_ts,
@@ -5176,16 +6345,21 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
                         "session": eff_session,
                         "git_root": rio::normalize_path(&git_root),
                         "candidate_first_ts": cand_first_ts,
+                        "handoff_goal_generation": launch_goal_gen,
+                        "handoff_goal_updated_ts": launch_goal_ts,
                         "model": eff_model,
                         "effort": effort,
                         "phase": phase,
                         "xhigh": args.xhigh,
+                        "business_intent": business_intent,
                         "pending_timeout_resume": true,
                         "last_timeout_seconds": eff_timeout as i64,
                         "next_timeout_seconds": next_to,
                         "updated_ts": now_sec(),
                     }),
                 );
+                let persisted = save_outcome == ThreadSaveOutcome::Saved;
+                let stale_goal_epoch = save_outcome == ThreadSaveOutcome::StaleGoalEpoch;
                 let effective_rec_to = if persisted {
                     next_to
                 } else {
@@ -5211,13 +6385,14 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
                     summary: &args.summary,
                     pretty: args.pretty,
                 });
-                let payload_to = build_thinking_timeout_payload(
+                let payload_to = build_thinking_timeout_payload_with_epoch(
                     &active_review_id,
                     eff_timeout as i64,
                     effective_rec_to,
                     &retry_base_cmd,
                     &timeout_sid,
                     persisted,
+                    stale_goal_epoch,
                 );
                 rio::print_cli_json(&payload_to, args.pretty);
             } else if timeout_kind == "network" {
@@ -5250,6 +6425,13 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
                 &eff_model,
                 effort,
             );
+            if cand_first_ts <= 0.0 {
+                if let Some(dp) =
+                    dispositions_state_path(&eff_session, &git_root, 0.0, cur_resume_sid)
+                {
+                    unlink_quiet(&dp);
+                }
+            }
             continue;
         }
         // SAFETY: Commit the packet only when Codex exited 0 without outage AND emitted a recognized standalone verdict line matching `phase`; if disk commit fails, fail closed with non-zero exit code below.
@@ -5383,7 +6565,7 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
             } else {
                 String::new()
             };
-            save_lane_thread_state(
+            let saved_ok = save_lane_thread_state(
                 &eff_session,
                 &git_root,
                 cand_first_ts,
@@ -5395,14 +6577,28 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
                     "session": eff_session,
                     "git_root": rio::normalize_path(&git_root),
                     "candidate_first_ts": cand_first_ts,
+                    "handoff_goal_generation": launch_goal_gen,
+                    "handoff_goal_updated_ts": launch_goal_ts,
                     "model": eff_model,
                     "effort": effort,
                     "xhigh": args.xhigh,
+                    "business_intent": business_intent,
                     "last_reviewed_tree_oid": reviewed_tree_oid,
                     "last_review_output": rio::truncate_chars(exec_res.stdout.trim(), 12_000),
                     "updated_ts": now_sec(),
                 }),
             );
+            if saved_ok
+                && cand_first_ts <= 0.0
+                && !prev_markerless_sid.is_empty()
+                && prev_markerless_sid != actual_sid
+            {
+                if let Some(dp) =
+                    dispositions_state_path(&eff_session, &git_root, 0.0, &prev_markerless_sid)
+                {
+                    unlink_quiet(&dp);
+                }
+            }
         } else if is_timeout_continuation {
             remove_lane_thread_state(
                 &eff_session,
@@ -5505,7 +6701,7 @@ pub fn run_cli(args: &[String]) -> i32 {
     if args.is_empty() {
         let _ = writeln!(
             std::io::stderr(),
-            "usage: codex_lane <check|status|reset|breaker|scan|review|redesign-reset|research-reset> [args...]"
+            "usage: codex_lane <check|status|reset|breaker|scan|review|dispose|redesign-reset|research-reset> [args...]"
         );
         return 2;
     }
@@ -5669,6 +6865,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             let mut rargs = ReviewArgs {
                 cwd: String::new(),
                 summary: String::new(),
+                intent: String::new(),
                 diff_file: String::new(),
                 review_id: String::new(),
                 session: String::new(),
@@ -5705,9 +6902,12 @@ pub fn run_cli(args: &[String]) -> i32 {
                     continue;
                 }
 
+                let mut goal_alias = String::new();
                 let mut str_flags = [
                     ("--cwd", &mut rargs.cwd),
                     ("--summary", &mut rargs.summary),
+                    ("--intent", &mut rargs.intent),
+                    ("--goal", &mut goal_alias),
                     ("--diff-file", &mut rargs.diff_file),
                     ("--review-id", &mut rargs.review_id),
                     ("--session", &mut rargs.session),
@@ -5715,7 +6915,12 @@ pub fn run_cli(args: &[String]) -> i32 {
                     ("--resume", &mut rargs.resume),
                 ];
                 match parse_str_flag_table(rest, &mut i, tok, &mut str_flags) {
-                    Ok(true) => continue,
+                    Ok(true) => {
+                        if !goal_alias.is_empty() {
+                            rargs.intent = goal_alias;
+                        }
+                        continue;
+                    }
                     Ok(false) => {}
                     Err(e) => {
                         let _ = writeln!(std::io::stderr(), "{}", e);
@@ -5723,16 +6928,24 @@ pub fn run_cli(args: &[String]) -> i32 {
                     }
                 }
 
+                let mut goal_hex_alias = String::new();
                 let mut hex_flags = [
                     ("--cwd-hex", &mut rargs.cwd),
                     ("--summary-hex", &mut rargs.summary),
+                    ("--intent-hex", &mut rargs.intent),
+                    ("--goal-hex", &mut goal_hex_alias),
                     ("--diff-file-hex", &mut rargs.diff_file),
                     ("--session-hex", &mut rargs.session),
                     ("--model-hex", &mut rargs.model),
                     ("--resume-hex", &mut rargs.resume),
                 ];
                 match parse_hex_flag_table(rest, &mut i, tok, &mut hex_flags) {
-                    Ok(true) => continue,
+                    Ok(true) => {
+                        if !goal_hex_alias.is_empty() {
+                            rargs.intent = goal_hex_alias;
+                        }
+                        continue;
+                    }
                     Ok(false) => {}
                     Err(e) => {
                         let _ = writeln!(std::io::stderr(), "{}", e);
@@ -5784,6 +6997,77 @@ pub fn run_cli(args: &[String]) -> i32 {
                 return 2;
             }
             cmd_review(&rargs)
+        }
+        "dispose" => {
+            let mut dargs = DisposeArgs {
+                cwd: String::new(),
+                session: String::new(),
+                finding: String::new(),
+                category: String::new(),
+                reason: String::new(),
+                model: String::new(),
+                xhigh: false,
+                list: false,
+                clear: false,
+                pretty: false,
+            };
+            let mut i = 0usize;
+            while i < rest.len() {
+                let tok = &rest[i];
+                if tok == "--list" {
+                    dargs.list = true;
+                    i += 1;
+                    continue;
+                }
+                if tok == "--clear" {
+                    dargs.clear = true;
+                    i += 1;
+                    continue;
+                }
+                if tok == "--xhigh" {
+                    dargs.xhigh = true;
+                    i += 1;
+                    continue;
+                }
+                if tok == "--pretty" {
+                    dargs.pretty = true;
+                    i += 1;
+                    continue;
+                }
+                let mut str_flags = [
+                    ("--cwd", &mut dargs.cwd),
+                    ("--session", &mut dargs.session),
+                    ("--finding", &mut dargs.finding),
+                    ("--category", &mut dargs.category),
+                    ("--reason", &mut dargs.reason),
+                    ("--model", &mut dargs.model),
+                ];
+                match parse_str_flag_table(rest, &mut i, tok, &mut str_flags) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(e) => {
+                        let _ = writeln!(std::io::stderr(), "{}", e);
+                        return 2;
+                    }
+                }
+                let mut hex_flags = [
+                    ("--cwd-hex", &mut dargs.cwd),
+                    ("--session-hex", &mut dargs.session),
+                    ("--finding-hex", &mut dargs.finding),
+                    ("--reason-hex", &mut dargs.reason),
+                ];
+                match parse_hex_flag_table(rest, &mut i, tok, &mut hex_flags) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(e) => {
+                        let _ = writeln!(std::io::stderr(), "{}", e);
+                        return 2;
+                    }
+                }
+                let _ = writeln!(std::io::stderr(), "error: unrecognized arguments: {}", tok);
+                return 2;
+            }
+            cmd_dispose(&dargs)
         }
         "redesign-reset" | "research-reset" => {
             let mut rr = ResearchResetArgs {
@@ -5843,7 +7127,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         other => {
             let _ = writeln!(
                 std::io::stderr(),
-                "usage: codex_lane <check|status|reset|breaker|scan|review|redesign-reset|research-reset> (invalid choice: '{}')",
+                "usage: codex_lane <check|status|reset|breaker|scan|review|dispose|redesign-reset|research-reset> (invalid choice: '{}')",
                 other
             );
             2
@@ -7300,6 +8584,7 @@ exit 0
             failed_count: 0,
             latest_pass_ts: base_t + 0.5,
             latest_fail_ts: 0.0,
+            ..Default::default()
         };
         let sub_ord3 = crate::cwg_stop::SubagentEvidence::default();
         let rcp_high = cwg_common::parse_terminal_receipt("[gate] verified: HIGH; ok").unwrap();
@@ -9152,6 +10437,8 @@ exit 0
             review_id: "cwg-r1",
             packet_nonce: "111122223333",
             scope_summary: "Harden auth gate",
+            business_intent: "",
+            rejected_findings: &[],
             diff_text: "diff --git a/src/auth.rs b/src/auth.rs\n+check();\n",
             interdiff_text: "",
             prior_ledger: "",
@@ -9168,6 +10455,8 @@ exit 0
             review_id: "cwg-r2",
             packet_nonce: "444455556666",
             scope_summary: "Harden auth gate",
+            business_intent: "",
+            rejected_findings: &[],
             diff_text: "diff --git a/src/auth.rs b/src/auth.rs\n+check_strict();\n",
             interdiff_text: "diff --git a/src/auth.rs b/src/auth.rs\n-check();\n+check_strict();\n",
             prior_ledger: "- [HIGH] src/auth.rs:10 missing strict check\nVERDICT: REVISE",
@@ -9204,5 +10493,1054 @@ exit 0
             assert!(id_out.contains("tracked.rs") && id_out.contains("pub fn v() -> i32 { 3 }"));
             assert!(id_out.contains("new_untracked.rs") && id_out.contains("pub fn helper()"));
         }
+    }
+
+    #[test]
+    fn test_pragmatic_business_intent_review_conflict_scenarios_and_anti_boomerang() {
+        let _guard = crate::win32_sqlite::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = TempTestDir::new("codex-pragmatic-intent");
+        let home = tmp.0.join("carbon-home");
+        fs::create_dir_all(&home).unwrap();
+        let home_s = home.to_string_lossy().into_owned();
+        let _env = EnvVarGuard::set(&[("CARBON_STACK_HOME", Some(&home_s))]);
+
+        let scenarios = [
+            (
+                "external-ai-api",
+                "Build AI agent orchestrator calling external Gemini and OpenAI APIs with env API keys, retries, timeouts, and token budget caps.",
+                "diff --git a/src/llm.rs b/src/llm.rs\n+pub async fn call_remote_model() {}\n",
+            ),
+            (
+                "network-agent",
+                "Autonomous web-research agent with outbound HTTPS search and document fetching for live docs.",
+                "diff --git a/src/net_agent.rs b/src/net_agent.rs\n+pub async fn fetch_live_docs(url: &str) {}\n",
+            ),
+            (
+                "third-party-integration",
+                "Two-way CRM/webhook integration with Bitrix24 and Jira using HMAC signature validation and scoped tokens.",
+                "diff --git a/src/webhook.rs b/src/webhook.rs\n+pub fn sync_crm_event() {}\n",
+            ),
+            (
+                "prod-infra-ops",
+                "Production SRE diagnostics and controlled service restart CLI over SSH/Kubernetes with RBAC, dry-run, and audit log.",
+                "diff --git a/src/ops.rs b/src/ops.rs\n+pub fn restart_pod_with_audit() {}\n",
+            ),
+        ];
+        for (name, intent, diff) in scenarios {
+            let prompt = build_adversarial_prompt(PromptBuildSpec {
+                review_id: "cwg-prag",
+                packet_nonce: "aaaabbbbcccc",
+                scope_summary: name,
+                business_intent: intent,
+                rejected_findings: &[],
+                diff_text: diff,
+                interdiff_text: "",
+                prior_ledger: "",
+                phase: "ordinary",
+                round_num: 1,
+                is_resume: false,
+                is_timeout_resume: false,
+            });
+            assert!(
+                prompt.contains("Review protects the implementation of business requirements"),
+                "core pragmatic principle missing for {}",
+                name
+            );
+            assert!(prompt.contains(intent), "business intent missing for {}", name);
+            assert!(prompt.contains("CLASS A") && prompt.contains("CLASS B") && prompt.contains("CLASS C") && prompt.contains("CLASS D"));
+            assert!(prompt.contains("PRESERVES_INTENT: YES"));
+            assert!(prompt.contains("Synthetic 'adversarial puzzles'"));
+            assert!(prompt.contains("replacing the proof mechanism structurally"));
+            assert!(prompt.contains("NEVER demand blocking internet access, forcing local-only models, disabling requested integrations, or removing production operations"));
+        }
+
+        let repo = tmp.0.join("repo");
+        fs::create_dir_all(repo.join(".agents")).unwrap();
+        let repo_s = repo.to_string_lossy().into_owned();
+        let sess = "prag-sess-1";
+        let mpath = cwg_common::marker_path(&rio::safe_key(sess, "default"));
+        rio::write_json(
+            &mpath,
+            &json!({
+                "session": sess,
+                "cwd": repo_s,
+                "first_ts": 5000.0,
+                "last_durable_ts": 5005.0,
+                "edits": 1,
+                "paths": [repo.join("src/llm.rs").to_string_lossy()],
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            run_cli(&[
+                "dispose".to_string(),
+                "--session".to_string(),
+                sess.to_string(),
+                "--cwd".to_string(),
+                repo_s.clone(),
+                "--finding".to_string(),
+                "Switch to local-only LLM".to_string(),
+                "--category".to_string(),
+                "invalid-cat".to_string(),
+                "--reason".to_string(),
+                "Destroys core requirement".to_string(),
+            ]),
+            2
+        );
+        assert_eq!(
+            run_cli(&[
+                "dispose".to_string(),
+                "--session".to_string(),
+                sess.to_string(),
+                "--cwd".to_string(),
+                repo_s.clone(),
+                "--finding".to_string(),
+                "Switch to local-only LLM and block outbound internet".to_string(),
+                "--category".to_string(),
+                "intent-conflict".to_string(),
+                "--reason".to_string(),
+                "User explicitly requested external Gemini/OpenAI APIs; proportional TLS, scoped env key, and timeout safeguards are implemented.".to_string(),
+            ]),
+            0
+        );
+        let active_disp = load_active_dispositions(sess, &repo_s, 5000.0, 0.0, "", false);
+        assert_eq!(active_disp.len(), 1);
+        assert_eq!(active_disp[0]["category"], "intent-conflict");
+
+        let p_r2 = build_adversarial_prompt(PromptBuildSpec {
+            review_id: "cwg-prag-r2",
+            packet_nonce: "ddddeeeeffff",
+            scope_summary: "Fix timeout handling",
+            business_intent: "External AI API orchestrator",
+            rejected_findings: &active_disp,
+            diff_text: "",
+            interdiff_text: "diff --git a/src/llm.rs b/src/llm.rs\n+timeout(30);\n",
+            prior_ledger: "- [HIGH] Switch to local-only LLM\nVERDICT: REVISE",
+            phase: "ordinary",
+            round_num: 2,
+            is_resume: true,
+            is_timeout_resume: false,
+        });
+        assert!(p_r2.contains("ANTI-BOOMERANG LEDGER — DO NOT RE-RAISE"));
+        assert!(p_r2.contains("[intent-conflict] Switch to local-only LLM and block outbound internet"));
+        assert!(p_r2.contains("SETTLED_BY_DISPOSITION"));
+
+        // Isolate across candidate timestamps, reset epochs, and closed->markerless transitions.
+        assert!(load_active_dispositions(sess, &repo_s, 6000.0, 0.0, "", false).is_empty());
+        assert!(load_active_dispositions(sess, &repo_s, 5000.0, 5500.0, "", false).is_empty());
+        assert!(load_active_dispositions(sess, &repo_s, 0.0, 0.0, "thread-a", false).is_empty());
+
+        // Markerless disposition binds strictly to its review thread (including Astra `--xhigh`) and Sol/Astra threads never overwrite or unlink each other.
+        let sol_model = resolve_review_model("", false);
+        let astra_model = resolve_review_model("", true);
+        assert!(save_lane_thread_state(
+            sess,
+            &repo_s,
+            0.0,
+            &astra_model,
+            "xhigh",
+            json!({
+                "session_id": "thread-astra-1",
+                "candidate_first_ts": 0.0,
+                "model": astra_model,
+                "effort": "xhigh",
+                "updated_ts": now_sec(),
+            }),
+        ));
+        assert_eq!(
+            active_markerless_thread_sid(sess, &repo_s, "", false),
+            "thread-astra-1"
+        );
+        assert_eq!(
+            active_markerless_thread_sid(sess, &repo_s, "", true),
+            "thread-astra-1"
+        );
+        assert!(save_lane_thread_state(
+            sess,
+            &repo_s,
+            0.0,
+            &sol_model,
+            "high",
+            json!({
+                "session_id": "thread-sol-1",
+                "candidate_first_ts": 0.0,
+                "model": sol_model,
+                "effort": "high",
+                "updated_ts": now_sec(),
+            }),
+        ));
+        assert_eq!(
+            active_markerless_thread_sid(sess, &repo_s, "", false),
+            "thread-sol-1"
+        );
+        assert_eq!(
+            active_markerless_thread_sid(sess, &repo_s, "", true),
+            "thread-astra-1"
+        );
+        let p_sol = dispositions_state_path(sess, &repo_s, 0.0, "thread-sol-1").unwrap();
+        let p_astra = dispositions_state_path(sess, &repo_s, 0.0, "thread-astra-1").unwrap();
+        assert_ne!(p_sol, p_astra, "Sol and Astra markerless threads must use distinct disposition files");
+        let _ = fs::remove_file(&mpath);
+        assert_eq!(
+            run_cli(&[
+                "dispose".to_string(),
+                "--session".to_string(),
+                sess.to_string(),
+                "--cwd".to_string(),
+                repo_s.clone(),
+                "--finding".to_string(),
+                "Sol-only settled item".to_string(),
+                "--category".to_string(),
+                "accepted-risk".to_string(),
+                "--reason".to_string(),
+                "Scoped to Sol thread".to_string(),
+            ]),
+            0
+        );
+        assert_eq!(
+            run_cli(&[
+                "dispose".to_string(),
+                "--session".to_string(),
+                sess.to_string(),
+                "--cwd".to_string(),
+                repo_s.clone(),
+                "--xhigh".to_string(),
+                "--finding".to_string(),
+                "Astra-only settled item".to_string(),
+                "--category".to_string(),
+                "intent-conflict".to_string(),
+                "--reason".to_string(),
+                "Scoped to Astra thread".to_string(),
+            ]),
+            0
+        );
+        let sol_items = load_active_dispositions(sess, &repo_s, 0.0, 0.0, "thread-sol-1", false);
+        let astra_items = load_active_dispositions(sess, &repo_s, 0.0, 0.0, "thread-astra-1", false);
+        assert_eq!(sol_items.len(), 1);
+        assert_eq!(sol_items[0]["finding"], "Sol-only settled item");
+        assert_eq!(astra_items.len(), 1);
+        assert_eq!(astra_items[0]["finding"], "Astra-only settled item");
+        assert_eq!(
+            run_cli(&[
+                "dispose".to_string(),
+                "--session".to_string(),
+                sess.to_string(),
+                "--cwd".to_string(),
+                repo_s.clone(),
+                "--clear".to_string(),
+            ]),
+            0
+        );
+        assert!(load_active_dispositions(sess, &repo_s, 0.0, 0.0, "thread-sol-1", false).is_empty());
+        assert_eq!(
+            load_active_dispositions(sess, &repo_s, 0.0, 0.0, "thread-astra-1", false).len(),
+            1,
+            "clearing Sol markerless dispositions must NOT wipe Astra's active thread dispositions"
+        );
+        assert!(load_active_dispositions(sess, &repo_s, 0.0, 0.0, "thread-b", false).is_empty());
+        assert!(load_active_dispositions(sess, &repo_s, 0.0, 0.0, "thread-astra-1", true).is_empty());
+        assert!(load_active_dispositions(sess, &repo_s, 0.0, 0.0, "", true).is_empty());
+        rio::write_json(
+            &mpath,
+            &json!({
+                "session": sess,
+                "cwd": repo_s,
+                "first_ts": 5000.0,
+                "last_durable_ts": 5005.0,
+                "edits": 1,
+                "paths": [repo.join("src/llm.rs").to_string_lossy()],
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            load_active_dispositions(sess, &repo_s, 5000.0, 0.0, "thread-astra-1", false).len(),
+            1
+        );
+
+        assert_eq!(
+            crate::cwg_mark::classify_shell_command(
+                "$null | carbon-stack.exe codex-lane dispose --session s --cwd . --finding \"x; y\" --category intent-conflict --reason \"keeps feature\""
+            ),
+            "BOOKKEEPING"
+        );
+        assert!(REVIEW_VAL_FLAGS.contains(&"--intent") && REVIEW_VAL_FLAGS.contains(&"--goal"));
+
+        assert_eq!(
+            run_cli(&[
+                "dispose".to_string(),
+                "--session".to_string(),
+                sess.to_string(),
+                "--cwd".to_string(),
+                repo_s.clone(),
+                "--clear".to_string(),
+            ]),
+            0
+        );
+        assert!(load_active_dispositions(sess, &repo_s, 5000.0, 0.0, "", false).is_empty());
+
+        // Secret redaction (incl. pathless `?code=...` URLs and multi-pair `Cookie:` headers) + operational follow-up filtering + partial handoff isolation.
+        let brain = tmp.0.join("brain");
+        let brain_s = brain.to_string_lossy().into_owned();
+        let _b_env = EnvVarGuard::set(&[("ANTIGRAVITY_BRAIN_ROOT", Some(brain_s.as_str()))]);
+        let tp = rio::member_transcript_path(&brain, sess);
+        fs::create_dir_all(tp.parent().unwrap()).unwrap();
+        let tr_lines = [
+            json!({
+                "type": "USER_INPUT",
+                "created_at": "1970-01-01T01:23:10Z",
+                "content": "<USER_REQUEST>Build Bitrix24 sync using webhook https://crm.example.com/custom-inbound/s3cr3t-route-99 and callback https://oauth.example.com?code=oauth_code_999 and IPv6 [https://[2001:db8::1]:8443/callback?code=ipv6_secret_99] and [hook](https://[2001:db8::1]:8443/hook(team's)/paren_secret_55) and 'https://[2001:db8::1]:8443/hook(team's)/sq_secret_43' and 'https://crm.example.com/v1/key_44' and https://api.example.com/items(a='1',b='odata_secret_45')/run?sig=xyz!$&*+,;= and https://[fe80::1%25eth0]?token=ipv6_tok_88 and https://admin:ipv6pass@[::1]:9443/cb?k=ipv6_k77 and Cookie: a=1; session=secret_cookie_222; theme=dark\nAlso X-API-Key: dev-1234 and Bearer eyJhbGciOiJIUzI1NiJ9.payload1234567890.sig1234567890 and sk-proj-supersecretkey1234567890</USER_REQUEST>"
+            }),
+            json!({
+                "type": "USER_INPUT",
+                "created_at": "1970-01-01T01:24:00Z",
+                "content": "Добавь ретраи вебхуков с экспоненциальным backoff и таймаутом 15s"
+            }),
+            json!({
+                "type": "USER_INPUT",
+                "created_at": "1970-01-01T01:25:00Z",
+                "content": "Запусти тесты и заверши задачу"
+            }),
+        ]
+        .iter()
+        .map(|v| serde_json::to_string(v).unwrap())
+        .collect::<Vec<String>>()
+        .join("\n");
+        fs::write(&tp, tr_lines).unwrap();
+
+        // Same-session stale handoff (even after partial `--remaining` touch!) must NOT rebind old goal to new candidate, and stale prior-candidate decisions must NOT leak when `--goal` switches candidates.
+        rio::write_json(
+            &repo.join(".agents").join("handoff.json"),
+            &json!({
+                "status": "completed",
+                "session": sess,
+                "candidate_first_ts": 1000.0,
+                "goal_updated_ts": 1000.0,
+                "goal": "Earlier task in same session",
+                "decisions": ["Use local-only models without internet"],
+                "superseded": ["Old obsolete constraint"],
+                "remaining": ["Stale leftover item"],
+                "updated_ts": 5005.0
+            }),
+        )
+        .unwrap();
+        let from_tr = resolve_business_intent("", sess, &repo_s, 5000.0, None);
+        assert!(!from_tr.contains("Earlier task in same session"), "{}", from_tr);
+        assert!(!from_tr.contains("Запусти тесты"), "{}", from_tr);
+        assert!(!from_tr.contains("s3cr3t-route-99"), "arbitrary webhook path leaked: {}", from_tr);
+        assert!(!from_tr.contains("oauth_code_999"), "pathless URL ?code query leaked: {}", from_tr);
+        assert!(!from_tr.contains("ipv6_secret_99"), "bracketed IPv6 URL path/query leaked: {}", from_tr);
+        assert!(!from_tr.contains("paren_secret_55"), "URL path containing parens+apostrophe leaked: {}", from_tr);
+        assert!(!from_tr.contains("sq_secret_43"), "single-quoted URL with apostrophe leaked: {}", from_tr);
+        assert!(!from_tr.contains("key_44"), "single-quoted URL path leaked: {}", from_tr);
+        assert!(!from_tr.contains("odata_secret_45"), "OData/sub-delim URL path/query leaked: {}", from_tr);
+        assert!(!from_tr.contains("ipv6pass"), "bracketed IPv6 userinfo leaked: {}", from_tr);
+        assert!(!from_tr.contains("ipv6_k77"), "bracketed IPv6 userinfo query leaked: {}", from_tr);
+        assert!(!from_tr.contains("ipv6_tok_88"), "bracketed IPv6 zone-id query leaked: {}", from_tr);
+        assert!(!from_tr.contains("secret_cookie_222"), "second Cookie pair leaked: {}", from_tr);
+        assert!(!from_tr.contains("dev-1234"), "short X-API-Key leaked: {}", from_tr);
+        assert!(!from_tr.contains("sk-proj-supersecretkey"), "api key leaked: {}", from_tr);
+        assert!(!from_tr.contains("eyJhbGciOiJIUzI1NiJ9"), "bearer leaked: {}", from_tr);
+        assert!(from_tr.contains("https://crm.example.com/[REDACTED:url]"), "{}", from_tr);
+        assert!(from_tr.contains("https://oauth.example.com/[REDACTED:url]"), "{}", from_tr);
+        assert!(from_tr.contains("[https://[2001:db8::1]:8443/[REDACTED:url]]"), "{}", from_tr);
+        assert!(from_tr.contains("[hook](https://[2001:db8::1]:8443/[REDACTED:url])"), "{}", from_tr);
+        assert!(from_tr.contains("'https://[2001:db8::1]:8443/[REDACTED:url]'"), "{}", from_tr);
+        assert!(from_tr.contains("'https://crm.example.com/[REDACTED:url]'"), "{}", from_tr);
+        assert!(from_tr.contains("https://api.example.com/[REDACTED:url]"), "{}", from_tr);
+        assert!(from_tr.contains("https://[fe80::1%25eth0]/[REDACTED:url]"), "{}", from_tr);
+        let sq_odata = crate::carbon_memory::sanitize_external_charter(
+            "Check 'https://api.example.com/items(a='1',b='sq_odata_47')' done",
+        );
+        assert!(
+            !sq_odata.contains("sq_odata_47")
+                && sq_odata.contains("'https://api.example.com/[REDACTED:url]'"),
+            "single-quoted OData URL with inner quotes inside parens leaked: {}",
+            sq_odata
+        );
+        let mention_after_url = crate::carbon_memory::sanitize_external_charter(
+            "See [https://example.com]@alice and (https://example.com)@bob",
+        );
+        assert_eq!(
+            mention_after_url,
+            "See [https://example.com]@alice and (https://example.com)@bob",
+            "enclosing delimiters before @mention must not corrupt authority into userinfo: {}",
+            mention_after_url
+        );
+
+        // Round 1 #1: Single-quoted URL with internal apostrophe before URI punctuation (`-`, `/`, `?`, `)-`) must NOT leak suffix.
+        let sq_dash = crate::carbon_memory::sanitize_external_charter(
+            "Check 'https://example.invalid/v1/o'-canary-value' and 'https://example.invalid/v1/o'/secret_slash' and 'https://example.invalid/v1/o'?token=sq_q_99' and 'https://example.invalid/v1/o')-tail_99' and ('https://crm.example.com/v1/ok_1'), done",
+        );
+        assert!(
+            !sq_dash.contains("canary-value")
+                && !sq_dash.contains("secret_slash")
+                && !sq_dash.contains("sq_q_99")
+                && !sq_dash.contains("tail_99")
+                && !sq_dash.contains("ok_1")
+                && sq_dash.contains("'https://example.invalid/[REDACTED:url]'")
+                && sq_dash.contains("('https://crm.example.com/[REDACTED:url]'), done"),
+            "single-quoted URL with internal apostrophe before RFC 3986 punctuation leaked: {}",
+            sq_dash
+        );
+
+        // Round 1 #2: Multiline USER_INPUT with `SERVICE_CREDENTIAL=synthetic_value` on its own line must strip the credential line before collapsing newlines.
+        let cred_sess = "prag-cred-multiline-sess";
+        let cred_tp = rio::member_transcript_path(&brain, cred_sess);
+        fs::create_dir_all(cred_tp.parent().unwrap()).unwrap();
+        let cred_line = json!({
+            "type": "USER_INPUT",
+            "created_at": "1970-01-01T01:23:10Z",
+            "content": "<USER_REQUEST>Build external CRM sync\nSERVICE_CREDENTIAL=synthetic_value\nKeep retry backoff</USER_REQUEST>"
+        });
+        fs::write(&cred_tp, format!("{}\n", serde_json::to_string(&cred_line).unwrap())).unwrap();
+        let cred_intent = resolve_business_intent("", cred_sess, &repo_s, 0.0, None);
+        assert!(
+            !cred_intent.contains("synthetic_value")
+                && !cred_intent.contains("SERVICE_CREDENTIAL")
+                && cred_intent.contains("Build external CRM sync")
+                && cred_intent.contains("Keep retry backoff"),
+            "multiline USER_INPUT must preserve newlines until raw credential line redaction finishes: {}",
+            cred_intent
+        );
+        assert!(from_tr.contains("Build Bitrix24 sync"), "{}", from_tr);
+        assert!(from_tr.contains("backoff"), "{}", from_tr);
+
+        // Verify `continuity handoff --remaining` preserves old `candidate_first_ts` & `goal_updated_ts` instead of rebinding to active marker `5000.0`.
+        assert_eq!(
+            crate::continuity_hook::run_cli(&[
+                "handoff".to_string(),
+                "--cwd".to_string(),
+                repo_s.clone(),
+                "--session".to_string(),
+                sess.to_string(),
+                "--remaining".to_string(),
+                "Verify logs".to_string(),
+                "--mirror-workspace".to_string(),
+            ]),
+            0
+        );
+        let ho_after_rem = rio::read_json(&repo.join(".agents").join("handoff.json")).unwrap();
+        assert_eq!(
+            val_to_f64(ho_after_rem.get("candidate_first_ts")),
+            1000.0,
+            "partial handoff --remaining must keep old goal's candidate_first_ts, not rebind to 5000.0"
+        );
+        let from_tr_after_rem = resolve_business_intent("", sess, &repo_s, 5000.0, None);
+        assert!(
+            !from_tr_after_rem.contains("Earlier task in same session"),
+            "partial handoff update must not let stale goal hijack new candidate: {}",
+            from_tr_after_rem
+        );
+
+        // Updating `--goal` via `continuity handoff` without `--replace` on a new candidate rebinds `candidate_first_ts` to `5000.0` AND drops stale prior-candidate decisions/superseded/remaining/status.
+        assert_eq!(
+            crate::continuity_hook::run_cli(&[
+                "handoff".to_string(),
+                "--cwd".to_string(),
+                repo_s.clone(),
+                "--session".to_string(),
+                sess.to_string(),
+                "--goal".to_string(),
+                "Deliver Bitrix24 webhook sync with HMAC verification".to_string(),
+                "--decision".to_string(),
+                "Use outbound HTTPS to Bitrix24 REST API".to_string(),
+                "--decision".to_string(),
+                "Keep secrets in env".to_string(),
+                "--mirror-workspace".to_string(),
+            ]),
+            0
+        );
+        let ho_after_goal = rio::read_json(&repo.join(".agents").join("handoff.json")).unwrap();
+        assert_eq!(
+            val_to_f64(ho_after_goal.get("candidate_first_ts")),
+            5000.0,
+            "explicit --goal update must bind candidate_first_ts to live candidate 5000.0"
+        );
+        assert_eq!(
+            ho_after_goal.get("status").and_then(Value::as_str),
+            Some("in_progress"),
+            "switching candidate with --goal must reset stale completed status"
+        );
+        let ho_decs = ho_after_goal
+            .get("decisions")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !ho_decs.iter().any(|v| v.as_str().unwrap_or("").contains("local-only")),
+            "stale prior-candidate decision must NOT leak into new candidate handoff: {:?}",
+            ho_decs
+        );
+        assert!(
+            ho_after_goal
+                .get("superseded")
+                .and_then(Value::as_array)
+                .is_some_and(|a| a.is_empty()),
+            "stale superseded items must be cleared on candidate switch"
+        );
+        assert!(
+            ho_after_goal
+                .get("remaining")
+                .and_then(Value::as_array)
+                .is_some_and(|a| a.is_empty()),
+            "stale remaining items must be cleared on candidate switch"
+        );
+        let from_ho = resolve_business_intent("", sess, &repo_s, 5000.0, None);
+        assert!(from_ho.contains("Deliver Bitrix24 webhook sync"), "{}", from_ho);
+        assert!(from_ho.contains("Use outbound HTTPS to Bitrix24 REST API"), "{}", from_ho);
+        assert!(!from_ho.contains("local-only"), "stale prior decision leaked into charter: {}", from_ho);
+
+        // #2: Markerless tasks in the same session (no active candidate marker -> both candidate_first_ts == 0.0):
+        // same-task `--decision` preserves prior decisions, whereas switching `--goal` advances `goal_generation` and drops stale prior decisions.
+        let ml_sess = "prag-markerless-sess";
+        let ml_repo = tmp.0.join("ml-repo");
+        fs::create_dir_all(&ml_repo).unwrap();
+        let ml_repo_s = ml_repo.to_string_lossy().into_owned();
+        assert_eq!(
+            crate::continuity_hook::run_cli(&[
+                "handoff".to_string(),
+                "--cwd".to_string(),
+                ml_repo_s.clone(),
+                "--session".to_string(),
+                ml_sess.to_string(),
+                "--goal".to_string(),
+                "Task 1: Build offline CLI tool".to_string(),
+                "--decision".to_string(),
+                "Local-only offline execution".to_string(),
+                "--mirror-workspace".to_string(),
+            ]),
+            0
+        );
+        assert_eq!(
+            crate::continuity_hook::run_cli(&[
+                "handoff".to_string(),
+                "--cwd".to_string(),
+                ml_repo_s.clone(),
+                "--session".to_string(),
+                ml_sess.to_string(),
+                "--decision".to_string(),
+                "Use JSON stdout".to_string(),
+                "--mirror-workspace".to_string(),
+            ]),
+            0
+        );
+        let ml_ho1 = rio::read_json(&ml_repo.join(".agents").join("handoff.json")).unwrap();
+        let ml_decs1: Vec<String> = ml_ho1["decisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        assert_eq!(ml_decs1.len(), 2, "same-task markerless update must keep existing decisions: {:?}", ml_decs1);
+        assert_eq!(ml_ho1.get("goal_generation").and_then(Value::as_u64), Some(1));
+
+        // Persist a markerless review thread under Task 1 (`goal_generation == 1`) and verify it matches Task 1,
+        // then becomes invalid IMMEDIATELY once Task 2 bumps `goal_generation` to 2 (even within the 1h TTL).
+        assert!(save_lane_thread_state(
+            ml_sess,
+            &ml_repo_s,
+            0.0,
+            cwg_common::CODEX_SOL_MODEL,
+            "high",
+            json!({
+                "session_id": "ml-thread-task1",
+                "last_review_id": "cwg-ml-1",
+                "business_intent": "Goal: Task 1: Build offline CLI tool\nAccepted architecture/decisions: Local-only offline execution; Use JSON stdout",
+                "updated_ts": now_sec(),
+            }),
+        ));
+        let ml_saved_t1 = active_thread_state_for_lane(
+            ml_sess,
+            &ml_repo_s,
+            Some(0.0),
+            cwg_common::CODEX_SOL_MODEL,
+            "high",
+        );
+        assert!(ml_saved_t1.is_some(), "same goal_generation markerless thread must match Task 1");
+        assert_eq!(
+            ml_saved_t1
+                .as_ref()
+                .and_then(|m| m.get("handoff_goal_generation"))
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        let ml_intent_t1 =
+            resolve_business_intent("", ml_sess, &ml_repo_s, 0.0, ml_saved_t1.as_ref());
+        assert!(ml_intent_t1.contains("Task 1: Build offline CLI tool"), "{}", ml_intent_t1);
+
+        assert_eq!(
+            crate::continuity_hook::run_cli(&[
+                "handoff".to_string(),
+                "--cwd".to_string(),
+                ml_repo_s.clone(),
+                "--session".to_string(),
+                ml_sess.to_string(),
+                "--goal".to_string(),
+                "Task 2: Integrate external OpenAI API".to_string(),
+                "--mirror-workspace".to_string(),
+            ]),
+            0
+        );
+        let ml_ho2 = rio::read_json(&ml_repo.join(".agents").join("handoff.json")).unwrap();
+        assert_eq!(ml_ho2.get("goal_generation").and_then(Value::as_u64), Some(2));
+        assert!(
+            ml_ho2["decisions"].as_array().is_some_and(|a| a.is_empty()),
+            "markerless task switch via new --goal must drop prior decisions: {:?}",
+            ml_ho2
+        );
+        assert!(
+            active_thread_state_for_lane(
+                ml_sess,
+                &ml_repo_s,
+                Some(0.0),
+                cwg_common::CODEX_SOL_MODEL,
+                "high",
+            )
+            .is_none(),
+            "bumping goal_generation in markerless mode must invalidate Task 1's saved lane thread"
+        );
+        assert!(
+            active_thread_state(ml_sess, &ml_repo_s, Some(0.0)).is_none(),
+            "bumping goal_generation in markerless mode must invalidate Task 1's active_thread_state"
+        );
+        let ml_intent_t2 =
+            resolve_business_intent("", ml_sess, &ml_repo_s, 0.0, ml_saved_t1.as_ref());
+        assert!(
+            ml_intent_t2.contains("Task 2: Integrate external OpenAI API")
+                && !ml_intent_t2.contains("Local-only"),
+            "resolve_business_intent must ignore stale saved thread charter after goal_generation bump: {}",
+            ml_intent_t2
+        );
+
+        // Round 1 #3: Stale markerless review launched under Goal A (`goal_generation=1`) must NOT persist under Goal B (`goal_generation=2`) if Goal B was recorded while Codex ran.
+        assert!(
+            !save_lane_thread_state(
+                ml_sess,
+                &ml_repo_s,
+                0.0,
+                cwg_common::CODEX_SOL_MODEL,
+                "high",
+                json!({
+                    "session_id": "ml-thread-task1-stale",
+                    "last_review_id": "cwg-ml-stale",
+                    "handoff_goal_generation": 1,
+                    "handoff_goal_updated_ts": val_to_f64(ml_ho1.get("goal_updated_ts")),
+                    "business_intent": "Goal: Task 1: Build offline CLI tool",
+                    "updated_ts": now_sec(),
+                }),
+            ),
+            "save_lane_thread_state must refuse to persist a Goal A thread after markerless handoff advanced to Goal B"
+        );
+        assert!(
+            active_thread_state_for_lane(
+                ml_sess,
+                &ml_repo_s,
+                Some(0.0),
+                cwg_common::CODEX_SOL_MODEL,
+                "high",
+            )
+            .is_none(),
+            "aborted Goal A save must not become active thread for Goal B"
+        );
+
+        // Round 1 #4: Failed `--new-session` in markerless mode must preserve the existing active thread AND its Anti-Boomerang disposition registry.
+        assert!(save_lane_thread_state(
+            ml_sess,
+            &ml_repo_s,
+            0.0,
+            cwg_common::CODEX_SOL_MODEL,
+            "high",
+            json!({
+                "session_id": "ml-thread-task2",
+                "last_review_id": "cwg-ml-2",
+                "handoff_goal_generation": 2,
+                "handoff_goal_updated_ts": val_to_f64(ml_ho2.get("goal_updated_ts")),
+                "business_intent": "Goal: Task 2: Integrate external OpenAI API",
+                "updated_ts": now_sec(),
+            }),
+        ));
+        assert_eq!(
+            run_cli(&[
+                "dispose".to_string(),
+                "--cwd".to_string(),
+                ml_repo_s.clone(),
+                "--session".to_string(),
+                ml_sess.to_string(),
+                "--category".to_string(),
+                "intent-conflict".to_string(),
+                "--finding".to_string(),
+                "Block external OpenAI calls".to_string(),
+                "--reason".to_string(),
+                "Task 2 explicitly requires external OpenAI API".to_string(),
+            ]),
+            0
+        );
+        let fail_codex = tmp.0.join("fake-codex-netfail.cmd");
+        fs::write(
+            &fail_codex,
+            "@echo off\r\nif \"%1\"==\"login\" (\r\n  echo Logged in using ChatGPT\r\n  exit /b 0\r\n)\r\necho stream disconnected: network error 1>&2\r\nexit /b 1\r\n",
+        )
+        .unwrap();
+        let fail_codex_s = fail_codex.to_string_lossy().into_owned();
+        let diff_stub = tmp.0.join("stub.diff");
+        fs::write(&diff_stub, "diff --git a/a.rs b/a.rs\n+fn f() {}\n").unwrap();
+        {
+            let _codex_env = EnvVarGuard::set(&[("CARBON_CODEX_BIN", Some(fail_codex_s.as_str()))]);
+            let rc_fail = run_cli(&[
+                "review".to_string(),
+                "--cwd".to_string(),
+                ml_repo_s.clone(),
+                "--session".to_string(),
+                ml_sess.to_string(),
+                "--new-session".to_string(),
+                "--diff-file".to_string(),
+                diff_stub.to_string_lossy().into_owned(),
+            ]);
+            assert_ne!(rc_fail, 0, "mock failing --new-session review must fail");
+        }
+        let preserved_disps =
+            load_active_dispositions(ml_sess, &ml_repo_s, 0.0, 0.0, "ml-thread-task2", false);
+        assert_eq!(
+            preserved_disps.len(),
+            1,
+            "failed --new-session must preserve existing markerless thread's Anti-Boomerang dispositions: {:?}",
+            preserved_disps
+        );
+
+        // Round 2/3 #1: Single-quoted URLs with internal apostrophe + punctuation runs (`'..canary-value'`, `''canary`, `',canary'`, and ambiguous unspaced `','https://canary-secret.invalid/next'`) must fail closed without leaking trailing secrets or embedded hosts, while spaced single-quoted lists redact each URL cleanly.
+        let r2_sq_punct = crate::carbon_memory::sanitize_external_charter(
+            "Use 'https://example.invalid/v1/o'..canary-value', 'https://example.invalid/v1/o''canary-two', 'https://example.invalid/v1/o',canary-three', 'https://example.invalid/callback?state=left','https://canary-secret.invalid/next', and ['https://a.invalid/s1', 'https://b.invalid/s2'].",
+        );
+        assert!(
+            !r2_sq_punct.contains("canary-value")
+                && !r2_sq_punct.contains("canary-two")
+                && !r2_sq_punct.contains("canary-three")
+                && !r2_sq_punct.contains("canary-secret.invalid")
+                && !r2_sq_punct.contains("next")
+                && !r2_sq_punct.contains("s1")
+                && !r2_sq_punct.contains("s2")
+                && r2_sq_punct.contains("'https://example.invalid/[REDACTED:url]'")
+                && r2_sq_punct.contains("['https://a.invalid/[REDACTED:url]', 'https://b.invalid/[REDACTED:url]']"),
+            "single-quoted URL with apostrophe/embedded-URL continuation must fail closed without leaking host or suffix: {}",
+            r2_sq_punct
+        );
+
+        // Round 2/3 #3: Unified launch epoch binds thread lookup & persistence to ONE coherent `(goal_generation, goal_updated_ts)` snapshot; timeout retry omits `--resume` on `StaleGoalEpoch` (while preserving `--resume` on genuine I/O failure), and explicit `--resume` from an earlier goal generation is rejected fail-closed.
+        let ml_ho2_ts = val_to_f64(ml_ho2.get("goal_updated_ts"));
+        assert!(
+            active_thread_state_for_lane_with_epoch(
+                ml_sess,
+                &ml_repo_s,
+                0.0,
+                cwg_common::CODEX_SOL_MODEL,
+                "high",
+                2,
+                ml_ho2_ts,
+            )
+            .is_some(),
+            "active_thread_state_for_lane_with_epoch must match Goal 2 thread under Goal 2 epoch"
+        );
+        assert!(
+            active_thread_state_for_lane_with_epoch(
+                ml_sess,
+                &ml_repo_s,
+                0.0,
+                cwg_common::CODEX_SOL_MODEL,
+                "high",
+                3,
+                ml_ho2_ts + 5.0,
+            )
+            .is_none(),
+            "active_thread_state_for_lane_with_epoch must reject Goal 2 thread under Goal 3 epoch"
+        );
+        assert_eq!(
+            crate::continuity_hook::run_cli(&[
+                "handoff".to_string(),
+                "--cwd".to_string(),
+                ml_repo_s.clone(),
+                "--session".to_string(),
+                ml_sess.to_string(),
+                "--goal".to_string(),
+                "Task 3: Stream telemetry over gRPC".to_string(),
+                "--mirror-workspace".to_string(),
+            ]),
+            0
+        );
+        assert_eq!(
+            save_lane_thread_state_with_outcome(
+                ml_sess,
+                &ml_repo_s,
+                0.0,
+                cwg_common::CODEX_SOL_MODEL,
+                "high",
+                json!({
+                    "session_id": "ml-thread-task2",
+                    "last_review_id": "cwg-ml-2-to",
+                    "handoff_goal_generation": 2,
+                    "handoff_goal_updated_ts": ml_ho2_ts,
+                    "pending_timeout_resume": true,
+                    "updated_ts": now_sec(),
+                }),
+            ),
+            ThreadSaveOutcome::StaleGoalEpoch,
+            "Goal 2 timeout save after Goal 3 switch must return StaleGoalEpoch"
+        );
+        let stale_to_payload = build_thinking_timeout_payload_with_epoch(
+            "cwg-ml-2-to",
+            600,
+            600,
+            "carbon-stack codex-lane review",
+            "ml-thread-task2",
+            false,
+            true,
+        );
+        assert!(
+            !val_to_str(stale_to_payload.get("retry_command")).contains("--resume"),
+            "timeout retry_command on StaleGoalEpoch must NOT append --resume: {:?}",
+            stale_to_payload
+        );
+        assert_eq!(
+            stale_to_payload.get("goal_epoch_changed"),
+            Some(&Value::Bool(true))
+        );
+        let io_fail_to_payload = build_thinking_timeout_payload_with_epoch(
+            "cwg-ml-2-io",
+            600,
+            600,
+            "carbon-stack codex-lane review",
+            "ml-thread-task2",
+            false,
+            false,
+        );
+        assert!(
+            val_to_str(io_fail_to_payload.get("retry_command")).contains("--resume ml-thread-task2"),
+            "genuine I/O persistence failure within same goal epoch must retain --resume: {:?}",
+            io_fail_to_payload
+        );
+        assert_eq!(
+            resolve_resume_session_with_saved(
+                ResumeSessionQuery {
+                    git_root: &ml_repo_s,
+                    session: ml_sess,
+                    candidate_first_ts: 0.0,
+                    explicit_resume: "ml-thread-task2",
+                    force_new: false,
+                    model: cwg_common::CODEX_SOL_MODEL,
+                    effort: "high",
+                },
+                None,
+            ),
+            "",
+            "explicit --resume of Goal 2 thread under Goal 3 must be rejected by resolve_resume_session_with_saved"
+        );
+        let r2_mock_bin = write_mock_codex_bin(&tmp.0);
+        let r2_sess_dir = tmp.0.join("r2-codex-sessions");
+        fs::create_dir_all(&r2_sess_dir).unwrap();
+        let r2_inv_log = tmp.0.join("r2-mock-invocations.log");
+        {
+            let _codex_env = EnvVarGuard::set(&[
+                ("CARBON_CODEX_BIN", Some(&r2_mock_bin.to_string_lossy())),
+                ("CARBON_CODEX_SESSIONS_DIR", Some(&r2_sess_dir.to_string_lossy())),
+                ("MOCK_CODEX_LOG", Some(&r2_inv_log.to_string_lossy())),
+            ]);
+            reset_breaker();
+            let rc_stale_resume = run_cli(&[
+                "review".to_string(),
+                "--cwd".to_string(),
+                ml_repo_s.clone(),
+                "--session".to_string(),
+                ml_sess.to_string(),
+                "--resume".to_string(),
+                "ml-thread-task2".to_string(),
+                "--summary".to_string(),
+                "FORCE_ORDINARY_APPROVED_MOCK Stale Goal 2 resume attempt".to_string(),
+                "--diff-file".to_string(),
+                diff_stub.to_string_lossy().into_owned(),
+            ]);
+            assert_eq!(
+                rc_stale_resume, 2,
+                "cmd_review must reject explicit --resume of stale Goal 2 thread under Goal 3"
+            );
+            let rc_t3 = run_cli(&[
+                "review".to_string(),
+                "--cwd".to_string(),
+                ml_repo_s.clone(),
+                "--session".to_string(),
+                ml_sess.to_string(),
+                "--summary".to_string(),
+                "FORCE_ORDINARY_APPROVED_MOCK Goal 3 review".to_string(),
+                "--diff-file".to_string(),
+                diff_stub.to_string_lossy().into_owned(),
+            ]);
+            assert_eq!(rc_t3, 0, "Goal 3 markerless review must succeed cleanly");
+        }
+        let r2_log_txt = fs::read_to_string(&r2_inv_log).unwrap_or_default();
+        assert!(
+            !r2_log_txt.contains("ml-thread-task2"),
+            "Goal 3 review must NOT resume Goal 2 thread `ml-thread-task2`: {}",
+            r2_log_txt
+        );
+        let ml_saved_t3 = active_thread_state_for_lane(
+            ml_sess,
+            &ml_repo_s,
+            Some(0.0),
+            cwg_common::CODEX_SOL_MODEL,
+            "high",
+        )
+        .expect("Goal 3 review must persist a fresh active thread");
+        let t3_sid = val_to_str(ml_saved_t3.get("session_id"));
+        assert_eq!(
+            ml_saved_t3.get("handoff_goal_generation").and_then(Value::as_u64),
+            Some(3),
+            "Goal 3 thread must be stamped with goal_generation=3: {:?}",
+            ml_saved_t3
+        );
+        assert_ne!(
+            t3_sid, "ml-thread-task2",
+            "Goal 3 thread must have a distinct session_id from Goal 2"
+        );
+        assert_eq!(
+            resolve_resume_session_with_saved(
+                ResumeSessionQuery {
+                    git_root: &ml_repo_s,
+                    session: ml_sess,
+                    candidate_first_ts: 0.0,
+                    explicit_resume: &t3_sid,
+                    force_new: false,
+                    model: cwg_common::CODEX_SOL_MODEL,
+                    effort: "high",
+                },
+                None,
+            ),
+            t3_sid,
+            "explicit --resume of active Goal 3 thread under Goal 3 must be allowed"
+        );
+
+        // Round 4 #2/#3: Sub-second Goal A rollout (origin 0.5s before Goal B, unsaved due to StaleGoalEpoch) MUST be rejected on explicit `--resume`, while an unsaved Goal 3 rollout (simulating I/O persistence failure within Goal 3) with matching `LAUNCH_SCOPE` MUST still be allowed (and cross-session/cross-repo rollouts rejected).
+        let ml_ho3 = rio::read_json(&ml_repo.join(".agents").join("handoff.json")).unwrap();
+        let ml_ho3_ts = val_to_f64(ml_ho3.get("goal_updated_ts"));
+        let r4_subsec_goal2_sid = "sess-r4-subsec-goal2";
+        let r4_subsec_iso = crate::win32_sqlite::format_iso_utc((ml_ho3_ts - 0.5).max(1.0));
+        let r4_goal2_prompt = inject_launch_scope_into_prompt(
+            "REVIEW_ID: cwg-r4g2\nPACKET_NONCE: aaaa1111bbbb\nROLE: Reviewer\n".to_string(),
+            ml_sess,
+            &ml_repo_s,
+            2,
+            ml_ho2_ts,
+        );
+        let r4_goal2_rollout = r2_sess_dir.join(format!("rollout-primary-{}.jsonl", r4_subsec_goal2_sid));
+        fs::write(
+            &r4_goal2_rollout,
+            format!(
+                "{}\n{}\n",
+                json!({"type": "session_meta", "timestamp": r4_subsec_iso, "payload": {"id": r4_subsec_goal2_sid, "session_id": r4_subsec_goal2_sid, "source": "exec"}}),
+                json!({"type": "response_item", "timestamp": r4_subsec_iso, "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": r4_goal2_prompt}]}})
+            ),
+        )
+        .unwrap();
+        let r4_unsaved_goal3_sid = "sess-r4-unsaved-goal3";
+        let r4_goal3_prompt = inject_launch_scope_into_prompt(
+            "REVIEW_ID: cwg-r4g3\nPACKET_NONCE: cccc2222dddd\nROLE: Reviewer\n".to_string(),
+            ml_sess,
+            &ml_repo_s,
+            3,
+            ml_ho3_ts,
+        );
+        let r4_goal3_rollout = r2_sess_dir.join(format!("rollout-primary-{}.jsonl", r4_unsaved_goal3_sid));
+        fs::write(
+            &r4_goal3_rollout,
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                json!({"type": "session_meta", "timestamp": r4_subsec_iso, "payload": {"id": r4_unsaved_goal3_sid, "session_id": r4_unsaved_goal3_sid, "source": "exec"}}),
+                json!({"type": "event_msg", "timestamp": r4_subsec_iso, "payload": {"type": "task_started"}}),
+                json!({"type": "response_item", "timestamp": r4_subsec_iso, "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "# AGENTS.md instructions for repo\nFollow workspace rules."}]}}),
+                json!({"type": "response_item", "timestamp": r4_subsec_iso, "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": r4_goal3_prompt}]}})
+            ),
+        )
+        .unwrap();
+        let r4_other_sess_sid = "sess-r4-other-sess-goal3";
+        let r4_other_prompt = inject_launch_scope_into_prompt(
+            "REVIEW_ID: cwg-r4os\nPACKET_NONCE: eeee3333ffff\nROLE: Reviewer\n".to_string(),
+            "different-session",
+            &ml_repo_s,
+            3,
+            ml_ho3_ts,
+        );
+        let r4_other_rollout = r2_sess_dir.join(format!("rollout-primary-{}.jsonl", r4_other_sess_sid));
+        fs::write(
+            &r4_other_rollout,
+            format!(
+                "{}\n{}\n",
+                json!({"type": "session_meta", "timestamp": r4_subsec_iso, "payload": {"id": r4_other_sess_sid, "session_id": r4_other_sess_sid, "source": "exec"}}),
+                json!({"type": "response_item", "timestamp": r4_subsec_iso, "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": r4_other_prompt}]}})
+            ),
+        )
+        .unwrap();
+        {
+            let _r4_sess_env = EnvVarGuard::set(&[(
+                "CARBON_CODEX_SESSIONS_DIR",
+                Some(&r2_sess_dir.to_string_lossy()),
+            )]);
+            assert!(
+                !is_markerless_explicit_resume_valid_for_goal_epoch(
+                    ml_sess,
+                    &ml_repo_s,
+                    cwg_common::CODEX_SOL_MODEL,
+                    "high",
+                    r4_subsec_goal2_sid,
+                    None,
+                    3,
+                    ml_ho3_ts,
+                ),
+                "sub-second Goal 2 rollout (0.5s before Goal 3) must NOT be resumable under Goal 3"
+            );
+            assert!(
+                is_markerless_explicit_resume_valid_for_goal_epoch(
+                    ml_sess,
+                    &ml_repo_s,
+                    cwg_common::CODEX_SOL_MODEL,
+                    "high",
+                    r4_unsaved_goal3_sid,
+                    None,
+                    3,
+                    ml_ho3_ts,
+                ),
+                "unsaved Goal 3 rollout with matching LAUNCH_SCOPE (e.g. after I/O write failure) MUST remain resumable under Goal 3"
+            );
+            assert!(
+                !is_markerless_explicit_resume_valid_for_goal_epoch(
+                    ml_sess,
+                    &ml_repo_s,
+                    cwg_common::CODEX_SOL_MODEL,
+                    "high",
+                    r4_other_sess_sid,
+                    None,
+                    3,
+                    ml_ho3_ts,
+                ),
+                "cross-session rollout with goal_gen=3 must NOT be resumable in another session"
+            );
+        }
+
+        let mut saved_th = Map::new();
+        saved_th.insert(
+            "business_intent".to_string(),
+            Value::String("Saved thread intent".to_string()),
+        );
+        assert_eq!(
+            resolve_business_intent("", sess, &repo_s, 5000.0, Some(&saved_th)),
+            "Saved thread intent"
+        );
+        assert_eq!(
+            resolve_business_intent("Explicit CLI intent", sess, &repo_s, 5000.0, Some(&saved_th)),
+            "Explicit CLI intent"
+        );
+        let stripped = strip_user_input_envelope(
+            "<CONTEXT_SUMMARY>old</CONTEXT_SUMMARY><USER_REQUEST>Build external AI API proxy</USER_REQUEST><ADDITIONAL_METADATA>time</ADDITIONAL_METADATA>",
+        );
+        assert_eq!(stripped, "Build external AI API proxy");
     }
 }

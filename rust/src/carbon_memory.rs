@@ -90,12 +90,364 @@ fn secret_patterns() -> &'static [SecretPattern] {
                 label: "secret_assignment",
                 // INVARIANT: `(?:^|[^A-Za-z0-9])` replaces Python's `(?<![A-Za-z0-9])` lookbehind because `regex = 1.12.3` omits lookaround.
                 regex: Regex::new(
-                    r#"(?i)(?:^|[^A-Za-z0-9])[A-Za-z0-9_.-]{0,40}?(?:secret(?:[_-]?access)?(?:[_-]?key)?|token|pass(?:word|wd)?|pwd|(?:api|access|private|signing|encryption|master|client)[_-]?key)["']?\s*[:=]\s*["']?[A-Za-z0-9/+._~!$%@&*:=-]{12,}["']?"#,
+                    r#"(?i)(?:^|[^A-Za-z0-9])[A-Za-z0-9_.-]{0,40}?(?:secret(?:[_-]?access)?(?:[_-]?key)?|token|pass(?:word|wd)?|pwd|credential|(?:api|access|private|signing|encryption|master|client)[_-]?key)["']?\s*[:=]\s*["']?[A-Za-z0-9/+._~!$%@&*:=-]{12,}["']?"#,
                 )
                 .expect("secret_assignment"),
             },
         ]
     })
+}
+
+fn extra_redaction_patterns() -> &'static [SecretPattern] {
+    static EXTRA: OnceLock<Vec<SecretPattern>> = OnceLock::new();
+    EXTRA.get_or_init(|| {
+        vec![
+            SecretPattern {
+                label: "private_key_pem",
+                regex: Regex::new(
+                    r"(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+                )
+                .expect("private_key_pem_block"),
+            },
+            SecretPattern {
+                label: "webhook_url_token",
+                regex: Regex::new(
+                    r"(?i)\bhttps?://[^\s/]+/(?:rest/\d+/[A-Za-z0-9]{10,}|services/T[0-9A-Za-z]+/B[0-9A-Za-z]+/[0-9A-Za-z]+|api/webhooks/\d+/[0-9A-Za-z_-]{16,}|webhooks?/[0-9A-Za-z_-]{16,})[^\s]*",
+                )
+                .expect("webhook_url_token"),
+            },
+            SecretPattern {
+                label: "url_secret_param",
+                regex: Regex::new(
+                    r"(?i)([?&](?:access_?token|api_?key|auth_?token|token|secret|key|sig|signature|password|passwd|webhook_?token)=)[^&\s#]{6,}",
+                )
+                .expect("url_secret_param"),
+            },
+            SecretPattern {
+                label: "bearer_or_basic_auth",
+                regex: Regex::new(
+                    r"(?i)\b(?:Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{6,}\b",
+                )
+                .expect("bearer_or_basic_auth"),
+            },
+            SecretPattern {
+                label: "quoted_credential_header",
+                regex: Regex::new(
+                    r#"(?i)(?:"(?:cookie|set-cookie|authorization|proxy-authorization|x[-_][a-z0-9_-]*(?:key|token|secret|auth|cookie))\s*:\s*[^"\r\n]+"|'(?:cookie|set-cookie|authorization|proxy-authorization|x[-_][a-z0-9_-]*(?:key|token|secret|auth|cookie))\s*:\s*[^'\r\n]+')"#,
+                )
+                .expect("quoted_credential_header"),
+            },
+            SecretPattern {
+                label: "full_credential_header",
+                regex: Regex::new(
+                    r#"(?i)(?:^|[\s,(\[{])["']?(?:cookie|set-cookie|authorization|proxy-authorization|x[-_][a-z0-9_-]*(?:key|token|secret|auth|cookie))["']?\s*[:=]\s*(?:"[^"\r\n]+"|'[^'\r\n]+'|[^\r\n]+)"#,
+                )
+                .expect("full_credential_header"),
+            },
+            SecretPattern {
+                label: "credential_header",
+                regex: Regex::new(
+                    r#"(?i)(?:^|[\s,;(\[{"'])(?:x[-_]?(?:api[-_]?key|auth[-_]?token|access[-_]?token|secret[-_]?key|webhook[-_]?secret|client[-_]?secret)|authorization|proxy-authorization|cookie|set-cookie|api[-_]?key|access[-_]?token|auth[-_]?token|client[-_]?secret|private[-_]?key|signing[-_]?key|webhook[-_]?secret|secret|token|password|passwd|pwd)["']?\s*[:=]\s*(?:["'][^"'\r\n]{3,}["']|[^\s"'`,;)}\]\r\n]{3,})"#,
+                )
+                .expect("credential_header"),
+            },
+        ]
+    })
+}
+
+fn find_url_scheme_at(b: &[u8], pos: usize) -> Option<usize> {
+    if pos > 0 && b[pos - 1].is_ascii_alphanumeric() {
+        return None;
+    }
+    for prefix in [b"https://".as_slice(), b"http://".as_slice(), b"wss://".as_slice(), b"ws://".as_slice()] {
+        let plen = prefix.len();
+        if pos + plen <= b.len() && b[pos..pos + plen].eq_ignore_ascii_case(prefix) {
+            return Some(plen);
+        }
+    }
+    None
+}
+
+fn is_url_hard_stop(byte: u8) -> bool {
+    byte <= 0x20 || byte == 0x7f || matches!(byte, b'"' | b'`' | b'<' | b'>')
+}
+
+fn is_closing_single_quote_stop(
+    b: &[u8],
+    pos: usize,
+    enclosing_single_quote: bool,
+    paren_depth: usize,
+    bracket_depth: usize,
+) -> bool {
+    if !enclosing_single_quote || b[pos] != b'\'' || paren_depth > 0 || bracket_depth > 0 {
+        return false;
+    }
+    // INVARIANT: Only treat `'` inside a single-quoted URL as the closing quote when ALL following outer punctuation/enclosing delimiters (`]`/`)`/`}`/`,`/`.`/`;`/`:`/`!`/`?`) lead directly to EOF or whitespace/hard-stop — fail closed on ambiguous unspaced continuations like `'..canary-value'` or `','https://canary-secret.invalid/next'` so embedded URLs inside query params can never leak unredacted hosts or suffixes.
+    let mut j = pos + 1;
+    while j < b.len()
+        && matches!(
+            b[j],
+            b']' | b')' | b'}' | b',' | b'.' | b';' | b':' | b'!' | b'?'
+        )
+    {
+        j += 1;
+    }
+    j >= b.len() || is_url_hard_stop(b[j])
+}
+
+fn sanitize_urls_in_text(text: &str) -> String {
+    // INVARIANT: Structurally scan every HTTP/WS URL per RFC 3986/6874 (supporting IPv6 literals, zone IDs, and ALL RFC 3986 sub-delims including `'`, `(`, `)`, `!`, `$`, `&`, `*`, `+`, `,`, `;`, `=` inside userinfo/path/query/fragment) so credentials, paths, queries, and fragments are always redacted to origin while preserving enclosing quotes and unmatched markdown `]`/`)`/`}` (never crossing `]`/`}` or unmatched `)` in authority into a following `@mention`).
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        let Some(scheme_len) = find_url_scheme_at(b, i) else {
+            let ch = text[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        };
+        let enclosing_sq = i > 0 && b[i - 1] == b'\'';
+        let scheme = &text[i..i + scheme_len];
+        let auth_start = i + scheme_len;
+
+        let mut auth_end = auth_start;
+        let mut auth_parens = 0usize;
+        let mut in_ipv6 = false;
+        let mut ipv6_closed = false;
+        while auth_end < b.len() {
+            let ch = b[auth_end];
+            if is_url_hard_stop(ch)
+                || is_closing_single_quote_stop(b, auth_end, enclosing_sq, auth_parens, usize::from(in_ipv6))
+                || matches!(ch, b'/' | b'?' | b'#')
+            {
+                break;
+            }
+            if in_ipv6 {
+                if ch == b']' {
+                    in_ipv6 = false;
+                    ipv6_closed = true;
+                }
+                auth_end += 1;
+                continue;
+            }
+            match ch {
+                b'[' if auth_end == auth_start || b[auth_end - 1] == b'@' => {
+                    in_ipv6 = true;
+                    auth_end += 1;
+                }
+                b'[' | b']' | b'{' | b'}' => break,
+                b'(' => {
+                    auth_parens += 1;
+                    auth_end += 1;
+                }
+                b')' => {
+                    if auth_parens == 0 {
+                        break;
+                    }
+                    auth_parens -= 1;
+                    auth_end += 1;
+                }
+                _ => auth_end += 1,
+            }
+        }
+        if in_ipv6 {
+            out.push_str(scheme);
+            i = auth_start;
+            continue;
+        }
+        let raw_auth = &text[auth_start..auth_end];
+        let (has_userinfo, hostport_raw) = match raw_auth.rfind('@') {
+            Some(at) => (true, &raw_auth[at + 1..]),
+            None => (false, raw_auth),
+        };
+        let hb = hostport_raw.as_bytes();
+        let hostport_end = if hb.first() == Some(&b'[') {
+            if let Some(close_br) = hostport_raw.find(']') {
+                let mut end = close_br + 1;
+                if hb.get(end) == Some(&b':') {
+                    end += 1;
+                    while end < hb.len() && hb[end].is_ascii_digit() {
+                        end += 1;
+                    }
+                }
+                end
+            } else {
+                out.push_str(scheme);
+                i = auth_start;
+                continue;
+            }
+        } else {
+            let mut end = 0usize;
+            while end < hb.len() && !matches!(hb[end], b'(' | b')' | b'[' | b']' | b'{' | b'}') {
+                end += 1;
+            }
+            end
+        };
+        let hostport = &hostport_raw[..hostport_end];
+        if hostport.is_empty() || (hb.first() == Some(&b'[') && !ipv6_closed) {
+            out.push_str(scheme);
+            i = auth_start;
+            continue;
+        }
+
+        out.push_str(scheme);
+        if has_userinfo {
+            out.push_str("[REDACTED:userinfo]@");
+        }
+        out.push_str(hostport);
+
+        let host_abs_end = auth_end - (hostport_raw.len() - hostport_end);
+        if host_abs_end < auth_end
+            || !b.get(auth_end).is_some_and(|c| matches!(c, b'/' | b'?' | b'#'))
+        {
+            i = host_abs_end;
+            continue;
+        }
+
+        let mut scan_end = auth_end;
+        let mut scan_parens = 0usize;
+        let mut scan_brackets = 0usize;
+        while scan_end < b.len() {
+            let ch = b[scan_end];
+            if is_url_hard_stop(ch)
+                || is_closing_single_quote_stop(b, scan_end, enclosing_sq, scan_parens, scan_brackets)
+            {
+                break;
+            }
+            match ch {
+                b'(' => scan_parens += 1,
+                b')' => scan_parens = scan_parens.saturating_sub(1),
+                b'[' => scan_brackets += 1,
+                b']' => scan_brackets = scan_brackets.saturating_sub(1),
+                _ => {}
+            }
+            scan_end += 1;
+        }
+        let raw_tail = &text[auth_end..scan_end];
+        let mut tail_end = raw_tail.len();
+        if raw_tail
+            .as_bytes()
+            .last()
+            .is_some_and(|c| matches!(c, b']' | b')' | b'}'))
+        {
+            let (mut open_br, mut close_br) = (0usize, 0usize);
+            let (mut open_par, mut close_par) = (0usize, 0usize);
+            let (mut open_cur, mut close_cur) = (0usize, 0usize);
+            for &x in raw_tail.as_bytes() {
+                match x {
+                    b'[' => open_br += 1,
+                    b']' => close_br += 1,
+                    b'(' => open_par += 1,
+                    b')' => close_par += 1,
+                    b'{' => open_cur += 1,
+                    b'}' => close_cur += 1,
+                    _ => {}
+                }
+            }
+            while tail_end > 0 {
+                match raw_tail.as_bytes()[tail_end - 1] {
+                    b']' if close_br > open_br => {
+                        tail_end -= 1;
+                        close_br -= 1;
+                    }
+                    b')' if close_par > open_par => {
+                        tail_end -= 1;
+                        close_par -= 1;
+                    }
+                    b'}' if close_cur > open_cur => {
+                        tail_end -= 1;
+                        close_cur -= 1;
+                    }
+                    _ => break,
+                }
+            }
+        }
+        if tail_end > 0 {
+            out.push_str("/[REDACTED:url]");
+        }
+        out.push_str(&raw_tail[tail_end..]);
+        i = scan_end;
+    }
+    out
+}
+
+fn raw_credential_line_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)^\s*(?:export\s+|set\s+|\$env:)?["']?[A-Z0-9_.-]*(?:API[_-]?KEY|SECRET|TOKEN|PASS(?:WORD|WD)?|AUTHORIZATION|COOKIE|CREDENTIAL|WEBHOOK)["']?\s*[:=]"#,
+        )
+        .expect("raw_credential_line_re")
+    })
+}
+
+pub fn redact_secrets(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let mut out = text.to_string();
+    for pat in extra_redaction_patterns() {
+        if pat.label == "url_secret_param" {
+            out = pat
+                .regex
+                .replace_all(&out, "${1}[REDACTED:url_secret_param]")
+                .into_owned();
+        } else if pat.label == "quoted_credential_header" {
+            out = pat
+                .regex
+                .replace_all(&out, "[REDACTED:credential_header]")
+                .into_owned();
+        } else if matches!(pat.label, "full_credential_header" | "credential_header") {
+            out = pat
+                .regex
+                .replace_all(&out, |caps: &regex::Captures<'_>| {
+                    let m = caps.get(0).map(|g| g.as_str()).unwrap_or("");
+                    if let Some(first) = m.chars().next() {
+                        if !first.is_ascii_alphanumeric() && first != '"' && first != '\'' {
+                            return format!("{}[REDACTED:credential_header]", first);
+                        }
+                    }
+                    "[REDACTED:credential_header]".to_string()
+                })
+                .into_owned();
+        } else {
+            let repl = format!("[REDACTED:{}]", pat.label);
+            out = pat.regex.replace_all(&out, repl.as_str()).into_owned();
+        }
+    }
+    for pat in secret_patterns() {
+        let label = pat.label;
+        out = pat
+            .regex
+            .replace_all(&out, |caps: &regex::Captures<'_>| {
+                let m = caps.get(0).map(|g| g.as_str()).unwrap_or("");
+                if label == "secret_assignment" {
+                    if let Some(first) = m.chars().next() {
+                        if !first.is_ascii_alphanumeric() {
+                            return format!("{}[REDACTED:{}]", first, label);
+                        }
+                    }
+                }
+                format!("[REDACTED:{}]", label)
+            })
+            .into_owned();
+    }
+    out
+}
+
+pub fn sanitize_external_charter(text: &str) -> String {
+    if text.trim().is_empty() {
+        return String::new();
+    }
+    // INVARIANT: Strip raw credential lines, structurally sanitize every URL to origin (removing `userinfo@`, `/path`, `?query`, `#fragment`), and redact full credential headers before sending charter text externally.
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|ln| !raw_credential_line_re().is_match(ln))
+        .collect();
+    let joined = kept.join("\n");
+    let no_url_paths = sanitize_urls_in_text(&joined);
+    redact_secrets(&no_url_paths)
 }
 
 fn recall_token_re() -> &'static Regex {

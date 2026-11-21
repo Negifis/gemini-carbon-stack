@@ -12,6 +12,12 @@ use crate::win32_sqlite::{is_link_or_junction, now_sec, run_command_with_job};
 
 pub const EDIT_TOOLS: &[&str] = &["edit_file", "write_file"];
 pub const SHELL_TOOLS: &[&str] = &["run_command"];
+pub const CHECK_KIND_BG_LAUNCH: &str = "bg_launch";
+pub const CHECK_KIND_CHECK: &str = "check";
+pub const CHECK_KIND_UNCERTAIN: &str = "uncertain_check";
+pub const CHECK_KIND_SKIPPED: &str = "check_skipped";
+
+const CHECKS_LEDGER_MAX_BYTES: u64 = 2_000_000;
 
 const NON_GIT_SCAN_MAX_FILES: usize = 400;
 const NON_GIT_SCAN_MAX_DEPTH: usize = 4;
@@ -153,7 +159,7 @@ const PS_VAR_NAME_PAT: &str = r"[A-Za-z_]\w*(?::[A-Za-z_]\w*)?";
 const PS_DQ_LITERAL_PAT: &str = r#""[^"`$]*""#;
 const PS_MUT_CLAUSE_LEADER: &str = r"\A\s*(?:\$[A-Za-z_]\w*\s*=\s*)?(?:\$null\s*\|\s*)?(?:&\s*)?";
 const CONTINUITY_BK_SUB: &str = r"(?:checkpoint|show|handoff)\b";
-const CODEX_LANE_BK_SUB: &str = r"(?:check|status|reset|review|research-reset)\b";
+const CODEX_LANE_BK_SUB: &str = r"(?:check|status|reset|review|dispose|research-reset|redesign-reset)\b";
 const CHAT_BUS_BK_SUB: &str = r"(?:wait|inbox|list|read|search|send|reply|configure|status)\b";
 const WT_RO_SUB: &str = r"(?:audit|status)\b";
 const WT_MUT_TAIL: &str = r"[^\r\n;|&]*\b(?:snapshot|remove|restore)\b";
@@ -183,8 +189,9 @@ fn bookkeeping_cmd_re() -> &'static Regex {
         let chat_bus_py = exe_pat_followed_by_space("chat_bus_cli", EXT_PY, false);
         let carbon_stack_bin = exe_pat_followed_by_space("carbon-stack", r"(?:\.exe)?", false);
         let chat_bus_bin = exe_pat_followed_by_space("chat-bus", r"(?:\.exe)?", false);
+        let bk_tail = format!(r#"(?:\s+(?:[^|;&\r\n"']|{}|{})*)?"#, PS_DQ_PAT, PS_SQ_PAT);
         let pat = format!(
-            r"(?i)\A\s*(?:\$null\s*\|\s*)?(?:&\s*)?(?:{py}\s+(?:-(?:X\s+utf8|[uBEsSO])\s+)*(?:{bk}|(?:{cont}\s+{cont_sub}|{cl}\s+{cl_sub}|{cb_py}\s+{cb_sub}))|{cs}\s+(?:(?:carbon[-_]memory|gate[-_]inbox|chip[-_]handoff|swarm[-_]cache|swarm[-_]ctl)\b|continuity\s+{cont_sub}|codex[-_]lane\s+{cl_sub})|{cb}\s+{cb_sub})(?:\s+[^|;&\r\n]*)?\z",
+            r"(?i)\A\s*(?:\$null\s*\|\s*)?(?:&\s*)?(?:{py}\s+(?:-(?:X\s+utf8|[uBEsSO])\s+)*(?:{bk}|(?:{cont}\s+{cont_sub}|{cl}\s+{cl_sub}|{cb_py}\s+{cb_sub}))|{cs}\s+(?:(?:carbon[-_]memory|gate[-_]inbox|chip[-_]handoff|swarm[-_]cache|swarm[-_]ctl)\b|continuity\s+{cont_sub}|codex[-_]lane\s+{cl_sub})|{cb}\s+{cb_sub}){tail}\z",
             py = py,
             bk = bk_scripts,
             cont = continuity,
@@ -195,6 +202,7 @@ fn bookkeeping_cmd_re() -> &'static Regex {
             cont_sub = CONTINUITY_BK_SUB,
             cl_sub = CODEX_LANE_BK_SUB,
             cb_sub = CHAT_BUS_BK_SUB,
+            tail = bk_tail,
         );
         Regex::new(&pat).expect("bookkeeping_cmd_re")
     })
@@ -274,6 +282,347 @@ fn validation_non_runner_re() -> &'static Regex {
             pkg_s = pkg_script,
         );
         Regex::new(&pat).expect("validation_non_runner_re")
+    })
+}
+
+fn extended_gate_validation_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // SAFETY: Gate check tracking recognizes additional standalone Node validation scripts (`validate`/`verify`/`check`/`lint`) WITHOUT widening `classify_shell_command` (File Ownership Guard).
+        let node = exe_pat_followed_by_space("node", r"(?:\.exe)?", false);
+        let node_verbs = "validate|verify|check|lint";
+        let pat = format!(
+            r#"(?i)\A\s*(?:\$null\s*\|\s*)?(?:&\s*)?{node}\s+(?:(?:--no-warnings|--experimental-[A-Za-z0-9_-]+)\s+)*["']?(?:\.[/\\])?(?:[A-Za-z0-9_][A-Za-z0-9_.-]*[/\\])*(?:(?:{nv})(?:[-_][A-Za-z0-9_.-]*)?|[A-Za-z0-9_][A-Za-z0-9_.-]*[-_.](?:{nv}))\.(?:c?js|mjs)["']?(?:\z|[\s|;&])"#,
+            node = node,
+            nv = node_verbs,
+        );
+        Regex::new(&pat).expect("extended_gate_validation_re")
+    })
+}
+
+fn extended_pkg_script_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // SAFETY: Gate check tracking only accepts package-manager `validate|verify` scripts after verifying the script exists in the resolved nearest `package.json` (eliminating `.npmrc` `if-present=true` silent exit-0 skips) without widening File Ownership Guard.
+        let s = r"(?:[A-Za-z0-9_.-]+:)*(?:validate|verify)(?:[:_-][A-Za-z0-9_:.-]+)*";
+        let pat = format!(
+            r#"(?i)\A\s*(?:\$null\s*\|\s*)?(?:&\s*)?(?:bun(?:\.exe)?\s+run|npm(?:\.cmd)?\s+run|(?:pnpm|yarn)(?:\.cmd)?(?:\s+run)?)\s+(?:'(?P<sq>{s})'|"(?P<dq>{s})"|(?P<bare>{s}))(?P<tail>(?:\z|[\s|;&][\s\S]*))"#,
+            s = s,
+        );
+        Regex::new(&pat).expect("extended_pkg_script_re")
+    })
+}
+
+fn double_dash_sep_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?:\A|\s)--(?:\z|\s)").expect("double_dash_sep_re"))
+}
+
+fn nav_target_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // SAFETY: Accept only native PowerShell directory-change syntax (at most one `-LiteralPath`/`-Path` flag; never cmd.exe `/d`, which PowerShell rejects while continuing in the original directory).
+        Regex::new(
+            r#"(?i)\A\s*(?:cd|chdir|Set-Location|sl|Push-Location|pushd)\s+(?:(?:-LiteralPath|-Path)\s+)?(?:'(?P<sq>(?:''|[^'])+)'|"(?P<dq>[^"$`\r\n]+)"|(?P<bare>[^\s|;&"'`$()\r\n/-][^\s|;&"'`$()\r\n]*))\s*\z"#,
+        )
+        .expect("nav_target_re")
+    })
+}
+
+fn advance_shell_nav_cwd(prev_cwd: Option<PathBuf>, seg: &str) -> Option<PathBuf> {
+    // SAFETY: Advance per-segment shell cwd only for valid literal PowerShell navigation targets (never `git -C` or `cd /d`); fail closed (`None`) on `Pop-Location`, bare `cd`, wildcards, variables, drive-relative paths (`C:` / `C:sub`), or non-existent dirs so package-script verification inspects the exact executing package.
+    let caps = nav_target_re().captures(seg)?;
+    let raw = if let Some(m) = caps.name("sq") {
+        m.as_str().replace("''", "'")
+    } else if let Some(m) = caps.name("dq") {
+        m.as_str().to_string()
+    } else {
+        caps.name("bare")?.as_str().to_string()
+    };
+    let trimmed = raw.trim();
+    let bytes = trimmed.as_bytes();
+    let is_drive_relative = bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && !matches!(bytes.get(2), Some(b'\\' | b'/'));
+    if trimmed.is_empty()
+        || trimmed == "-"
+        || trimmed == "+"
+        || trimmed.starts_with('~')
+        || is_drive_relative
+        || trimmed
+            .chars()
+            .any(|ch| matches!(ch, '$' | '`' | '*' | '?' | '[' | ']'))
+    {
+        return None;
+    }
+    let p = Path::new(trimmed);
+    let resolved = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        prev_cwd?.join(p)
+    };
+    resolved.is_dir().then(|| rio::resolve_abs_path(&resolved))
+}
+
+struct LazyShellCwd<'a> {
+    base: Option<&'a str>,
+    nav_segs: Vec<&'a str>,
+    resolved: Option<Option<PathBuf>>,
+}
+
+impl<'a> LazyShellCwd<'a> {
+    fn new(base: Option<&'a str>) -> Self {
+        Self {
+            base,
+            nav_segs: Vec::new(),
+            resolved: None,
+        }
+    }
+
+    fn push_nav(&mut self, seg: &'a str) {
+        if let Some(ref mut cur) = self.resolved {
+            *cur = advance_shell_nav_cwd(cur.take(), seg);
+        } else {
+            self.nav_segs.push(seg);
+        }
+    }
+
+    fn current(&mut self) -> Option<&Path> {
+        let cur = self.resolved.get_or_insert_with(|| {
+            let mut c = initial_shell_cwd(self.base);
+            for seg in self.nav_segs.drain(..) {
+                c = advance_shell_nav_cwd(c, seg);
+            }
+            c
+        });
+        cur.as_deref()
+    }
+}
+
+fn ini_unsafe(raw: &str) -> String {
+    // INVARIANT: Mirror npm's `ini` (`lib/ini.js:unsafe`) so quoted keys/values (`"workspaces"=true`, `'workspaces'=true`, JSON `\uXXXX` escapes, inline `;`/`#` comments, and `\\`/`\;`/`\#` escapes) decode identically to `@npmcli/config`.
+    let val = raw.trim();
+    if val.len() >= 2 && val.starts_with('"') && val.ends_with('"') {
+        return serde_json::from_str::<String>(val)
+            .unwrap_or_else(|_| val[1..val.len() - 1].to_string());
+    }
+    if val.len() >= 2 && val.starts_with('\'') && val.ends_with('\'') {
+        let inner = &val[1..val.len() - 1];
+        return serde_json::from_str::<String>(inner).unwrap_or_else(|_| inner.to_string());
+    }
+    let mut out = String::with_capacity(val.len());
+    let mut esc = false;
+    for ch in val.chars() {
+        if esc {
+            if matches!(ch, '\\' | ';' | '#') {
+                out.push(ch);
+            } else {
+                out.push('\\');
+                out.push(ch);
+            }
+            esc = false;
+        } else if matches!(ch, ';' | '#') {
+            break;
+        } else if ch == '\\' {
+            esc = true;
+        } else {
+            out.push(ch);
+        }
+    }
+    if esc {
+        out.push('\\');
+    }
+    out.trim().to_string()
+}
+
+fn npmrc_kv_redirects_target(key: &str, val: Option<&str>) -> bool {
+    match key {
+        "workspaces" | "ws" | "recursive" | "global" | "g" | "include-workspace-root" | "iwr"
+        | "ignore-scripts" => !matches!(
+            val,
+            Some("" | "false" | "0" | "no" | "off" | "null")
+        ),
+        "location" | "l" => !matches!(val, Some("project" | "user" | "")),
+        "workspace" | "w" | "filter" | "dir" | "cwd" => !matches!(val, Some("" | "null")),
+        _ => false,
+    }
+}
+
+fn npmrc_file_redirects_target(path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    if meta.len() > 262_144 {
+        return true;
+    }
+    let Ok(text) = fs::read_to_string(path) else {
+        return true;
+    };
+    let clean_text = text.trim_start_matches('\u{feff}');
+    for raw_line in clean_text.split(['\r', '\n']) {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            continue;
+        }
+        // SAFETY: `@npmcli/config` substitutes `${ENV}` inside both `.npmrc` keys and values; fail closed on any `${` interpolation rather than guessing runtime env expansion.
+        if line.contains("${") {
+            return true;
+        }
+        let (key_part, val_opt) = match line.split_once('=') {
+            Some((k, v)) => (k, Some(v)),
+            None => (line, None),
+        };
+        let mut key_dec = ini_unsafe(key_part);
+        let val_dec = val_opt.map(ini_unsafe);
+        if key_dec.contains("${") || val_dec.as_deref().is_some_and(|v| v.contains("${")) {
+            return true;
+        }
+        if key_dec.len() > 2 && key_dec.ends_with("[]") {
+            key_dec.truncate(key_dec.len() - 2);
+        }
+        let key = key_dec.to_ascii_lowercase();
+        let val = val_dec.map(|v| v.to_ascii_lowercase());
+        if matches!(key.as_str(), "userconfig" | "globalconfig") {
+            if !matches!(val.as_deref(), Some("" | "null")) {
+                return true;
+            }
+            continue;
+        }
+        if npmrc_kv_redirects_target(&key, val.as_deref()) {
+            return true;
+        }
+    }
+    false
+}
+
+fn npmrc_redirects_pkg_target(cmd_cwd: &Path, pkg_dir: &Path) -> bool {
+    // SAFETY: Fail closed when env or any active `.npmrc` (project/ancestor/user/global) enables `workspaces`, `workspace`, `recursive`, `filter`, `ignore-scripts`, `dir`/`cwd`, `global`, or `${ENV}` redirection, because npm/pnpm can redirect `run <script>` into child packages lacking the script and exit 0 under `if-present=true`.
+    let mut env_rc_paths: Vec<PathBuf> = Vec::new();
+    for (k, v) in std::env::vars() {
+        const PREFIX: &str = "NPM_CONFIG_";
+        if k.len() <= PREFIX.len() || !k.as_bytes()[..PREFIX.len()].eq_ignore_ascii_case(PREFIX.as_bytes()) {
+            continue;
+        }
+        let norm_key = k[PREFIX.len()..].to_ascii_lowercase().replace('_', "-");
+        if matches!(norm_key.as_str(), "userconfig" | "globalconfig") {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                env_rc_paths.push(PathBuf::from(trimmed));
+            }
+            continue;
+        }
+        let low_v = v.trim().to_ascii_lowercase();
+        if npmrc_kv_redirects_target(&norm_key, Some(low_v.as_str())) {
+            return true;
+        }
+    }
+    let mut seen_rc: HashSet<String> = HashSet::new();
+    let mut check_rc = |p: PathBuf| -> bool {
+        let key = rio::fold_path(&p.to_string_lossy());
+        seen_rc.insert(key) && npmrc_file_redirects_target(&p)
+    };
+    for p in env_rc_paths {
+        if check_rc(p) {
+            return true;
+        }
+    }
+    let mut cur = Some(cmd_cwd);
+    let mut reached_pkg = false;
+    for _ in 0..32 {
+        let Some(dir) = cur else {
+            break;
+        };
+        if dir == pkg_dir {
+            reached_pkg = true;
+        }
+        if check_rc(dir.join(".npmrc")) {
+            return true;
+        }
+        if reached_pkg && dir.join(".git").exists() {
+            break;
+        }
+        cur = dir.parent();
+    }
+    if check_rc(rio::home_dir().join(".npmrc")) {
+        return true;
+    }
+    #[cfg(windows)]
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let t = appdata.trim();
+        if !t.is_empty() && check_rc(PathBuf::from(t).join("npm").join("etc").join("npmrc")) {
+            return true;
+        }
+    }
+    false
+}
+
+fn package_json_defines_script(cmd_cwd: &Path, script_name: &str) -> bool {
+    if script_name.is_empty() {
+        return false;
+    }
+    let mut cur = Some(cmd_cwd);
+    for _ in 0..32 {
+        let Some(dir) = cur else {
+            break;
+        };
+        let pkg_path = dir.join("package.json");
+        if pkg_path.is_file() {
+            // INVARIANT: Stop at the nearest ancestor `package.json` (`localPrefix`), short-circuit if the script is missing/empty, then reject workspace-redirected configs (`.npmrc`/env) so child packages missing the script can never silently exit 0 under `if-present=true`.
+            let defined = rio::read_json(&pkg_path)
+                .and_then(|v| {
+                    v.get("scripts")
+                        .and_then(Value::as_object)
+                        .and_then(|scripts| scripts.get(script_name))
+                        .and_then(Value::as_str)
+                        .map(|body| !body.trim().is_empty())
+                })
+                .unwrap_or(false);
+            return defined && !npmrc_redirects_pkg_target(cmd_cwd, dir);
+        }
+        // INVARIANT: Mirror `@npmcli/config` `loadLocalPrefix` — a closer `node_modules` directory without `package.json` anchors `localPrefix` there instead of walking further up.
+        if dir.join("node_modules").is_dir() {
+            return false;
+        }
+        cur = dir.parent();
+    }
+    false
+}
+
+fn is_confirmed_extended_pkg_script(seg: &str, lazy_cwd: &mut LazyShellCwd<'_>) -> bool {
+    let Some(caps) = extended_pkg_script_re().captures(seg) else {
+        return false;
+    };
+    let tail = caps.name("tail").map_or("", |m| m.as_str());
+    let before_dd = double_dash_sep_re()
+        .find(tail)
+        .map_or(tail, |m| &tail[..m.start()]);
+    // SAFETY: Reject ANY package-manager argument/flag before `--` (covering npm `nopt` flag abbreviations like `--prefi`, `-w`, `--ws`, `--if-present`, pnpm `-r`/`--filter`, yarn `--cwd`, etc.) instead of maintaining a fragile option denylist.
+    if !before_dd.trim().is_empty() {
+        return false;
+    }
+    let script_name = caps
+        .name("sq")
+        .or_else(|| caps.name("dq"))
+        .or_else(|| caps.name("bare"))
+        .map(|m| m.as_str())
+        .unwrap_or("");
+    let Some(cwd) = lazy_cwd.current() else {
+        return false;
+    };
+    package_json_defines_script(cwd, script_name)
+}
+
+fn if_present_flag_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?i)(?:\A|[\s"'])--if-present(?:\z|[=\s"'])"#).expect("if_present_flag_re")
     })
 }
 
@@ -366,20 +715,39 @@ fn is_benign_ps_env_assign(seg: &str) -> bool {
         && !up.starts_with("CARBON_")
         && !up.starts_with("CARGO_BUILD_")
         && !up.starts_with("CARGO_TARGET_")
+        && !up.starts_with("NPM_CONFIG_")
 }
 
-fn is_validation_segment(seg: &str) -> bool {
+fn is_validation_segment_with_mode(
+    seg: &str,
+    allow_extended: bool,
+    lazy_cwd: Option<&mut LazyShellCwd<'_>>,
+) -> bool {
     let low = seg.to_ascii_lowercase();
     if low.contains("semgrep") && semgrep_autofix_re().is_match(seg) {
         return false;
     }
+    if low.contains("--if-present") && if_present_flag_re().is_match(seg) {
+        // SAFETY: `--if-present` lets npm/pnpm/yarn/bun exit 0 without executing a missing script.
+        return false;
+    }
     if validation_non_runner_re().is_match(seg) {
+        return true;
+    }
+    if allow_extended
+        && (extended_gate_validation_re().is_match(seg)
+            || lazy_cwd.is_some_and(|lc| is_confirmed_extended_pkg_script(seg, lc)))
+    {
         return true;
     }
     if let Some(caps) = validation_runner_re().captures(seg) {
         return exe_caps_boundary_ok(&caps, seg);
     }
     false
+}
+
+fn is_validation_segment(seg: &str) -> bool {
+    is_validation_segment_with_mode(seg, false, None)
 }
 
 fn mutating_cmdlet_re() -> &'static Regex {
@@ -1274,14 +1642,29 @@ fn is_bookkeeping_segment(seg: &str) -> bool {
         && bookkeeping_cmd_re().is_match(seg)
 }
 
-fn classify_non_mutating_segments(segments: &[(String, String)]) -> &'static str {
+fn initial_shell_cwd(base_cwd: Option<&str>) -> Option<PathBuf> {
+    let trimmed = base_cwd?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let p = Path::new(trimmed);
+    p.is_dir().then(|| rio::resolve_abs_path(p))
+}
+
+fn classify_non_mutating_segments(
+    segments: &[(String, String)],
+    allow_extended: bool,
+    base_cwd: Option<&str>,
+) -> (&'static str, bool) {
     if segments.is_empty() {
-        return "READ_ONLY";
+        return ("READ_ONLY", false);
     }
     let mut val_count = 0usize;
     let mut last_val_idx = 0usize;
     let mut saw_bookkeeping = false;
     let mut has_or_chain = false;
+    let mut has_uncertain = false;
+    let mut lazy_cwd = LazyShellCwd::new(base_cwd);
     let n_segs = segments.len();
 
     for (idx, (op, seg)) in segments.iter().enumerate() {
@@ -1302,66 +1685,92 @@ fn classify_non_mutating_segments(segments: &[(String, String)]) -> &'static str
             saw_bookkeeping = true;
             continue;
         }
-        if is_validation_segment(seg) {
+        let lc_opt = allow_extended.then_some(&mut lazy_cwd);
+        if is_validation_segment_with_mode(seg, allow_extended, lc_opt) {
             let is_null_pipe = op == "|"
                 && idx > 0
                 && (segments[idx - 1].0.is_empty()
                     || segments[idx - 1].0 == ";"
                     || segments[idx - 1].0 == "&&")
                 && segments[idx - 1].1.trim().eq_ignore_ascii_case("$null");
-            if !op.is_empty() && op != ";" && op != "&&" && !is_null_pipe {
-                return "UNCERTAIN";
-            }
             val_count += 1;
             last_val_idx = idx;
+            if !op.is_empty() && op != ";" && op != "&&" && !is_null_pipe {
+                has_uncertain = true;
+                if !allow_extended {
+                    return ("UNCERTAIN", false);
+                }
+            }
+            continue;
+        }
+        if nav_segment_re().is_match(seg) {
+            if allow_extended {
+                lazy_cwd.push_nav(seg);
+            }
             continue;
         }
         if read_only_cmd_re().is_match(seg)
-            || nav_segment_re().is_match(seg)
             || ((op.is_empty() || op == ";" || op == "&&") && is_benign_ps_env_assign(seg))
         {
             continue;
         }
-        return "UNCERTAIN";
+        has_uncertain = true;
+        if !allow_extended {
+            return ("UNCERTAIN", false);
+        }
     }
     if val_count > 0 {
-        // SAFETY: Conditional `||`, trailing segments/pipes, or multiple runners can skip or mask a test exit code.
-        return if !has_or_chain && val_count == 1 && last_val_idx == n_segs - 1 {
+        // SAFETY: Conditional `||`, trailing segments/pipes, non-allowlisted segments, or multiple runners can skip or mask a test exit code.
+        let pol = if !has_uncertain && !has_or_chain && val_count == 1 && last_val_idx == n_segs - 1
+        {
             "VALIDATION"
         } else {
             "UNCERTAIN"
         };
+        return (pol, true);
+    }
+    if has_uncertain {
+        return ("UNCERTAIN", false);
     }
     if saw_bookkeeping {
-        return "BOOKKEEPING";
+        return ("BOOKKEEPING", false);
     }
-    "READ_ONLY"
+    ("READ_ONLY", false)
 }
 
-pub fn has_validation_segment(cmd: &str) -> bool {
-    let core = rio::unwrap_tokenade_command(cmd);
-    !core.is_empty()
-        && split_shell_segments(&core, false)
-            .iter()
-            .any(|(_, seg)| is_validation_segment(seg))
+fn segments_have_gate_validation(segments: &[(String, String)], base_cwd: Option<&str>) -> bool {
+    let mut lazy_cwd = LazyShellCwd::new(base_cwd);
+    for (_, seg) in segments {
+        if nav_segment_re().is_match(seg) {
+            lazy_cwd.push_nav(seg);
+            continue;
+        }
+        if is_validation_segment_with_mode(seg, true, Some(&mut lazy_cwd)) {
+            return true;
+        }
+    }
+    false
 }
 
-pub fn classify_shell_command(cmd: &str) -> &'static str {
-    let core = rio::unwrap_tokenade_command(cmd);
+fn classify_shell_command_core_with_mode(
+    core: &str,
+    allow_extended: bool,
+    cmd_cwd: Option<&str>,
+) -> (&'static str, bool) {
     if core.is_empty() {
-        return "READ_ONLY";
+        return ("READ_ONLY", false);
     }
 
-    let no_single = strip_single_quoted(&core);
-    let unquoted = strip_quoted(&core);
-    let segments = split_shell_segments(&core, false);
-    let subexprs = extract_ps_subexprs(&core);
+    let no_single = strip_single_quoted(core);
+    let unquoted = strip_quoted(core);
+    let segments = split_shell_segments(core, false);
+    let subexprs = extract_ps_subexprs(core);
 
-    if has_mutating_shell_pattern(&core, &segments, &no_single, &unquoted, &subexprs) {
-        return "MUTATING";
+    if has_mutating_shell_pattern(core, &segments, &no_single, &unquoted, &subexprs) {
+        return ("MUTATING", false);
     }
 
-    let has_dynamic_syntax = has_inline_py(&core)
+    let has_dynamic_syntax = has_inline_py(core)
         || !subexprs.is_empty()
         || unquoted.contains('(')
         || unquoted.contains(')')
@@ -1371,10 +1780,52 @@ pub fn classify_shell_command(cmd: &str) -> &'static str {
         || pre_flag_re().is_match(&unquoted);
 
     if has_dynamic_syntax {
-        return "UNCERTAIN";
+        let has_val = allow_extended && segments_have_gate_validation(&segments, cmd_cwd);
+        return ("UNCERTAIN", has_val);
     }
 
-    classify_non_mutating_segments(&segments)
+    classify_non_mutating_segments(&segments, allow_extended, cmd_cwd)
+}
+
+pub(crate) fn classify_shell_command_core(core: &str) -> &'static str {
+    classify_shell_command_core_with_mode(core, false, None).0
+}
+
+pub(crate) fn has_extended_pkg_script_segment(core: &str) -> bool {
+    if core.trim().is_empty() {
+        return false;
+    }
+    split_shell_segments(core, false)
+        .iter()
+        .any(|(_, seg)| extended_pkg_script_re().is_match(seg))
+}
+
+pub(crate) fn classify_gate_check_with_val(
+    core: &str,
+    cmd_cwd: Option<&str>,
+) -> (&'static str, bool) {
+    classify_shell_command_core_with_mode(core, true, cmd_cwd)
+}
+
+pub fn classify_shell_command(cmd: &str) -> &'static str {
+    let core = rio::unwrap_tokenade_command(cmd);
+    classify_shell_command_core(&core)
+}
+
+pub(crate) fn canonical_shell_snap_cmd(core_cmd: &str) -> String {
+    // INVARIANT: Normalize line endings, per-line whitespace, and leading `$null | ` per line so raw PreToolUse and Tokenade-rewritten PostToolUse (including indented commands after a leading `Set-Location` line) hash to the exact same anonymous snapshot key.
+    core_cmd
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim();
+            rio::leading_null_pipe_re()
+                .replace(trimmed, "")
+                .trim()
+                .to_string()
+        })
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn abs_path_str(p: &Path) -> String {
@@ -2084,7 +2535,22 @@ fn update_candidate_marker_unlocked(
                 if shell_durable_edit {
                     m.insert("shell_durable_edit".to_string(), Value::Bool(true));
                 }
+                if unknown_barrier {
+                    m.insert("unmeasured_shell_edit".to_string(), Value::Bool(true));
+                }
             }
+        }
+        if let Some(ckey) = pre_marker_call_key {
+            let pv_path = cwg_common::snapshot_path(session, &format!("previs-{}", ckey));
+            if let Some(pv_val) = rio::read_json(&pv_path) {
+                let _ = fs::remove_file(&pv_path);
+                if let Some(p) = pv_val.get("path").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                    cwg_common::latch_design_paths_in_marker(&mut marker, &[p.to_string()]);
+                }
+            }
+        }
+        if changed_fp || added_new_path || !shell_durable_edit {
+            refresh_design_edit_fields(&mut marker, &durable_new_paths, now);
         }
         cwg_common::trim_content_marks(&mut marker, marks);
         let has_round_id = marker
@@ -2144,6 +2610,7 @@ fn update_candidate_marker_unlocked(
                 if let Value::Object(ref mut m) = marker {
                     m.insert("last_durable_ts".to_string(), json!(now));
                 }
+                refresh_design_edit_fields(&mut marker, &dpaths, now);
                 cwg_common::trim_content_marks(&mut marker, marks);
                 refresh_swarm_round_fields(&mut marker, session, &repo_root, &fp);
             } else if marks
@@ -2209,6 +2676,10 @@ fn marker_repo_root(marker: &Value, eff_cwd: &str) -> String {
     eff_cwd.to_string()
 }
 
+fn refresh_design_edit_fields(marker: &mut Value, touched_paths: &[String], now: f64) {
+    let _ = cwg_common::sync_design_edit_fields(marker, touched_paths, now);
+}
+
 fn build_transition_note(
     before: Option<&Value>,
     after: &Value,
@@ -2228,11 +2699,16 @@ fn build_transition_note(
     };
     let needs_simplify = json_truthy(cctx.get("needs_simplify"));
     let needs_review = json_truthy(cctx.get("needs_review"));
-    if !needs_simplify && !needs_review {
-        return None;
-    }
     let policy = cctx.get("policy");
     let dpaths = cwg_common::durable_paths_from_val(cctx.get("dpaths"));
+    let design_paths = cctx
+        .get("design_paths")
+        .map(|v| cwg_common::durable_paths_from_val(Some(v)))
+        .unwrap_or_else(|| cwg_common::design_gate_paths(&dpaths, policy));
+    let needs_design = !design_paths.is_empty();
+    if !needs_simplify && !needs_review && !needs_design {
+        return None;
+    }
     let new_floor = cctx
         .get("floor")
         .and_then(|v| v.as_str())
@@ -2242,13 +2718,37 @@ fn build_transition_note(
         if cwg_common::candidate_class(b) == new_class {
             let old_cctx = cwg_common::resolve_candidate_context(b, false);
             let old_floor = old_cctx.get("floor").and_then(|v| v.as_str()).unwrap_or("");
+            let old_needs_design = old_cctx
+                .get("design_paths")
+                .map(|v| !cwg_common::durable_paths_from_val(Some(v)).is_empty())
+                .unwrap_or_else(|| {
+                    cwg_common::has_design_gate_paths(
+                        &cwg_common::durable_paths_from_val(old_cctx.get("dpaths")),
+                        old_cctx.get("policy"),
+                    )
+                });
             if old_floor == new_floor
                 && json_truthy(old_cctx.get("needs_simplify")) == needs_simplify
                 && json_truthy(old_cctx.get("needs_review")) == needs_review
+                && old_needs_design == needs_design
             {
                 return None;
             }
         }
+    }
+
+    let design_note = if needs_design {
+        format!(
+            "[Design Gate] UI/дизайн ({}ф: {}): до/во время вёрстки — `modern-web-guidance` + `mobbin` (`mobbin_mobbin`) + `frontend-design`/`critique-*`; после — реальные скриншоты в браузере (desktop+mobile, light/dark) + независимое read-only визуальное ревью (`visual-qa-reviewer` или `visual-design-critic` + `ux-adversarial-auditor` с веб-поиском и `mobbin_mobbin`) до `VISUAL_REVIEW_VERDICT: APPROVED`.",
+            design_paths.len(),
+            cwg_common::format_last_basenames(&design_paths, 3),
+        )
+    } else {
+        String::new()
+    };
+
+    if !needs_simplify && !needs_review {
+        return Some(design_note);
     }
 
     let req_tests = match cctx.get("require_tests") {
@@ -2263,20 +2763,20 @@ fn build_transition_note(
         }
     };
 
-    let start = dpaths.len().saturating_sub(3);
-    let shown: Vec<&str> = dpaths[start..]
-        .iter()
-        .map(|p| p.rsplit('/').next().unwrap_or(p.as_str()))
-        .collect();
     let reqs = cwg_common::receipt_requirements_summary(new_floor, policy, req_tests);
-    Some(format!(
+    let base = format!(
         "[Code Work Gate] `{}` ({}ф: {}): {}. Финал: `[gate] verified: {}; <кандидат и проверки>`.",
         new_floor,
         dpaths.len(),
-        shown.join(", "),
+        cwg_common::format_last_basenames(&dpaths, 3),
         reqs,
         new_floor,
-    ))
+    );
+    if design_note.is_empty() {
+        Some(base)
+    } else {
+        Some(format!("{}\n{}", base, design_note))
+    }
 }
 
 fn capture_direct_codex_packet(cmd: &str, cwd: &str, session: &str) {
@@ -3184,6 +3684,10 @@ fn payload_step_idx(payload: &Value) -> Option<&Value> {
         .find(|v| v.is_i64() || v.is_u64())
 }
 
+pub fn canonical_cmd_sha(canonical_cmd: &str) -> String {
+    sha256_hex(canonical_cmd.as_bytes())
+}
+
 fn tool_call_snap_key(
     payload: &Value,
     tc: Option<&Map<String, Value>>,
@@ -3198,9 +3702,38 @@ fn tool_call_snap_key(
     if let Some(si) = payload_step_idx(payload) {
         return (format!("step_{}", si), String::new(), true);
     }
+    // INVARIANT: Shell callers pass Tokenade-unwrapped `core_cmd` so PreToolUse (raw cmd) and PostToolUse (tokenade-wrapped cmd) hash to the same anonymous snapshot key without running unwrap on edit keys.
     let sig = format!("{}\0{}", rio::fold_path(cwd), cmd);
     let cmd_sha = sha256_hex(sig.as_bytes());
     (format!("anon_{}", &cmd_sha[..24]), cmd_sha, false)
+}
+
+fn extract_tool_response_text<'a>(payload: &'a Value) -> &'a str {
+    // INVARIANT: Antigravity PostToolUse delivers `toolResponse` as either a raw string or an object (`{"output": "..."}`); inspect only host-envelope fields (`output`/`content`/`text`), never raw `stdout`/`stderr`, so child stdout cannot spoof the host exit header.
+    fn extract_from_value<'a>(v: &'a Value, depth: u8) -> Option<&'a str> {
+        match v {
+            Value::String(s) if !s.trim().is_empty() => Some(s.as_str()),
+            Value::Object(map) if depth < 2 => {
+                for key in ["output", "content", "text"] {
+                    if let Some(sub) = map.get(key) {
+                        if let Some(found) = extract_from_value(sub, depth + 1) {
+                            return Some(found);
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+    for key in ["toolResponse", "response", "result", "output"] {
+        if let Some(val) = payload.get(key) {
+            if let Some(found) = extract_from_value(val, 0) {
+                return found;
+            }
+        }
+    }
+    ""
 }
 
 fn with_locked_anon_queue<R, F: FnOnce() -> R>(session: &str, f: F) -> Option<R> {
@@ -3470,6 +4003,16 @@ pub fn record_pre_tool_use(payload: &Value) {
                 .filter(|s| !s.trim().is_empty());
             let edit_key = edit_tool_call_key(payload, tc, tool_name, &cwd, edit_path);
             latch_live_simplify_if_ready(&session, tp, edit_path, &cwd, &edit_key);
+            if let Some(ep) = edit_path {
+                let low = ep.to_ascii_lowercase();
+                if (low.ends_with(".tsx") || low.ends_with(".jsx") || low.ends_with(".dart"))
+                    && cwg_common::existing_file_has_confirmed_visual_content(ep, &cwd)
+                {
+                    // INVARIANT: Record pre-edit visual status ONLY for existing files with confirmed visual content before `edit_file`/`write_file` mutates disk so removing all JSX/Widget markup (`<div />` -> `return null`) still triggers Design Gate without falsely latching brand-new pure-logic `.tsx` files.
+                    let pv_path = cwg_common::snapshot_path(&session, &format!("previs-{}", edit_key));
+                    let _ = rio::write_json(&pv_path, &json!({ "path": rio::normalize_path(ep) }));
+                }
+            }
         }
         return;
     }
@@ -3479,7 +4022,8 @@ pub fn record_pre_tool_use(payload: &Value) {
         .and_then(|a| a.get("CommandLine"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let policy = classify_shell_command(cmd);
+    let core_cmd = rio::unwrap_tokenade_command(cmd);
+    let policy = classify_shell_command_core(&core_cmd);
     let low_cmd = cmd.to_lowercase();
     let has_direct_codex = low_cmd.contains("codex")
         && low_cmd.contains("exec")
@@ -3496,7 +4040,9 @@ pub fn record_pre_tool_use(payload: &Value) {
 
     let session = rio::session_key(payload);
     let cwd = rio::effective_cwd(payload);
-    let (call_key, cmd_sha, has_unique_id) = tool_call_snap_key(payload, tc, &cwd, cmd);
+    let canonical_snap_cmd = canonical_shell_snap_cmd(&core_cmd);
+    let (call_key, cmd_sha, has_unique_id) =
+        tool_call_snap_key(payload, tc, &cwd, &canonical_snap_cmd);
 
     if has_direct_codex {
         capture_direct_codex_packet(cmd, &cwd, &session);
@@ -3653,7 +4199,8 @@ pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
         .get("CommandLine")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let policy = classify_shell_command(cmd);
+    let core_cmd = rio::unwrap_tokenade_command(cmd);
+    let policy = classify_shell_command_core(&core_cmd);
     if !failed && policy == "MUTATING" {
         rio::bump_mutation_stamp(&session);
     }
@@ -3673,34 +4220,36 @@ pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
     }
 
     let cwd = rio::effective_cwd(payload);
-    let (call_key, cmd_sha, has_unique_id) = tool_call_snap_key(payload, tc, &cwd, cmd);
+    // INVARIANT: Pass the shell's initial `cwd` (never `resolve_command_cwd`, which follows `git -C`) so per-segment navigation tracks the exact executing package directory for `package.json` checks.
+    let shell_cwd_opt = (!cwd.is_empty()).then_some(cwd.as_str());
+    let canonical_snap_cmd = canonical_shell_snap_cmd(&core_cmd);
+    let (call_key, cmd_sha, has_unique_id) =
+        tool_call_snap_key(payload, tc, &cwd, &canonical_snap_cmd);
     let snap_file = cwg_common::snapshot_path(&session, &call_key);
-    let is_validation_like =
-        policy == "VALIDATION" || (policy == "UNCERTAIN" && has_validation_segment(cmd));
-    let out_txt = if is_validation_like {
-        payload
-            .get("toolResponse")
-            .or_else(|| payload.get("response"))
-            .or_else(|| payload.get("result"))
-            .or_else(|| payload.get("output"))
-            .map(|v| rio::val_to_str(Some(v)))
-            .unwrap_or_default()
+    // INVARIANT: `policy == "MUTATING" | "VALIDATION"` is invariant under `allow_extended=true`, so only re-classify when `policy == "UNCERTAIN"`.
+    let (check_policy, is_validation_like) = if policy == "UNCERTAIN" {
+        classify_gate_check_with_val(&core_cmd, shell_cwd_opt)
     } else {
-        String::new()
+        (policy, policy == "VALIDATION")
+    };
+    let out_txt = if is_validation_like {
+        extract_tool_response_text(payload)
+    } else {
+        ""
     };
     let bg_tid = if is_validation_like {
-        rio::extract_bg_task_id(&out_txt)
+        rio::extract_bg_task_id(out_txt)
     } else {
         None
     };
     let exit_code = if is_validation_like && bg_tid.is_none() {
-        cwg_common::parse_host_command_exit_code(&out_txt)
+        cwg_common::parse_host_command_exit_code(out_txt)
     } else {
         None
     };
     let host_nonzero = matches!(exit_code, Some(code) if code != 0);
     let check_failed = failed || host_nonzero;
-    let confirmed_sync_zero = policy == "VALIDATION" && !check_failed && exit_code == Some(0);
+    let confirmed_sync_zero = check_policy == "VALIDATION" && !check_failed && exit_code == Some(0);
 
     let (before_snap, pre_start_ts) = if has_unique_id {
         let snap = rio::read_json(&snap_file);
@@ -3714,49 +4263,100 @@ pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
         pop_anon_snapshot(&session, &snap_file, &cmd_sha, confirmed_sync_zero)
     };
 
+    let norm_shell_cwd = rio::normalize_path(&cwd);
+    let step_idx = payload_step_idx(payload).cloned().unwrap_or(Value::Null);
+    let call_id_str = first_non_empty_str(tc, &["id", "callId", "toolCallId"])
+        .or_else(|| {
+            first_non_empty_str(
+                payload.as_object(),
+                &["toolCallId", "callId", "invocationId"],
+            )
+        })
+        .unwrap_or_default();
+    let ledger_cmd_sha = canonical_cmd_sha(&canonical_snap_cmd);
     if is_validation_like {
-        let step_idx = payload_step_idx(payload).cloned().unwrap_or(Value::Null);
         let start_ts_val = if pre_start_ts > 0.0 {
             json!(pre_start_ts)
         } else {
             Value::Null
         };
-        if let Some(bg_tid) = bg_tid {
-            let _ = rio::append_jsonl(
-                &cwg_common::checks_ledger_path(&session),
-                &json!({
-                    "kind": "bg_launch",
-                    "task_id": bg_tid,
-                    "policy": policy,
-                    "start_ts": start_ts_val,
-                    "ts": now_sec(),
-                    "step_idx": step_idx,
-                }),
-                2_000_000,
-            );
-        } else if policy == "VALIDATION" || check_failed {
-            let cmd_trunc: String = cmd.chars().take(240).collect();
-            let err_trunc: String = if failed {
-                error_text.chars().take(200).collect()
+        let ledger_rec = if let Some(bg_tid) = bg_tid {
+            Some(json!({
+                "kind": CHECK_KIND_BG_LAUNCH,
+                "task_id": bg_tid,
+                "policy": check_policy,
+                "cmd": rio::truncate_chars(&canonical_snap_cmd, 240),
+                "cmd_sha": ledger_cmd_sha,
+                "call_id": call_id_str,
+                "cwd": norm_shell_cwd,
+                "start_ts": start_ts_val,
+                "ts": now_sec(),
+                "step_idx": step_idx,
+            }))
+        } else if check_policy == "VALIDATION" || check_failed {
+            let err_trunc = if failed {
+                rio::truncate_chars(error_text, 200)
             } else if host_nonzero {
-                "nonzero_exit_code".to_string()
+                "nonzero_exit_code"
             } else {
-                String::new()
+                ""
             };
+            Some(json!({
+                "kind": CHECK_KIND_CHECK,
+                "passed": !check_failed,
+                "cmd": rio::truncate_chars(cmd, 240),
+                "cmd_sha": ledger_cmd_sha,
+                "call_id": call_id_str,
+                "cwd": norm_shell_cwd,
+                "error": err_trunc,
+                "ts": now_sec(),
+                "start_ts": start_ts_val,
+                "step_idx": step_idx,
+            }))
+        } else if exit_code == Some(0) {
+            // INVARIANT: Record ignored exit-0 chained/non-standalone validation runs separately from `"check"` so `cwg_stop` can emit actionable standalone-command guidance without crediting chained runs.
+            Some(json!({
+                "kind": CHECK_KIND_UNCERTAIN,
+                "passed": true,
+                "cmd": rio::truncate_chars(&canonical_snap_cmd, 240),
+                "cmd_sha": ledger_cmd_sha,
+                "call_id": call_id_str,
+                "cwd": norm_shell_cwd,
+                "ts": now_sec(),
+                "start_ts": start_ts_val,
+                "step_idx": step_idx,
+            }))
+        } else {
+            None
+        };
+        if let Some(rec) = ledger_rec {
             let _ = rio::append_jsonl(
                 &cwg_common::checks_ledger_path(&session),
-                &json!({
-                    "kind": "check",
-                    "passed": !check_failed,
-                    "cmd": cmd_trunc,
-                    "error": err_trunc,
-                    "ts": now_sec(),
-                    "start_ts": start_ts_val,
-                    "step_idx": step_idx,
-                }),
-                2_000_000,
+                &rec,
+                CHECKS_LEDGER_MAX_BYTES,
             );
         }
+    } else if !check_failed && bg_tid.is_none() && has_extended_pkg_script_segment(&core_cmd) {
+        let start_ts_val = if pre_start_ts > 0.0 {
+            json!(pre_start_ts)
+        } else {
+            Value::Null
+        };
+        // INVARIANT: Use the exact same `extended_pkg_script_re` segment parser as `classify_gate_check_with_val` (covering `npm.cmd`, `pnpm.cmd`, `yarn.cmd`, `bun.exe`, quoted names) and persist full `cmd_sha` + `call_id` + `cwd` + `start_ts` + `ts` so `Stop` binds skipped runs regardless of command length or duration.
+        let _ = rio::append_jsonl(
+            &cwg_common::checks_ledger_path(&session),
+            &json!({
+                "kind": CHECK_KIND_SKIPPED,
+                "cmd": rio::truncate_chars(&canonical_snap_cmd, 240),
+                "cmd_sha": ledger_cmd_sha,
+                "call_id": call_id_str,
+                "cwd": norm_shell_cwd,
+                "start_ts": start_ts_val,
+                "ts": now_sec(),
+                "step_idx": step_idx,
+            }),
+            CHECKS_LEDGER_MAX_BYTES,
+        );
     }
 
     let (cmd_cwd, prev_git_root): (String, Option<String>) = match before_snap {
@@ -3814,13 +4414,33 @@ pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
 
     cwg_common::publish_claim(&session, &changed_paths, false, &cmd_cwd);
 
+    // INVARIANT: Keep `marker["cwd"]` anchored to the shell's initial workspace/repo root rather than an ephemeral `Set-Location` subpackage directory so later commands executed from the root are never misclassified against a subpackage `package.json`.
+    let marker_cwd: &str = if !cwd.is_empty() {
+        match snap_git_root.as_deref() {
+            Some(gr) if !gr.is_empty() => {
+                let f_cwd = rio::fold_path(&cwd);
+                let f_gr = rio::fold_path(gr);
+                if f_cwd == f_gr || f_cwd.starts_with(&format!("{}/", f_gr.trim_end_matches('/'))) {
+                    &cwd
+                } else {
+                    gr
+                }
+            }
+            _ => &cwd,
+        }
+    } else if let Some(gr) = snap_git_root.as_deref().filter(|s| !s.is_empty()) {
+        gr
+    } else {
+        &cmd_cwd
+    };
+
     let cmd60: String = cmd.chars().take(60).collect();
     if !changed_paths.is_empty() {
         rio::bump_mutation_stamp(&session);
         let cause_lbl = format!("run_command:{}", cmd60);
         let (before, after, persisted) = update_candidate_marker(CandidateMarkerUpdate {
             session: &session,
-            cwd: &cmd_cwd,
+            cwd: marker_cwd,
             durable_new_paths: &changed_paths,
             operational_mutation: false,
             changed_lines_delta: 10,
@@ -3863,7 +4483,7 @@ pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
             let cause_lbl = format!("run_command:{}", cmd60);
             let (before, after, persisted) = update_candidate_marker(CandidateMarkerUpdate {
                 session: &session,
-                cwd: &cmd_cwd,
+                cwd: marker_cwd,
                 durable_new_paths: &[],
                 operational_mutation: true,
                 changed_lines_delta: 0,
@@ -4003,6 +4623,11 @@ mod tests {
         let _ = ps_control_kw_re();
         let _ = dot_slash_re();
         let _ = out_null_re();
+        let _ = extended_gate_validation_re();
+        let _ = extended_pkg_script_re();
+        let _ = double_dash_sep_re();
+        let _ = nav_target_re();
+        let _ = if_present_flag_re();
     }
 
     #[test]
@@ -4092,6 +4717,26 @@ mod tests {
                 "BOOKKEEPING",
             ),
             (
+                r#"$null | & "C:\Users\in\.gemini\config\plugins\gemini-carbon-stack\bin\carbon-stack.exe" codex-lane review --cwd "C:\Users\in\.gemini" --session "s1" --summary "fix A; fix B | verify C & D""#,
+                "BOOKKEEPING",
+            ),
+            (
+                r#"$null | & "C:\Users\in\.gemini\config\plugins\gemini-carbon-stack\bin\carbon-stack.exe" codex-lane redesign-reset --session "s1" --decision redesign"#,
+                "BOOKKEEPING",
+            ),
+            (
+                r#"C:\Users\in\.gemini\config\plugins\gemini-carbon-stack\bin\carbon-stack.exe codex-lane review --summary "ok"; rm -rf ."#,
+                "MUTATING",
+            ),
+            (
+                r#"C:\Users\in\.gemini\config\plugins\gemini-carbon-stack\bin\carbon-stack.exe codex-lane review --summary "$(echo hi)""#,
+                "UNCERTAIN",
+            ),
+            (
+                r#"C:\Users\in\.gemini\config\plugins\gemini-carbon-stack\bin\carbon-stack.exe codex-lane review --summary "$(rm -rf .)""#,
+                "MUTATING",
+            ),
+            (
                 r"C:\Users\in\.gemini\config\plugins\gemini-carbon-stack\bin\carbon-stack.exe code-search foo",
                 "READ_ONLY",
             ),
@@ -4106,6 +4751,20 @@ mod tests {
             (
                 r"& 'C:/Users/in/AppData/Roaming/npm/node_modules/@tokenade/cli/node_modules/@tokenade/cli-win32-x64/tokenade.exe' wrap --shell powershell '$null | node scripts/ci/test-backend-jest-modes.js'",
                 "VALIDATION",
+            ),
+            ("$null | node scripts/ux/validate-system.js", "UNCERTAIN"),
+            ("$null | npm run ux:validate", "UNCERTAIN"),
+            ("pnpm run schema:verify", "UNCERTAIN"),
+            ("npm run test --if-present", "UNCERTAIN"),
+            ("npm run validate --if-present", "UNCERTAIN"),
+            (r#"$env:NPM_CONFIG_IF_PRESENT="true"; npm run test"#, "UNCERTAIN"),
+            (
+                "$null | node scripts/ux/validate-system.js ; $null | node scripts/ci/test-mr-routing.js",
+                "UNCERTAIN",
+            ),
+            (
+                r"& 'C:/Users/in/AppData/Roaming/npm/node_modules/@tokenade/cli/node_modules/@tokenade/cli-win32-x64/tokenade.exe' wrap --shell powershell '$null | node scripts/ux/validate-system.js ; $null | node scripts/ci/test-mr-routing.js'",
+                "UNCERTAIN",
             ),
             ("node --test backend/src/foo.mjs", "VALIDATION"),
             (
@@ -4145,6 +4804,170 @@ mod tests {
         for (cmd, expected) in cases {
             assert_eq!(classify_shell_command(cmd), expected, "cmd: {}", cmd);
         }
+
+        // INVARIANT: Gate-check classification recognizes additional standalone repo validation scripts without widening strict `classify_shell_command` (used by File Ownership Guard), while still rejecting `--if-present` and `;`-chained runners.
+        let gate_check_cases = [
+            ("$null | node scripts/ux/validate-system.js", "VALIDATION"),
+            (
+                r"& 'C:/Users/in/AppData/Roaming/npm/node_modules/@tokenade/cli/node_modules/@tokenade/cli-win32-x64/tokenade.exe' wrap --shell powershell '$null | node scripts/ux/validate-system.js'",
+                "VALIDATION",
+            ),
+            ("$null | node scripts/validate.js", "VALIDATION"),
+            ("$null | node scripts/verify.mjs", "VALIDATION"),
+            ("node scripts/check.cjs", "VALIDATION"),
+            ("node scripts/lint.js", "VALIDATION"),
+            ("node scripts/schema-check.cjs", "VALIDATION"),
+            ("$null | npm run ux:validate", "UNCERTAIN"),
+            ("npm run validate", "UNCERTAIN"),
+            ("pnpm run schema:verify", "UNCERTAIN"),
+            ("npm run validate --if-present", "UNCERTAIN"),
+            ("npm run test --if-present", "UNCERTAIN"),
+            ("npm run test '--if-present'", "UNCERTAIN"),
+            ("pnpm run check --if-present=true", "UNCERTAIN"),
+            (r#"$env:NPM_CONFIG_IF_PRESENT="true"; npm run test"#, "UNCERTAIN"),
+            ("node scripts/migrate.js", "UNCERTAIN"),
+            (
+                "$null | node scripts/ux/validate-system.js ; $null | node scripts/ci/test-mr-routing.js",
+                "UNCERTAIN",
+            ),
+        ];
+        for (cmd, expected) in gate_check_cases {
+            let core = rio::unwrap_tokenade_command(cmd);
+            assert_eq!(
+                classify_gate_check_with_val(&core, None).0,
+                expected,
+                "gate_check cmd: {}",
+                cmd
+            );
+        }
+
+        // INVARIANT: Extended package-manager `validate`/`verify` scripts are credited ONLY when the resolved nearest `package.json` explicitly defines a non-empty script and no workspace/dir/if-present redirection flag is present before `--`.
+        let pkg_tmp = std::env::temp_dir().join(format!(
+            "cwg-mark-pkg-scripts-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&pkg_tmp);
+        let pkg_nested = pkg_tmp.join("src").join("nested");
+        let pkg_sub_missing = pkg_tmp.join("sub_missing");
+        let pkg_sub_only = pkg_tmp.join("sub_only");
+        let pkg_ws_mono = pkg_tmp.join("mono_ws");
+        let pkg_ws_quoted = pkg_tmp.join("mono_ws_quoted");
+        let pkg_ws_escaped = pkg_tmp.join("mono_ws_escaped");
+        let pkg_ws_env = pkg_tmp.join("mono_ws_env");
+        let pkg_ws_env_esc = pkg_tmp.join("mono_ws_env_esc");
+        let pkg_ignore_scripts = pkg_tmp.join("ignore_scripts_pkg");
+        let pkg_nm_barrier = pkg_tmp.join("nm_barrier").join("child");
+        fs::create_dir_all(&pkg_nested).unwrap();
+        fs::create_dir_all(&pkg_sub_missing).unwrap();
+        fs::create_dir_all(&pkg_sub_only).unwrap();
+        fs::create_dir_all(pkg_ws_mono.join("packages").join("app")).unwrap();
+        fs::create_dir_all(pkg_ws_quoted.join("packages").join("app")).unwrap();
+        fs::create_dir_all(pkg_ws_escaped.join("packages").join("app")).unwrap();
+        fs::create_dir_all(pkg_ws_env.join("packages").join("app")).unwrap();
+        fs::create_dir_all(pkg_ws_env_esc.join("packages").join("app")).unwrap();
+        fs::create_dir_all(&pkg_ignore_scripts).unwrap();
+        fs::create_dir_all(pkg_tmp.join("nm_barrier").join("node_modules")).unwrap();
+        fs::create_dir_all(&pkg_nm_barrier).unwrap();
+        fs::write(
+            pkg_tmp.join("package.json"),
+            r#"{"name":"root","scripts":{"ux:validate":"node scripts/ux/validate-system.js","schema:verify":"node scripts/verify.mjs","validate":"node scripts/validate.js","verify":"node scripts/verify.mjs","empty:validate":"   "}}"#,
+        )
+        .unwrap();
+        fs::write(pkg_tmp.join(".npmrc"), "if-present=true\n").unwrap();
+        fs::write(
+            pkg_sub_missing.join("package.json"),
+            r#"{"name":"sub","scripts":{"test":"node test.js"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            pkg_sub_only.join("package.json"),
+            r#"{"name":"sub-only","scripts":{"sub:validate":"node sub.js"}}"#,
+        )
+        .unwrap();
+        for (ws_root, npmrc_body) in [
+            (&pkg_ws_mono, "workspaces=true\nif-present=true\n"),
+            (&pkg_ws_quoted, "\"workspaces\"=true\nif-present=true\n"),
+            (&pkg_ws_escaped, "\"\\u0077orkspaces\"=true\nif-present=true\n"),
+            (&pkg_ws_env, "${CI_WORKSPACE_OPTION}=true\nif-present=true\n"),
+            (&pkg_ws_env_esc, "\"\\u0024{CI_WORKSPACE_OPTION}\"=true\nif-present=true\n"),
+            (&pkg_ignore_scripts, "ignore-scripts=true\n"),
+        ] {
+            fs::write(
+                ws_root.join("package.json"),
+                r#"{"name":"mono","workspaces":["packages/*"],"scripts":{"validate":"node validate.js"}}"#,
+            )
+            .unwrap();
+            fs::write(ws_root.join(".npmrc"), npmrc_body).unwrap();
+            if ws_root.join("packages").join("app").is_dir() {
+                fs::write(
+                    ws_root.join("packages").join("app").join("package.json"),
+                    r#"{"name":"app","scripts":{"test":"node t.js"}}"#,
+                )
+                .unwrap();
+            }
+        }
+        let root_cwd = pkg_tmp.to_string_lossy().into_owned();
+        let nested_cwd = pkg_nested.to_string_lossy().into_owned();
+        let sub_cwd = pkg_sub_missing.to_string_lossy().into_owned();
+        let mono_cwd = pkg_ws_mono.to_string_lossy().into_owned();
+        let mono_quoted_cwd = pkg_ws_quoted.to_string_lossy().into_owned();
+        let mono_escaped_cwd = pkg_ws_escaped.to_string_lossy().into_owned();
+        let mono_env_cwd = pkg_ws_env.to_string_lossy().into_owned();
+        let mono_env_esc_cwd = pkg_ws_env_esc.to_string_lossy().into_owned();
+        let ignore_scripts_cwd = pkg_ignore_scripts.to_string_lossy().into_owned();
+        let nm_barrier_cwd = pkg_nm_barrier.to_string_lossy().into_owned();
+        let pkg_confirmed_cases = [
+            ("$null | npm run ux:validate", root_cwd.as_str(), "VALIDATION"),
+            ("npm run 'ux:validate' -- --strict -w ignored", root_cwd.as_str(), "VALIDATION"),
+            ("pnpm run schema:verify", root_cwd.as_str(), "VALIDATION"),
+            ("pnpm schema:verify", root_cwd.as_str(), "VALIDATION"),
+            ("yarn ux:validate", root_cwd.as_str(), "VALIDATION"),
+            ("bun run verify", root_cwd.as_str(), "VALIDATION"),
+            ("$null | npm run ux:validate", nested_cwd.as_str(), "VALIDATION"),
+            ("git -C 'sub_missing' status; npm run ux:validate", root_cwd.as_str(), "VALIDATION"),
+            ("git -C 'sub_only' status; npm run sub:validate", root_cwd.as_str(), "UNCERTAIN"),
+            ("Set-Location 'sub_only'; npm run sub:validate", root_cwd.as_str(), "VALIDATION"),
+            ("cd /d sub_only; npm run sub:validate", root_cwd.as_str(), "UNCERTAIN"),
+            ("cd C:sub_only; npm run sub:validate", root_cwd.as_str(), "UNCERTAIN"),
+            ("cd -Path -Path sub_only; npm run sub:validate", root_cwd.as_str(), "UNCERTAIN"),
+            ("Set-Location 'sub_missing'; npm run ux:validate", root_cwd.as_str(), "UNCERTAIN"),
+            ("npm run ux:validate", sub_cwd.as_str(), "UNCERTAIN"),
+            ("npm run ux:validate", nm_barrier_cwd.as_str(), "UNCERTAIN"),
+            ("npm run validate", mono_cwd.as_str(), "UNCERTAIN"),
+            ("npm run validate", mono_quoted_cwd.as_str(), "UNCERTAIN"),
+            ("npm run validate", mono_escaped_cwd.as_str(), "UNCERTAIN"),
+            ("npm run validate", mono_env_cwd.as_str(), "UNCERTAIN"),
+            ("npm run validate", mono_env_esc_cwd.as_str(), "UNCERTAIN"),
+            ("npm run validate", ignore_scripts_cwd.as_str(), "UNCERTAIN"),
+            ("npm run missing:validate", root_cwd.as_str(), "UNCERTAIN"),
+            ("npm run empty:validate", root_cwd.as_str(), "UNCERTAIN"),
+            ("npm run ux:validate --if-present", root_cwd.as_str(), "UNCERTAIN"),
+            ("npm run ux:validate --ws", root_cwd.as_str(), "UNCERTAIN"),
+            ("npm run ux:validate -ws", root_cwd.as_str(), "UNCERTAIN"),
+            ("npm run ux:validate -w sub_missing", root_cwd.as_str(), "UNCERTAIN"),
+            ("npm run ux:validate --workspaces", root_cwd.as_str(), "UNCERTAIN"),
+            ("npm run ux:validate --iwr", root_cwd.as_str(), "UNCERTAIN"),
+            ("npm run ux:validate -g", root_cwd.as_str(), "UNCERTAIN"),
+            ("npm run ux:validate --prefix sub_missing", root_cwd.as_str(), "UNCERTAIN"),
+            ("npm run ux:validate --prefi sub_missing", root_cwd.as_str(), "UNCERTAIN"),
+            ("npm run ux:validate --userconfig custom.npmrc", root_cwd.as_str(), "UNCERTAIN"),
+            ("pnpm run schema:verify -r", root_cwd.as_str(), "UNCERTAIN"),
+            ("pnpm run schema:verify --filter sub", root_cwd.as_str(), "UNCERTAIN"),
+            ("yarn run validate --cwd sub_missing", root_cwd.as_str(), "UNCERTAIN"),
+            ("Set-Location nonexistent_dir; npm run ux:validate", root_cwd.as_str(), "UNCERTAIN"),
+            ("Pop-Location; npm run ux:validate", root_cwd.as_str(), "UNCERTAIN"),
+        ];
+        for (cmd, cwd_s, expected) in pkg_confirmed_cases {
+            let core = rio::unwrap_tokenade_command(cmd);
+            assert_eq!(
+                classify_gate_check_with_val(&core, Some(cwd_s)).0,
+                expected,
+                "pkg gate_check cmd: {} (cwd={})",
+                cmd,
+                cwd_s
+            );
+        }
+        let _ = fs::remove_dir_all(&pkg_tmp);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use regex::Regex;
 use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -605,6 +605,271 @@ fn collect_continuity_status(eff_cwd: &str) -> Value {
     })
 }
 
+fn is_placeholder_secret(val: &str) -> bool {
+    let v = val.trim();
+    if v.is_empty() {
+        return true;
+    }
+    if v.starts_with('<') && v.ends_with('>') {
+        return true;
+    }
+    // SAFETY: Compare ASCII prefixes on raw bytes so multi-byte UTF-8 secret values can never trigger a slice-boundary panic that leaks the string to stderr.
+    let bytes = v.as_bytes();
+    bytes
+        .get(..5)
+        .map_or(false, |b| b.eq_ignore_ascii_case(b"your_"))
+        || bytes
+            .get(..13)
+            .map_or(false, |b| b.eq_ignore_ascii_case(b"replace_with_"))
+}
+
+fn read_configured_secret_key_names(path: &Path) -> Vec<String> {
+    // SAFETY: Never read or expose secret values — collect strictly valid non-placeholder variable names.
+    // INVARIANT: Mirrors placeholder/dotenv clearing semantics of `mcp_env_exec.py:parse_dotenv_text`.
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut keys: BTreeSet<String> = BTreeSet::new();
+    for line in raw.trim_start_matches('\u{feff}').lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let valid_key = !key.is_empty()
+            && (key.as_bytes()[0].is_ascii_alphabetic() || key.as_bytes()[0] == b'_')
+            && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+        if !valid_key {
+            continue;
+        }
+        let mut val = v.trim();
+        if val.len() >= 2
+            && ((val.starts_with('"') && val.ends_with('"'))
+                || (val.starts_with('\'') && val.ends_with('\'')))
+        {
+            val = val[1..val.len() - 1].trim();
+        }
+        if is_placeholder_secret(val) {
+            keys.remove(key);
+        } else {
+            keys.insert(key.to_string());
+        }
+    }
+    keys.into_iter().collect()
+}
+
+fn find_latest_winget_bins(
+    la_dir: &Path,
+    prefixes: &[(&'static str, &str)],
+) -> BTreeMap<&'static str, PathBuf> {
+    let mut best: BTreeMap<&'static str, (String, PathBuf)> = BTreeMap::new();
+    let wg_pkgs = la_dir.join("Microsoft").join("WinGet").join("Packages");
+    let Ok(entries) = fs::read_dir(&wg_pkgs) else {
+        return BTreeMap::new();
+    };
+    for ent in entries.flatten() {
+        let fname = ent.file_name();
+        let fname_lossy = fname.to_string_lossy();
+        for &(key, pkg_prefix) in prefixes {
+            let prefix_bytes = pkg_prefix.as_bytes();
+            // SAFETY: Compare ASCII prefix on raw bytes to avoid UTF-8 char-boundary panics on non-ASCII directory names.
+            if fname_lossy
+                .as_bytes()
+                .get(..prefix_bytes.len())
+                .map_or(false, |b| b.eq_ignore_ascii_case(prefix_bytes))
+            {
+                let exe_name = format!("{}.exe", key);
+                let cand = ent.path().join(&exe_name);
+                if cand.is_file() {
+                    let sort_key = fname_lossy.to_ascii_lowercase();
+                    let replace = best
+                        .get(key)
+                        .map_or(true, |(prev_key, _)| sort_key > *prev_key);
+                    if replace {
+                        best.insert(key, (sort_key, cand));
+                    }
+                }
+            }
+        }
+    }
+    best.into_iter().map(|(k, (_, p))| (k, p)).collect()
+}
+
+fn detect_suite_cli(name: &str, fast_paths: &[PathBuf]) -> Option<String> {
+    for p in fast_paths {
+        if p.is_file() {
+            return Some(rio::normalize_path(&p.to_string_lossy()));
+        }
+    }
+    // INVARIANT: `rio::which_in_path` already iterates `PATHEXT` on Windows; avoid redundant `.exe`/`.cmd` rescans.
+    rio::which_in_path(name).map(|s| rio::normalize_path(&s))
+}
+
+fn collect_hook_error_breakdown(err_records: &[Value]) -> BTreeMap<String, usize> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for rec in err_records {
+        let hook_name = rec
+            .get("hook")
+            .or_else(|| rec.get("event"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("unknown");
+        *counts.entry(hook_name.to_string()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn collect_engineering_suite_status(
+    gemini_dir: &Path,
+    mcp_servers: Option<&Map<String, Value>>,
+    err_records: &[Value],
+) -> Value {
+    let home = rio::home_dir();
+    let local_bin = home.join(".local").join("bin");
+    let mut active_mcp: Vec<String> = Vec::new();
+    let mut disabled_mcp: Vec<String> = Vec::new();
+    let mut eager_true_mcp: Vec<String> = Vec::new();
+
+    if let Some(servers) = mcp_servers {
+        for (name, cfg) in servers {
+            let is_disabled = cfg
+                .get("disabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if is_disabled {
+                disabled_mcp.push(name.clone());
+            } else {
+                active_mcp.push(name.clone());
+                if cfg.get("eager").and_then(|v| v.as_bool()) != Some(false) {
+                    eager_true_mcp.push(name.clone());
+                }
+            }
+        }
+    }
+    active_mcp.sort();
+    disabled_mcp.sort();
+    eager_true_mcp.sort();
+
+    let la_dir = env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    let appdata_dir = env::var_os("APPDATA").map(PathBuf::from);
+    let wg_links = la_dir
+        .as_ref()
+        .map(|d| d.join("Microsoft").join("WinGet").join("Links"));
+
+    let mut drawio_paths = vec![local_bin.join("drawio.cmd")];
+    if let Some(ref la) = la_dir {
+        drawio_paths.push(la.join("Programs").join("draw.io").join("draw.io.exe"));
+    }
+    drawio_paths.push(PathBuf::from(r"C:\Program Files\draw.io\draw.io.exe"));
+
+    let mut glab_paths = Vec::new();
+    if let Some(ref la) = la_dir {
+        glab_paths.push(la.join("Programs").join("glab").join("glab.exe"));
+    }
+    let mut npm_ast_grep = Vec::new();
+    let mut npm_odiff = Vec::new();
+    if let Some(ref ad) = appdata_dir {
+        let npm_bin = ad.join("npm");
+        npm_ast_grep.push(npm_bin.join("ast-grep.cmd"));
+        npm_odiff.push(npm_bin.join("odiff.cmd"));
+    }
+
+    let mut trivy_found: Option<String> = None;
+    let mut nomad_found: Option<String> = None;
+    for (slot, exe) in [
+        (&mut trivy_found, "trivy.exe"),
+        (&mut nomad_found, "nomad.exe"),
+    ] {
+        let cand_local = local_bin.join(exe);
+        if cand_local.is_file() {
+            *slot = Some(rio::normalize_path(&cand_local.to_string_lossy()));
+        } else if let Some(ref links) = wg_links {
+            let cand_link = links.join(exe);
+            if cand_link.is_file() {
+                *slot = Some(rio::normalize_path(&cand_link.to_string_lossy()));
+            }
+        }
+    }
+    if (trivy_found.is_none() || nomad_found.is_none()) && la_dir.is_some() {
+        let mut needed: Vec<(&'static str, &'static str)> = Vec::new();
+        if trivy_found.is_none() {
+            needed.push(("trivy", "AquaSecurity.Trivy"));
+        }
+        if nomad_found.is_none() {
+            needed.push(("nomad", "Hashicorp.Nomad"));
+        }
+        let wg_hits = find_latest_winget_bins(la_dir.as_ref().unwrap(), &needed);
+        if trivy_found.is_none() {
+            if let Some(p) = wg_hits.get("trivy") {
+                trivy_found = Some(rio::normalize_path(&p.to_string_lossy()));
+            }
+        }
+        if nomad_found.is_none() {
+            if let Some(p) = wg_hits.get("nomad") {
+                nomad_found = Some(rio::normalize_path(&p.to_string_lossy()));
+            }
+        }
+    }
+
+    let bsl_paths = vec![
+        local_bin.join("bsl-language-server.cmd"),
+        PathBuf::from(r"C:\tools\bsl-language-server\bsl-language-server\bsl-language-server.exe"),
+    ];
+
+    let cli_specs: [(&str, Option<String>, Vec<PathBuf>); 11] = [
+        ("codebase-memory-mcp", None, vec![local_bin.join("codebase-memory-mcp.exe")]),
+        ("drawio", None, drawio_paths),
+        ("d2", None, vec![PathBuf::from(r"C:\Program Files\D2\d2.exe")]),
+        ("trivy", trivy_found, vec![]),
+        ("nomad", nomad_found, vec![]),
+        ("hurl", None, vec![local_bin.join("hurl.exe")]),
+        ("schemathesis", None, vec![local_bin.join("schemathesis.exe")]),
+        ("ast-grep", None, npm_ast_grep),
+        ("glab", None, glab_paths),
+        ("bsl-language-server", None, bsl_paths),
+        ("odiff", None, npm_odiff),
+    ];
+
+    let mut cli_status = Map::new();
+    let mut cli_ready: usize = 0;
+    for (name, pre_resolved, fast_paths) in cli_specs {
+        let found = pre_resolved.or_else(|| detect_suite_cli(name, &fast_paths));
+        if found.is_some() {
+            cli_ready += 1;
+        }
+        cli_status.insert(
+            name.to_string(),
+            found.map(Value::String).unwrap_or(Value::Null),
+        );
+    }
+
+    let launcher_path = gemini_dir
+        .join("config")
+        .join("mcp-launchers")
+        .join("mcp_env_exec.py");
+    let secrets_env_path = gemini_dir.join("secrets").join("mcp-gate.env");
+    let configured_secret_keys = read_configured_secret_key_names(&secrets_env_path);
+
+    json!({
+        "active_mcp_servers": active_mcp,
+        "active_mcp_count": active_mcp.len(),
+        "disabled_mcp_servers": disabled_mcp,
+        "disabled_mcp_count": disabled_mcp.len(),
+        "all_lazy_eager_false": mcp_servers.is_some() && eager_true_mcp.is_empty(),
+        "non_lazy_mcp_servers": eager_true_mcp,
+        "mcp_env_launcher_present": launcher_path.is_file(),
+        "configured_secret_keys": configured_secret_keys,
+        "cli_ready": cli_ready,
+        "cli_total": cli_status.len(),
+        "cli_tools": cli_status,
+        "hook_error_breakdown": collect_hook_error_breakdown(err_records),
+    })
+}
+
 pub fn collect_doctor_report(cwd: &str, plugin_dir: Option<&str>, compact: bool) -> Value {
     collect_doctor_report_for_os(cwd, plugin_dir, compact, None, cfg!(windows), false)
 }
@@ -617,8 +882,8 @@ pub(crate) fn collect_doctor_report_for_os(
     is_windows: bool,
     allow_unbuilt_source_bin: bool,
 ) -> Value {
-    let installed_dir = rio::home_dir()
-        .join(".gemini")
+    let gemini_dir = rio::home_dir().join(".gemini");
+    let installed_dir = gemini_dir
         .join("config")
         .join("plugins")
         .join("gemini-carbon-stack");
@@ -673,12 +938,10 @@ pub(crate) fn collect_doctor_report_for_os(
     }
 
     let err_log = rio::state_dir().join("logs").join("hook-errors.jsonl");
-    let recent_errors = rio::read_jsonl(&err_log, None).len();
+    let err_records = rio::read_jsonl(&err_log, None);
+    let recent_errors = err_records.len();
 
-    let mcp_cfg_path = rio::home_dir()
-        .join(".gemini")
-        .join("config")
-        .join("mcp_config.json");
+    let mcp_cfg_path = gemini_dir.join("config").join("mcp_config.json");
     let mcp_cfg = rio::read_json(&mcp_cfg_path);
     let mcp_servers = mcp_cfg
         .as_ref()
@@ -696,10 +959,7 @@ pub(crate) fn collect_doctor_report_for_os(
                 .map_or(false, |a| !a.is_empty())
     });
 
-    let cli_settings_path = rio::home_dir()
-        .join(".gemini")
-        .join("antigravity-cli")
-        .join("settings.json");
+    let cli_settings_path = gemini_dir.join("antigravity-cli").join("settings.json");
     let cli_settings = rio::read_json(&cli_settings_path);
     let cli_use_g1_credits_safe = cli_settings
         .as_ref()
@@ -866,6 +1126,10 @@ pub(crate) fn collect_doctor_report_for_os(
     if !compact || !ok {
         report.insert("skills".to_string(), json!(skills));
         report.insert("agents".to_string(), json!(agents));
+        report.insert(
+            "engineering_suite".to_string(),
+            collect_engineering_suite_status(&gemini_dir, mcp_servers, &err_records),
+        );
         let mut neon_levels = BTreeMap::new();
         neon_levels.insert("low", cwg_common::NEON_LOW_MODEL);
         neon_levels.insert("medium", cwg_common::NEON_MEDIUM_MODEL);
@@ -876,21 +1140,35 @@ pub(crate) fn collect_doctor_report_for_os(
         hydrogen_levels.insert("medium", cwg_common::HYDROGEN_MEDIUM_MODEL);
         hydrogen_levels.insert("high", cwg_common::HYDROGEN_HIGH_MODEL);
         hydrogen_levels.insert("xhigh", cwg_common::HYDROGEN_XHIGH_MODEL);
+        let max_rounds = cwg_common::MAX_ORDINARY_REVIEW_ROUNDS;
+        let max_closure = cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE;
         report.insert(
             "model_routing".to_string(),
             json!({
                 "coordinator": cwg_common::ORCHESTRATOR_NEON_MODEL,
-                "pipeline_order": "unittest -> primary review -> simplify once -> batch kill -> --closure",
+                "pipeline_order": format!(
+                    "unittest -> simplify once -> batch kill -> re-test after edits -> primary review (1..{}) -> APPROVED | (Round {} ESCALATE -> mandatory research -> fix + re-test -> <={} --closure passes | 1 redesign-reset)",
+                    max_rounds, max_rounds, max_closure
+                ),
                 "simplify_lenses": {
                     "lenses": cwg_common::SIMPLIFY_LENSES,
                     "standard_mode": "opt_in single_combined (simplify-reviewer) via .agents/carbon-gate.json",
-                    "high_xhigh_mode": "fast_path ALL (<=2 files & <=30 lines) else three_parallel_lenses (reuse, quality, efficiency)",
+                    "high_xhigh_mode": format!(
+                        "fast_path ALL (<={} files & <={} lines) else {}_parallel_lenses ({})",
+                        cwg_common::FAST_PATH_MAX_FILES,
+                        cwg_common::FAST_PATH_MAX_LINES,
+                        cwg_common::SIMPLIFY_LENSES.len(),
+                        cwg_common::SIMPLIFY_LENSES.join(", ")
+                    ),
                     "primary_model": cwg_common::SONNET_HIGH_MODEL,
                     "fallback_model": cwg_common::SIMPLIFY_FALLBACK_MODEL,
                     "secondary_fallback_model": cwg_common::HYDROGEN_XHIGH_MODEL,
                     "prompt_cache_ttl_seconds": cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
                 },
-                "external_review": "codex-cli (primary logic review + final --closure)",
+                "external_review": format!(
+                    "codex-cli (1..{} rounds in one session; after Round {} ESCALATE: mandatory research -> fix + re-test -> <={} --closure passes)",
+                    max_rounds, max_rounds, max_closure
+                ),
                 "internal_review": {
                     "primary_model": cwg_common::OPUS_HIGH_MODEL,
                     "high_escalation_model": cwg_common::NEON_XHIGH_MODEL,
@@ -903,6 +1181,7 @@ pub(crate) fn collect_doctor_report_for_os(
                         "root-cause-debugger",
                         "frontend-ui-builder",
                         "repo-architect-scout",
+                        "infra-sre-diagnostician",
                         "test-author",
                         "complex_disjoint_builder",
                         "simplify_fallback",
@@ -915,6 +1194,7 @@ pub(crate) fn collect_doctor_report_for_os(
                     "roles": [
                         "browser",
                         "translator",
+                        "gitlab-delivery-analyst",
                         "scout_swarm",
                         "simple_disjoint_builder",
                         "simplify_secondary_fallback",
@@ -973,8 +1253,19 @@ pub fn format_doctor_text(report: &Value) -> String {
         .get("logged_hook_errors")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    let suite_line = match report.get("engineering_suite") {
+        Some(s) => format!(
+            "engineering_suite: active_mcp={}, disabled_mcp={}, all_lazy={}, cli_ready={}/{}\n",
+            s.get("active_mcp_count").and_then(|v| v.as_u64()).unwrap_or(0),
+            s.get("disabled_mcp_count").and_then(|v| v.as_u64()).unwrap_or(0),
+            s.get("all_lazy_eager_false").and_then(|v| v.as_bool()).unwrap_or(false),
+            s.get("cli_ready").and_then(|v| v.as_u64()).unwrap_or(0),
+            s.get("cli_total").and_then(|v| v.as_u64()).unwrap_or(0),
+        ),
+        None => String::new(),
+    };
     format!(
-        "status: {}\nbundle_dir: {}\nstack_home: {}\nrust_engine: {}\nripgrep: {}\ncodex: {}\ncounts: skills={}, agents={}, rules={}\ngate_inbox: {}\nlogged_hook_errors: {}\n",
+        "status: {}\nbundle_dir: {}\nstack_home: {}\nrust_engine: {}\nripgrep: {}\ncodex: {}\ncounts: skills={}, agents={}, rules={}\ngate_inbox: {}\nlogged_hook_errors: {}\n{}",
         if ok { "OK" } else { "DEGRADED" },
         bundle,
         stack_home,
@@ -985,7 +1276,8 @@ pub fn format_doctor_text(report: &Value) -> String {
         agents,
         rules,
         gate_inbox,
-        hook_errs
+        hook_errs,
+        suite_line
     )
 }
 
@@ -1229,6 +1521,16 @@ mod tests {
         let txt = format_doctor_text(&report);
         assert!(txt.contains("bundle_dir:"));
         assert!(txt.contains("rust_engine:"));
+        assert!(txt.contains("engineering_suite:"));
+        assert!(report["model_routing"]["pipeline_order"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("unittest -> simplify once -> batch kill -> re-test after edits -> primary review"));
+        assert!(report["model_routing"]["pipeline_order"]
+            .as_str()
+            .unwrap_or("")
+            .contains("mandatory research -> fix + re-test -> <=2 --closure passes"));
+        assert!(report["engineering_suite"].is_object());
 
         match prev_home {
             Some(v) => env::set_var("CARBON_STACK_HOME", v),
@@ -1238,5 +1540,57 @@ mod tests {
             Some(v) => env::set_var("CARBON_STACK_BIN", v),
             None => env::remove_var("CARBON_STACK_BIN"),
         }
+    }
+
+    #[test]
+    fn test_secret_key_names_and_hook_error_breakdown() {
+        let tmp = TempDir::new("sd-secrets");
+        let env_file = tmp.0.join("mcp-gate.env");
+        fs::write(
+            &env_file,
+            "# comment\nEXA_API_KEY=real_val\nUTF8_SECRET_5=abcdЯsecret\nUTF8_SECRET_13=123456789012Жsecret\nCLEARED_KEY=real_val\nCLEARED_KEY=\nEMPTY=\nPLACEHOLDER=<your_key>\nYOUR_KEY=your_token\nSEMGREP_APP_TOKEN=\"tok123\"\nINVALID-KEY=1\n",
+        )
+        .unwrap();
+        let keys = read_configured_secret_key_names(&env_file);
+        assert_eq!(
+            keys,
+            vec![
+                "EXA_API_KEY".to_string(),
+                "SEMGREP_APP_TOKEN".to_string(),
+                "UTF8_SECRET_13".to_string(),
+                "UTF8_SECRET_5".to_string(),
+            ]
+        );
+        // Non-ASCII directory name under WinGet/Packages must not panic
+        let wg_non_ascii = tmp.0
+            .join("Microsoft")
+            .join("WinGet")
+            .join("Packages")
+            .join("ПапкаЯ1234567890");
+        fs::create_dir_all(&wg_non_ascii).unwrap();
+        let wg_hits = find_latest_winget_bins(&tmp.0, &[("trivy", "AquaSecurity.Trivy")]);
+        assert!(wg_hits.is_empty());
+
+        let errs = vec![
+            json!({"hook": "PreToolUse", "error": "x"}),
+            json!({"hook": "PreToolUse", "error": "y"}),
+            json!({"event": "Stop", "error": "z"}),
+        ];
+        let breakdown = collect_hook_error_breakdown(&errs);
+        assert_eq!(breakdown.get("PreToolUse"), Some(&2));
+        assert_eq!(breakdown.get("Stop"), Some(&1));
+
+        let missing_suite = collect_engineering_suite_status(&tmp.0, None, &errs);
+        assert_eq!(missing_suite["all_lazy_eager_false"], false);
+
+        let mut servers = Map::new();
+        servers.insert("gitlab".to_string(), json!({"eager": false}));
+        servers.insert("noisy".to_string(), json!({"eager": true}));
+        servers.insert("proxmox".to_string(), json!({"eager": false, "disabled": true}));
+        let suite = collect_engineering_suite_status(&tmp.0, Some(&servers), &errs);
+        assert_eq!(suite["active_mcp_count"], 2);
+        assert_eq!(suite["disabled_mcp_count"], 1);
+        assert_eq!(suite["all_lazy_eager_false"], false);
+        assert_eq!(suite["non_lazy_mcp_servers"], json!(["noisy"]));
     }
 }

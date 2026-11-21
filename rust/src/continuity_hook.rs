@@ -1595,44 +1595,116 @@ fn run_cmd_handoff(rest: &[String]) -> i32 {
     let existing = resolve_handoff(&cwd, &[], Some(&pkey), &session)
         .1
         .unwrap_or_default();
-    let next_goal = goal.unwrap_or_else(|| val_to_str(existing.get("goal")));
+    let existing_goal = val_to_str(existing.get("goal"));
+    let goal_provided = goal.as_deref().is_some_and(|g| !g.trim().is_empty());
+    let next_goal = goal.unwrap_or_else(|| existing_goal.clone());
+    let existing_sess = val_to_str(existing.get("session")).trim().to_string();
+    let handoff_session = if !session.trim().is_empty() {
+        session.trim().to_string()
+    } else {
+        existing_sess.clone()
+    };
+    let live_cand_first_ts = if !handoff_session.is_empty() {
+        cwg_common::read_marker_with_pending(&handoff_session)
+            .filter(|m| !json_truthy(m.get("closed")))
+            .map(|m| val_to_f64(m.get("first_ts")))
+            .unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    let now = now_sec();
+    let existing_cand_ts = val_to_f64(existing.get("candidate_first_ts"));
+    let existing_goal_ts = val_to_f64(existing.get("goal_updated_ts"));
+    let kept_goal_ts = if existing_goal_ts > 0.0 {
+        existing_goal_ts
+    } else {
+        val_to_f64(existing.get("updated_ts"))
+    };
+    let goal_changed = goal_provided
+        && !existing_goal.trim().is_empty()
+        && next_goal.trim() != existing_goal.trim();
+    let session_switched = !existing_sess.is_empty()
+        && !handoff_session.is_empty()
+        && existing_sess != handoff_session;
+    let candidate_switched = session_switched
+        || (live_cand_first_ts > 0.0
+            && existing_cand_ts > 0.0
+            && (existing_cand_ts - live_cand_first_ts).abs() > 1.0)
+        || (live_cand_first_ts > 0.0
+            && existing_cand_ts <= 0.0
+            && kept_goal_ts > 0.0
+            && kept_goal_ts + 300.0 < live_cand_first_ts)
+        || (existing_cand_ts > 0.0 && live_cand_first_ts <= 0.0 && goal_changed);
+    let same_live_candidate = !session_switched
+        && live_cand_first_ts > 0.0
+        && existing_cand_ts > 0.0
+        && (existing_cand_ts - live_cand_first_ts).abs() <= 1.0;
+    // INVARIANT: When `--goal` switches to a different session/candidate OR introduces a new goal text without a matching live candidate marker (e.g. markerless task 1 -> markerless task 2), advance `goal_generation` and drop stale prior `decisions`/`superseded`/`remaining` unless explicitly re-passed, while preserving them on same-task partial updates or same-candidate goal refinements.
+    let reset_prior_items = replace
+        || (goal_provided && (candidate_switched || (goal_changed && !same_live_candidate)));
+    let existing_goal_gen = existing
+        .get("goal_generation")
+        .and_then(Value::as_u64)
+        .unwrap_or(if existing_goal.trim().is_empty() { 0 } else { 1 });
+    let next_goal_gen = if reset_prior_items || (goal_provided && existing_goal.trim().is_empty()) {
+        existing_goal_gen.saturating_add(1)
+    } else {
+        existing_goal_gen
+    };
     let next_status = status.unwrap_or_else(|| {
-        let s = val_to_str(existing.get("status"));
-        if s.is_empty() {
+        if reset_prior_items {
             "in_progress".to_string()
         } else {
-            s
+            let s = val_to_str(existing.get("status"));
+            if s.is_empty() {
+                "in_progress".to_string()
+            } else {
+                s
+            }
         }
     });
-    let next_decs = merge_handoff_items(
-        &handoff_items(&existing, "decisions"),
-        decisions.as_deref(),
-        replace,
-    );
-    let next_sups = merge_handoff_items(
-        &handoff_items(&existing, "superseded"),
-        superseded.as_deref(),
-        replace,
-    );
-    let next_rems = merge_handoff_items(
-        &handoff_items(&existing, "remaining"),
-        remaining.as_deref(),
-        replace,
-    );
+    let prev_decs = if reset_prior_items {
+        Vec::new()
+    } else {
+        handoff_items(&existing, "decisions")
+    };
+    let prev_sups = if reset_prior_items {
+        Vec::new()
+    } else {
+        handoff_items(&existing, "superseded")
+    };
+    let prev_rems = if reset_prior_items {
+        Vec::new()
+    } else {
+        handoff_items(&existing, "remaining")
+    };
+    let next_decs = merge_handoff_items(&prev_decs, decisions.as_deref(), reset_prior_items);
+    let next_sups = merge_handoff_items(&prev_sups, superseded.as_deref(), reset_prior_items);
+    let next_rems = merge_handoff_items(&prev_rems, remaining.as_deref(), reset_prior_items);
     let git_val = if cwd.is_empty() {
         json!({})
     } else {
         collect_git_brief(&cwd).map(Value::Object).unwrap_or_else(|| json!({}))
     };
 
+    // INVARIANT: Bind `candidate_first_ts` and `goal_updated_ts` together with the goal itself; partial updates (`--remaining`/`--decisions`) without a new `--goal` must never rebind an older goal to a new candidate.
+    let (cand_first_ts, goal_updated_ts) = if goal_provided || existing_goal.trim().is_empty() {
+        (live_cand_first_ts, now)
+    } else {
+        (existing_cand_ts, kept_goal_ts)
+    };
     let updated = json!({
         "goal": next_goal,
+        "goal_generation": next_goal_gen,
         "status": next_status,
         "decisions": next_decs,
         "superseded": next_sups,
         "remaining": next_rems,
         "git": git_val,
-        "updated_ts": now_sec(),
+        "session": handoff_session,
+        "candidate_first_ts": cand_first_ts,
+        "goal_updated_ts": goal_updated_ts,
+        "updated_ts": now,
     });
     let _ = rio::write_json(&ho_file, &updated);
     let mut mirrored = false;

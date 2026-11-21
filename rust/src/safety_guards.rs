@@ -2394,6 +2394,35 @@ mod tests {
         let (dec_art, _, _) = evaluate_pre_tool_use(&payload_art);
         assert_eq!(dec_art, "allow");
 
+        // SAFETY: Extended gate validation scripts (`npm run validate`, `node scripts/validate.js`) must remain DENIED by File Ownership Guard in shared worktrees.
+        for blocked_cmd in [
+            "npm run validate",
+            "pnpm run schema:verify",
+            "node scripts/ux/validate-system.js",
+            "node scripts/validate.js",
+            "npm run test --if-present",
+        ] {
+            let payload_cmd = json!({
+                "worker_name": "builder-a",
+                "cwd": root.to_string_lossy(),
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": blocked_cmd}
+                }
+            });
+            let (dec_cmd, reason_cmd, _) = evaluate_pre_tool_use(&payload_cmd);
+            assert_eq!(
+                dec_cmd, "deny",
+                "File Ownership Guard must deny `{}` in shared worktree",
+                blocked_cmd
+            );
+            assert!(
+                reason_cmd.unwrap_or_default().contains("File Ownership Guard"),
+                "expected File Ownership Guard denial for `{}`",
+                blocked_cmd
+            );
+        }
+
         let _ = fs::remove_dir_all(&root);
     }
 

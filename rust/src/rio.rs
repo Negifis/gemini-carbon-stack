@@ -118,7 +118,7 @@ fn git_dash_c_re() -> &'static Regex {
     })
 }
 
-fn leading_null_pipe_re() -> &'static Regex {
+pub(crate) fn leading_null_pipe_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?i)\A\s*\$null\s*\|\s*").expect("leading_null_pipe_re"))
 }
@@ -126,8 +126,9 @@ fn leading_null_pipe_re() -> &'static Regex {
 fn tokenade_wrap_seg_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
+        // INVARIANT: Match `\r\n` atomically in `lead` and consume only horizontal `[ \t]*` so CRLF line breaks before a wrapped command are preserved instead of collapsing to bare `\r`.
         Regex::new(
-            r#"(?i)(?P<lead>\A|[;\r\n|&])\s*(?:\$null\s*\|\s*)?(?:&\s*)?(?:'(?:''|[^'\r\n])*tokenade(?:\.cmd|\.exe)?'|"[^"`$\r\n]*tokenade(?:\.cmd|\.exe)?"|[^\s|;&"'`$()\r\n]*tokenade(?:\.cmd|\.exe)?)\s+(?:wrap|exec-compact|raw|bypass|noproxy|shellwrap)\b(?:\s+--shell\s+[A-Za-z0-9_.-]+)?\s+(?P<inner>'(?:''|[^'])*'|"(?:`[\s\S]|""|[^"`])*"|[^|;&"'\r\n]+?)(?P<ws_tail>\s*)(?:[;\r\n|&]|\z)"#,
+            r#"(?i)(?P<lead>\A|\r\n|[;\r\n|&])[ \t]*(?:\$null\s*\|\s*)?(?:&\s*)?(?:'(?:''|[^'\r\n])*tokenade(?:\.cmd|\.exe)?'|"[^"`$\r\n]*tokenade(?:\.cmd|\.exe)?"|[^\s|;&"'`$()\r\n]*tokenade(?:\.cmd|\.exe)?)\s+(?:wrap|exec-compact|raw|bypass|noproxy|shellwrap)\b(?:\s+--shell\s+[A-Za-z0-9_.-]+)?\s+(?P<inner>'(?:''|[^'])*'|"(?:`[\s\S]|""|[^"`])*"|[^|;&"'\r\n]+?)(?P<ws_tail>\s*)(?:[;\r\n|&]|\z)"#,
         )
         .expect("tokenade_wrap_seg_re")
     })
@@ -1200,6 +1201,35 @@ pub fn read_jsonl(path: &Path, max_lines: Option<usize>) -> Vec<Value> {
         }
     }
     parse_jsonl_lines(&lines)
+}
+
+pub fn read_jsonl_with_rotated(path: &Path, max_lines: Option<usize>) -> Vec<Value> {
+    // INVARIANT: `append_jsonl` rotates `name.jsonl` -> `name.jsonl.1` when size exceeds `max_bytes`; read the newest entries from `.1` before the active file so pre-rotation records remain visible across rotation boundaries.
+    let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let rot_path = (!fname.is_empty()).then(|| path.with_file_name(format!("{}.1", fname)));
+    let cur = read_jsonl(path, max_lines);
+    let Some(rot) = rot_path.filter(|p| p.is_file()) else {
+        return cur;
+    };
+    if let Some(n) = max_lines {
+        if n > 0 && cur.len() >= n {
+            return cur;
+        }
+        let rem = n.saturating_sub(cur.len());
+        if rem == 0 {
+            return cur;
+        }
+        let mut rot_recs = read_jsonl(&rot, Some(rem.saturating_add(1)));
+        if rot_recs.len() > rem {
+            let drop_n = rot_recs.len() - rem;
+            rot_recs.drain(0..drop_n);
+        }
+        rot_recs.extend(cur);
+        return rot_recs;
+    }
+    let mut combined = read_jsonl(&rot, None);
+    combined.extend(cur);
+    combined
 }
 
 pub fn resolve_transcript_path(transcript_path: &str) -> Option<PathBuf> {
@@ -2697,6 +2727,12 @@ mod tests {
         assert_eq!(
             unwrap_tokenade_command("echo tokenade wrap 'git status'"),
             "echo tokenade wrap 'git status'"
+        );
+        assert_eq!(
+            unwrap_tokenade_command(
+                "Set-Location 'C:\\repo'\r\n& 'C:/tools/tokenade.exe' wrap --shell powershell '$null | node scripts/validate.js'"
+            ),
+            "Set-Location 'C:\\repo'\r\n$null | node scripts/validate.js"
         );
     }
 
