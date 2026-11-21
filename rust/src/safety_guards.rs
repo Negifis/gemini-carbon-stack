@@ -238,6 +238,25 @@ fn pending_simplify_cap_deny(session: &str, transcript_path: &str) -> Option<Str
     None
 }
 
+fn contains_ascii_ci(haystack: &str, needle: &[u8]) -> bool {
+    let hb = haystack.as_bytes();
+    needle.is_empty()
+        || (hb.len() >= needle.len()
+            && hb.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle)))
+}
+
+fn is_closure_review_prompt(text: &str) -> bool {
+    const MARKERS: &[&[u8]] = &[
+        b"CLOSURE_VALIDATION",
+        b"CLOSURE_PHASE",
+        b"--CLOSURE",
+        b"CLOSURE VALIDATION",
+        b"AUTONOMOUS CLOSURE",
+        b"POST-ESCALATE CLOSURE",
+    ];
+    MARKERS.iter().any(|m| contains_ascii_ci(text, m))
+}
+
 fn pending_post_block_simplify_deny(
     session: &str,
     cwd: &str,
@@ -275,7 +294,7 @@ fn pending_post_block_simplify_deny(
     let has_open_persistent = cwg_common::read_marker_with_pending(session)
         .map(|m| !json_truthy(m.get("closed")) && cwg_common::candidate_class(&m) == cwg_common::WORK_PERSISTENT)
         .unwrap_or(false);
-    if has_open_persistent {
+    if has_open_persistent && !cls_summary.legacy_three_round_closure_active {
         if !cls_summary.has_round_cap_escalate {
             return Some(format!(
                 "[Finite Gate Policy] Режим `--closure` допускается только после финального раунда `ESCALATE` (раунд {0}/{0}). Сначала выполните штатные раунды `carbon-stack codex-lane review` (1..{0}), либо завершите задачу квитанцией `[gate] draft-blocked`, если все {0} раунда вернули `REVISE`.",
@@ -741,7 +760,7 @@ pub fn guard_swarm_invocation_with_payload(
         && is_rev_target
         && !is_non_coord_worker
     {
-        if brief_str.to_lowercase().contains("closure_validation:") {
+        if is_closure_review_prompt(&brief_str) {
             if let Some(p) = payload {
                 let s = rio::session_key(p);
                 let c = rio::effective_cwd(p);
@@ -814,6 +833,18 @@ pub fn guard_subagent_invocation_with_payload(
         let cwd = rio::effective_cwd(payload);
         if let Some(rm_deny) = pending_research_mode_deny(&session, &cwd, transcript_path) {
             return ("deny".to_string(), Some(rm_deny), None);
+        }
+        if NATIVE_REVIEWERS.contains(&base_sub_type) && is_closure_review_prompt(&prompt) {
+            let min_risk = if base_sub_type == "adversarial-reviewer-xhigh" {
+                "XHIGH"
+            } else {
+                ""
+            };
+            if let Some(cls_deny) =
+                pending_post_block_simplify_deny(&session, &cwd, transcript_path, min_risk)
+            {
+                return ("deny".to_string(), Some(cls_deny), None);
+            }
         }
         if is_simplify_sub {
             if let Some(sc_deny) = pending_simplify_cap_deny(&session, transcript_path) {
@@ -2013,9 +2044,14 @@ pub fn guard_post_message(
             return ("deny".to_string(), Some(sc_deny));
         }
     }
-    if text.to_lowercase().contains("closure_validation:")
-        && targeted.iter().any(|w| !cwg_common::is_simplify_worker_name(w))
-    {
+    if targeted.iter().any(|w| {
+        !cwg_common::is_simplify_worker_name(w)
+            && (is_closure_review_prompt(&cwg_common::extract_worker_scoped_brief(
+                &text,
+                w,
+                &known_workers,
+            )) || (mentions_all && is_closure_review_prompt(&text)))
+    }) {
         if let Some(sim_deny) = pending_post_block_simplify_deny(&session, cwd, tp, "") {
             return ("deny".to_string(), Some(sim_deny));
         }
@@ -2684,6 +2720,38 @@ mod tests {
         let (dec_2nd_sim, rsn_2nd_sim, _) = evaluate_pre_tool_use(&wake_2nd_sim);
         assert_eq!(dec_2nd_sim, "deny");
         assert!(rsn_2nd_sim.unwrap_or_default().contains("MAX_SIMPLIFY_PASSES = 1"));
+
+        // INVARIANT (Codex Round-1/2 #7): Closure eligibility guard applies to ANY targeted non-simplify review-capable worker receiving a closure prompt (including model-targeted custom names without `CLOSURE_VALIDATION:` / `VERDICT:` tokens).
+        fs::write(
+            sdir_cap.join("members.json"),
+            json!({"members": {"auditor-x": {"model": cwg_common::OPUS_HIGH_MODEL, "role": "worker", "state": "waiting", "killed": false}}}).to_string(),
+        )
+        .unwrap();
+        for prompt_txt in [
+            "@auditor-x Run closure validation and emit CLOSURE_VALIDATION: READY or BLOCKED",
+            "@auditor-x Run post-ESCALATE autonomous closure validation",
+        ] {
+            let custom_cls_msg = json!({
+                "conversationId": sid_sim_cap,
+                "workspacePaths": [rio::normalize_path(&repo_sim_cap.to_string_lossy())],
+                "transcriptPath": tp_cap.to_string_lossy(),
+                "toolCall": {
+                    "name": "post_message",
+                    "args": {"text": prompt_txt}
+                }
+            });
+            let (dec_custom_cls, rsn_custom_cls, _) = evaluate_pre_tool_use(&custom_cls_msg);
+            assert_eq!(
+                dec_custom_cls, "deny",
+                "custom-named review worker receiving closure prompt `{}` must hit closure eligibility guard",
+                prompt_txt
+            );
+            assert!(
+                rsn_custom_cls.unwrap_or_default().contains("Finite Gate Policy"),
+                "denial for `{}` must come from Finite Gate closure guard",
+                prompt_txt
+            );
+        }
 
         let _ = fs::remove_dir_all(&root);
     }

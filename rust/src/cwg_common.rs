@@ -1718,6 +1718,29 @@ fn eval_single_head_lane_entry(
         accepts_current_dh: false,
         accepts_tree_oid: false,
     };
+    let is_pre_marker_adopted = json_truthy(ctx.last_entry.get("pre_marker_adopted"))
+        || json_truthy(ctx.marker.get("pre_marker_probe"));
+    if is_pre_marker_adopted && val_to_str(ctx.last_entry.get("diff_hash")).is_empty() {
+        // SAFETY: Pre-marker whole-worktree `prepare` entries have empty `diff_hash`; accept `tree_oid` ONLY when text coverage (`pre_marker_text_covered`), non-empty `raw_worktree_digest`, live `tree_oid`, and live raw-bytes digest all match identically.
+        if ctx
+            .last_entry
+            .get("pre_marker_text_covered")
+            .and_then(Value::as_bool)
+            != Some(true)
+            || val_to_str(ctx.last_entry.get("raw_worktree_digest")).is_empty()
+            || !live_tree_oid_matches(ctx.gr, ctx.tree_oid, live_oid_cache)
+            || !live_raw_digest_matches(ctx.gr, ctx.last_entry, live_raw_digest_cache)
+        {
+            return rejected;
+        }
+        *has_valid_modern_lane = true;
+        *has_same_repo_base_provenance = true;
+        return SingleHeadLaneOutcome {
+            accepts_current_dh: ctx.allow_tree_binding
+                && val_to_str(ctx.marker.get("current_diff_hash")) == ctx.tree_oid,
+            accepts_tree_oid: ctx.allow_tree_binding,
+        };
+    }
     if let Some(ut) = ctx
         .last_entry
         .get("unfiltered_tree_match")
@@ -1842,10 +1865,11 @@ fn collect_accepted_hashes_from_doc(
     }
     let marker_first_ts = marker_cycle_first_ts(m);
     let prev_mts = val_to_f64(doc.get("marker_first_ts"));
-    // INVARIANT: Fail closed (`Vec::new()`) when the marker cycle ran `prepare` and `rounds.json` holds a mismatched or missing `marker_first_ts` (e.g. failed write), while keeping pre-marker `prev_mts <= 0.0` unbound from `tree_oid` when no active-marker `prepare` occurred.
+    let is_pre_marker_probe = json_truthy(m.get("pre_marker_probe"));
+    // INVARIANT: Fail closed (`Vec::new()`) when the marker cycle ran `prepare` and `rounds.json` holds a mismatched or missing `marker_first_ts` (e.g. failed write), while keeping pre-marker `prev_mts <= 0.0` unbound from `tree_oid` except during an in-memory `pre_marker_probe` verification.
     if marker_first_ts > 0.0 {
         let mts_mismatch = cycle_ts_mismatch(prev_mts, marker_first_ts);
-        if mts_mismatch || prev_mts <= 0.0 {
+        if mts_mismatch || (prev_mts <= 0.0 && !is_pre_marker_probe) {
             let cycle_has_marker_prepare = marker_has_prepare_cycle(marker)
                 || cached_disk_cycle_marker(skey, marker, disk_marker_cache).is_some();
             if cycle_has_marker_prepare {
@@ -1856,7 +1880,7 @@ fn collect_accepted_hashes_from_doc(
             }
         }
     }
-    let allow_tree_binding = !(marker_first_ts > 0.0 && prev_mts <= 0.0);
+    let allow_tree_binding = is_pre_marker_probe || !(marker_first_ts > 0.0 && prev_mts <= 0.0);
     let folded_gr = rio::fold_path(&gr);
     let expected_lane_prefix = format!("{}|", folded_gr);
     let lanes_opt = doc.get("lanes").and_then(Value::as_object);
@@ -3537,6 +3561,7 @@ pub fn apply_pending_marker_deltas(
                 "shell_durable_edit": false,
                 "content_marks": [],
                 "applied_pending_ids": [],
+                "gate_max_review_rounds": MAX_ORDINARY_REVIEW_ROUNDS,
                 "closed": false,
             })
         }
@@ -5475,11 +5500,16 @@ pub fn latch_marker_closure_halt(latch: ClosureHaltLatch<'_>) {
             return false;
         }
         if let Some((cur_cnt, cur_ts, _)) = active_marker_closure_halt(&fresh) {
-            if cur_cnt >= blocked_count && cur_ts >= last_blocked_ts && consumed_ids.is_empty() {
+            if cur_cnt >= blocked_count
+                && cur_ts >= last_blocked_ts
+                && marker_closure_halt_schema_version(&fresh) >= CLOSURE_HALT_SCHEMA_VERSION
+                && consumed_ids.is_empty()
+            {
                 return true;
             }
         }
         if let Some(mobj) = fresh.as_object_mut() {
+            // INVARIANT: Stamp `CLOSURE_HALT_SCHEMA_VERSION` (2) on every verified post-upgrade `closure_halt` so later Round-4 rollout eviction can never reconcile away a legitimate halt.
             mobj.insert(
                 "closure_halt".to_string(),
                 json!({
@@ -5488,6 +5518,7 @@ pub fn latch_marker_closure_halt(latch: ClosureHaltLatch<'_>) {
                     "last_blocked_ts": last_blocked_ts,
                     "blocked_review_ids": blocked_ids,
                     "cycle_base_ts": cycle_base_ts,
+                    "halt_schema_version": CLOSURE_HALT_SCHEMA_VERSION,
                 }),
             );
         }
@@ -5499,6 +5530,284 @@ pub fn latch_marker_closure_halt(latch: ClosureHaltLatch<'_>) {
         }
         false
     });
+}
+
+pub const CLOSURE_HALT_SCHEMA_VERSION: u64 = 2;
+
+pub fn marker_closure_halt_schema_version(marker: &Value) -> u64 {
+    marker
+        .get("closure_halt")
+        .and_then(Value::as_object)
+        .and_then(|ch| ch.get("halt_schema_version"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+pub fn enforcement_state_closed_ts(session: &str) -> f64 {
+    if session.trim().is_empty() {
+        return 0.0;
+    }
+    rio::read_json(&enforcement_state_path(session))
+        .map(|st| val_to_f64(st.get("closed_ts")))
+        .unwrap_or(0.0)
+}
+
+const PRE_MARKER_PREPARE_MAX_AGE_SEC: f64 = 3600.0;
+const PRE_MARKER_VERIFIED_TTL_SEC: f64 = 120.0;
+
+fn simplify_lane_key(git_root: &str) -> String {
+    format!("{}|simplify", rio::fold_path(git_root))
+}
+
+fn unbound_simplify_last_entry<'a>(doc: &'a Value, lane_key: &str) -> Option<&'a Value> {
+    if val_to_f64(doc.get("marker_first_ts")) > 0.0 {
+        return None;
+    }
+    doc.get("lanes")
+        .and_then(Value::as_object)?
+        .get(lane_key)
+        .and_then(Value::as_array)?
+        .last()
+}
+
+pub fn has_unbound_pre_marker_simplify_rounds(session: &str) -> bool {
+    if session.trim().is_empty() {
+        return false;
+    }
+    let skey = rio::safe_key(session, "default");
+    let Some(doc) = rio::read_json(&swarm_rounds_path(&skey)) else {
+        return false;
+    };
+    if val_to_f64(doc.get("marker_first_ts")) > 0.0 {
+        return false;
+    }
+    doc.get("lanes")
+        .and_then(Value::as_object)
+        .is_some_and(|lm| {
+            lm.iter().any(|(k, v)| {
+                k.ends_with("|simplify") && v.as_array().is_some_and(|arr| !arr.is_empty())
+            })
+        })
+}
+
+pub fn read_pre_marker_simplify_prepare(
+    session: &str,
+    git_root: &str,
+    now: f64,
+    prior_closed_ts: f64,
+    expected_call_key: Option<&str>,
+) -> Option<(f64, String, Vec<String>)> {
+    if session.trim().is_empty() || git_root.trim().is_empty() {
+        return None;
+    }
+    let skey = rio::safe_key(session, "default");
+    let doc = rio::read_json(&swarm_rounds_path(&skey))?;
+    let folded_gr = rio::fold_path(git_root);
+    let last_ent = unbound_simplify_last_entry(&doc, &format!("{}|simplify", folded_gr))?;
+    let tree_oid = val_to_str(last_ent.get("tree_oid"));
+    if !is_git_oid(&tree_oid)
+        || !val_to_str(last_ent.get("diff_hash")).is_empty()
+        || val_to_str(last_ent.get("raw_worktree_digest")).is_empty()
+        || last_ent
+            .get("pre_marker_text_covered")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return None;
+    }
+    // INVARIANT: Bind to `last_ent.ts` (never `min(ts)` over older abandoned prepares) so a stale earlier entry cannot poison a fresh pre-marker prepare.
+    let prep_ts = val_to_f64(last_ent.get("ts"));
+    if prep_ts <= 0.0
+        || prep_ts <= prior_closed_ts + TS_EPS
+        || prep_ts > now + TS_EPS
+        || (now - prep_ts) > PRE_MARKER_PREPARE_MAX_AGE_SEC
+    {
+        return None;
+    }
+    let mut pre_hashes: Vec<String> = Vec::new();
+    if let Some(exp_key) = expected_call_key.map(str::trim).filter(|k| !k.is_empty()) {
+        if let Some(pv) = doc
+            .get("pre_marker_verified")
+            .and_then(Value::as_object)
+        {
+            let pv_repo = val_to_str(pv.get("repo"));
+            let pv_prep_ts = val_to_f64(pv.get("prep_ts"));
+            let pv_ts = val_to_f64(pv.get("verified_ts"));
+            let pv_call_key = val_to_str(pv.get("call_key"));
+            if pv_repo == folded_gr
+                && pv_call_key == exp_key
+                && (pv_prep_ts - prep_ts).abs() <= TS_EPS
+                && pv_ts > 0.0
+                && (now - pv_ts) <= PRE_MARKER_VERIFIED_TTL_SEC
+            {
+                if let Some(arr) = pv.get("hashes").and_then(Value::as_array) {
+                    for v in arr {
+                        let s = val_to_str(Some(v)).trim().to_string();
+                        if !s.is_empty() && !pre_hashes.contains(&s) {
+                            pre_hashes.push(s);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Some((prep_ts, tree_oid, pre_hashes))
+}
+
+fn mutate_unbound_pre_marker_rounds(
+    session: &str,
+    git_root: &str,
+    prep_ts: f64,
+    mutate: impl FnOnce(&mut Map<String, Value>, &str, &str) -> bool,
+) -> bool {
+    if session.trim().is_empty() || git_root.trim().is_empty() || prep_ts <= 0.0 {
+        return false;
+    }
+    let skey = rio::safe_key(session, "default");
+    let rpath = swarm_rounds_path(&skey);
+    let folded_gr = rio::fold_path(git_root);
+    let lane_key = format!("{}|simplify", folded_gr);
+    // SAFETY: Acquire only `swarm_rounds_lock_path` (never nested inside `marker_lock_path`) to respect the strict `swarm_rounds_lock -> marker_lock` hierarchy.
+    rio::with_file_lock(&swarm_rounds_lock_path(&skey), 5.0, 30.0, |locked| {
+        if !locked {
+            return false;
+        }
+        let Some(mut doc) = rio::read_json(&rpath) else {
+            return false;
+        };
+        let Some(last_ent) = unbound_simplify_last_entry(&doc, &lane_key) else {
+            return false;
+        };
+        let ent_ts = val_to_f64(last_ent.get("ts"));
+        if ent_ts <= 0.0
+            || (ent_ts - prep_ts).abs() > TS_EPS
+            || !val_to_str(last_ent.get("diff_hash")).is_empty()
+        {
+            return false;
+        }
+        let Some(obj) = doc.as_object_mut() else {
+            return false;
+        };
+        if !mutate(obj, &folded_gr, &lane_key) {
+            return false;
+        }
+        rio::write_json(&rpath, &doc).is_ok()
+    })
+}
+
+pub fn record_pre_marker_verified_simplify(
+    session: &str,
+    git_root: &str,
+    prep_ts: f64,
+    now: f64,
+    call_key: &str,
+    hashes: &[String],
+) -> bool {
+    if hashes.is_empty() || call_key.trim().is_empty() {
+        return false;
+    }
+    mutate_unbound_pre_marker_rounds(session, git_root, prep_ts, |obj, folded_gr, _| {
+        obj.insert(
+            "pre_marker_verified".to_string(),
+            json!({
+                "repo": folded_gr,
+                "prep_ts": prep_ts,
+                "verified_ts": now,
+                "call_key": call_key,
+                "hashes": hashes,
+            }),
+        );
+        true
+    })
+}
+
+pub fn clear_pre_marker_verified_simplify(session: &str) -> bool {
+    if session.trim().is_empty() {
+        return false;
+    }
+    let skey = rio::safe_key(session, "default");
+    let rpath = swarm_rounds_path(&skey);
+    let has_pv = rio::read_json(&rpath)
+        .and_then(|d| d.get("pre_marker_verified").cloned())
+        .is_some();
+    if !has_pv {
+        return false;
+    }
+    rio::with_file_lock(&swarm_rounds_lock_path(&skey), 5.0, 30.0, |locked| {
+        if !locked {
+            return false;
+        }
+        let Some(mut doc) = rio::read_json(&rpath) else {
+            return false;
+        };
+        let Some(obj) = doc.as_object_mut() else {
+            return false;
+        };
+        if obj.remove("pre_marker_verified").is_none() {
+            return false;
+        }
+        rio::write_json(&rpath, &doc).is_ok()
+    })
+}
+
+pub fn finalize_pre_marker_simplify_adoption(session: &str, git_root: &str, prep_ts: f64) -> bool {
+    mutate_unbound_pre_marker_rounds(session, git_root, prep_ts, |obj, _, lane_key| {
+        let Some(last_ent) = obj
+            .get_mut("lanes")
+            .and_then(Value::as_object_mut)
+            .and_then(|lm| lm.get_mut(lane_key))
+            .and_then(Value::as_array_mut)
+            .and_then(|arr| arr.last_mut())
+            .and_then(Value::as_object_mut)
+        else {
+            return false;
+        };
+        last_ent.insert("pre_marker_adopted".to_string(), Value::Bool(true));
+        obj.insert("marker_first_ts".to_string(), json!(prep_ts));
+        obj.remove("pre_marker_verified");
+        true
+    })
+}
+
+pub fn active_pre_marker_tree_oid(session: &str, marker: &Value) -> String {
+    let gr = val_to_str(marker.get("git_root"));
+    if session.trim().is_empty() || gr.trim().is_empty() {
+        return String::new();
+    }
+    let skey = rio::safe_key(session, "default");
+    let Some(doc) = rio::read_json(&swarm_rounds_path(&skey)) else {
+        return String::new();
+    };
+    let doc_mts = val_to_f64(doc.get("marker_first_ts"));
+    let m_fts = marker_cycle_first_ts(marker);
+    if doc_mts <= 0.0 || (m_fts > 0.0 && cycle_ts_mismatch(doc_mts, m_fts)) {
+        return String::new();
+    }
+    let lane_key = simplify_lane_key(&gr);
+    let Some(last_ent) = doc
+        .get("lanes")
+        .and_then(Value::as_object)
+        .and_then(|lm| lm.get(&lane_key))
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.last())
+    else {
+        return String::new();
+    };
+    if !json_truthy(last_ent.get("pre_marker_adopted"))
+        || val_to_str(last_ent.get("raw_worktree_digest")).is_empty()
+        || last_ent
+            .get("pre_marker_text_covered")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return String::new();
+    }
+    let tree_oid = val_to_str(last_ent.get("tree_oid"));
+    if is_git_oid(&tree_oid) {
+        tree_oid
+    } else {
+        String::new()
+    }
 }
 
 pub fn latch_marker_closure_halt_for_marker(
@@ -6005,21 +6314,158 @@ fn emit_window_step(
     Ok(())
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ResearchWindowStatus {
+    Verified,
+    ProvenAbsent,
+    Incomplete,
+}
+
+struct WindowCompletenessTracker {
+    windows: Vec<(f64, f64)>,
+    seen_indices: HashSet<i64>,
+    max_idx_seen: Option<i64>,
+    out_of_order_ranges: Vec<(i64, i64)>,
+    max_idx_le_win_lo: Vec<Option<i64>>,
+    min_idx_le_since: Vec<Option<i64>>,
+    min_idx_ge_until: Vec<Option<i64>>,
+    max_idx_in_win: Vec<Option<i64>>,
+    truncated_in_window: bool,
+    unindexed_in_window: bool,
+    had_parse_error: bool,
+}
+
+impl WindowCompletenessTracker {
+    fn new(windows: &[(f64, f64)]) -> Self {
+        let n = windows.len();
+        Self {
+            windows: windows.to_vec(),
+            seen_indices: HashSet::new(),
+            max_idx_seen: None,
+            out_of_order_ranges: Vec::new(),
+            max_idx_le_win_lo: vec![None; n],
+            min_idx_le_since: vec![None; n],
+            min_idx_ge_until: vec![None; n],
+            max_idx_in_win: vec![None; n],
+            truncated_in_window: false,
+            unindexed_in_window: false,
+            had_parse_error: false,
+        }
+    }
+
+    fn in_evidence_window(&self, ts: f64) -> bool {
+        ts <= 0.0
+            || self
+                .windows
+                .iter()
+                .any(|&(s, u)| ts >= (s - 300.0).max(0.0) && ts <= u + 1.0)
+    }
+
+    fn observe(&mut self, step_idx: Option<i64>, ts: f64, has_evidence_trunc: bool) {
+        if has_evidence_trunc && self.in_evidence_window(ts) {
+            self.truncated_in_window = true;
+        }
+        let Some(idx) = step_idx else {
+            if self.in_evidence_window(ts) {
+                self.unindexed_in_window = true;
+            }
+            return;
+        };
+        if let Some(prev_max) = self.max_idx_seen {
+            if idx <= prev_max {
+                self.out_of_order_ranges.push((idx, prev_max));
+            } else {
+                self.max_idx_seen = Some(idx);
+            }
+        } else {
+            self.max_idx_seen = Some(idx);
+        }
+        self.seen_indices.insert(idx);
+        if ts <= 0.0 {
+            return;
+        }
+        for (wi, &(since_ts, until_ts)) in self.windows.iter().enumerate() {
+            let win_lo = (since_ts - 300.0).max(0.0);
+            let win_hi = until_ts + 1.0;
+            if ts <= win_lo {
+                self.max_idx_le_win_lo[wi] = Some(
+                    self.max_idx_le_win_lo[wi].map_or(idx, |prev| prev.max(idx)),
+                );
+            }
+            if ts <= since_ts {
+                self.min_idx_le_since[wi] = Some(
+                    self.min_idx_le_since[wi].map_or(idx, |prev| prev.min(idx)),
+                );
+            }
+            if ts >= until_ts - 1.0 {
+                self.min_idx_ge_until[wi] = Some(
+                    self.min_idx_ge_until[wi].map_or(idx, |prev| prev.min(idx)),
+                );
+            }
+            if ts <= win_hi {
+                self.max_idx_in_win[wi] = Some(
+                    self.max_idx_in_win[wi].map_or(idx, |prev| prev.max(idx)),
+                );
+            }
+        }
+    }
+
+    fn covers_all_windows(&self) -> bool {
+        if self.had_parse_error || self.truncated_in_window || self.unindexed_in_window {
+            return false;
+        }
+        for wi in 0..self.windows.len() {
+            let lo_i = if let Some(i) = self.max_idx_le_win_lo[wi] {
+                i
+            } else if self.min_idx_le_since[wi] == Some(0) {
+                0
+            } else {
+                return false;
+            };
+            let Some(right_i) = self.min_idx_ge_until[wi] else {
+                return false;
+            };
+            let hi_i = right_i.max(self.max_idx_in_win[wi].unwrap_or(right_i));
+            if lo_i > hi_i || (hi_i - lo_i) > 200_000 {
+                return false;
+            }
+            // SAFETY: Because `find_research_evidence_since` pairs `PLANNER_RESPONSE` with following `GENERIC` steps in record order, any `step_index` inversion or duplicate overlapping `[lo_i, hi_i]` must fail closed to `Incomplete` rather than `ProvenAbsent`.
+            if self
+                .out_of_order_ranges
+                .iter()
+                .any(|&(a, b)| a <= hi_i && b >= lo_i)
+            {
+                return false;
+            }
+            if !(lo_i..=hi_i).all(|i| self.seen_indices.contains(&i)) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+struct TranscriptWindowScan {
+    steps: Vec<Value>,
+    complete: bool,
+}
+
 fn scan_transcript_file_windows(
     tp: &Path,
-    windows: &[(f64, f64)],
+    scan_ranges: &[(f64, f64)],
+    evidence_windows: &[(f64, f64)],
     bail_on_truncated: bool,
-) -> Result<(Vec<Value>, bool), ()> {
+) -> Result<TranscriptWindowScan, ()> {
     let fh = File::open(tp).map_err(|_| ())?;
     let mut reader = BufReader::new(fh);
     let mut line = String::new();
     let mut steps: Vec<Value> = Vec::new();
-    let mut truncated_tool_calls = false;
+    let mut tracker = WindowCompletenessTracker::new(evidence_windows);
     let mut in_planner_span = false;
     let mut pending_planner: Option<WindowStepDeser> = None;
     let mut pending_generics: Vec<WindowStepDeser> = Vec::new();
-    let max_hi = windows.iter().map(|&(_, hi)| hi).fold(0.0_f64, f64::max);
-    let in_any_window = |ts: f64| ts > 0.0 && windows.iter().any(|&(lo, hi)| ts >= lo && ts <= hi);
+    let max_hi = scan_ranges.iter().map(|&(_, hi)| hi).fold(0.0_f64, f64::max);
+    let in_any_window = |ts: f64| ts > 0.0 && scan_ranges.iter().any(|&(lo, hi)| ts >= lo && ts <= hi);
 
     while reader.read_line(&mut line).map_err(|_| ())? > 0 {
         let trimmed = line.trim();
@@ -6028,6 +6474,7 @@ fn scan_transcript_file_windows(
             continue;
         }
         let Ok(deser) = serde_json::from_str::<WindowStepDeser>(trimmed) else {
+            tracker.had_parse_error = true;
             in_planner_span = false;
             pending_planner = None;
             pending_generics.clear();
@@ -6035,22 +6482,27 @@ fn scan_transcript_file_windows(
             line.clear();
             continue;
         };
+        let step_ts = deser.created_at.as_deref().map(rio::parse_iso_ts).unwrap_or(0.0);
+        let step_idx = deser.step_index.as_ref().and_then(Value::as_i64);
+        let has_ev_trunc = deser
+            .truncated_fields
+            .as_ref()
+            .is_some_and(|arr| arr.iter().any(|x| x == "tool_calls" || x == "content"));
+        tracker.observe(step_idx, step_ts, has_ev_trunc);
+        if bail_on_truncated && tracker.truncated_in_window {
+            return Ok(TranscriptWindowScan {
+                steps: Vec::new(),
+                complete: false,
+            });
+        }
+        let mut step_trunc_ignored = false;
         match deser.step_type.as_str() {
             "PLANNER_RESPONSE" => {
                 pending_planner = None;
                 pending_generics.clear();
-                let ts = deser.created_at.as_deref().map(rio::parse_iso_ts).unwrap_or(0.0);
+                let ts = step_ts;
                 if in_any_window(ts) {
-                    if emit_window_step(
-                        deser,
-                        bail_on_truncated,
-                        &mut steps,
-                        &mut truncated_tool_calls,
-                    )
-                    .is_err()
-                    {
-                        return Ok((Vec::new(), true));
-                    }
+                    let _ = emit_window_step(deser, false, &mut steps, &mut step_trunc_ignored);
                     in_planner_span = true;
                 } else {
                     in_planner_span = false;
@@ -6061,19 +6513,10 @@ fn scan_transcript_file_windows(
                 }
             }
             "GENERIC" if in_planner_span => {
-                if emit_window_step(
-                    deser,
-                    bail_on_truncated,
-                    &mut steps,
-                    &mut truncated_tool_calls,
-                )
-                .is_err()
-                {
-                    return Ok((Vec::new(), true));
-                }
+                let _ = emit_window_step(deser, false, &mut steps, &mut step_trunc_ignored);
             }
             "GENERIC" if pending_planner.is_some() => {
-                let gts = deser.created_at.as_deref().map(rio::parse_iso_ts).unwrap_or(0.0);
+                let gts = step_ts;
                 if in_any_window(gts) {
                     if let Some(p_deser) = pending_planner.take() {
                         let g_desers = std::mem::take(&mut pending_generics);
@@ -6081,16 +6524,7 @@ fn scan_transcript_file_windows(
                             .chain(g_desers)
                             .chain(std::iter::once(deser))
                         {
-                            if emit_window_step(
-                                item,
-                                bail_on_truncated,
-                                &mut steps,
-                                &mut truncated_tool_calls,
-                            )
-                            .is_err()
-                            {
-                                return Ok((Vec::new(), true));
-                            }
+                            let _ = emit_window_step(item, false, &mut steps, &mut step_trunc_ignored);
                         }
                         in_planner_span = true;
                     }
@@ -6106,18 +6540,9 @@ fn scan_transcript_file_windows(
                 in_planner_span = false;
                 pending_planner = None;
                 pending_generics.clear();
-                let sts = deser.created_at.as_deref().map(rio::parse_iso_ts).unwrap_or(0.0);
+                let sts = step_ts;
                 if in_any_window(sts) {
-                    if emit_window_step(
-                        deser,
-                        bail_on_truncated,
-                        &mut steps,
-                        &mut truncated_tool_calls,
-                    )
-                    .is_err()
-                    {
-                        return Ok((Vec::new(), true));
-                    }
+                    let _ = emit_window_step(deser, false, &mut steps, &mut step_trunc_ignored);
                 } else {
                     push_window_gap(&mut steps);
                 }
@@ -6134,7 +6559,8 @@ fn scan_transcript_file_windows(
     if tp.file_name().and_then(|s| s.to_str()) == Some("transcript.jsonl") && !steps.is_empty() {
         rio::decode_compact_step_args(&mut steps);
     }
-    Ok((steps, truncated_tool_calls))
+    let complete = tracker.covers_all_windows();
+    Ok(TranscriptWindowScan { steps, complete })
 }
 
 fn all_windows_have_research(steps: &[Value], gap_windows: &[(f64, f64)]) -> bool {
@@ -6143,10 +6569,10 @@ fn all_windows_have_research(steps: &[Value], gap_windows: &[(f64, f64)]) -> boo
         .all(|&(blk_ts, r_ts)| !find_research_evidence_since(steps, blk_ts, Some(r_ts + 1.0)).is_empty())
 }
 
-fn verify_gap_windows_from_transcript(
+fn verify_gap_windows_from_transcript_status(
     transcript_path: &str,
     gap_windows: &[(f64, f64)],
-) -> Result<bool, ()> {
+) -> Result<ResearchWindowStatus, ()> {
     if transcript_path.trim().is_empty() || gap_windows.is_empty() {
         return Err(());
     }
@@ -6158,34 +6584,54 @@ fn verify_gap_windows_from_transcript(
     let full_p = rio::resolve_transcript_path(transcript_path);
     let has_distinct_full = full_p.as_ref().is_some_and(|fp| fp != &compact_p);
     if compact_p.is_file() {
-        if let Ok((steps, false)) =
-            scan_transcript_file_windows(&compact_p, &scan_ranges, has_distinct_full)
+        if let Ok(scan) =
+            scan_transcript_file_windows(&compact_p, &scan_ranges, gap_windows, has_distinct_full)
         {
-            if all_windows_have_research(&steps, gap_windows) {
-                return Ok(true);
+            if all_windows_have_research(&scan.steps, gap_windows) {
+                return Ok(ResearchWindowStatus::Verified);
             }
             if !has_distinct_full {
-                return Ok(false);
+                return Ok(if scan.complete {
+                    ResearchWindowStatus::ProvenAbsent
+                } else {
+                    ResearchWindowStatus::Incomplete
+                });
             }
         }
     }
     let Some(fp) = full_p else {
         return Err(());
     };
-    let (full_steps, _) = scan_transcript_file_windows(&fp, &scan_ranges, false)?;
-    Ok(all_windows_have_research(&full_steps, gap_windows))
+    let full_scan = scan_transcript_file_windows(&fp, &scan_ranges, gap_windows, false)?;
+    if all_windows_have_research(&full_scan.steps, gap_windows) {
+        return Ok(ResearchWindowStatus::Verified);
+    }
+    Ok(if full_scan.complete {
+        ResearchWindowStatus::ProvenAbsent
+    } else {
+        ResearchWindowStatus::Incomplete
+    })
 }
 
-pub fn has_verified_research_between(
+fn verify_gap_windows_from_transcript(
+    transcript_path: &str,
+    gap_windows: &[(f64, f64)],
+) -> Result<bool, ()> {
+    verify_gap_windows_from_transcript_status(transcript_path, gap_windows)
+        .map(|st| st == ResearchWindowStatus::Verified)
+}
+
+pub fn research_status_between(
     steps: Option<&[Value]>,
     transcript_path: Option<&str>,
     since_ts: f64,
     until_ts: f64,
-) -> bool {
-    // INVARIANT: Require verified external/docs research in `(since_ts, until_ts]` after Round-4 `ESCALATE` before admitting or accepting `--closure`, falling back to gap-free transcript window streaming when in-memory steps are absent, truncated, or gapped.
+) -> ResearchWindowStatus {
+    // INVARIANT: Distinguish `Verified` (confirmed docs/web research in `(since_ts, until_ts]`), `ProvenAbsent` (complete, index-contiguous, window-untruncated history covering `[since_ts, until_ts]` with zero research), and `Incomplete` (evicted/missing/gapped/window-truncated history).
     if since_ts <= 0.0 || until_ts < since_ts {
-        return false;
+        return ResearchWindowStatus::Incomplete;
     }
+    let window = [(since_ts, until_ts)];
     if let Some(st) = steps.filter(|s| !s.is_empty()) {
         let has_gap = rio::has_prefix_slice_gap(st);
         let drops_synthetic_head = st.len() > 1
@@ -6196,30 +6642,45 @@ pub fn has_verified_research_between(
                 .is_some_and(|i1| i1 > 1);
         let contig_steps = if drops_synthetic_head { &st[1..] } else { st };
         if !find_research_evidence_since(contig_steps, since_ts, Some(until_ts + 1.0)).is_empty() {
-            return true;
+            return ResearchWindowStatus::Verified;
         }
-        let contig_earliest_ts = contig_steps
-            .iter()
-            .filter_map(|s| {
-                s.get("created_at")
-                    .and_then(Value::as_str)
-                    .map(rio::parse_iso_ts)
-            })
-            .filter(|&ts| ts > 0.0)
-            .fold(f64::INFINITY, f64::min);
-        let has_trunc = contig_steps.iter().any(|s| {
-            s.get("truncated_fields")
+        let mut tracker = WindowCompletenessTracker::new(&window);
+        for s in contig_steps {
+            let ts = s
+                .get("created_at")
+                .and_then(Value::as_str)
+                .map(rio::parse_iso_ts)
+                .unwrap_or(0.0);
+            let idx = s.get("step_index").and_then(Value::as_i64);
+            let has_trunc = s
+                .get("truncated_fields")
                 .and_then(Value::as_array)
-                .is_some_and(|arr| !arr.is_empty())
-        });
-        if !has_gap && !has_trunc && contig_earliest_ts <= since_ts {
-            return false;
+                .is_some_and(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .any(|x| x == "tool_calls" || x == "content")
+                });
+            tracker.observe(idx, ts, has_trunc);
+        }
+        if !has_gap && tracker.covers_all_windows() {
+            return ResearchWindowStatus::ProvenAbsent;
         }
     }
     if let Some(tp) = transcript_path.filter(|p| !p.trim().is_empty()) {
-        return verify_gap_windows_from_transcript(tp, &[(since_ts, until_ts)]).unwrap_or(false);
+        return verify_gap_windows_from_transcript_status(tp, &window)
+            .unwrap_or(ResearchWindowStatus::Incomplete);
     }
-    false
+    ResearchWindowStatus::Incomplete
+}
+
+pub fn has_verified_research_between(
+    steps: Option<&[Value]>,
+    transcript_path: Option<&str>,
+    since_ts: f64,
+    until_ts: f64,
+) -> bool {
+    research_status_between(steps, transcript_path, since_ts, until_ts)
+        == ResearchWindowStatus::Verified
 }
 
 fn transcript_read_err() -> (f64, i64, Option<String>) {

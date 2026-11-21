@@ -1884,19 +1884,39 @@ struct CandidateMarkerUpdate<'a> {
     unknown_barrier: bool,
     cause_label: &'a str,
     known_git_root: Option<&'a str>,
+    pre_marker_call_key: Option<&'a str>,
+}
+
+fn prior_closed_candidate_ts(session: &str, raw_before: Option<&Value>) -> f64 {
+    let from_marker = raw_before
+        .filter(|m| json_truthy(m.get("closed")))
+        .map(|m| rio::val_to_f64(m.get("last_ts")).max(rio::val_to_f64(m.get("first_ts"))))
+        .unwrap_or(0.0);
+    from_marker.max(cwg_common::enforcement_state_closed_ts(session))
 }
 
 fn update_candidate_marker(upd: CandidateMarkerUpdate<'_>) -> (Option<Value>, Value, bool) {
-    // SAFETY: Serialize candidate marker read-modify-write via `marker_lock_path`; on lock timeout, journal out-of-band instead of writing `marker_path` unlocked.
-    rio::with_file_lock(&cwg_common::marker_lock_path(upd.session), 5.0, 30.0, |locked| {
-        update_candidate_marker_unlocked(upd, locked)
-    })
+    // SAFETY: Serialize candidate marker read-modify-write via `marker_lock_path`, and finalize any pre-marker `swarm_rounds` adoption ONLY after releasing `marker_lock_path` to avoid AB-BA lock inversion with `swarm_cache`.
+    let (before_open, marker, ok, adopted) =
+        rio::with_file_lock(&cwg_common::marker_lock_path(upd.session), 5.0, 30.0, |locked| {
+            update_candidate_marker_unlocked(upd, locked)
+        });
+    if ok {
+        if let Some((git_top, prep_ts)) = adopted {
+            let _ = cwg_common::finalize_pre_marker_simplify_adoption(
+                upd.session,
+                &git_top,
+                prep_ts,
+            );
+        }
+    }
+    (before_open, marker, ok)
 }
 
 fn update_candidate_marker_unlocked(
     upd: CandidateMarkerUpdate<'_>,
     persist: bool,
-) -> (Option<Value>, Value, bool) {
+) -> (Option<Value>, Value, bool, Option<(String, f64)>) {
     let CandidateMarkerUpdate {
         session,
         cwd,
@@ -1907,6 +1927,7 @@ fn update_candidate_marker_unlocked(
         unknown_barrier,
         cause_label,
         known_git_root,
+        pre_marker_call_key,
     } = upd;
     let now = now_sec();
     let mp = cwg_common::marker_path(session);
@@ -1924,7 +1945,7 @@ fn update_candidate_marker_unlocked(
         String::new()
     };
 
-    let (before_open, mut marker): (Option<Value>, Value) = match before {
+    let (before_open, mut marker, adopted_prep): (Option<Value>, Value, Option<(String, f64)>) = match before {
         Some(Value::Object(ref bmap)) if !json_truthy(bmap.get("closed")) => {
             let mut m = bmap.clone();
             let cur_cwd = m.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
@@ -1942,13 +1963,28 @@ fn update_candidate_marker_unlocked(
                     );
                 }
             }
-            (Some(Value::Object(bmap.clone())), Value::Object(m))
+            (Some(Value::Object(bmap.clone())), Value::Object(m), None)
         }
         _ => {
             let git_top = resolve_known_or_git_root(known_git_root, &eff_cwd);
-            let m = json!({
+            let adopted = if !git_top.is_empty()
+                && cwg_common::has_unbound_pre_marker_simplify_rounds(session)
+            {
+                let prior_closed = prior_closed_candidate_ts(session, raw_before.as_ref());
+                cwg_common::read_pre_marker_simplify_prepare(
+                    session,
+                    &git_top,
+                    now,
+                    prior_closed,
+                    pre_marker_call_key,
+                )
+            } else {
+                None
+            };
+            let eff_first_ts = adopted.as_ref().map_or(now, |(pts, _, _)| *pts);
+            let mut m = json!({
                 "session": session,
-                "first_ts": now,
+                "first_ts": eff_first_ts,
                 "last_ts": now,
                 "last_durable_ts": if durable_new_paths.is_empty() { 0.0 } else { now },
                 "cwd": rio::normalize_path(&eff_cwd),
@@ -1959,9 +1995,30 @@ fn update_candidate_marker_unlocked(
                 "edits": 0,
                 "shell_durable_edit": false,
                 "content_marks": [],
+                "gate_max_review_rounds": cwg_common::MAX_ORDINARY_REVIEW_ROUNDS,
                 "closed": false,
             });
-            (None, m)
+            let adopted_ret = if let Some((prep_ts, _, pre_hashes)) = adopted {
+                if let Value::Object(ref mut mobj) = m {
+                    // INVARIANT: Anchor a newly opened marker to an active post-close pre-marker `swarm-cache prepare` on the same repo so in-flight or just-completed simplify passes remain candidate-bound.
+                    mobj.insert("swarm_prepare_cycle_ts".to_string(), json!(prep_ts));
+                    if !pre_hashes.is_empty() {
+                        mobj.insert(
+                            "simplify_verified_latched".to_string(),
+                            json!({
+                                "candidate_first_ts": prep_ts,
+                                "reset_epoch": 0,
+                                "verified_ts": now,
+                                "verified_hashes": pre_hashes,
+                            }),
+                        );
+                    }
+                }
+                Some((git_top, prep_ts))
+            } else {
+                None
+            };
+            (None, m, adopted_ret)
         }
     };
 
@@ -2134,7 +2191,7 @@ fn update_candidate_marker_unlocked(
         })
         .is_some();
     }
-    (before_open, marker, persisted_ok)
+    (before_open, marker, persisted_ok, adopted_prep)
 }
 
 fn marker_repo_root(marker: &Value, eff_cwd: &str) -> String {
@@ -3307,17 +3364,82 @@ fn pop_anon_snapshot(
     .unwrap_or((None, 0.0))
 }
 
-fn latch_live_simplify_if_ready(session: &str, transcript_path: &str) {
+fn edit_tool_call_key(
+    payload: &Value,
+    tc: Option<&Map<String, Value>>,
+    tool_name: &str,
+    cwd: &str,
+    edit_path: Option<&str>,
+) -> String {
+    let sig = format!(
+        "{}\0{}",
+        tool_name,
+        rio::fold_path(edit_path.unwrap_or(""))
+    );
+    tool_call_snap_key(payload, tc, cwd, &sig).0
+}
+
+fn latch_live_simplify_if_ready(
+    session: &str,
+    transcript_path: &str,
+    hint_path: Option<&str>,
+    hint_cwd: &str,
+    call_key: &str,
+) {
     if session.trim().is_empty() || session == "unknown" {
         return;
     }
-    if let Some(m_pre) = cwg_common::read_marker_with_pending(session).filter(|m| {
+    let m_raw = cwg_common::read_marker_with_pending(session);
+    if let Some(m_pre) = m_raw.as_ref().filter(|m| {
         !json_truthy(m.get("closed"))
             && cwg_common::marker_has_prepare_cycle(Some(m))
             && cwg_common::active_marker_verified_simplify_hashes(m).is_empty()
     }) {
         // INVARIANT: Forward-latch live-verified simplify hashes right before the first mutating edit so applying `ACTIONABLE_FIXES` or `REVISE` fixes never breaks a verified snapshot while pre-edit drift outside `marker.paths` remains unlatched.
-        let _ = crate::cwg_stop::has_completed_candidate_simplify(session, &m_pre, transcript_path);
+        let _ = crate::cwg_stop::latch_live_simplify_for_pre_edit(
+            session,
+            m_pre,
+            transcript_path,
+            hint_path,
+        );
+        return;
+    }
+    let no_open_marker = m_raw
+        .as_ref()
+        .map_or(true, |m| json_truthy(m.get("closed")));
+    if !no_open_marker || !cwg_common::has_unbound_pre_marker_simplify_rounds(session) {
+        return;
+    }
+    let probe_dir = hint_path
+        .filter(|p| !p.trim().is_empty())
+        .and_then(|p| Path::new(p).parent().map(|d| d.to_string_lossy().into_owned()))
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| hint_cwd.to_string());
+    if probe_dir.is_empty() {
+        let _ = cwg_common::clear_pre_marker_verified_simplify(session);
+        return;
+    }
+    let git_top = rio::git_toplevel(&probe_dir, false).unwrap_or_default();
+    if git_top.is_empty() {
+        let _ = cwg_common::clear_pre_marker_verified_simplify(session);
+        return;
+    }
+    let now = now_sec();
+    let prior_closed = prior_closed_candidate_ts(session, m_raw.as_ref());
+    // SAFETY: Re-probe live worktree state on every pre-marker tool invocation (never trusting cached `pre_marker_verified`), binding the fresh record strictly to `call_key` or clearing any stale record on drift/failure.
+    if let Some((prep_ts, tree_oid, _)) =
+        cwg_common::read_pre_marker_simplify_prepare(session, &git_top, now, prior_closed, None)
+    {
+        let _ = crate::cwg_stop::probe_and_record_pre_marker_simplify(
+            session,
+            &git_top,
+            prep_ts,
+            &tree_oid,
+            call_key,
+            transcript_path,
+        );
+    } else {
+        let _ = cwg_common::clear_pre_marker_verified_simplify(session);
     }
 }
 
@@ -3339,7 +3461,15 @@ pub fn record_pre_tool_use(payload: &Value) {
     if is_edit_tool {
         if !rio::is_subagent_session(tp, None) {
             let session = rio::session_key(payload);
-            latch_live_simplify_if_ready(&session, tp);
+            let cwd = rio::effective_cwd(payload);
+            let edit_path = tc
+                .and_then(|m| m.get("args"))
+                .and_then(|v| v.as_object())
+                .and_then(|a| a.get("Path").or_else(|| a.get("path")))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty());
+            let edit_key = edit_tool_call_key(payload, tc, tool_name, &cwd, edit_path);
+            latch_live_simplify_if_ready(&session, tp, edit_path, &cwd, &edit_key);
         }
         return;
     }
@@ -3372,7 +3502,8 @@ pub fn record_pre_tool_use(payload: &Value) {
         capture_direct_codex_packet(cmd, &cwd, &session);
     }
     if policy != "READ_ONLY" && policy != "BOOKKEEPING" {
-        latch_live_simplify_if_ready(&session, tp);
+        let cmd_cwd = resolve_command_cwd(cmd, &cwd, &session);
+        latch_live_simplify_if_ready(&session, tp, None, &cmd_cwd, &call_key);
         // INVARIANT: Stamp `pre_ts` before snapshot subprocesses run so `PostToolUse` records the true pre-spawn `start_ts` on the same wall clock as `last_durable_ts`.
         let pre_ts = now_sec();
         let snap_file = cwg_common::snapshot_path(&session, &call_key);
@@ -3382,7 +3513,6 @@ pub fn record_pre_tool_use(payload: &Value) {
             .get("artifactDirectoryPath")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let cmd_cwd = resolve_command_cwd(cmd, &cwd, &session);
         cwg_common::publish_claim(&session, &[], true, &cmd_cwd);
         let mut snap = take_git_snapshot(&cmd_cwd, art_dir, &wps, None);
         if let Value::Object(ref mut m) = snap {
@@ -3439,25 +3569,43 @@ pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
     let session = rio::session_key(payload);
 
     if is_edit {
+        let is_sub = rio::is_subagent_session(tp, None);
         if failed {
+            if !is_sub {
+                let _ = cwg_common::clear_pre_marker_verified_simplify(&session);
+            }
             return Ok(());
         }
-        let target_path = args.get("Path").and_then(|v| v.as_str()).unwrap_or("");
+        let target_path = args
+            .get("Path")
+            .or_else(|| args.get("path"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if target_path.is_empty() {
+            if !is_sub {
+                let _ = cwg_common::clear_pre_marker_verified_simplify(&session);
+            }
             return Ok(());
         }
         // INVARIANT: Advance Loop Guard mutation stamp for subagent and scratch edits too without spawning continuity PostToolUse.
         rio::bump_mutation_stamp(&session);
         if json_truthy(args.get("ArtifactMetadata")) {
+            if !is_sub {
+                let _ = cwg_common::clear_pre_marker_verified_simplify(&session);
+            }
             return Ok(());
         }
         let cwd = rio::effective_cwd(payload);
         if cwg_common::is_scratch_or_ephemeral(target_path, art_dir, &wps, &cwd) {
+            if !is_sub {
+                let _ = cwg_common::clear_pre_marker_verified_simplify(&session);
+            }
             return Ok(());
         }
-        if rio::is_subagent_session(tp, None) {
+        if is_sub {
             return Ok(());
         }
+        let edit_call_key = edit_tool_call_key(payload, tc, tool_name, &cwd, Some(target_path));
         let target_vec = vec![target_path.to_string()];
         cwg_common::publish_claim(&session, &target_vec, false, &cwd);
         let base_name = Path::new(target_path)
@@ -3475,6 +3623,7 @@ pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
             unknown_barrier: false,
             cause_label: &cause_lbl,
             known_git_root: None,
+            pre_marker_call_key: Some(&edit_call_key),
         });
         let cctx = cwg_common::resolve_candidate_context(&after, false);
         if let Some(note) = build_transition_note(before.as_ref(), &after, Some(&cctx)) {
@@ -3679,6 +3828,7 @@ pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
             unknown_barrier: unmeasured,
             cause_label: &cause_lbl,
             known_git_root: snap_git_root.as_deref(),
+            pre_marker_call_key: Some(&call_key),
         });
         let cctx = cwg_common::resolve_candidate_context(&after, false);
         if let Some(note) = build_transition_note(before.as_ref(), &after, Some(&cctx)) {
@@ -3721,6 +3871,7 @@ pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
                 unknown_barrier: unmeasured || opaque_unmeasured,
                 cause_label: &cause_lbl,
                 known_git_root: snap_git_root.as_deref(),
+                pre_marker_call_key: Some(&call_key),
             });
             if let Some(note) = build_transition_note(before.as_ref(), &after, None) {
                 cwg_common::queue_pending_note(&session, &note);
@@ -3738,7 +3889,11 @@ pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
             if !persisted {
                 return Err(format!("Failed to persist operational marker delta for session {}", session));
             }
+        } else {
+            let _ = cwg_common::clear_pre_marker_verified_simplify(&session);
         }
+    } else {
+        let _ = cwg_common::clear_pre_marker_verified_simplify(&session);
     }
     Ok(())
 }
@@ -4067,7 +4222,7 @@ mod tests {
         fs::write(&f_edit, "pub fn a() {}\n").unwrap();
         let f_vec = vec![f_edit.to_string_lossy().into_owned()];
         let tmp_home_str = tmp_home.to_string_lossy().into_owned();
-        let (_, _, ok1) = update_candidate_marker_unlocked(
+        let (_, _, ok1, _) = update_candidate_marker_unlocked(
             CandidateMarkerUpdate {
                 session: sess_p,
                 cwd: &tmp_home_str,
@@ -4078,6 +4233,7 @@ mod tests {
                 unknown_barrier: false,
                 cause_label: "edit:mod.rs",
                 known_git_root: None,
+                pre_marker_call_key: None,
             },
             false,
         );
@@ -4085,7 +4241,7 @@ mod tests {
         assert!(!cwg_common::marker_path(sess_p).exists());
         assert!(cwg_common::has_pending_marker_deltas(sess_p));
         assert!(cwg_common::pending_marker_mtime_ns(sess_p) > 0);
-        let (_, flushed, ok2) = update_candidate_marker_unlocked(
+        let (_, flushed, ok2, _) = update_candidate_marker_unlocked(
             CandidateMarkerUpdate {
                 session: sess_p,
                 cwd: &tmp_home_str,
@@ -4096,6 +4252,7 @@ mod tests {
                 unknown_barrier: false,
                 cause_label: "edit2:mod.rs",
                 known_git_root: None,
+                pre_marker_call_key: None,
             },
             true,
         );

@@ -560,6 +560,7 @@ struct SyncDiffResult {
     full_diff_path: String,
     incremental_diff_path: String,
     incremental_stat: String,
+    text_covered: Option<bool>,
 }
 
 struct RoundSyncInput<'a> {
@@ -679,19 +680,21 @@ fn sync_round_diffs(input: RoundSyncInput<'_>) -> Result<SyncDiffResult, String>
         String::new()
     };
 
-    if enforce_text_coverage {
-        if need_head_diff
-            && has_uncovered_binary_diff(git_root, head_oid, cur_tree_oid, rel_paths, &full_diff)
-        {
-            return Err("uncovered_binary_diff".to_string());
-        }
-        if need_inc
-            && !base_changed
-            && prev_tree_oid != cur_tree_oid
-            && has_uncovered_binary_diff(git_root, prev_tree_oid, cur_tree_oid, rel_paths, &inc_diff)
-        {
-            return Err("uncovered_binary_diff".to_string());
-        }
+    let uncovered_head = need_head_diff
+        && has_uncovered_binary_diff(git_root, head_oid, cur_tree_oid, rel_paths, &full_diff);
+    let uncovered_inc = need_inc
+        && !base_changed
+        && prev_tree_oid != cur_tree_oid
+        && has_uncovered_binary_diff(git_root, prev_tree_oid, cur_tree_oid, rel_paths, &inc_diff);
+    let text_covered = if uncovered_head || uncovered_inc {
+        Some(false)
+    } else if need_head_diff {
+        Some(true)
+    } else {
+        None
+    };
+    if enforce_text_coverage && text_covered == Some(false) {
+        return Err("uncovered_binary_diff".to_string());
     }
 
     let full_diff_path = if need_full {
@@ -710,6 +713,7 @@ fn sync_round_diffs(input: RoundSyncInput<'_>) -> Result<SyncDiffResult, String>
             full_diff_path,
             incremental_diff_path: String::new(),
             incremental_stat: String::new(),
+            text_covered,
         });
     };
 
@@ -749,6 +753,7 @@ fn sync_round_diffs(input: RoundSyncInput<'_>) -> Result<SyncDiffResult, String>
             full_diff_path,
             incremental_diff_path: inc_diff_path,
             incremental_stat,
+            text_covered,
         });
     }
 
@@ -806,6 +811,7 @@ fn sync_round_diffs(input: RoundSyncInput<'_>) -> Result<SyncDiffResult, String>
         full_diff_path,
         incremental_diff_path: inc_diff_path,
         incremental_stat,
+        text_covered,
     })
 }
 
@@ -1646,6 +1652,11 @@ fn prepare_round_locked(ctx: PrepareLockedCtx<'_>) -> Value {
         .join(input.session)
         .join("scratch")
         .join(proj_key);
+    let missing_pre_marker_cov = !has_any_active_marker
+        && history
+            .last()
+            .and_then(|h| h.get("pre_marker_text_covered"))
+            .is_none();
     let diff_res = match sync_round_diffs(RoundSyncInput {
         git_root,
         head_oid,
@@ -1658,7 +1669,7 @@ fn prepare_round_locked(ctx: PrepareLockedCtx<'_>) -> Value {
         scratch_dir: &scratch_dir,
         clean_label,
         cur_round,
-        regen: advance_round || changed_paths || changed_diff_hash,
+        regen: advance_round || changed_paths || changed_diff_hash || missing_pre_marker_cov,
         enforce_text_coverage: full_candidate_covered,
     }) {
         Ok(res) => res,
@@ -1684,11 +1695,26 @@ fn prepare_round_locked(ctx: PrepareLockedCtx<'_>) -> Value {
         }
     };
 
+    let mut pre_marker_cov_updated = false;
+    if let Some(tc) = diff_res.text_covered {
+        if let Some(Value::Object(last_obj)) = history.last_mut() {
+            if last_obj
+                .get("pre_marker_text_covered")
+                .and_then(Value::as_bool)
+                != Some(tc)
+            {
+                last_obj.insert("pre_marker_text_covered".to_string(), Value::Bool(tc));
+                pre_marker_cov_updated = true;
+            }
+        }
+    }
+
     let state_mutated = advance_round
         || changed_paths
         || changed_diff_hash
         || seen_heads_updated
-        || snapshot_bound_updated;
+        || snapshot_bound_updated
+        || pre_marker_cov_updated;
     let marker_rps_missing =
         cwg_common::active_cycle_repo_prepare_state(marker.as_ref(), folded_git_root).is_none();
     if rio::git_head_oid(git_root) != raw_head
