@@ -1044,8 +1044,9 @@ pub fn with_file_lock<T, F: FnOnce(bool) -> T>(
                                 lock_path, stale_sec,
                             ) {
                                 crate::win32_sqlite::UnixDirReclaim::ReclaimedRetry => {}
-                                crate::win32_sqlite::UnixDirReclaim::NotStale
-                                | crate::win32_sqlite::UnixDirReclaim::AcquiredDir => break,
+                                crate::win32_sqlite::UnixDirReclaim::NotStale => break,
+                                #[cfg(any(target_os = "linux", target_os = "macos", test))]
+                                crate::win32_sqlite::UnixDirReclaim::AcquiredDir => break,
                             }
                         }
                         match crate::win32_sqlite::create_legacy_lock_exclusive(lock_path) {
