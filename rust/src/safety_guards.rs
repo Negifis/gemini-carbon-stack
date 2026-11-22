@@ -114,6 +114,7 @@ pub fn guard_shell_command_with_session(
     ("allow".to_string(), None)
 }
 
+#[cfg(test)]
 pub fn guard_shell_command(cmd: &str, cwd: &str) -> (String, Option<String>) {
     guard_shell_command_with_session(cmd, cwd, "")
 }
@@ -133,6 +134,7 @@ pub fn guard_swarm_invocation_with_payload(
     ("allow".to_string(), None)
 }
 
+#[cfg(test)]
 pub fn guard_swarm_invocation(args: &Value) -> (String, Option<String>) {
     guard_swarm_invocation_with_payload(args, None)
 }
@@ -235,6 +237,7 @@ pub fn guard_subagent_invocation_with_payload(
     ("allow".to_string(), None, None)
 }
 
+#[cfg(test)]
 pub fn guard_subagent_invocation(args: &Value) -> (String, Option<String>) {
     let empty_payload = Value::Object(Map::new());
     let (dec, reason, _) = guard_subagent_invocation_with_payload(&empty_payload, args);

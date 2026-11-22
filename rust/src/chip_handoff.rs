@@ -85,10 +85,6 @@ fn translit_char(c: char) -> &'static str {
     }
 }
 
-pub fn chips_dir() -> PathBuf {
-    chip_hooks::chips_dir()
-}
-
 pub fn chip_trees_dir() -> PathBuf {
     let dir = rio::state_dir().join("chips").join("trees");
     let _ = fs::create_dir_all(&dir);

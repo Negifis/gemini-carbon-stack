@@ -221,10 +221,6 @@ fn quota_exhausted(quotas: &Map<String, Value>, model: &str) -> bool {
     parse_quota_pct(quotas, model).is_some_and(|pct| pct <= 0.0)
 }
 
-fn quota_positive(quotas: &Map<String, Value>, model: &str) -> bool {
-    parse_quota_pct(quotas, model).is_some_and(|pct| pct > 0.0)
-}
-
 fn max_into(slot: &mut f64, val: f64) {
     *slot = (*slot).max(val);
 }
@@ -240,14 +236,8 @@ fn board_ts_upper_bound(bts: f64, coarse: bool) -> f64 {
 }
 
 fn reset_sticky_issue_state(state: &mut Map<String, Value>) {
-    for prefix in ["sonnet", "neon", "hydrogen", "opus"] {
-        state.insert(format!("{}_issue_verified", prefix), Value::Bool(false));
-        state.insert(format!("{}_issue_ts", prefix), json!(0.0));
-    }
-    for prefix in ["sonnet", "neon", "hydrogen"] {
-        state.insert(format!("{}_last_issue_ts", prefix), json!(0.0));
-        state.insert(format!("{}_healthy_ts", prefix), json!(0.0));
-    }
+    state.insert("opus_issue_verified".to_string(), Value::Bool(false));
+    state.insert("opus_issue_ts".to_string(), json!(0.0));
 }
 
 pub(crate) fn subagent_uri_re() -> &'static Regex {
@@ -638,14 +628,6 @@ fn handle_bg_check_sys_step(
     if !sys_pt.coarse && sys_pt.ts > *max_prior_ts {
         *max_prior_ts = sys_pt.ts;
     }
-}
-
-pub fn read_checks_evidence_with_steps(
-    session: &str,
-    first_ts: f64,
-    steps: &[Value],
-) -> ChecksEvidence {
-    read_checks_evidence_with_steps_in_cwd(session, first_ts, steps, "")
 }
 
 pub fn read_checks_evidence_with_steps_in_cwd(
@@ -1471,18 +1453,6 @@ pub struct SwarmEvidence {
     pub passive_bg_tasks: Vec<String>,
     pub opus_issue_verified: bool,
     pub opus_issue_ts: f64,
-    pub sonnet_issue_verified: bool,
-    pub sonnet_issue_ts: f64,
-    pub sonnet_last_issue_ts: f64,
-    pub sonnet_healthy_ts: f64,
-    pub neon_issue_verified: bool,
-    pub neon_issue_ts: f64,
-    pub neon_last_issue_ts: f64,
-    pub neon_healthy_ts: f64,
-    pub hydrogen_issue_verified: bool,
-    pub hydrogen_issue_ts: f64,
-    pub hydrogen_last_issue_ts: f64,
-    pub hydrogen_healthy_ts: f64,
     pub codex_cmd_failed: bool,
     pub codex_issue_ts: f64,
     pub codex_issue_step: isize,
@@ -1492,27 +1462,6 @@ pub struct SwarmEvidence {
     pub stalled_workers: Vec<Value>,
     pub worker_activity_count: Option<usize>,
     pub compact_steps: Vec<Value>,
-}
-
-pub fn scan_swarm_activity(
-    steps: &[Value],
-    transcript_path: Option<&str>,
-    first_ts: f64,
-    round_start_msg_id: i64,
-    current_diff_hash: &str,
-    cwd: &str,
-) -> SwarmEvidence {
-    scan_swarm_activity_with_reset(SwarmScanInput {
-        steps,
-        transcript_path,
-        first_ts,
-        round_start_msg_id,
-        current_diff_hash,
-        cwd,
-        research_reset_ts: 0.0,
-        research_reset_seq: 0,
-        marker: None,
-    })
 }
 
 fn record_system_swarm_errors(
@@ -1736,23 +1685,17 @@ pub struct SwarmScanInput<'a> {
     pub transcript_path: Option<&'a str>,
     pub first_ts: f64,
     pub round_start_msg_id: i64,
-    pub current_diff_hash: &'a str,
     pub cwd: &'a str,
-    pub research_reset_ts: f64,
-    pub research_reset_seq: i64,
     pub marker: Option<&'a Value>,
 }
 
-pub fn scan_swarm_activity_with_reset(input: SwarmScanInput<'_>) -> SwarmEvidence {
+pub fn scan_swarm_activity(input: SwarmScanInput<'_>) -> SwarmEvidence {
     let SwarmScanInput {
         steps,
         transcript_path,
         first_ts,
         round_start_msg_id,
-        current_diff_hash: _,
         cwd,
-        research_reset_ts,
-        research_reset_seq,
         marker,
     } = input;
     let mut ev = SwarmEvidence {
@@ -1771,20 +1714,11 @@ pub fn scan_swarm_activity_with_reset(input: SwarmScanInput<'_>) -> SwarmEvidenc
     let mut pending_bg_tasks: BTreeSet<String> = BTreeSet::new();
     let mut passive_bg_tasks: BTreeSet<String> = BTreeSet::new();
 
-    let mark_issue_ts = |verified: &mut bool,
-                         issue_ts: &mut f64,
-                         last_issue_ts: Option<&mut f64>,
-                         min_ts: f64,
-                         max_ts: f64| {
+    let mark_issue_ts = |verified: &mut bool, issue_ts: &mut f64, min_ts: f64| {
         *verified = true;
         let eff_min = if min_ts > 0.0 { min_ts } else { now_sec() };
         if *issue_ts <= 0.0 || eff_min < *issue_ts {
             *issue_ts = eff_min;
-        }
-        if let Some(last_ts) = last_issue_ts {
-            if max_ts > *last_ts {
-                *last_ts = max_ts;
-            }
         }
     };
 
@@ -1806,50 +1740,17 @@ pub fn scan_swarm_activity_with_reset(input: SwarmScanInput<'_>) -> SwarmEvidenc
         }
     };
 
-    let record_model_failure = |ev: &mut SwarmEvidence,
-                                models: &HashSet<String>,
-                                _worker_name: &str,
-                                min_ts: f64,
-                                max_ts: f64| {
-        if models
-            .iter()
-            .any(|m| m.contains(cwg_common::OPUS_HIGH_MODEL))
-        {
-            mark_issue_ts(
-                &mut ev.opus_issue_verified,
-                &mut ev.opus_issue_ts,
-                None,
-                min_ts,
-                max_ts,
-            );
-            ev.review_failures
-                .push(if min_ts > 0.0 { min_ts } else { now_sec() });
-        }
-        for (model_id, verified, issue_ts, last_ts) in [
-            (
-                cwg_common::SONNET_HIGH_MODEL,
-                &mut ev.sonnet_issue_verified,
-                &mut ev.sonnet_issue_ts,
-                &mut ev.sonnet_last_issue_ts,
-            ),
-            (
-                cwg_common::NEON_XHIGH_MODEL,
-                &mut ev.neon_issue_verified,
-                &mut ev.neon_issue_ts,
-                &mut ev.neon_last_issue_ts,
-            ),
-            (
-                cwg_common::HYDROGEN_XHIGH_MODEL,
-                &mut ev.hydrogen_issue_verified,
-                &mut ev.hydrogen_issue_ts,
-                &mut ev.hydrogen_last_issue_ts,
-            ),
-        ] {
-            if models.iter().any(|m| m.contains(model_id)) {
-                mark_issue_ts(verified, issue_ts, Some(last_ts), min_ts, max_ts);
+    let record_model_failure =
+        |ev: &mut SwarmEvidence, models: &HashSet<String>, _worker_name: &str, min_ts: f64| {
+            if models
+                .iter()
+                .any(|m| m.contains(cwg_common::OPUS_HIGH_MODEL))
+            {
+                mark_issue_ts(&mut ev.opus_issue_verified, &mut ev.opus_issue_ts, min_ts);
+                ev.review_failures
+                    .push(if min_ts > 0.0 { min_ts } else { now_sec() });
             }
-        }
-    };
+        };
 
     let mut model_event_ord: usize = 0;
     let mut inspect_swarm_tool_result = |ev: &mut SwarmEvidence,
@@ -1997,51 +1898,13 @@ pub fn scan_swarm_activity_with_reset(input: SwarmScanInput<'_>) -> SwarmEvidenc
                     })
                     .unwrap_or_default();
                 let quotas_opt = md.get("quotas").and_then(|v| v.as_object());
-                for (mdl, flag, ts_ref, last_ts_ref, healthy_ts_ref) in [
-                    (
-                        cwg_common::OPUS_HIGH_MODEL,
-                        &mut ev.opus_issue_verified,
-                        &mut ev.opus_issue_ts,
-                        None,
-                        None,
-                    ),
-                    (
-                        cwg_common::SONNET_HIGH_MODEL,
-                        &mut ev.sonnet_issue_verified,
-                        &mut ev.sonnet_issue_ts,
-                        Some(&mut ev.sonnet_last_issue_ts),
-                        Some(&mut ev.sonnet_healthy_ts),
-                    ),
-                    (
-                        cwg_common::NEON_XHIGH_MODEL,
-                        &mut ev.neon_issue_verified,
-                        &mut ev.neon_issue_ts,
-                        Some(&mut ev.neon_last_issue_ts),
-                        Some(&mut ev.neon_healthy_ts),
-                    ),
-                    (
-                        cwg_common::HYDROGEN_XHIGH_MODEL,
-                        &mut ev.hydrogen_issue_verified,
-                        &mut ev.hydrogen_issue_ts,
-                        Some(&mut ev.hydrogen_last_issue_ts),
-                        Some(&mut ev.hydrogen_healthy_ts),
-                    ),
-                ] {
-                    let missing = !avail.is_empty() && allow_missing_avail && !avail.contains(mdl);
-                    let exhausted = quotas_opt.is_some_and(|q| quota_exhausted(q, mdl));
-                    if missing || exhausted {
-                        mark_issue_ts(flag, ts_ref, last_ts_ref, res_ts, res_ts);
-                    } else {
-                        // INVARIANT: Presence in `models` alone does not prove positive quota (0%-quota models stay listed); require confirmed `DONE` status, positive `res_ts`, and explicit positive quota in `quotas` before clearing exhaustion.
-                        let listed_ok = avail.is_empty() || avail.contains(mdl);
-                        let healthy =
-                            listed_ok && quotas_opt.is_some_and(|q| quota_positive(q, mdl));
-                        if healthy && res_ts > 0.0 {
-                            if let Some(h_ts) = healthy_ts_ref {
-                                *h_ts = (*h_ts).max(res_ts);
-                            }
-                        }
-                    }
+                let missing = !avail.is_empty()
+                    && allow_missing_avail
+                    && !avail.contains(cwg_common::OPUS_HIGH_MODEL);
+                let exhausted =
+                    quotas_opt.is_some_and(|q| quota_exhausted(q, cwg_common::OPUS_HIGH_MODEL));
+                if missing || exhausted {
+                    mark_issue_ts(&mut ev.opus_issue_verified, &mut ev.opus_issue_ts, res_ts);
                 }
             }
         }
@@ -2050,20 +1913,20 @@ pub fn scan_swarm_activity_with_reset(input: SwarmScanInput<'_>) -> SwarmEvidenc
         if is_err && !req_model.is_empty() && model_failure_re().is_match(&err_detail) {
             let mut single = HashSet::new();
             single.insert(req_model);
-            record_model_failure(ev, &single, &wname, res_ts, res_ts);
+            record_model_failure(ev, &single, &wname, res_ts);
         }
     };
 
     let fallback_cid = marker.map(|m| val_to_str(m.get("session"))).unwrap_or_default();
     let (brain_root_opt, conv_cid) =
         rio::swarm_brain_and_cid(transcript_path.unwrap_or(""), &fallback_cid);
-    let prior_closed_ts = if first_ts > 0.0 && research_reset_ts <= 0.0 && !conv_cid.is_empty() {
+    let prior_closed_ts = if first_ts > 0.0 && !conv_cid.is_empty() {
         cwg_common::enforcement_state_closed_ts(&conv_cid)
     } else {
         0.0
     };
-    // INVARIANT: Allow a bounded pre-marker `swarm(action="models")` quota check strictly after any prior closed candidate (when no `research_reset` is active) so checking model availability before `swarm-cache prepare` / first edit still proves fallback causality.
-    let models_floor_ts = if first_ts > 0.0 && research_reset_ts <= 0.0 {
+    // INVARIANT: Allow a bounded pre-marker `swarm(action="models")` quota check strictly after any prior closed candidate so checking model availability before `swarm-cache prepare` / first edit still proves fallback causality.
+    let models_floor_ts = if first_ts > 0.0 {
         (first_ts - MODELS_LEAD_IN_MAX_SEC).max(prior_closed_ts + TS_EPS)
     } else {
         0.0
@@ -2349,13 +2212,10 @@ pub fn scan_swarm_activity_with_reset(input: SwarmScanInput<'_>) -> SwarmEvidenc
         ord_ts: f64,
         pub_ts: f64,
         pub_coarse: bool,
-        pub_ord_ub: f64,
         step_idx: Option<usize>,
         seq: i64,
     }
     let mut running_board_ts = 0.0f64;
-    let mut running_pub_lb = 0.0f64;
-    let mut running_pub_ub = 0.0f64;
     let mut parsed_board: Vec<BoardEntry> = Vec::with_capacity(raw_board.len());
 
     for (bp_idx, bp) in raw_board.iter().enumerate() {
@@ -2370,12 +2230,6 @@ pub fn scan_swarm_activity_with_reset(input: SwarmScanInput<'_>) -> SwarmEvidenc
         let raw_bts = raw_pt.ts;
         let pub_ts = raw_pt.ts;
         let pub_coarse = raw_pt.coarse;
-        let pub_ord_ub = cwg_common::advance_monotonic_board_ub(
-            pub_ts,
-            pub_coarse,
-            &mut running_pub_lb,
-            &mut running_pub_ub,
-        );
         let mut raw_ts = raw_bts;
         let mut coarse_ts = raw_pt.coarse;
         let mut bstep_idx: Option<usize> = None;
@@ -2415,24 +2269,10 @@ pub fn scan_swarm_activity_with_reset(input: SwarmScanInput<'_>) -> SwarmEvidenc
             ord_ts,
             pub_ts,
             pub_coarse,
-            pub_ord_ub,
             step_idx: bstep_idx,
             seq: bseq,
         });
     }
-
-    let has_reset = research_reset_ts > 0.0 || research_reset_seq > 0;
-    let eff_research_reset_seq: i64 = if has_reset {
-        cwg_common::compute_effective_reset_board_seq(
-            parsed_board
-                .iter()
-                .map(|e| (e.seq, e.pub_ts, e.pub_coarse)),
-            research_reset_seq,
-            research_reset_ts,
-        )
-    } else {
-        0
-    };
 
     let known_workers: Vec<&str> = rio::swarm_worker_names(&members_map);
 
@@ -2455,21 +2295,6 @@ pub fn scan_swarm_activity_with_reset(input: SwarmScanInput<'_>) -> SwarmEvidenc
             ""
         };
 
-        let is_pre_reset_worker = has_reset
-            && cwg_common::is_worker_spawned_before_reset(
-                mname,
-                Some(minfo),
-                &raw_board,
-                research_reset_ts,
-                research_reset_seq,
-                marker,
-                if brain_root.as_os_str().is_empty() {
-                    None
-                } else {
-                    Some(brain_root.as_path())
-                },
-            );
-
         let mut coord_posts: Vec<(f64, bool, String, Option<usize>, i64, f64)> = Vec::new();
         let mut broadcast_posts: Vec<(f64, bool, String, Option<usize>, i64, f64)> = Vec::new();
         let mut worker_board_posts: Vec<(f64, bool, f64, String, i64)> = Vec::new();
@@ -2477,18 +2302,6 @@ pub fn scan_swarm_activity_with_reset(input: SwarmScanInput<'_>) -> SwarmEvidenc
 
         for entry in &parsed_board {
             if entry.text.is_empty() {
-                continue;
-            }
-            // INVARIANT: Post-research-reset workers reusing a standard roster name must never inherit pre-reset board posts from a killed Cycle-1 worker.
-            if has_reset
-                && !is_pre_reset_worker
-                && cwg_common::is_board_row_before_reset(
-                    entry.seq,
-                    entry.pub_ord_ub,
-                    eff_research_reset_seq,
-                    research_reset_ts,
-                )
-            {
                 continue;
             }
             if entry.ord_ts > last_board_ts {
@@ -2555,11 +2368,6 @@ pub fn scan_swarm_activity_with_reset(input: SwarmScanInput<'_>) -> SwarmEvidenc
             }
         }
 
-        let reset_min_ts = if has_reset && !is_pre_reset_worker && research_reset_ts > 0.0 {
-            research_reset_ts
-        } else {
-            0.0
-        };
         let keys = [
             Some(mname.as_str()),
             (!group_prefix.is_empty()).then_some(group_prefix),
@@ -2568,31 +2376,11 @@ pub fn scan_swarm_activity_with_reset(input: SwarmScanInput<'_>) -> SwarmEvidenc
         let mut worker_opus_req_ts: Option<f64> = None;
         for key in keys.into_iter().flatten() {
             if let Some(entries) = worker_model_events.get(key) {
-                for ev_item in entries {
-                    let keep = match ev_item {
-                        WorkerModelEvent::ConfirmedAdd { ts, .. } => {
-                            reset_min_ts <= 0.0 || *ts <= 0.0 || *ts > reset_min_ts
-                        }
-                        WorkerModelEvent::ConfirmedSwitch { req_ts, done_ub, .. } => {
-                            reset_min_ts <= 0.0
-                                || (*req_ts <= 0.0 && *done_ub <= 0.0)
-                                || (*done_ub).max(*req_ts) > reset_min_ts
-                        }
-                        WorkerModelEvent::UnconfirmedSwitch { req_ts, .. } => {
-                            reset_min_ts <= 0.0 || *req_ts <= 0.0 || *req_ts > reset_min_ts
-                        }
-                    };
-                    if keep {
-                        model_events.push(ev_item.clone());
-                    }
-                }
+                model_events.extend(entries.iter().cloned());
             }
             if let Some(entries) = opus_requested_ts.get(key) {
                 for &ots in entries {
-                    if (reset_min_ts <= 0.0 || ots <= 0.0 || ots > reset_min_ts)
-                        && ots > 0.0
-                        && worker_opus_req_ts.map_or(true, |cur| ots < cur)
-                    {
+                    if ots > 0.0 && worker_opus_req_ts.map_or(true, |cur| ots < cur) {
                         worker_opus_req_ts = Some(ots);
                     }
                 }
@@ -2792,16 +2580,16 @@ pub fn scan_swarm_activity_with_reset(input: SwarmScanInput<'_>) -> SwarmEvidenc
                 cand
             };
             let mut any_attributed = false;
-            for (resolved_model, min_ts, max_ts) in attempt_errors {
+            for (resolved_model, min_ts, _max_ts) in attempt_errors {
                 if let Some(err_model) = resolved_model {
                     let mut single = HashSet::new();
                     single.insert(err_model);
-                    record_model_failure(&mut ev, &single, mname, min_ts, max_ts);
+                    record_model_failure(&mut ev, &single, mname, min_ts);
                     any_attributed = true;
                 } else {
                     let cand = fallback_model_candidates();
                     if !cand.is_empty() {
-                        record_model_failure(&mut ev, &cand, mname, min_ts, max_ts);
+                        record_model_failure(&mut ev, &cand, mname, min_ts);
                         any_attributed = true;
                     }
                 }
@@ -2810,7 +2598,7 @@ pub fn scan_swarm_activity_with_reset(input: SwarmScanInput<'_>) -> SwarmEvidenc
                 let cand = fallback_model_candidates();
                 if !cand.is_empty() {
                     let fb_ts = tsum.error_ts.max(host_err_ts);
-                    record_model_failure(&mut ev, &cand, mname, fb_ts, tsum.error_ts);
+                    record_model_failure(&mut ev, &cand, mname, fb_ts);
                 }
             }
         }
@@ -3213,23 +3001,6 @@ pub fn scan_swarm_activity_with_reset(input: SwarmScanInput<'_>) -> SwarmEvidenc
         let latest_assign_seq = coord_posts.last().map(|p| p.4).unwrap_or(0);
         let latest_reply_seq = worker_board_posts.iter().map(|p| p.4).max().unwrap_or(0);
         let meta_brief = val_to_str(minfo.get("brief"));
-        let mut brief_parts: Vec<&str> = Vec::with_capacity(
-            coord_posts.len() + broadcast_posts.len() + usize::from(!meta_brief.trim().is_empty()),
-        );
-        if !meta_brief.trim().is_empty() {
-            brief_parts.push(meta_brief.as_str());
-        }
-        for p in &coord_posts {
-            if !p.2.is_empty() {
-                brief_parts.push(p.2.as_str());
-            }
-        }
-        for p in &broadcast_posts {
-            if !p.2.is_empty() {
-                brief_parts.push(p.2.as_str());
-            }
-        }
-        let latest_brief = brief_parts.join("\n");
         let has_reply_since_assign = if latest_assign_seq > 0 && !worker_board_posts.is_empty() {
             latest_reply_seq > latest_assign_seq
         } else {
@@ -3264,15 +3035,6 @@ pub fn scan_swarm_activity_with_reset(input: SwarmScanInput<'_>) -> SwarmEvidenc
         }
         if !killed {
             ev.idle_unkilled_workers.push(mname.clone());
-        }
-        if is_pre_reset_worker
-            && cwg_common::is_simplify_or_review_swarm_worker_with_brief(
-                mname,
-                Some(minfo),
-                &latest_brief,
-            )
-        {
-            continue;
         }
         if combined_outputs.is_empty() {
             continue;
@@ -3321,14 +3083,6 @@ pub fn scan_swarm_activity_with_reset(input: SwarmScanInput<'_>) -> SwarmEvidenc
         }
         if let Some(switches) = model_switches.get(mname) {
             for item in switches {
-                if has_reset
-                    && !is_pre_reset_worker
-                    && research_reset_ts > 0.0
-                    && item.0 > 0.0
-                    && item.0 <= research_reset_ts
-                {
-                    continue;
-                }
                 windows.push(ReviewWindow {
                     ts: item.0,
                     coarse_ts: false,
@@ -3854,7 +3608,7 @@ pub fn scan_native_subagents(
                 continue;
             }
 
-            // INVARIANT: Bind each simplify/review verdict strictly to the timestamp of the message chunk that produced it; coalesce only an immediate post-`send_message` sign-off repeating the identical decision.
+            // INVARIANT: Bind each review verdict strictly to the timestamp of the message chunk that produced it; coalesce only an immediate post-`send_message` sign-off repeating the identical decision.
             let merged_chunks = merge_subagent_chunks(&sub_chunks, delivered);
             let last_chunk_ts = merged_chunks.iter().map(|c| c.ts).reduce(f64::max).unwrap_or(0.0);
             let fallback_end_ts = if last_chunk_ts > 0.0 {
@@ -4632,7 +4386,7 @@ impl<'a> ClosureEvalCtx<'a> {
 
 fn closure_blocked_halt_msg(blocked_count: usize) -> String {
     format!(
-        "closure validation reached {}/{} `BLOCKED` verdicts (terminal closure cap); do NOT restart review or simplify — finish finitely with `[gate] draft-blocked: <exact blocker and handoff>`",
+        "closure validation reached {}/{} `BLOCKED` verdicts (terminal closure cap); do NOT restart review — finish finitely with `[gate] draft-blocked: <exact blocker and handoff>`",
         blocked_count, MAX_CLOSURE_PASSES
     )
 }
@@ -4971,7 +4725,6 @@ fn validate_candidate_closure_inner(
         }
     }
 
-    let rr_ts = cwg_common::last_research_reset_ts(marker);
     if (rkind == "verified" || rkind == "pr-ready")
         && !dpaths.is_empty()
         && cwg_common::last_mark_fp(marker).is_none()
@@ -4991,14 +4744,13 @@ fn validate_candidate_closure_inner(
 
     // INVARIANT: Evaluate PERSISTENT closure (`verified`, `pr-ready`, `draft-blocked`) against both candidate path risk floor and active-cycle escalated risk (`--xhigh` or cycle receipt).
     let first_ts_for_risk = val_to_f64(marker.get("first_ts"));
-    let rr_ts_for_risk = cwg_common::last_research_reset_ts(marker);
     let mut cycle_risk_inputs = vec![floor.clone()];
     let marker_dr = cwg_common::active_marker_declared_risk(marker);
     if !marker_dr.is_empty() {
         cycle_risk_inputs.push(marker_dr);
     }
     if let Some(tx_steps) = steps {
-        let tx_dr = max_cycle_declared_receipt_risk(tx_steps, first_ts_for_risk, rr_ts_for_risk);
+        let tx_dr = max_cycle_declared_receipt_risk(tx_steps, first_ts_for_risk);
         if !tx_dr.is_empty() {
             cycle_risk_inputs.push(tx_dr);
         }
@@ -5143,33 +4895,13 @@ fn validate_candidate_closure_inner(
         ab_call_ts <= 0.0 || rev_lts >= ab_call_ts - 5.0
     };
 
-    let is_post_reset_rev = |rev_item: &Value| -> bool {
-        if rr_ts <= 0.0 {
-            return true;
-        }
-        let lts = val_to_f64(rev_item.get("launch_ts"));
-        let vts = val_to_f64(rev_item.get("verdict_ts"));
-        !((vts > 0.0 && vts <= rr_ts) || (lts > 0.0 && lts < rr_ts))
-    };
-
-    let mut pre_reset_resumed_reviews: Vec<Value> = Vec::new();
     let mut all_reviews: Vec<Value> = Vec::new();
     for r in sub_ev.reviews.iter().chain(swarm_ev.reviews.iter()) {
-        if is_post_reset_rev(r) {
-            all_reviews.push(r.clone());
-        }
+        all_reviews.push(r.clone());
     }
     for r in codex_reviews {
-        if is_aborted_codex_review(r) || !is_post_reset_rev(r) {
+        if is_aborted_codex_review(r) {
             continue;
-        }
-        if rr_ts > 0.0 {
-            let sid = val_to_str(r.get("session_id"));
-            let rpath = val_to_str(r.get("rollout_path"));
-            if !codex_lane::is_post_reset_codex_session_proven(&sid, &rpath, rr_ts, first_ts_val) {
-                pre_reset_resumed_reviews.push(r.clone());
-                continue;
-            }
         }
         all_reviews.push(r.clone());
     }
@@ -5215,7 +4947,7 @@ fn validate_candidate_closure_inner(
             .then_with(|| val_to_f64(a.get("launch_ts")).total_cmp(&val_to_f64(b.get("launch_ts"))))
     });
 
-    let mut cycle_cutoff_ts = if rr_ts > 0.0 { rr_ts } else { 0.0 };
+    let mut cycle_cutoff_ts = 0.0;
     let mut cycle_raw_ordinary: Vec<Value> = Vec::new();
     let mut cycle_counted_ordinary_n = 0usize;
     let mut cycle_raw_closure: Vec<Value> = Vec::new();
@@ -5247,7 +4979,7 @@ fn validate_candidate_closure_inner(
                     .partition_cycle_closure(&cycle_raw_ordinary, &cycle_raw_closure)
                     .0
                     .is_empty();
-            // INVARIANT: Any valid terminal `VERDICT: APPROVED` inside `MAX_REVIEW_ROUNDS` invalidated by a later durable edit retires its sequence so subsequent delta rounds start a fresh budget of at most 3 (`claude-code-stack` §6).
+            // INVARIANT: Any valid terminal `VERDICT: APPROVED` inside `MAX_REVIEW_ROUNDS` invalidated by a later durable edit retires its sequence so subsequent delta rounds start a fresh budget of at most `MAX_REVIEW_ROUNDS`.
             if !has_effective_closure_so_far
                 && within_cycle_ordinary_caps(cycle_counted_ordinary_n, &cycle_raw_ordinary)
                 && !eval.has_prior_terminal_approval(&cycle_raw_ordinary)
@@ -5577,7 +5309,7 @@ fn validate_candidate_closure_inner(
                     &json!({ "launch_ts": res_until_ts }),
                 );
         }
-        // INVARIANT: Report `has_fresh_ordinary_approved` as `true` only when `simplify` is satisfied and no subsequent closure pass superseded `APPROVED`, avoiding deadlock on legacy `APPROVED -> closure BLOCKED` cycles.
+        // INVARIANT: Report `has_fresh_ordinary_approved` as `true` only when no subsequent closure pass superseded `APPROVED`, avoiding deadlock on legacy `APPROVED -> closure BLOCKED` cycles.
         probe.has_fresh_ordinary_approved = !probe_early_reject && has_fresh_valid_app;
     }
 
@@ -5614,18 +5346,6 @@ fn validate_candidate_closure_inner(
         if is_closing_kind && blocked_closure_count >= MAX_CLOSURE_PASSES {
             return (false, closure_blocked_halt_msg(blocked_closure_count));
         }
-
-    if is_closing_kind
-        && raw_ordinary_reviews.is_empty()
-        && raw_closure_reviews.is_empty()
-        && !pre_reset_resumed_reviews.is_empty()
-    {
-        return (
-            false,
-            "post-research-reset review resumed a pre-reset Codex session; start a brand-new review session without `--resume`"
-                .to_string(),
-        );
-    }
 
     let closing_inelig_err =
         |ctx_eval: &mut ClosureEvalCtx, min_launch_ts: Option<f64>, check_after_cls: bool|
@@ -5860,7 +5580,7 @@ fn validate_candidate_closure_inner(
                     ),
                 );
             }
-            // INVARIANT: Under the finite `claude-code-stack` gate, a fresh `VERDICT: APPROVED` after candidate-bound `simplify` immediately closes `verified` without post-approval `--closure`.
+            // INVARIANT: Under the finite gate, a fresh `VERDICT: APPROVED` immediately closes `verified` without post-approval `--closure`.
             let ord_vts = val_to_f64(ord_rev.get("launch_ts")).max(val_to_f64(ord_rev.get("verdict_ts")));
             if effective_cycle_closure
                 .iter()
@@ -5961,7 +5681,7 @@ fn validate_candidate_closure_inner(
             || cycle_counted_ordinary_n >= MAX_REVIEW_ROUNDS
             || blocked_closure_count >= MAX_CLOSURE_PASSES
             || legacy_three_round_closure;
-        // INVARIANT: When all `MAX_CLOSURE_PASSES` slots are consumed without a fresh valid `READY` (e.g. a mid-review edit made Pass 2 `READY` arrive already stale, so CLI/hooks forbid Pass 3 and `redesign-reset`), allow finite terminal `draft-blocked`.
+        // INVARIANT: When all `MAX_CLOSURE_PASSES` slots are consumed without a fresh valid `READY` (e.g. a mid-review edit made Pass 2 `READY` arrive already stale, so CLI/hooks forbid Pass 3), allow finite terminal `draft-blocked`.
         let closure_budget_exhausted_no_ready = effective_cycle_closure.len() >= MAX_CLOSURE_PASSES
             && closure_ready_rev.is_none()
             && pending_reset_kind != "READY";
@@ -6026,37 +5746,8 @@ fn merge_sticky_issue_entry(
     *issue_ts = eff_ts;
 }
 
-fn merge_sticky_max_ts(state: &mut Map<String, Value>, key: &str, ts: &mut f64) {
-    let eff = (*ts).max(val_to_f64(state.get(key)));
-    if eff > 0.0 {
-        state.insert(key.to_string(), json!(eff));
-        *ts = eff;
-    }
-}
-
 pub fn merge_sticky_outage_state(state: &mut Map<String, Value>, swarm_ev: &mut SwarmEvidence) {
     // INVARIANT: Propagate earliest confirmed candidate outage flags/timestamps bidirectionally between `state` and `swarm_ev` so in-window activity never erases earlier evicted outages.
-    merge_sticky_issue_entry(
-        state,
-        "sonnet_issue_verified",
-        "sonnet_issue_ts",
-        &mut swarm_ev.sonnet_issue_verified,
-        &mut swarm_ev.sonnet_issue_ts,
-    );
-    merge_sticky_issue_entry(
-        state,
-        "neon_issue_verified",
-        "neon_issue_ts",
-        &mut swarm_ev.neon_issue_verified,
-        &mut swarm_ev.neon_issue_ts,
-    );
-    merge_sticky_issue_entry(
-        state,
-        "hydrogen_issue_verified",
-        "hydrogen_issue_ts",
-        &mut swarm_ev.hydrogen_issue_verified,
-        &mut swarm_ev.hydrogen_issue_ts,
-    );
     merge_sticky_issue_entry(
         state,
         "opus_issue_verified",
@@ -6064,17 +5755,7 @@ pub fn merge_sticky_outage_state(state: &mut Map<String, Value>, swarm_ev: &mut 
         &mut swarm_ev.opus_issue_verified,
         &mut swarm_ev.opus_issue_ts,
     );
-    merge_sticky_max_ts(state, "sonnet_last_issue_ts", &mut swarm_ev.sonnet_last_issue_ts);
-    merge_sticky_max_ts(state, "sonnet_healthy_ts", &mut swarm_ev.sonnet_healthy_ts);
-    merge_sticky_max_ts(state, "neon_last_issue_ts", &mut swarm_ev.neon_last_issue_ts);
-    merge_sticky_max_ts(state, "neon_healthy_ts", &mut swarm_ev.neon_healthy_ts);
-    merge_sticky_max_ts(state, "hydrogen_last_issue_ts", &mut swarm_ev.hydrogen_last_issue_ts);
-    merge_sticky_max_ts(state, "hydrogen_healthy_ts", &mut swarm_ev.hydrogen_healthy_ts);
 }
-
-
-
-
 
 fn engine_priority_error_for_swarm(
     rev_item: &Value,
@@ -6230,7 +5911,7 @@ fn resolve_session_transcript_path(session: &str, transcript_path: &str) -> Stri
     base_tp.to_string_lossy().into_owned()
 }
 
-fn max_cycle_declared_receipt_risk(steps: &[Value], min_ts: f64, rr_ts: f64) -> String {
+fn max_cycle_declared_receipt_risk(steps: &[Value], min_ts: f64) -> String {
     let mut found: Vec<String> = Vec::new();
     for step in steps.iter().rev() {
         let source = step.get("source").and_then(|v| v.as_str()).unwrap_or("");
@@ -6243,12 +5924,6 @@ fn max_cycle_declared_receipt_risk(steps: &[Value], min_ts: f64, rr_ts: f64) -> 
             .and_then(|v| v.as_str())
             .map(rio::parse_iso_ts)
             .unwrap_or(0.0);
-        if rr_ts > 0.0 && sts <= rr_ts {
-            if sts > 0.0 {
-                break;
-            }
-            continue;
-        }
         if sts > 0.0 && sts < min_ts - 1.0 {
             break;
         }
@@ -6277,7 +5952,7 @@ pub fn evaluate_closure_cycle_for_marker(
     transcript_path: &str,
     min_risk_override: &str,
 ) -> codex_lane::ClosureCycleSummary {
-    // INVARIANT: Evaluate CLI closure pass limits, `has_fresh_ready`, and `research-reset` eligibility through `validate_candidate_closure_inner` so CLI and `Stop` share a single cycle state machine.
+    // INVARIANT: Evaluate CLI closure pass limits and `has_fresh_ready` through `validate_candidate_closure_inner` so CLI and `Stop` share a single cycle state machine.
     if session.trim().is_empty() || !marker.is_object() || json_truthy(marker.get("closed")) {
         return codex_lane::ClosureCycleSummary::default();
     }
@@ -6294,13 +5969,10 @@ pub fn evaluate_closure_cycle_for_marker(
     let caught_marker = catch_up_unmeasured_changes(base_marker);
     let eff_marker: &Value = &caught_marker;
     let first_ts_val = val_to_f64(eff_marker.get("first_ts"));
-    let rr_ts = cwg_common::last_research_reset_ts(eff_marker);
-    let rr_seq = cwg_common::last_research_reset_board_seq(eff_marker);
-    let eff_first_ts = first_ts_val.max(rr_ts);
-    if eff_first_ts <= 0.0 {
+    if first_ts_val <= 0.0 {
         return codex_lane::ClosureCycleSummary::default();
     }
-    let eff_round_start = val_to_i64(eff_marker.get("round_start_msg_id")).max(rr_seq);
+    let eff_round_start = val_to_i64(eff_marker.get("round_start_msg_id"));
     let eff_tp = resolve_session_transcript_path(session, transcript_path);
     let tp_opt = if eff_tp.is_empty() {
         None
@@ -6312,7 +5984,7 @@ pub fn evaluate_closure_cycle_for_marker(
     } else {
         Vec::new()
     };
-    let sub_ev = scan_native_subagents(&steps, tp_opt, eff_first_ts);
+    let sub_ev = scan_native_subagents(&steps, tp_opt, first_ts_val);
     let eff_cwd = if !git_root.is_empty() {
         git_root.to_string()
     } else {
@@ -6323,16 +5995,12 @@ pub fn evaluate_closure_cycle_for_marker(
             val_to_str(eff_marker.get("cwd"))
         }
     };
-    let cur_dh = val_to_str(eff_marker.get("current_diff_hash"));
-    let mut swarm_ev = scan_swarm_activity_with_reset(SwarmScanInput {
+    let mut swarm_ev = scan_swarm_activity(SwarmScanInput {
         steps: &steps,
         transcript_path: tp_opt,
-        first_ts: eff_first_ts,
+        first_ts: first_ts_val,
         round_start_msg_id: eff_round_start,
-        current_diff_hash: &cur_dh,
         cwd: &eff_cwd,
-        research_reset_ts: rr_ts,
-        research_reset_seq: rr_seq,
         marker: Some(eff_marker),
     });
     if let Some(Value::Object(mut st)) = rio::read_json(&cwg_common::enforcement_state_path(session))
@@ -6349,7 +6017,7 @@ pub fn evaluate_closure_cycle_for_marker(
         String::new()
     };
 
-    let codex_reviews = codex_lane::scan_verified_codex_reviews(eff_first_ts, session, git_root);
+    let codex_reviews = codex_lane::scan_verified_codex_reviews(first_ts_val, session, git_root);
     let synthetic_checks = ChecksEvidence {
         checks_count: 1,
         passed_count: 1,
@@ -6399,7 +6067,7 @@ fn marker_matches_validated(
     expected_stats: Option<&PathStatMap>,
     allow_unhashed: bool,
 ) -> bool {
-    // SAFETY: Re-verify under `marker_lock_path` that neither `marker.json`, cycle-reset metadata, nor live candidate file bytes mutated while `decide_stop` ran unlocked validation; unhashed (>32 MB) files fail closed on `verified`/`pr-ready` closure and require unchanged `(len, mtime_ns)` on `no-change`/`draft-blocked`/exhaustion/anomaly retirement.
+    // SAFETY: Re-verify under `marker_lock_path` that neither `marker.json` nor live candidate file bytes mutated while `decide_stop` ran unlocked validation; unhashed (>32 MB) files fail closed on `verified`/`pr-ready` closure and require unchanged `(len, mtime_ns)` on `no-change`/`draft-blocked`/exhaustion/anomaly retirement.
     let Some(live) = live_merged else {
         return false;
     };
@@ -6413,7 +6081,6 @@ fn marker_matches_validated(
         || live_paths != exp_paths
         || (val_to_f64(live.get("last_durable_ts")) - val_to_f64(expected.get("last_durable_ts"))).abs() > TS_EPS
         || val_to_f64(live.get("last_ts")) > val_to_f64(expected.get("last_ts")) + TS_EPS
-        || live.get("research_resets") != expected.get("research_resets")
         || live.get("closure_halt") != expected.get("closure_halt")
         || live.get("cycle_declared_risk") != expected.get("cycle_declared_risk")
         || val_to_i64(live.get("round_start_msg_id")) != val_to_i64(expected.get("round_start_msg_id"))
@@ -6510,7 +6177,6 @@ fn retire_candidate_checked(input: RetireCandidateInput<'_>) -> bool {
     state.insert("blocks".to_string(), json!(0));
     state.insert("waits".to_string(), json!(0));
     state.insert("total_waits".to_string(), json!(0));
-    state.insert("notify_reminders".to_string(), json!(0));
     let closed_ts = now_sec();
     state.insert("closed_ts".to_string(), json!(closed_ts));
     state.insert(
@@ -6642,8 +6308,8 @@ pub fn format_block_message(
     let guidance = if reason.contains("terminal closure cap") || reason.contains("draft-blocked") {
         let reqs = cwg_common::receipt_requirements_summary(&floor, policy, has_tests);
         format!(
-            "Кандидат `PERSISTENT` (риск `{}`). Обязательные условия: {}.\n- Конечный потолок гейта (`3` раунда ревью + `2/2` прохода `--closure` с `BLOCKED`) исчерпан: новые циклы ревью запрещены.\n- Сохраните текущее состояние, опишите точный оставшийся блокер и завершите ответ терминальной квитанцией `[gate] draft-blocked: <точный блокер и handoff>`.",
-            floor, reqs
+            "Кандидат `PERSISTENT` (риск `{}`). Обязательные условия: {}.\n- Конечный потолок гейта (`{}` раунда ревью + `{}/{}` прохода `--closure` с `BLOCKED`) исчерпан: новые циклы ревью запрещены.\n- Сохраните текущее состояние, опишите точный оставшийся блокер и завершите ответ терминальной квитанцией `[gate] draft-blocked: <точный блокер и handoff>`.",
+            floor, reqs, MAX_REVIEW_ROUNDS, MAX_CLOSURE_PASSES, MAX_CLOSURE_PASSES
         )
     } else {
         let reqs = cwg_common::receipt_requirements_summary(&floor, policy, has_tests);
@@ -6818,16 +6484,11 @@ pub fn decide_stop(payload: &Value) -> Option<String> {
     };
 
     let ckey = cwg_common::candidate_key(&marker);
-    let cur_reset_epoch = cwg_common::research_reset_epoch(&marker) as i64;
-    if val_to_str(state.get("candidate_key")) != ckey
-        || val_to_i64(state.get("reset_epoch")) != cur_reset_epoch
-    {
+    if val_to_str(state.get("candidate_key")) != ckey {
         state.insert("candidate_key".to_string(), Value::String(ckey));
-        state.insert("reset_epoch".to_string(), json!(cur_reset_epoch));
         state.insert("blocks".to_string(), json!(0));
         state.insert("waits".to_string(), json!(0));
         state.insert("total_waits".to_string(), json!(0));
-        state.insert("notify_reminders".to_string(), json!(0));
         state.insert("block_nonce".to_string(), Value::String(String::new()));
     }
 
@@ -6858,11 +6519,7 @@ pub fn decide_stop(payload: &Value) -> Option<String> {
         .map(|r| val_to_str(r.get("risk")).to_uppercase())
         .filter(|r| cwg_common::is_valid_risk(r))
         .unwrap_or_default();
-    let tx_decl_risk = max_cycle_declared_receipt_risk(
-        &steps,
-        first_ts,
-        cwg_common::last_research_reset_ts(&marker),
-    );
+    let tx_decl_risk = max_cycle_declared_receipt_risk(&steps, first_ts);
     let cycle_receipt_risk = match (receipt_declared_risk.is_empty(), tx_decl_risk.is_empty()) {
         (true, true) => String::new(),
         (false, true) => receipt_declared_risk,
@@ -6918,10 +6575,7 @@ pub fn decide_stop(payload: &Value) -> Option<String> {
             cctx = cwg_common::resolve_candidate_context(&marker, true);
         }
     } else {
-        let rr_ts = cwg_common::last_research_reset_ts(&marker);
-        let rr_seq = cwg_common::last_research_reset_board_seq(&marker);
-        let eff_first_ts = first_ts.max(rr_ts);
-        let eff_round_start_msg_id = val_to_i64(marker.get("round_start_msg_id")).max(rr_seq);
+        let eff_round_start_msg_id = val_to_i64(marker.get("round_start_msg_id"));
         let check_base_cwd = {
             let pc = rio::effective_cwd(payload);
             if !pc.is_empty() {
@@ -6937,7 +6591,7 @@ pub fn decide_stop(payload: &Value) -> Option<String> {
         };
         let checks_ev =
             read_checks_evidence_with_steps_in_cwd(&session, first_ts, &steps, &check_base_cwd);
-        let sub_ev = scan_native_subagents(&steps, transcript_path, eff_first_ts);
+        let sub_ev = scan_native_subagents(&steps, transcript_path, first_ts);
         let eff_cwd = {
             let gr = val_to_str(marker.get("git_root"));
             if !gr.is_empty() {
@@ -6951,21 +6605,17 @@ pub fn decide_stop(payload: &Value) -> Option<String> {
                 }
             }
         };
-        let cur_dh = val_to_str(marker.get("current_diff_hash"));
-        let mut swarm_ev = scan_swarm_activity_with_reset(SwarmScanInput {
+        let mut swarm_ev = scan_swarm_activity(SwarmScanInput {
             steps: &steps,
             transcript_path,
-            first_ts: eff_first_ts,
+            first_ts,
             round_start_msg_id: eff_round_start_msg_id,
-            current_diff_hash: &cur_dh,
             cwd: &eff_cwd,
-            research_reset_ts: rr_ts,
-            research_reset_seq: rr_seq,
             marker: Some(&marker),
         });
         merge_sticky_outage_state(&mut state, &mut swarm_ev);
         let codex_revs = codex_lane::scan_verified_codex_reviews(
-            eff_first_ts,
+            first_ts,
             &session,
             &val_to_str(marker.get("git_root")),
         );
@@ -7277,15 +6927,12 @@ mod tests {
         state.insert("opus_issue_ts".to_string(), json!(100.0));
 
         let mut swarm_ev = SwarmEvidence {
-            sonnet_issue_verified: true,
             opus_issue_verified: true,
             opus_issue_ts: 250.0,
             ..SwarmEvidence::default()
         };
 
         merge_sticky_outage_state(&mut state, &mut swarm_ev);
-        assert_eq!(state.get("sonnet_issue_verified"), Some(&Value::Bool(true)));
-        assert!(swarm_ev.sonnet_issue_verified);
         assert_eq!(state.get("opus_issue_verified"), Some(&Value::Bool(true)));
         assert!(swarm_ev.opus_issue_verified);
         assert_eq!(val_to_f64(state.get("opus_issue_ts")), 100.0);
@@ -7312,7 +6959,7 @@ mod tests {
         let compact_tp = logs_dir.join("transcript.jsonl");
         let full_tp = logs_dir.join("transcript_full.jsonl");
 
-        // INVARIANT: Evicted step 1 in compact transcript reports Sonnet out-of-quota error.
+        // INVARIANT: Evicted step 1 in compact transcript reports Opus out-of-quota error before tail step 5.
         let compact_lines = [
             json!({
                 "step_index": 0,
@@ -7329,8 +6976,8 @@ mod tests {
                     "name": "swarm",
                     "args": {
                         "action": "\"add\"",
-                        "name": "\"simp-reuse\"",
-                        "model": "\"claude-sonnet-5-5-high\""
+                        "name": "\"reviewer-opus-0\"",
+                        "model": "\"claude-opus-5-5-high\""
                     }
                 }]
             }),
@@ -7341,7 +6988,7 @@ mod tests {
                 "status": "ERROR",
                 "created_at": "2026-11-17T10:00:11Z",
                 "content": "",
-                "error": "out of quota for claude-sonnet-5-5-high"
+                "error": "out of quota for claude-opus-5-5-high"
             }),
         ];
         let compact_body: String = compact_lines
@@ -7388,18 +7035,19 @@ mod tests {
         .unwrap();
 
         let first_ts = rio::parse_iso_ts("2026-11-17T09:59:55Z");
-        let ev = scan_swarm_activity(
-            &tail_steps,
-            Some(&full_tp.to_string_lossy()),
+        let early_err_ts = rio::parse_iso_ts("2026-11-17T10:00:11Z");
+        let full_tp_str = full_tp.to_string_lossy().into_owned();
+        let ev = scan_swarm_activity(SwarmScanInput {
+            steps: &tail_steps,
+            transcript_path: Some(&full_tp_str),
             first_ts,
-            0,
-            "",
-            "",
-        );
-        assert!(ev.sonnet_issue_verified);
+            round_start_msg_id: 0,
+            cwd: "",
+            marker: None,
+        });
         assert!(ev.opus_issue_verified);
-        assert!(ev.opus_issue_ts > 0.0);
-        assert_eq!(ev.review_failures.len(), 1);
+        assert!((ev.opus_issue_ts - early_err_ts).abs() < 0.001);
+        assert_eq!(ev.review_failures.len(), 2);
     }
 
     #[test]
@@ -7624,7 +7272,14 @@ mod tests {
         ];
         let tx_ev = extract_transcript_edit_evidence(&wait_steps, &marker);
         assert!(tx_ev.edit_spans.is_empty());
-        let sw_wait = scan_swarm_activity(&wait_steps, None, 100.0, 0, "", "");
+        let sw_wait = scan_swarm_activity(SwarmScanInput {
+            steps: &wait_steps,
+            transcript_path: None,
+            first_ts: 100.0,
+            round_start_msg_id: 0,
+            cwd: "",
+            marker: None,
+        });
         assert!(sw_wait.pending_bg_tasks.is_empty());
         assert_eq!(sw_wait.passive_bg_tasks, vec!["sess-1/task-99".to_string()]);
     }
@@ -7813,67 +7468,6 @@ mod tests {
         assert!(!ok_3rd);
         assert!(why_3rd.contains("MAX_CLOSURE_PASSES=2"), "got: {}", why_3rd);
 
-        // INVARIANT: Post-research-reset worker reusing standard name `adversarial-reviewer` with new `conversation_id` is counted without inheriting Cycle-1 board messages.
-        let sdir = brain.join(sess).join(".system_generated").join("swarm");
-        let ldir = brain.join(sess).join(".system_generated").join("logs");
-        fs::create_dir_all(&sdir).unwrap();
-        fs::create_dir_all(&ldir).unwrap();
-        let tp_fake = ldir.join("transcript.jsonl");
-        fs::write(&tp_fake, "").unwrap();
-        let rr_marker = json!({
-            "session": sess,
-            "research_resets": [{
-                "reset_ts": 2000.0,
-                "last_blocked_ts": 1990.0,
-                "board_head_seq": 5,
-                "pre_reset_worker_cids": ["cid-old-cycle1"],
-                "decision": "refactor",
-                "findings": "docs",
-                "research_tools": ["search_web"]
-            }]
-        });
-        fs::write(
-            sdir.join("members.json"),
-            json!({
-                "members": {
-                    "adversarial-reviewer": {
-                        "conversation_id": "cid-new-cycle2",
-                        "model": cwg_common::OPUS_HIGH_MODEL,
-                        "role": "worker",
-                        "killed": true,
-                        "created_at": "1970-01-01T00:33:25Z"
-                    }
-                }
-            })
-            .to_string(),
-        )
-        .unwrap();
-        let board_rows = [
-            json!({"seq": 1, "agent": "coordinator", "time": "1970-01-01T00:20:00Z", "text": "@adversarial-reviewer old cycle"}),
-            json!({"seq": 6, "agent": "coordinator", "time": "1970-01-01T00:33:26Z", "text": "@adversarial-reviewer review h2"}),
-            json!({"seq": 7, "agent": "adversarial-reviewer", "time": "1970-01-01T00:33:30Z", "text": "VERDICT: APPROVED"}),
-        ];
-        fs::write(
-            sdir.join("board.jsonl"),
-            board_rows.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
-        )
-        .unwrap();
-        let tp_fake_str = tp_fake.to_string_lossy().into_owned();
-        let ws_str = ws.to_string_lossy().into_owned();
-        let scanned_new = scan_swarm_activity_with_reset(SwarmScanInput {
-            steps: &[],
-            transcript_path: Some(&tp_fake_str),
-            first_ts: 2000.0,
-            round_start_msg_id: 5,
-            current_diff_hash: "h2",
-            cwd: &ws_str,
-            research_reset_ts: 2000.0,
-            research_reset_seq: 5,
-            marker: Some(&rr_marker),
-        });
-        assert_eq!(scanned_new.reviews.len(), 1);
-        assert!(val_to_f64(scanned_new.reviews[0].get("launch_ts")) > 2000.0);
-
         // SAFETY: `retire_candidate_checked` refuses to close/delete `marker.json` if a concurrent `PostToolUse` persisted a newer edit into `marker.json` after Stop's initial snapshot.
         let sess_conc = "sess-retire-toctou";
         let mfile_conc = cwg_common::marker_path(sess_conc);
@@ -8008,7 +7602,7 @@ mod tests {
             Some(1)
         );
 
-        // SAFETY: Concurrent `research-reset` (`research_resets` + `round_start_msg_id` updated without file edits) also prevents `decide_stop` exhaustion from deleting the marker.
+        // SAFETY: Concurrent `round_start_msg_id` advancement without file edits also prevents `decide_stop` exhaustion from deleting the marker.
         fs::write(&notes_md, "# v1\n").unwrap();
         rio::write_json(&mfile_exh, &exh_marker).unwrap();
         rio::write_json(
@@ -8023,7 +7617,6 @@ mod tests {
         let mfile_for_rr = mfile_exh.clone();
         *TEST_MID_DECIDE_STOP_HOOK.lock().unwrap() = Some(Box::new(move || {
             let mut m = rio::read_json(&mfile_for_rr).unwrap();
-            m["research_resets"] = json!([{"reset_ts": 205.0, "board_head_seq": 12, "decision": "refine"}]);
             m["round_start_msg_id"] = json!(12);
             rio::write_json(&mfile_for_rr, &m).unwrap();
         }));
@@ -8189,17 +7782,13 @@ mod tests {
         assert!(!mfile_big_nc.exists());
         let _ = fs::remove_dir_all(&git_big_dir);
 
-        // SAFETY: With empty `transcript_path` (CLI mode), `active_cycle_closure_blocks_for_marker` resolves `<brain_root>/<session>`, rejects scouts, and clamps overlapping `breaker.json` outage windows on `reset_breaker_at`.
+        // SAFETY: With empty `transcript_path` (CLI mode), `active_cycle_closure_summary_for_marker` resolves `<brain_root>/<session>`, rejects scouts, and clamps overlapping `breaker.json` outage windows on `reset_breaker_at`.
         let sess_board_cli = "sess-board-cli-parity";
-        let swarm_cli_dir = tmp
-            .path
-            .join("brain")
+        let swarm_cli_dir = brain
             .join(sess_board_cli)
             .join(".system_generated")
             .join("swarm");
-        let logs_cli_dir = tmp
-            .path
-            .join("brain")
+        let logs_cli_dir = brain
             .join(sess_board_cli)
             .join(".system_generated")
             .join("logs");
@@ -8266,12 +7855,13 @@ mod tests {
             "closed": false,
         });
         codex_lane::wipe_breaker_for_test();
-        let (cnt_codex_up, _, _) = codex_lane::active_cycle_closure_blocks_for_marker(
+        let cnt_codex_up = codex_lane::active_cycle_closure_summary_for_marker(
             &cli_marker,
             sess_board_cli,
             &ws.to_string_lossy(),
             "",
-        );
+        )
+        .blocked_count;
         assert_eq!(cnt_codex_up, 0);
 
         let rev1_launch_ts = rio::parse_iso_ts("2026-11-18 10:01:10");
@@ -8297,27 +7887,40 @@ mod tests {
             codex_lane::breaker_status().get("tripped").and_then(|v| v.as_bool()),
             Some(false)
         );
-        let (cnt_during_outage, _, _) = codex_lane::active_cycle_closure_blocks_for_marker(
+        let during_outage_sum = codex_lane::active_cycle_closure_summary_for_marker(
             &cli_marker,
             sess_board_cli,
             &ws.to_string_lossy(),
             "",
         );
-        assert_eq!(cnt_during_outage, 2);
+        assert_eq!(during_outage_sum.blocked_count, 2);
 
-        // SAFETY: Durable `closure_halt` latched on `marker.json` preserves the 2-BLOCKED hard stop even after rollout/packet/board eviction until `research_resets` advances past `last_blocked_ts`.
+        // SAFETY: Durable `closure_halt` latched on `marker.json` preserves the 2-BLOCKED hard stop even after rollout/packet/board eviction.
         let mfile_cli = cwg_common::marker_path(sess_board_cli);
         rio::write_json(&mfile_cli, &cli_marker).unwrap();
-        let (latched_n, latched_ts, latched_ids) =
-            codex_lane::active_cycle_closure_blocks(sess_board_cli, &ws.to_string_lossy(), "");
+        let latched_n = during_outage_sum.live_blocked_count;
+        let latched_ts = during_outage_sum.last_blocked_ts;
+        let latched_ids = during_outage_sum.blocked_ids.clone();
         assert_eq!(latched_n, 2);
         assert!(latched_ts > 0.0);
+        cwg_common::latch_marker_closure_halt_for_marker(
+            sess_board_cli,
+            &cli_marker,
+            latched_n,
+            latched_ts,
+            &latched_ids,
+        );
         let _ = fs::remove_file(swarm_cli_dir.join("board.jsonl"));
         codex_lane::wipe_breaker_for_test();
-        let (cnt_after_eviction, _, _) =
-            codex_lane::active_cycle_closure_blocks(sess_board_cli, &ws.to_string_lossy(), "");
-        assert_eq!(cnt_after_eviction, 2);
         let halted_marker = rio::read_json(&mfile_cli).unwrap();
+        let cnt_after_eviction = codex_lane::active_cycle_closure_summary_for_marker(
+            &halted_marker,
+            sess_board_cli,
+            &ws.to_string_lossy(),
+            "",
+        )
+        .blocked_count;
+        assert_eq!(cnt_after_eviction, 2);
         let rcp_evict = json!({"kind": "verified", "risk": "HIGH"});
         let chk_evict = ChecksEvidence {
             checks_count: 1,
@@ -8384,7 +7987,6 @@ mod tests {
         cwg_common::latch_marker_closure_halt(cwg_common::ClosureHaltLatch {
             session: sess_board_cli,
             expected_first_ts: 100.0,
-            expected_rr_ts: 0.0,
             expected_round_start_msg_id: 0,
             blocked_count: 2,
             last_blocked_ts: latched_ts,
@@ -8393,18 +7995,6 @@ mod tests {
         });
         let after_stale_latch = rio::read_json(&mfile_cli).unwrap();
         assert!(after_stale_latch.get("closure_halt").is_none());
-
-        let mut cleared_marker = halted_marker.clone();
-        cleared_marker["research_resets"] = json!([{
-            "reset_ts": latched_ts + 1.0,
-            "last_blocked_ts": latched_ts,
-            "blocked_review_ids": latched_ids,
-            "decision": "refine",
-            "findings": "verified durable halt clear",
-            "research_tools": ["search_web"],
-            "board_head_seq": 8,
-        }]);
-        assert!(cwg_common::active_marker_closure_halt(&cleared_marker).is_none());
         let _ = fs::remove_file(&mfile_cli);
         fs::write(
             swarm_cli_dir.join("board.jsonl"),
@@ -8430,12 +8020,13 @@ mod tests {
         post_rec_marker["last_ts"] = json!(post_rec_first_ts);
         post_rec_marker["last_durable_ts"] = json!(post_rec_first_ts);
         post_rec_marker["round_start_msg_id"] = json!(8);
-        let (cnt_post_recovery, _, _) = codex_lane::active_cycle_closure_blocks_for_marker(
+        let cnt_post_recovery = codex_lane::active_cycle_closure_summary_for_marker(
             &post_rec_marker,
             sess_board_cli,
             &ws.to_string_lossy(),
             "",
-        );
+        )
+        .blocked_count;
         codex_lane::wipe_breaker_for_test();
         assert_eq!(cnt_post_recovery, 0);
 
@@ -8599,7 +8190,7 @@ mod tests {
             "toolResponse": {"output": "Command exited with code 0.\n\nCommand output:\nvalidate-system: OK\n"}
         });
         cwg_mark::record_post_tool_use(&post_tok).unwrap();
-        let ev_tok = read_checks_evidence_with_steps(sess_tok, 0.0, &[]);
+        let ev_tok = read_checks_evidence_with_steps_in_cwd(sess_tok, 0.0, &[], "");
         assert_eq!((ev_tok.checks_count, ev_tok.passed_count, ev_tok.failed_count), (1, 1, 0));
         assert!(
             ev_tok.latest_pass_ts > 0.0 && ev_tok.latest_pass_ts <= t_after_pre,
@@ -8640,7 +8231,7 @@ mod tests {
             "toolResponse": {"output": "Command exited with code 0.\n\nCommand output:\nvalidate: OK\n"}
         });
         cwg_mark::record_post_tool_use(&post_cd_tok).unwrap();
-        let ev_cd_tok = read_checks_evidence_with_steps(sess_cd_tok, 0.0, &[]);
+        let ev_cd_tok = read_checks_evidence_with_steps_in_cwd(sess_cd_tok, 0.0, &[], "");
         assert_eq!((ev_cd_tok.checks_count, ev_cd_tok.passed_count), (1, 1));
         assert!(
             ev_cd_tok.latest_pass_ts > 0.0 && ev_cd_tok.latest_pass_ts <= t_cd_after_pre,
@@ -8925,7 +8516,7 @@ mod tests {
             "toolResponse": {"output": "Command exited with code 1.\n\nCommand output:\nCommand exited with code 0.\n"}
         });
         cwg_mark::record_post_tool_use(&post_fail_obj).unwrap();
-        let ev_fail_obj = read_checks_evidence_with_steps(sess_fail_obj, 0.0, &[]);
+        let ev_fail_obj = read_checks_evidence_with_steps_in_cwd(sess_fail_obj, 0.0, &[], "");
         assert_eq!((ev_fail_obj.checks_count, ev_fail_obj.passed_count, ev_fail_obj.failed_count), (1, 0, 1));
 
         let sess_bg_obj = "sess-obj-bg-launch";
@@ -8946,7 +8537,7 @@ mod tests {
             "output": "Tool is running as a background task with task id: sess-obj-bg-launch/task-20\n"
         });
         cwg_mark::record_post_tool_use(&post_bg_obj).unwrap();
-        let ev_bg_pending = read_checks_evidence_with_steps(sess_bg_obj, 0.0, &[]);
+        let ev_bg_pending = read_checks_evidence_with_steps_in_cwd(sess_bg_obj, 0.0, &[], "");
         assert_eq!(ev_bg_pending.checks_count, 0, "pending bg_launch must not count before completion");
         let bg_done_steps = vec![json!({
             "source": "SYSTEM",
@@ -8954,7 +8545,7 @@ mod tests {
             "created_at": "2026-11-21T11:16:31Z",
             "content": "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-21T11:16:31Z sender=sess-obj-bg-launch/task-20 priority=MESSAGE_PRIORITY_HIGH content=Task id \"sess-obj-bg-launch/task-20\" finished with result:\nCommand exited with code 0.\n\nCommand output:\nvalidate-system: OK\n</SYSTEM_MESSAGE>"
         })];
-        let ev_bg_done = read_checks_evidence_with_steps(sess_bg_obj, 0.0, &bg_done_steps);
+        let ev_bg_done = read_checks_evidence_with_steps_in_cwd(sess_bg_obj, 0.0, &bg_done_steps, "");
         assert_eq!((ev_bg_done.checks_count, ev_bg_done.passed_count), (1, 1));
         assert!(
             ev_bg_done.latest_pass_ts > 0.0 && ev_bg_done.latest_pass_ts <= t_bg_pre,
@@ -8980,7 +8571,7 @@ mod tests {
             "toolResponse": {"stdout": "Command exited with code 0.\n"}
         });
         cwg_mark::record_post_tool_use(&post_raw_stdout_only).unwrap();
-        let ev_raw_stdout = read_checks_evidence_with_steps(sess_chained, 0.0, &[]);
+        let ev_raw_stdout = read_checks_evidence_with_steps_in_cwd(sess_chained, 0.0, &[], "");
         assert!(
             !ev_raw_stdout.saw_uncertain_pass,
             "raw stdout field must not spoof host exit header"
@@ -9036,7 +8627,7 @@ mod tests {
                 "content": "Command exited with code 0.\n\nCommand output:\nvalidate-system: OK\n"
             }),
         ];
-        let ev_chained = read_checks_evidence_with_steps(sess_chained, 1795258412.0, &chained_steps);
+        let ev_chained = read_checks_evidence_with_steps_in_cwd(sess_chained, 1795258412.0, &chained_steps, "");
         assert_eq!(
             (ev_chained.checks_count, ev_chained.passed_count, ev_chained.saw_uncertain_pass),
             (0, 0, true),
@@ -9056,14 +8647,14 @@ mod tests {
             "toolResponse": {"output": "   \n", "text": "Command exited with code 0.\n\nCommand output:\nvalidate-system: OK\n"}
         });
         cwg_mark::record_post_tool_use(&post_anon_unc).unwrap();
-        let ev_anon_now = read_checks_evidence_with_steps(sess_anon_unc, 0.0, &[]);
+        let ev_anon_now = read_checks_evidence_with_steps_in_cwd(sess_anon_unc, 0.0, &[], "");
         assert_eq!(
             (ev_anon_now.checks_count, ev_anon_now.saw_uncertain_pass),
             (0, true),
             "whitespace-only output must fall back to text host envelope: {:?}",
             ev_anon_now
         );
-        let ev_anon_stale = read_checks_evidence_with_steps(sess_anon_unc, now_sec() + 60.0, &[]);
+        let ev_anon_stale = read_checks_evidence_with_steps_in_cwd(sess_anon_unc, now_sec() + 60.0, &[], "");
         assert!(
             !ev_anon_stale.saw_uncertain_pass,
             "pre-candidate uncertain run must not trigger ignored-check hint for a newer candidate"
@@ -9303,7 +8894,7 @@ mod tests {
     }
 
     #[test]
-    fn test_outside_marker_crlf_simplify_rejection_and_four_revise_draft_blocked() {
+    fn test_outside_marker_crlf_and_four_revise_draft_blocked() {
         let _guard = crate::win32_sqlite::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -9411,15 +9002,12 @@ mod tests {
             ..Default::default()
         };
         let sub_empty = SubagentEvidence::default();
-        let sw_ev = scan_swarm_activity_with_reset(SwarmScanInput {
+        let sw_ev = scan_swarm_activity(SwarmScanInput {
             steps: &[],
             transcript_path: Some(&tp_str),
             first_ts: t_first,
             round_start_msg_id: 1,
-            current_diff_hash: &fp_r2,
             cwd: &repo_str,
-            research_reset_ts: 0.0,
-            research_reset_seq: 0,
             marker: Some(&marker_r2),
         });
         let four_revise: Vec<Value> = (1..=4)
@@ -9603,7 +9191,6 @@ mod tests {
             m_r8["session"] = json!("sess-r8-evicted-no-disk-tx");
             m_r8["closure_halt"] = json!({
                 "candidate_first_ts": 1000.0,
-                "research_reset_ts": 0.0,
                 "round_start_msg_id": 0,
                 "blocked_count": 2,
                 "last_blocked_ts": 1056.0,
@@ -9918,7 +9505,6 @@ mod tests {
         let t_first = rio::parse_iso_ts("2026-11-21T04:00:00Z");
         let t_prep = rio::parse_iso_ts("2026-11-21T04:01:00Z");
         let t_models = rio::parse_iso_ts("2026-11-21T04:02:00Z");
-        let t_sim_start = rio::parse_iso_ts("2026-11-21T04:03:00Z");
         let t_edit_post = rio::parse_iso_ts("2026-11-21T04:05:00Z");
         let iso = |ts: f64| crate::win32_sqlite::format_iso_utc(ts);
 
@@ -9947,7 +9533,7 @@ mod tests {
             session: sess,
             cwd: &repo_str,
             brain_root: &brain,
-            label: "simplify",
+            label: "review",
             ttl_seconds: 270,
             paths: &[],
             reset: false,
@@ -9979,7 +9565,7 @@ mod tests {
             "type": "GENERIC",
             "status": "DONE",
             "created_at": iso(t_models + 1.0),
-            "content": "{\"models\":[\"claude-sonnet-5-5-high\",\"gemini-4-neon-xhigh\"]...TRUNCATED",
+            "content": "{\"models\":[\"claude-opus-5-5-high\",\"gemini-4-neon-xhigh\"]...TRUNCATED",
             "truncated_fields": ["content"]
         });
         let full_models_step = json!({
@@ -9988,7 +9574,7 @@ mod tests {
             "type": "GENERIC",
             "status": "DONE",
             "created_at": iso(t_models + 1.0),
-            "content": "{\"models\":[\"claude-sonnet-5-5-high\",\"gemini-4-neon-xhigh\"],\"quotas\":{\"claude-sonnet-5-5-high\":{\"quota_remaining\":\"0%\"},\"gemini-4-neon-xhigh\":{\"quota_remaining\":\"90%\"}}}"
+            "content": "{\"models\":[\"claude-opus-5-5-high\",\"gemini-4-neon-xhigh\"],\"quotas\":{\"claude-opus-5-5-high\":{\"quota_remaining\":\"0%\"},\"gemini-4-neon-xhigh\":{\"quota_remaining\":\"90%\"}}}"
         });
         let models_call_step = json!({
             "step_index": 4,
@@ -10004,31 +9590,14 @@ mod tests {
             &brain,
             sess,
             &full_tx,
-            json!({
-                "members": {
-                    "simplify-reuse": {"role": "worker", "conversation_id": "cid-82f-r", "model": cwg_common::NEON_XHIGH_MODEL, "killed": true},
-                    "simplify-quality": {"role": "worker", "conversation_id": "cid-82f-q", "model": cwg_common::NEON_XHIGH_MODEL, "killed": true},
-                    "simplify-efficiency": {"role": "worker", "conversation_id": "cid-82f-e", "model": cwg_common::NEON_XHIGH_MODEL, "killed": true},
-                }
-            }),
-            &[
-                json!({"seq": 1, "agent": "coordinator", "time": iso(t_sim_start), "text": "@simplify-reuse direct review"}),
-                json!({"seq": 2, "agent": "coordinator", "time": iso(t_sim_start + 1.0), "text": "@simplify-quality direct review"}),
-                json!({"seq": 3, "agent": "coordinator", "time": iso(t_sim_start + 2.0), "text": "@simplify-efficiency direct review"}),
-                json!({"seq": 4, "agent": "simplify-reuse", "time": iso(t_sim_start + 20.0), "text": "@coordinator\nSIMPLIFY_LENS: REUSE\nSIMPLIFY_VERDICT: ACTIONABLE_FIXES"}),
-                json!({"seq": 5, "agent": "simplify-quality", "time": iso(t_sim_start + 25.0), "text": "@coordinator\nSIMPLIFY_LENS: QUALITY\nSIMPLIFY_VERDICT: ACTIONABLE_FIXES"}),
-                json!({"seq": 6, "agent": "simplify-efficiency", "time": iso(t_sim_start + 30.0), "text": "@coordinator\nSIMPLIFY_LENS: EFFICIENCY\nSIMPLIFY_VERDICT: ACTIONABLE_FIXES"}),
-            ],
-            &[
-                ("cid-82f-r", &[json!({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": iso(t_sim_start)})]),
-                ("cid-82f-q", &[json!({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": iso(t_sim_start + 1.0)})]),
-                ("cid-82f-e", &[json!({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": iso(t_sim_start + 2.0)})]),
-            ],
+            json!({"members": {}}),
+            &[],
+            &[],
         );
         fs::write(tp_full.with_file_name("transcript.jsonl"), &compact_tx).unwrap();
         let tp_full_str = tp_full.to_string_lossy().into_owned();
 
-        // 3) Post-simplify durable edit (still unmeasured `fp: null`) + 4 ordinary rounds (ESCALATE) + research + 2/2 closure BLOCKED -> `[gate] draft-blocked` accepted!
+        // 3) Post-prepare durable edit (still unmeasured `fp: null`) + 4 ordinary rounds (ESCALATE) + research + 2/2 closure BLOCKED -> `[gate] draft-blocked` accepted!
         let mut m_post = m_after_prep.clone();
         m_post["last_ts"] = json!(t_edit_post);
         m_post["last_durable_ts"] = json!(t_edit_post);
@@ -10043,19 +9612,16 @@ mod tests {
             json!({"step_index": 5000, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": iso(t_edit_post + 45.0), "tool_calls": [{"name": "search_web", "args": {"query": "wechat runtime"}}]}),
             json!({"step_index": 5001, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": iso(t_edit_post + 46.0), "content": "docs"}),
         ];
-        let sw_ev = scan_swarm_activity_with_reset(SwarmScanInput {
+        let sw_ev = scan_swarm_activity(SwarmScanInput {
             steps: &tail_steps,
             transcript_path: Some(&tp_full_str),
             first_ts: t_first,
             round_start_msg_id: 0,
-            current_diff_hash: "",
             cwd: &repo_str,
-            research_reset_ts: 0.0,
-            research_reset_seq: 0,
             marker: Some(&m_post),
         });
         assert!(
-            sw_ev.sonnet_issue_verified,
+            sw_ev.opus_issue_verified,
             "truncated compact models(all=true) must hydrate quotas from transcript_full.jsonl"
         );
 
@@ -10139,7 +9705,7 @@ mod tests {
                     session: sess_rw,
                     cwd: &repo_str,
                     brain_root: &brain,
-                    label: "simplify",
+                    label: "review",
                     ttl_seconds: 270,
                     paths: &[],
                     reset: false,
@@ -10156,7 +9722,7 @@ mod tests {
                     session: sess_rw,
                     cwd: &repo_str,
                     brain_root: &brain,
-                    label: "simplify",
+                    label: "review",
                     ttl_seconds: 270,
                     paths: &[],
                     reset: false,
@@ -10173,7 +9739,7 @@ mod tests {
         );
         let _ = fs::remove_file(&rpath_rw);
 
-        // 6) Contract counter-checks (Codex #3 & #4): partial `--paths` prepare returns `direct_read_allowed: false`; under active `prepare`, fresh `ACTIONABLE_FIXES` without `DIFF_HASH` revokes earlier `CLEAN` without crediting lenses.
+        // 6) Contract counter-check (Codex #3): partial `--paths` prepare returns `direct_read_allowed: false`.
         let sess_af = "sess-anom-82f-unhashed-af";
         let skey_af = rio::safe_key(sess_af, "default");
         let mpath_af = cwg_common::marker_path(&skey_af);
@@ -10198,7 +9764,7 @@ mod tests {
             session: sess_af,
             cwd: &repo_str,
             brain_root: &brain,
-            label: "simplify",
+            label: "review",
             ttl_seconds: 270,
             paths: &[],
             reset: false,
@@ -10210,7 +9776,7 @@ mod tests {
                 session: sess_af,
                 cwd: &repo_str,
                 brain_root: &brain,
-                label: "simplify",
+                label: "review",
                 ttl_seconds: 270,
                 paths: &["rust/src/auth.rs".to_string()],
                 reset: false,
@@ -10262,7 +9828,7 @@ mod tests {
                             session: sess_mp,
                             cwd: &repo_str,
                             brain_root: &brain,
-                            label: "simplify",
+                            label: "review",
                             ttl_seconds: 270,
                             paths: &[],
                             reset: false,
@@ -10287,7 +9853,7 @@ mod tests {
                                 session: sess_mp,
                                 cwd: &repo_str,
                                 brain_root: &brain,
-                                label: "simplify",
+                                label: "review",
                                 ttl_seconds: 270,
                                 paths: &[],
                                 reset: false,
@@ -10340,7 +9906,7 @@ mod tests {
                 "require_marker_cycle_ts": t_first,
                 "seen_heads": { rio::fold_path(&repo_str): [live_head_mp] },
                 "lanes": {
-                    format!("{}|simplify", rio::fold_path(&repo_str)): [{
+                    format!("{}|review", rio::fold_path(&repo_str)): [{
                         "round": 1,
                         "head_oid": live_head_mp,
                         "tree_oid": live_tree_mp,
@@ -10401,7 +9967,7 @@ mod tests {
                 "session": sess_pm,
                 "marker_first_ts": 0.0,
                 "lanes": {
-                    format!("{}|simplify", rio::fold_path(&repo_str)): [{
+                    format!("{}|review", rio::fold_path(&repo_str)): [{
                         "round": 1,
                         "tree_oid": "1111111111111111111111111111111111111111",
                         "paths": []
@@ -10414,7 +9980,7 @@ mod tests {
             session: sess_pm,
             cwd: &repo_str,
             brain_root: &brain,
-            label: "simplify",
+            label: "review",
             ttl_seconds: 270,
             paths: &[],
             reset: false,
@@ -10786,57 +10352,57 @@ mod tests {
         assert!(ok, "HIGH visual candidate must close without simplify or Design Gate: {}", res);
         assert_eq!(res, "verified");
 
-        let mut m_simp = marker.clone();
-        let sess_simp = "sess-stage2-waiting-simplify";
-        m_simp["session"] = json!(sess_simp);
-        let brain_simp = tmp.path.join("brain");
-        let tp_simp = setup_neon_session_env(
-            &brain_simp,
-            sess_simp,
+        let mut m_helper = marker.clone();
+        let sess_helper = "sess-stage2-waiting-helper";
+        m_helper["session"] = json!(sess_helper);
+        let brain_helper = tmp.path.join("brain");
+        let tp_helper = setup_neon_session_env(
+            &brain_helper,
+            sess_helper,
             "",
             json!({
                 "members": {
-                    "simplify-reviewer": {
+                    "doc-helper": {
                         "role": "worker",
-                        "conversation_id": "cid-simp-wait",
+                        "conversation_id": "cid-doc-wait",
                         "model": cwg_common::SONNET_HIGH_MODEL,
                         "killed": false
                     },
                     "helper-1": {
                         "role": "worker",
-                        "conversation_id": "cid-simp-helper",
+                        "conversation_id": "cid-helper-wait",
                         "model": cwg_common::SONNET_HIGH_MODEL,
                         "killed": false
                     }
                 }
             }),
             &[
-                json!({"seq": 1, "agent": "simplify-reviewer", "time": "2026-11-22T10:00:00Z", "text": "SIMPLIFY_LENS: ALL\nSIMPLIFY_VERDICT: CLEAN"}),
-                json!({"seq": 2, "agent": "helper-1", "time": "2026-11-22T10:00:05Z", "text": "SIMPLIFY_VERDICT: ACTIONABLE_FIXES"}),
+                json!({"seq": 1, "agent": "doc-helper", "time": "2026-11-22T10:00:00Z", "text": "@coordinator [done] updated docs index"}),
+                json!({"seq": 2, "agent": "helper-1", "time": "2026-11-22T10:00:05Z", "text": "@coordinator [done] helper slice complete"}),
             ],
             &[],
         );
-        let tp_simp_str = tp_simp.to_string_lossy().into_owned();
-        assert!(cwg_common::active_review_workers(&brain_simp, sess_simp).is_empty());
-        let (ok_simp, res_simp) = validate_candidate_closure(CandidateClosureInput {
+        let tp_helper_str = tp_helper.to_string_lossy().into_owned();
+        assert!(cwg_common::active_review_workers(&brain_helper, sess_helper).is_empty());
+        let (ok_helper, res_helper) = validate_candidate_closure(CandidateClosureInput {
             receipt: Some(&receipt),
-            marker_in: &m_simp,
+            marker_in: &m_helper,
             checks_ev: &checks_ev,
             sub_ev: &SubagentEvidence::default(),
             swarm_ev: &SwarmEvidence::default(),
             codex_reviews: &codex_reviews,
             ctx: None,
             steps: None,
-            transcript_path: Some(&tp_simp_str),
+            transcript_path: Some(&tp_helper_str),
         });
-        assert!(ok_simp, "waiting simplify worker must not block APPROVED Stop: {}", res_simp);
-        assert_eq!(res_simp, "verified");
+        assert!(ok_helper, "waiting non-review helper worker must not block APPROVED Stop: {}", res_helper);
+        assert_eq!(res_helper, "verified");
 
         let sess_rev = "sess-stage2-waiting-reviewer";
         let mut m_rev = marker.clone();
         m_rev["session"] = json!(sess_rev);
         let tp_rev = setup_neon_session_env(
-            &brain_simp,
+            &brain_helper,
             sess_rev,
             "",
             json!({
@@ -10854,7 +10420,7 @@ mod tests {
         );
         let tp_rev_str = tp_rev.to_string_lossy().into_owned();
         assert_eq!(
-            cwg_common::active_review_workers(&brain_simp, sess_rev),
+            cwg_common::active_review_workers(&brain_helper, sess_rev),
             vec!["adversarial-reviewer".to_string()]
         );
         let (ok_rev, res_rev) = validate_candidate_closure(CandidateClosureInput {

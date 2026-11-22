@@ -16,7 +16,6 @@ use crate::win32_sqlite::{format_iso_utc, now_sec};
 
 pub const READ_REPEAT_DENY_LIMIT: i64 = 3;
 pub const CMD_REPEAT_WARN_LIMIT: i64 = 3;
-pub const CMD_REPEAT_DENY_LIMIT: i64 = 4;
 pub const HANDOFF_MAX_CHARS: usize = 900;
 pub const MAX_LINT_BLOCKS_PER_EPISODE: i64 = 2;
 pub const TREE_LOCK_TTL_SECONDS: f64 = 1800.0;
@@ -238,15 +237,6 @@ fn resolve_handoff(
         return (ws_ho, ws_dict);
     }
     (Some(ho_file), st_dict)
-}
-
-pub fn resolve_handoff_file(
-    cwd: &str,
-    workspace_paths: &[String],
-    pkey: Option<&str>,
-    session: &str,
-) -> Option<PathBuf> {
-    resolve_handoff(cwd, workspace_paths, pkey, session).0
 }
 
 pub fn load_handoff(

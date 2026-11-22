@@ -15,7 +15,6 @@ use crate::cwg_common;
 use crate::gate_inbox;
 use crate::rio;
 use crate::swarm_cache;
-use crate::tokenade_hook;
 use crate::win32_sqlite::{run_command_with_job, SqlParam, SqliteConn, SQLITE_OPEN_READONLY};
 
 const HOOK_EVENTS: &[&str] = &[
@@ -44,6 +43,42 @@ fn process_ls_re() -> &'static Regex {
 
 pub fn find_agy_cli() -> Option<String> {
     rio::find_agy_cli()
+}
+
+fn find_tokenade_bin() -> Option<String> {
+    for env_key in ["CARBON_TOKENADE_BIN", "TOKENADE_BIN"] {
+        if let Ok(val) = env::var(env_key) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() && Path::new(trimmed).is_file() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(appdata) = env::var("APPDATA") {
+            let trimmed = appdata.trim();
+            if !trimmed.is_empty() {
+                // INVARIANT: Prefer the compiled Rust `tokenade.exe` binary (~3 ms) over `tokenade.cmd` (~120 ms cmd+node shim).
+                let native_exe = PathBuf::from(trimmed)
+                    .join("npm")
+                    .join("node_modules")
+                    .join("@tokenade")
+                    .join("cli")
+                    .join("node_modules")
+                    .join("@tokenade")
+                    .join("cli-win32-x64")
+                    .join("tokenade.exe");
+                if native_exe.is_file() {
+                    return Some(native_exe.to_string_lossy().into_owned());
+                }
+            }
+        }
+        if let Some(found) = rio::which_in_path("tokenade.exe") {
+            return Some(found);
+        }
+    }
+    rio::which_in_path("tokenade")
 }
 
 pub fn find_rust_binary() -> Option<String> {
@@ -1212,8 +1247,8 @@ pub(crate) fn collect_doctor_report_for_os(
         == Some(false);
 
     let token_opt_info = json!({
-        "tokenade_cli": tokenade_hook::find_tokenade_bin(),
-        "tokenade_auto_wrap": tokenade_hook::is_auto_wrap_enabled(),
+        "tokenade_cli": find_tokenade_bin(),
+        "tokenade_auto_wrap": false,
         "ripgrep_cli": code_search::find_rg(),
         "uvx_cli": code_search::which_in_path("uvx").or_else(|| code_search::which_in_path("uvx.exe")),
         "mcp_servers": mcp_server_names,
@@ -1273,10 +1308,6 @@ pub(crate) fn collect_doctor_report_for_os(
         "swarm_ctl": swarm_ctl_ok,
         "swarm_orchestration_skill": swarm_skill_ok,
         "guards_matcher_ok": swarm_guards_ok,
-        "fast_path_limits": {
-            "max_files": cwg_common::FAST_PATH_MAX_FILES,
-            "max_lines": cwg_common::FAST_PATH_MAX_LINES,
-        },
         "cursor_threshold": cwg_common::BOARD_CURSOR_THRESHOLD,
         "stall_timeout_sec": cwg_common::swarm_stall_timeout_sec(),
         "gitignore_has_swarm": gitignore_has_swarm,
@@ -1405,7 +1436,7 @@ pub(crate) fn collect_doctor_report_for_os(
                 "advisory_simplify": {
                     "mode": "optional single advisory pass (simplify-reviewer) before primary review",
                     "primary_model": cwg_common::SONNET_HIGH_MODEL,
-                    "fallback_model": cwg_common::SIMPLIFY_FALLBACK_MODEL,
+                    "fallback_model": cwg_common::NEON_XHIGH_MODEL,
                     "secondary_fallback_model": cwg_common::HYDROGEN_XHIGH_MODEL,
                     "prompt_cache_ttl_seconds": cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
                 },

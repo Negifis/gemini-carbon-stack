@@ -136,7 +136,7 @@ const PS_VAR_NAME_PAT: &str = r"[A-Za-z_]\w*(?::[A-Za-z_]\w*)?";
 const PS_DQ_LITERAL_PAT: &str = r#""[^"`$]*""#;
 const PS_MUT_CLAUSE_LEADER: &str = r"\A\s*(?:\$[A-Za-z_]\w*\s*=\s*)?(?:\$null\s*\|\s*)?(?:&\s*)?";
 const CONTINUITY_BK_SUB: &str = r"(?:checkpoint|show|handoff)\b";
-const CODEX_LANE_BK_SUB: &str = r"(?:check|status|reset|review|dispose|research-reset|redesign-reset)\b";
+const CODEX_LANE_BK_SUB: &str = r"(?:check|status|reset|review|dispose)\b";
 const CHAT_BUS_BK_SUB: &str = r"(?:wait|inbox|list|read|search|send|reply|configure|status)\b";
 const WT_RO_SUB: &str = r"(?:audit|status)\b";
 const WT_MUT_TAIL: &str = r"[^\r\n;|&]*\b(?:snapshot|remove|restore)\b";
@@ -2131,10 +2131,6 @@ fn clean_integration_rel_paths(root: &str, bh: &str, ah: &str, cmd: &str, no_dir
         else if !matches!(sub.as_str(), "status" | "fetch" | "rev-parse" | "branch" | "log" | "show" | "diff") { return None; }
     }
     saw.then(HashSet::new)
-}
-
-pub fn diff_git_snapshots(before: Option<&Value>, after: Option<&Value>) -> (Vec<String>, bool) {
-    diff_git_snapshots_for_cmd(before, after, "")
 }
 
 pub fn diff_git_snapshots_for_cmd(
@@ -4345,10 +4341,6 @@ mod tests {
                 "BOOKKEEPING",
             ),
             (
-                r#"$null | & "C:\Users\in\.gemini\config\plugins\gemini-carbon-stack\bin\carbon-stack.exe" codex-lane redesign-reset --session "s1" --decision redesign"#,
-                "BOOKKEEPING",
-            ),
-            (
                 r#"C:\Users\in\.gemini\config\plugins\gemini-carbon-stack\bin\carbon-stack.exe codex-lane review --summary "ok"; rm -rf ."#,
                 "MUTATING",
             ),
@@ -4632,7 +4624,7 @@ mod tests {
                 "c:/repo/a.rs": "M :10:1234567890abcdef1234"
             }
         });
-        let (chg, unm) = diff_git_snapshots(Some(&b_snap), Some(&a_snap));
+        let (chg, unm) = diff_git_snapshots_for_cmd(Some(&b_snap), Some(&a_snap), "");
         assert!(chg.is_empty());
         assert!(!unm);
 

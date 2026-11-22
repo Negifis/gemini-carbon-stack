@@ -26,8 +26,6 @@ pub const RISK_XHIGH: &str = "XHIGH";
 pub const SHELL_MUTATION_SENTINEL: &str = "<shell-mutation>";
 pub const MAX_CONTENT_MARKS: usize = 512;
 
-pub const FAST_PATH_MAX_FILES: usize = 2;
-pub const FAST_PATH_MAX_LINES: usize = 30;
 pub const BOARD_CURSOR_THRESHOLD: usize = 15;
 pub const DEFAULT_SWARM_STALL_TIMEOUT_SEC: f64 = 240.0;
 
@@ -70,20 +68,9 @@ pub fn is_codex_xhigh_turn(model: &str, effort: &str) -> bool {
 }
 
 pub const TS_EPS: f64 = 1e-6;
-pub const SIMPLIFY_LENSES: &[&str] = &["reuse", "quality", "efficiency"];
-pub const SIMPLIFY_FALLBACK_MODELS: &[&str] = &[NEON_XHIGH_MODEL, HYDROGEN_XHIGH_MODEL];
-pub const SIMPLIFY_FALLBACK_MODEL: &str = SIMPLIFY_FALLBACK_MODELS[0];
-pub const SIMPLIFY_TIER_SONNET: &str = "sonnet";
-pub const SIMPLIFY_TIER_FALLBACK: &str = "fallback";
-pub const SIMPLIFY_TIER_SECONDARY_FALLBACK: &str = "secondary-fallback";
 pub const REVIEW_ENGINE_INTERNAL_OPUS: &str = "internal-opus";
 pub const REVIEW_ENGINE_INTERNAL_NEON: &str = "internal-neon";
 pub const REVIEW_ENGINE_INTERNAL_CARBON: &str = "internal-carbon";
-
-pub fn is_simplify_allowed_model(model: &str) -> bool {
-    let m = model.trim().to_ascii_lowercase();
-    m == SONNET_HIGH_MODEL || SIMPLIFY_FALLBACK_MODELS.contains(&m.as_str())
-}
 
 pub fn is_review_worker_name(name: &str) -> bool {
     let low_name = name.trim().to_ascii_lowercase();
@@ -140,25 +127,13 @@ pub fn review_escalation_chain(risk: &str) -> String {
 }
 pub const ANTHROPIC_EPHEMERAL_TTL_SECONDS: u64 = 300;
 pub const SWARM_CACHE_SAFE_TTL_SECONDS: u64 = 270;
-// INVARIANT: Empirically calibrated finite gate limits across 532 Antigravity transcripts + 270 Codex turns (80% Pareto knee before nitpick/regression churn): 1 advisory simplify pass (93.3% value; Pass 2 had 0% task gain and 29% test regressions), 4 ordinary review rounds (82.1% core findings, 92.6% productive rounds; Round 5+ dropped to 0% productive rounds), 2 closure passes (`1 + 4 + 2 = 7` max total gate rounds = 79.7% total value), and at most 1 finite architectural `REDESIGN` reset per candidate (`MAX_REDESIGN_RESETS = 1`).
-pub const MAX_SIMPLIFY_PASSES: usize = 1;
+// INVARIANT: Empirically calibrated finite linear gate limits: at most 4 ordinary review rounds (Round 5+ dropped to 0% productive rounds), followed after Round-4 ESCALATE + focused research by at most 2 closure passes before finite `[gate] pr-ready` or `[gate] draft-blocked`.
 pub const MAX_ORDINARY_REVIEW_ROUNDS: usize = 4;
 pub const MAX_CLOSURE_PASSES_PER_CYCLE: usize = 2;
-pub const MAX_REDESIGN_RESETS: usize = 1;
-pub const MAX_TOTAL_GATE_ROUNDS: usize =
-    MAX_SIMPLIFY_PASSES + MAX_ORDINARY_REVIEW_ROUNDS + MAX_CLOSURE_PASSES_PER_CYCLE;
-pub const REDESIGN_RESET_DECISIONS: &[&str] = &["redesign", "refactor"];
-pub const RESEARCH_RESET_DECISIONS: &[&str] = &["redesign", "refactor", "refine"];
 
 pub const CODEX_REVIEW_OUTPUT_BANNER: &str = "--- CODEX REVIEW OUTPUT ---";
 
 const DOC_EXTENSIONS: &[&str] = &[".md", ".mdx", ".txt", ".rst", ".adoc", ".csv", ".tsv"];
-const SIMPLIFY_AGENT_TYPES: &[&str] = &[
-    "simplify-reuse-reviewer",
-    "simplify-quality-reviewer",
-    "simplify-efficiency-reviewer",
-    "simplify-reviewer",
-];
 
 fn high_risk_patterns() -> &'static [Regex] {
     static RE: OnceLock<Vec<Regex>> = OnceLock::new();
@@ -179,7 +154,7 @@ fn high_risk_patterns() -> &'static [Regex] {
             r"(?i)(?:^|/|_|-)(?:auth|oauth\d*|jwt|crypto|security|permissions?|rbac|acl|secrets?|vault|signing)(?:/|_|-|\.|$)",
             r"(?i)(?:^|/)(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock|cargo\.lock|poetry\.lock|uv\.lock|go\.sum)$",
             r"(?i)(?:^|/)(?:pyproject\.toml|cargo\.toml|go\.mod|tsconfig\.json|webpack\.config\.|vite\.config\.)$",
-            r"(?i)(?:^|/)(?:install\.py|bin/carbon-stack(?:\.exe)?|rust/src/(?:cwg_(?:common|mark|stop|pre_invocation)|codex_lane|safety_guards|tokenade_hook|installer|gate_inbox|chip_hooks|continuity_hook)\.rs)$",
+            r"(?i)(?:^|/)(?:install\.py|bin/carbon-stack(?:\.exe)?|rust/src/(?:cwg_(?:common|mark|stop|pre_invocation)|codex_lane|safety_guards|installer|gate_inbox|chip_hooks|continuity_hook)\.rs)$",
         ]
         .iter()
         .map(|p| Regex::new(p).expect("high_risk_pattern"))
@@ -336,339 +311,14 @@ fn json_array_start_re() -> &'static Regex {
     })
 }
 
-fn simplify_template_pair_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"(?i)(?:(?:\*{1,2}|__|`)\s*){0,2}(?:SIMPLIFY_LENS|(?:SIMPLIFY_)?VERDICT)(?:(?:\*{1,2}|__|`)\s*){0,2}\s*:\s*(?:(?:\*{1,2}|__|`)\s*){0,2}(?:CLEAN|FINDINGS_REPORTED|ACTIONABLE_FIXES|REUSE|QUALITY|EFFICIENCY|ALL|COMBINED)(?:(?:\*{1,2}|__|`)\s*){0,2}\s*(?:\(|,|\||/)?\s*(?:\bor\b|\bили\b|\|)\s*(?:(?:\*{1,2}|__|`)\s*){0,2}(?:SIMPLIFY_LENS|(?:SIMPLIFY_)?VERDICT)(?:(?:\*{1,2}|__|`)\s*){0,2}\s*:\s*(?:(?:\*{1,2}|__|`)\s*){0,2}(?:CLEAN|FINDINGS_REPORTED|ACTIONABLE_FIXES|REUSE|QUALITY|EFFICIENCY|ALL|COMBINED)(?:(?:\*{1,2}|__|`)\s*){0,2}\)?",
-        )
-        .expect("simplify_template_pair_re")
-    })
-}
-
-fn simplify_verdict_core_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        // INVARIANT: Leading markdown wrappers allow only horizontal whitespace (`[ \t]*`) so a
-        // prior message's closing `**` never spans `\n\n` into the next message's verdict tag.
-        Regex::new(
-            r"(?i)(?:(?:\*{1,2}|__|`)[ \t]*){0,2}(?:SIMPLIFY_)?VERDICT(?:(?:\*{1,2}|__|`)\s*){0,2}\s*:\s*(?:(?:\*{1,2}|__|`)\s*){0,2}(CLEAN|FINDINGS_REPORTED|ACTIONABLE_FIXES)",
-        )
-        .expect("simplify_verdict_core_re")
-    })
-}
-
-fn simplify_prose_audit_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        // INVARIANT: Strictly advisory fallback (`FINDINGS_REPORTED`, never `CLEAN`) for completed
-        // simplify worker posts that open with `@coordinator [done] ... findings:` + structured items
-        // without repeating an explicit `SIMPLIFY_VERDICT:` line (`anom-3e5cd389`).
-        Regex::new(
-            r"(?im)^[ \t]*(?:@[A-Za-z0-9_-]+[ \t]+)*\[(?:done|complete|completed)\][ \t]+(?:(?:(?:\*{1,2}|__|`)[ \t]*){0,2}(?:SIMPLIFY_LENS\s*:\s*(?:REUSE|QUALITY|EFFICIENCY|ALL|COMBINED)|(?:reuse|quality|efficiency|simplify)(?:[ \t]+(?:review|lens|audit))?)[ \t]+(?:findings|review|audit|report|issues|результаты|замечания)|(?:findings|review[ \t]+findings|audit[ \t]+findings|замечания|аудит[ \t]+заверш[её]н))\s*:?[ \t]*\r?\n[ \t]*(?:[-*+]|\d+[.)])[ \t]+\S",
-        )
-        .expect("simplify_prose_audit_re")
-    })
-}
-
-fn simplify_lens_core_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"(?i)(?:(?:\*{1,2}|__|`)[ \t]*){0,2}SIMPLIFY_LENS(?:(?:\*{1,2}|__|`)\s*){0,2}\s*:\s*(?:(?:\*{1,2}|__|`)\s*){0,2}(REUSE|QUALITY|EFFICIENCY)",
-        )
-        .expect("simplify_lens_core_re")
-    })
-}
-
-fn simplify_combined_lens_core_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"(?i)(?:(?:\*{1,2}|__|`)[ \t]*){0,2}SIMPLIFY_LENS(?:(?:\*{1,2}|__|`)\s*){0,2}\s*:\s*(?:(?:\*{1,2}|__|`)\s*){0,2}(ALL|COMBINED)",
-        )
-        .expect("simplify_combined_lens_core_re")
-    })
-}
-
-fn simplify_alt_tail_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        // WORKAROUND: Emulates Python negative lookahead `_SIMPLIFY_ALT_TAIL` and `/(?!/)` without lookaround.
-        Regex::new(
-            r"(?i)\A\s*(?:(?:\*{1,2}|__|`)\s*){0,2}(?:\||/(?:[^/]|\z)|\(?\s*\b(?:or|или)\b\s+(?:(?:(?:\*{1,2}|__|`)\s*){0,2}(?:SIMPLIFY_LENS|(?:SIMPLIFY_)?VERDICT)(?:(?:\*{1,2}|__|`)\s*){0,2}\s*:\s*(?:(?:\*{1,2}|__|`)\s*){0,2})?(?:CLEAN|FINDINGS_REPORTED|ACTIONABLE_FIXES|REUSE|QUALITY|EFFICIENCY|ALL|COMBINED)\b|,\s*(?:(?:\*{1,2}|__|`)\s*){0,2}(?:(?:or|или)\b\s+)?(?:CLEAN|FINDINGS_REPORTED|ACTIONABLE_FIXES|REUSE|QUALITY|EFFICIENCY|ALL|COMBINED)\b)",
-        )
-        .expect("simplify_alt_tail_re")
-    })
-}
-
 fn review_tier_xhigh_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?i)\bREVIEW_TIER\s*:\s*XHIGH\b").expect("review_tier_xhigh_re"))
 }
 
-fn diff_hash_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?i)\bDIFF_HASH\s*:\s*([A-Za-z0-9_.:-]+)").expect("diff_hash_re")
-    })
-}
-
 fn flash_model_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?i)\bflash(?:[-_]lite)?\b").expect("flash_model_re"))
-}
-
-fn compact_simplify_worker_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?i)^simp-(?:reuse|qual(?:ity)?|eff(?:icie(?:ncy)?)?|all)(?:$|[-_][a-z0-9._-]*$)")
-            .expect("compact_simplify_worker_re")
-    })
-}
-
-fn is_ascii_ident_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
-}
-
-fn is_unicode_word_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
-}
-
-fn skip_md_and_ws(b: &[u8], mut i: usize) -> usize {
-    while i < b.len() {
-        if b[i].is_ascii_whitespace() || b[i] == b'*' || b[i] == b'`' {
-            i += 1;
-        } else if i + 1 < b.len() && b[i] == b'_' && b[i + 1] == b'_' {
-            i += 2;
-        } else {
-            break;
-        }
-    }
-    i
-}
-
-fn is_simplify_line_prefix_clean(prefix: &str) -> bool {
-    // INVARIANT: Single-pass O(L) byte scanner (zero regex backtracking, zero UTF-8 str-slice panics) rejecting inline prose citations (`anom-d6ceeff0`) while allowing `@mention`, bullets, and prior tags.
-    let tb = prefix.trim_start().as_bytes();
-    let b = if tb.len() >= 2
-        && matches!(tb[0], b'-' | b'*' | b'+' | b'>')
-        && tb[1].is_ascii_whitespace()
-    {
-        &tb[2..]
-    } else {
-        tb
-    };
-    let mut i = 0usize;
-    loop {
-        i = skip_md_and_ws(b, i);
-        if i >= b.len() {
-            return true;
-        }
-        if b[i] == b'@' {
-            i += 1;
-            let start = i;
-            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'-') {
-                i += 1;
-            }
-            if i == start || (i < b.len() && !b[i].is_ascii_whitespace()) {
-                return false;
-            }
-            continue;
-        }
-        let rest = &b[i..];
-        if let Some(tag_len) = [
-            b"[done]".as_slice(),
-            b"[complete]".as_slice(),
-            b"[completed]".as_slice(),
-        ]
-        .iter()
-        .find(|&&t| {
-            rest.get(..t.len()).map_or(false, |h| h.eq_ignore_ascii_case(t))
-                && rest.get(t.len()).map_or(true, |c| c.is_ascii_whitespace())
-        })
-        .map(|t| t.len())
-        {
-            i += tag_len;
-            continue;
-        }
-        let key_len = [
-            b"SIMPLIFY_LENS".as_slice(),
-            b"SIMPLIFY_VERDICT".as_slice(),
-            b"VERDICT".as_slice(),
-            b"DIFF_HASH".as_slice(),
-        ]
-        .iter()
-        .find(|&&k| rest.get(..k.len()).map_or(false, |h| h.eq_ignore_ascii_case(k)))
-        .map(|k| k.len());
-        let Some(klen) = key_len else {
-            return false;
-        };
-        i += klen;
-        i = skip_md_and_ws(b, i);
-        if i >= b.len() || b[i] != b':' {
-            return false;
-        }
-        i += 1;
-        i = skip_md_and_ws(b, i);
-        let val_start = i;
-        while i < b.len()
-            && (b[i].is_ascii_alphanumeric() || matches!(b[i], b'_' | b'.' | b':' | b'-'))
-        {
-            i += 1;
-        }
-        if i == val_start {
-            return false;
-        }
-        loop {
-            let next_i = skip_md_and_ws(b, i);
-            if next_i < b.len() && matches!(b[next_i], b',' | b'.' | b';' | b'|' | b'/' | b'-') {
-                i = next_i + 1;
-            } else {
-                i = next_i;
-                break;
-            }
-        }
-    }
-}
-
-fn simplify_tag_prefix_ok(before: &str) -> bool {
-    // WORKAROUND: Emulates `(?<![A-Za-z0-9_])(?<!\(or )(?<!\(or `)(?<!\bor )(?<!\bor `)(?<!\bили )` plus O(L) line-prefix guard (`anom-d6ceeff0`).
-    if let Some(prev) = before.chars().next_back() {
-        if is_ascii_ident_char(prev) {
-            return false;
-        }
-    }
-    let low = before.to_lowercase();
-    if low.ends_with("(or ") || low.ends_with("(or `") {
-        return false;
-    }
-    for suffix in ["or ", "or `", "или "] {
-        if let Some(head) = low.strip_suffix(suffix) {
-            let boundary_ok = head
-                .chars()
-                .next_back()
-                .map_or(true, |c| !is_unicode_word_char(c));
-            if boundary_ok {
-                return false;
-            }
-        }
-    }
-    let line_before = before.rsplit('\n').next().unwrap_or(before);
-    let eff_prefix = match line_before.rfind("content=") {
-        Some(idx) => &line_before[idx + "content=".len()..],
-        None => line_before,
-    };
-    is_simplify_line_prefix_clean(eff_prefix)
-}
-
-fn simplify_tag_suffix_ok(after: &str) -> bool {
-    // WORKAROUND: Emulates `(?:(?![A-Za-z0-9_])|(?=__(?![A-Za-z0-9_])))` + `_SIMPLIFY_ALT_TAIL`.
-    let right_boundary_ok = match after.chars().next() {
-        None => true,
-        Some(c) if !is_ascii_ident_char(c) => true,
-        Some('_') if after.starts_with("__") => after[2..]
-            .chars()
-            .next()
-            .map_or(true, |c| !is_ascii_ident_char(c)),
-        Some(_) => false,
-    };
-    if !right_boundary_ok {
-        return false;
-    }
-    !simplify_alt_tail_re().is_match(after)
-}
-
-fn mask_simplify_template_pairs(text: &str) -> std::borrow::Cow<'_, str> {
-    let re = simplify_template_pair_re();
-    let mut iter = re.find_iter(text).peekable();
-    if iter.peek().is_none() {
-        return std::borrow::Cow::Borrowed(text);
-    }
-    let mut buf = text.as_bytes().to_vec();
-    // INVARIANT: Replace each template pair byte-for-byte with ASCII spaces so every
-    // surviving token keeps its exact UTF-8 byte offset in `text`.
-    for m in iter {
-        buf[m.start()..m.end()].fill(b' ');
-    }
-    std::borrow::Cow::Owned(String::from_utf8(buf).expect("ascii space mask preserves utf8"))
-}
-
-fn for_each_simplify_tag_match<'a>(
-    core_re: &Regex,
-    text: &'a str,
-    mut on_match: impl FnMut(usize, usize, &'a str) -> bool,
-) {
-    let mut pos = 0usize;
-    while pos <= text.len() {
-        let Some(caps) = core_re.captures_at(text, pos) else {
-            break;
-        };
-        let whole = caps.get(0).expect("group 0");
-        let val = caps.get(1).expect("group 1");
-        let before = &text[..whole.start()];
-        let after = &text[whole.end()..];
-        if simplify_tag_prefix_ok(before) && simplify_tag_suffix_ok(after) {
-            if !on_match(whole.start(), whole.end(), val.as_str()) {
-                break;
-            }
-            if whole.end() > pos {
-                pos = whole.end();
-            } else if let Some(ch) = text[pos..].chars().next() {
-                pos += ch.len_utf8();
-            } else {
-                break;
-            }
-        } else if let Some(ch) = text[whole.start()..].chars().next() {
-            pos = whole.start() + ch.len_utf8();
-        } else {
-            break;
-        }
-    }
-}
-
-fn find_simplify_explicit_verdict_spans_cleaned(cleaned: &str) -> Vec<(usize, usize, bool)> {
-    let mut out = Vec::new();
-    for_each_simplify_tag_match(simplify_verdict_core_re(), cleaned, |s, e, val| {
-        out.push((s, e, val.eq_ignore_ascii_case("CLEAN")));
-        true
-    });
-    out
-}
-
-fn find_simplify_verdict_spans_cleaned(cleaned: &str) -> Vec<(usize, usize, bool)> {
-    let mut out = find_simplify_explicit_verdict_spans_cleaned(cleaned);
-    if out.is_empty() {
-        if let Some(m) = simplify_prose_audit_re().find(cleaned) {
-            out.push((m.start(), m.end(), false));
-        }
-    }
-    out
-}
-
-fn extract_simplify_lens_flags_cleaned(cleaned: &str) -> (bool, bool) {
-    let mut has_combined = false;
-    for_each_simplify_tag_match(simplify_combined_lens_core_re(), cleaned, |_, _, _| {
-        has_combined = true;
-        false
-    });
-    if has_combined {
-        return (true, false);
-    }
-    let mut first_lens: Option<&str> = None;
-    let mut multi_lens_spoof = false;
-    for_each_simplify_tag_match(simplify_lens_core_re(), cleaned, |_, _, val| {
-        if let Some(first) = first_lens {
-            if !first.eq_ignore_ascii_case(val) {
-                multi_lens_spoof = true;
-                return false;
-            }
-        } else {
-            first_lens = Some(val);
-        }
-        true
-    });
-    (false, multi_lens_spoof)
 }
 
 fn decision_from_json_dict(obj: &Map<String, Value>) -> (Option<String>, Option<String>) {
@@ -953,37 +603,6 @@ pub fn extract_split_review_revoker(head: &str, tail: &str) -> (Option<String>, 
     (None, None)
 }
 
-pub fn extract_diff_hash(text: &str) -> String {
-    diff_hash_re()
-        .captures_iter(text)
-        .last()
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().trim().to_string())
-        .unwrap_or_default()
-}
-
-pub fn check_diff_hashes_any<S: AsRef<str>>(text: &str, accepted: &[S]) -> (bool, bool) {
-    if accepted.is_empty() {
-        return (false, diff_hash_re().is_match(text));
-    }
-    let mut has_match = false;
-    let mut has_mismatch = false;
-    for caps in diff_hash_re().captures_iter(text) {
-        if let Some(m) = caps.get(1) {
-            let val = m.as_str();
-            if accepted.iter().any(|a| a.as_ref() == val) {
-                has_match = true;
-            } else {
-                has_mismatch = true;
-            }
-            if has_match && has_mismatch {
-                break;
-            }
-        }
-    }
-    (has_match, has_mismatch)
-}
-
 pub const SWARM_ROUNDS_TS_TOLERANCE_SEC: f64 = 1.0;
 
 pub fn is_git_oid(s: &str) -> bool {
@@ -991,7 +610,7 @@ pub fn is_git_oid(s: &str) -> bool {
 }
 
 pub fn marker_cycle_first_ts(marker: &Value) -> f64 {
-    val_to_f64(marker.get("first_ts")).max(last_research_reset_ts(marker))
+    val_to_f64(marker.get("first_ts"))
 }
 
 pub fn marker_has_prepare_cycle(marker: Option<&Value>) -> bool {
@@ -2213,146 +1832,8 @@ pub fn swarm_prepare_hash_policy(
     (req, acc)
 }
 
-pub fn accepted_candidate_diff_hashes(
-    fallback_session: &str,
-    marker: Option<&Value>,
-    current_diff_hash: &str,
-) -> Vec<String> {
-    swarm_prepare_hash_policy(fallback_session, marker, current_diff_hash).1
-}
-
-pub fn tree_oid_is_fast_path_eligible(repo_root: &str, tree_oid: &str) -> bool {
-    if repo_root.trim().is_empty()
-        || !is_git_oid(tree_oid)
-        || rio::git_toplevel(repo_root, false).is_none()
-    {
-        return false;
-    }
-    let (rc, out, _) = rio::run_git(repo_root, &["diff", "--numstat", "HEAD", tree_oid], 5.0);
-    if rc != 0 {
-        return false;
-    }
-    let mut files_count = 0usize;
-    let mut total_lines = 0usize;
-    for line in out.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let parts: Vec<&str> = trimmed.split('\t').collect();
-        if parts.len() < 3 {
-            continue;
-        }
-        let rel = parts[2].trim();
-        if rel.is_empty() || is_scratch_or_ephemeral(rel, "", &[], repo_root) {
-            continue;
-        }
-        if parts[0].trim() == "-" || parts[1].trim() == "-" {
-            return false;
-        }
-        files_count += 1;
-        total_lines += parts[0].trim().parse::<usize>().unwrap_or(0)
-            + parts[1].trim().parse::<usize>().unwrap_or(0);
-    }
-    files_count > 0 && files_count <= FAST_PATH_MAX_FILES && total_lines <= FAST_PATH_MAX_LINES
-}
-
-pub fn has_historical_fast_path_simplify_round(
-    fallback_session: &str,
-    marker: Option<&Value>,
-    repo_root: &str,
-    max_prepare_ts: f64,
-) -> bool {
-    let Some(skey) = resolve_swarm_rounds_session_key(fallback_session, marker) else {
-        return false;
-    };
-    let Some(Value::Object(rounds_doc)) = rio::read_json(&swarm_rounds_path(&skey)) else {
-        return false;
-    };
-    if !has_active_rounds_in_doc(&rounds_doc, marker) {
-        return false;
-    }
-    let Some(lanes) = rounds_doc.get("lanes").and_then(Value::as_object) else {
-        return false;
-    };
-    let cycle_floor_ts = marker
-        .map(|m| val_to_f64(m.get("first_ts")).max(last_research_reset_ts(m)))
-        .unwrap_or(0.0);
-    for (lane_key, hist_val) in lanes {
-        if !lane_key.to_ascii_lowercase().contains("simplify") {
-            continue;
-        }
-        let Some(hist_arr) = hist_val.as_array() else {
-            continue;
-        };
-        for ent in hist_arr {
-            let ets = val_to_f64(ent.get("ts"));
-            if cycle_floor_ts > 0.0 && ets > 0.0 && ets + TS_EPS < cycle_floor_ts {
-                continue;
-            }
-            if max_prepare_ts > 0.0 && ets > max_prepare_ts + TS_EPS {
-                continue;
-            }
-            let tree_oid = val_to_str(ent.get("tree_oid"));
-            if tree_oid_is_fast_path_eligible(repo_root, &tree_oid) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 pub fn is_flash_model(model: &str) -> bool {
     flash_model_re().is_match(model.trim())
-}
-
-pub fn is_simplify_worker_name(name: &str) -> bool {
-    let low = name.trim().to_lowercase();
-    if low.is_empty() {
-        return false;
-    }
-    low.contains("simplify") || compact_simplify_worker_re().is_match(&low)
-}
-
-pub fn simplify_lens_from_worker_name(name: &str) -> String {
-    let low = name.trim().to_lowercase();
-    if low.is_empty() {
-        return String::new();
-    }
-    for &lens in SIMPLIFY_LENSES {
-        if low.contains(lens) {
-            return lens.to_string();
-        }
-    }
-    if is_simplify_worker_name(&low) {
-        if low.contains("efficie")
-            || low.starts_with("simp-eff")
-            || low.contains("-eff-")
-            || low.ends_with("-eff")
-            || low.contains("_eff_")
-            || low.ends_with("_eff")
-        {
-            return "efficiency".to_string();
-        }
-        if low.starts_with("simp-qual")
-            || low.contains("-qual-")
-            || low.ends_with("-qual")
-            || low.contains("_qual_")
-            || low.ends_with("_qual")
-        {
-            return "quality".to_string();
-        }
-    }
-    String::new()
-}
-
-pub fn is_simplify_subagent_call(sub_type: &str, role: &str) -> bool {
-    let trimmed = sub_type.trim().to_lowercase();
-    let base = trimmed.rsplit(':').next().unwrap_or("");
-    if SIMPLIFY_AGENT_TYPES.contains(&base) {
-        return true;
-    }
-    (base == "research" || base == "self") && is_simplify_worker_name(role)
 }
 
 pub fn is_review_tier_xhigh(text: &str) -> bool {
@@ -2369,109 +1850,6 @@ pub fn swarm_stall_timeout_sec() -> f64 {
         Ok(parsed) if parsed.is_finite() && parsed > 0.0 => parsed,
         _ => DEFAULT_SWARM_STALL_TIMEOUT_SEC,
     }
-}
-
-pub fn find_simplify_verdict_spans(text: &str) -> Vec<(usize, usize, bool)> {
-    let cleaned = mask_simplify_template_pairs(text);
-    find_simplify_verdict_spans_cleaned(&cleaned)
-}
-
-pub fn parse_simplify_lens_flags(text: &str) -> (bool, bool) {
-    let cleaned = mask_simplify_template_pairs(text);
-    extract_simplify_lens_flags_cleaned(&cleaned)
-}
-
-pub fn parse_simplify_window_spans(text: &str) -> (Vec<(usize, usize, bool)>, bool, bool) {
-    parse_simplify_window_spans_messages(&[text])
-}
-
-pub fn parse_simplify_window_spans_messages(
-    messages: &[&str],
-) -> (Vec<(usize, usize, bool)>, bool, bool) {
-    if messages.is_empty() {
-        return (Vec::new(), false, false);
-    }
-    let total_len: usize =
-        messages.iter().map(|m| m.len()).sum::<usize>() + messages.len().saturating_sub(1) * 2;
-    let mut joined = String::with_capacity(total_len);
-    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(messages.len());
-    for (i, msg) in messages.iter().enumerate() {
-        if i > 0 {
-            joined.push_str("\n\n");
-        }
-        let start = joined.len();
-        joined.push_str(msg);
-        ranges.push((start, joined.len()));
-    }
-    let cleaned = mask_simplify_template_pairs(&joined);
-    let mut spans = find_simplify_explicit_verdict_spans_cleaned(&cleaned);
-    // INVARIANT: Detect prose simplify findings per individual uncovered message so a later prose findings report after an earlier `CLEAN` verdict revokes `CLEAN` and participates in chronological & `DIFF_HASH` checks.
-    for &(msg_start, msg_end) in &ranges {
-        let covered_by_explicit = spans
-            .iter()
-            .any(|&(ms, me, _)| ms < msg_end && me > msg_start);
-        if covered_by_explicit {
-            continue;
-        }
-        if let Some(m) = simplify_prose_audit_re().find(&cleaned[msg_start..msg_end]) {
-            spans.push((msg_start + m.start(), msg_start + m.end(), false));
-        }
-    }
-    if spans.is_empty() {
-        return (spans, false, false);
-    }
-    spans.sort_by_key(|&(ms, me, _)| (ms, me));
-    let (has_combined, multi_lens_spoof) = extract_simplify_lens_flags_cleaned(&cleaned);
-    (spans, has_combined, multi_lens_spoof)
-}
-
-pub fn parse_simplify_verdict(text: &str, default_lens: Option<&str>) -> Value {
-    let cleaned = mask_simplify_template_pairs(text);
-    let mut has_combined = false;
-    for_each_simplify_tag_match(simplify_combined_lens_core_re(), &cleaned, |_, _, _| {
-        has_combined = true;
-        false
-    });
-    let mut seen = HashSet::new();
-    let mut unique_lenses = Vec::new();
-    for_each_simplify_tag_match(simplify_lens_core_re(), &cleaned, |_, _, val| {
-        let low = val.to_lowercase();
-        if seen.insert(low.clone()) {
-            unique_lenses.push(low);
-        }
-        true
-    });
-    let mut last_verdict: Option<&str> = None;
-    for_each_simplify_tag_match(simplify_verdict_core_re(), &cleaned, |_, _, val| {
-        last_verdict = Some(val);
-        true
-    });
-    let verdict = match last_verdict {
-        Some(s) => s.to_uppercase(),
-        None if simplify_prose_audit_re().is_match(&cleaned) => "FINDINGS_REPORTED".to_string(),
-        None => String::new(),
-    };
-    let multi_lens_spoof = !has_combined && unique_lenses.len() > 1;
-    let lens = if has_combined {
-        "all".to_string()
-    } else if unique_lenses.len() == 1 {
-        unique_lenses[0].clone()
-    } else if multi_lens_spoof {
-        "combined".to_string()
-    } else {
-        default_lens.unwrap_or("").trim().to_lowercase()
-    };
-    let clean = verdict == "CLEAN";
-    let combined = has_combined || multi_lens_spoof || lens == "all" || lens == "combined";
-    json!({
-        "lens": lens,
-        "verdict": verdict,
-        "clean": clean,
-        "combined": combined,
-        "has_explicit_all": has_combined,
-        "multi_lens_spoof": multi_lens_spoof,
-        "explicit_lenses": unique_lenses,
-    })
 }
 
 fn normalize_diff_metrics(raw: &Map<String, Value>, default_source: &str) -> Value {
@@ -2551,7 +1929,6 @@ pub fn compute_diff_metrics(marker: &Value, repo_root: &str, diff_stats: Option<
         let mut git_files: HashSet<String> = HashSet::new();
         let mut adds: i64 = 0;
         let mut dels: i64 = 0;
-        let mut has_binary = false;
         if rc_d == 0 && !out_d.is_empty() {
             for line in out_d.lines() {
                 let mut parts = line.splitn(3, '\t');
@@ -2563,9 +1940,7 @@ pub fn compute_diff_metrics(marker: &Value, repo_root: &str, diff_stats: Option<
                 }
                 let norm_rel = rel.trim().replace('\\', "/").trim_start_matches("./").to_string();
                 git_files.insert(rio::fold_path(&norm_rel));
-                if a_raw == "-" || d_raw == "-" {
-                    has_binary = true;
-                } else {
+                if a_raw != "-" && d_raw != "-" {
                     adds += a_raw.trim().parse::<i64>().unwrap_or(0);
                     dels += d_raw.trim().parse::<i64>().unwrap_or(0);
                 }
@@ -2583,9 +1958,7 @@ pub fn compute_diff_metrics(marker: &Value, repo_root: &str, diff_stats: Option<
                 let fp = root_path.join(rel);
                 if fp.is_file() {
                     if let Ok((f_bin, f_lines)) = probe_untracked_file_lines(&fp) {
-                        if f_bin {
-                            has_binary = true;
-                        } else {
+                        if !f_bin {
                             adds += f_lines;
                         }
                     }
@@ -2602,11 +1975,7 @@ pub fn compute_diff_metrics(marker: &Value, repo_root: &str, diff_stats: Option<
                     }
                 }
             }
-            let total = if !has_binary {
-                adds + dels
-            } else {
-                (adds + dels).max((FAST_PATH_MAX_LINES as i64) + 1)
-            };
+            let total = adds + dels;
             let files_count = all_files.len().max(candidate_dpaths.len());
             return json!({
                 "files_count": files_count,
@@ -2633,36 +2002,6 @@ pub fn compute_diff_metrics(marker: &Value, repo_root: &str, diff_stats: Option<
         "total_lines": changed_lines,
         "source": "marker-fallback",
     })
-}
-
-pub fn is_simplify_fast_path_eligible(
-    marker: &Value,
-    swarm_ev: Option<&Value>,
-    diff_stats: Option<&Value>,
-    repo_root: &str,
-) -> bool {
-    if let Some(sev) = swarm_ev {
-        if json_truthy(sev.get("multi_lens_spoof")) {
-            return false;
-        }
-    }
-    let effective_root = if !repo_root.trim().is_empty() {
-        repo_root.to_string()
-    } else {
-        let rr = val_to_str(marker.get("repo_root"));
-        if !rr.trim().is_empty() {
-            rr
-        } else {
-            val_to_str(marker.get("cwd"))
-        }
-    };
-    let metrics = compute_diff_metrics(marker, &effective_root, diff_stats);
-    let mut files_count = val_to_i64(metrics.get("files_count")).max(0) as usize;
-    let total_lines = val_to_i64(metrics.get("total_lines")).max(0) as usize;
-    if files_count == 0 {
-        files_count = durable_paths_from_val(marker.get("paths")).len();
-    }
-    files_count > 0 && files_count <= FAST_PATH_MAX_FILES && total_lines <= FAST_PATH_MAX_LINES
 }
 
 pub fn extract_msg_seq(row: &Value, fallback: i64) -> i64 {
@@ -4009,17 +3348,12 @@ pub fn is_scratch_or_ephemeral(
     false
 }
 
-pub fn is_ephemeral_path(path: &str) -> bool {
-    is_scratch_or_ephemeral(path, "", &[], "")
-}
-
 pub fn default_gate_policy() -> Value {
     json!({
         "default_code_risk": "STANDARD",
         "low_risk_globs": [],
         "high_risk_globs": [],
         "xhigh_risk_globs": [],
-        "require_simplify_on_standard": false,
         "require_review_on_standard": false,
         "require_tests_on_standard": null,
     })
@@ -4137,13 +3471,11 @@ fn parse_gate_policy(root: Option<&Path>, raw: &Map<String, Value>) -> Value {
             policy.insert(key.to_string(), Value::Array(cleaned));
         }
     }
-    for key in [
-        "require_simplify_on_standard",
-        "require_review_on_standard",
-    ] {
-        if raw.contains_key(key) {
-            policy.insert(key.to_string(), Value::Bool(json_truthy(raw.get(key))));
-        }
+    if raw.contains_key("require_review_on_standard") {
+        policy.insert(
+            "require_review_on_standard".to_string(),
+            Value::Bool(json_truthy(raw.get("require_review_on_standard"))),
+        );
     }
     if let Some(val) = raw.get("require_tests_on_standard") {
         if !val.is_null() {
@@ -4668,30 +4000,6 @@ pub fn content_fingerprint(paths: &[String], max_file_bytes: u64) -> String {
     digest_from_entries(&dpaths, &entries)
 }
 
-pub fn content_fingerprints_consistent(
-    all_paths: &[String],
-    subset_paths: &[String],
-    max_file_bytes: u64,
-) -> (String, String) {
-    // INVARIANT: Hash every unique path once into a single snapshot map so overall `all_fp` and visual `design_fp` can never diverge due to a concurrent external write between two separate reads.
-    let mut all_dpaths = durable_paths(all_paths);
-    all_dpaths.sort_by_key(|p| rio::fold_path(p));
-    let mut sub_dpaths = durable_paths(subset_paths);
-    sub_dpaths.sort_by_key(|p| rio::fold_path(p));
-    let mut entries: HashMap<String, Option<String>> =
-        HashMap::with_capacity(all_dpaths.len() + sub_dpaths.len());
-    for p in all_dpaths.iter().chain(sub_dpaths.iter()) {
-        let key = rio::fold_path(p);
-        if !entries.contains_key(&key) {
-            entries.insert(key, fingerprint_path_entry(p, max_file_bytes));
-        }
-    }
-    (
-        digest_from_entries(&all_dpaths, &entries),
-        digest_from_entries(&sub_dpaths, &entries),
-    )
-}
-
 pub fn trim_content_marks(marker: &mut Value, marks: Vec<Value>) {
     let Some(obj) = marker.as_object_mut() else {
         return;
@@ -4961,10 +4269,6 @@ pub fn candidate_key(marker: &Value) -> String {
     hex_str[..20].to_string()
 }
 
-pub fn requires_simplify(_risk: &str, _policy: Option<&Value>) -> bool {
-    false
-}
-
 pub fn requires_review(risk: &str, policy: Option<&Value>) -> bool {
     let default_pol = default_gate_policy();
     let pol = policy.unwrap_or(&default_pol);
@@ -5210,7 +4514,6 @@ pub fn resolve_candidate_context(marker: &Value, include_tests: bool) -> Value {
         .filter(|v| !v.is_null())
         .map(|v| val_to_str(Some(v)));
 
-    let needs_simplify = false;
     let needs_review = if !items.is_empty() {
         let nr = requires_review(&floor, Some(&policy))
             || items
@@ -5250,7 +4553,6 @@ pub fn resolve_candidate_context(marker: &Value, include_tests: bool) -> Value {
         "policy": policy,
         "floor": floor,
         "require_tests": req_tests,
-        "needs_simplify": needs_simplify,
         "needs_review": needs_review,
     })
 }
@@ -5278,7 +4580,7 @@ pub fn receipt_requirements_summary(floor: &str, policy: Option<&Value>, has_tes
         ("XHIGH", " --xhigh", "--xhigh --closure", CODEX_ASTRA_MODEL)
     };
     format!(
-        "decisive test/check execution -> primary {} APPROVED review (1..{} rounds via `carbon-stack codex-lane review{}` on `{}` -> {}; APPROVED closes gate; after Round {} ESCALATE: focused research -> fix + re-test -> <={} `{}` passes or 1 `redesign-reset`)",
+        "decisive test/check execution -> primary {} APPROVED review (1..{} rounds via `carbon-stack codex-lane review{}` on `{}` -> {}; APPROVED closes gate; after Round {} ESCALATE: focused research -> fix + re-test -> <={} `{}` passes)",
         label,
         MAX_ORDINARY_REVIEW_ROUNDS,
         xhigh_flag,
@@ -5588,30 +4890,6 @@ pub fn find_research_evidence_since(
     found
 }
 
-pub fn last_research_reset_ts(marker: &Value) -> f64 {
-    marker
-        .get("research_resets")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .map(|ent| val_to_f64(ent.get("reset_ts")))
-                .fold(0.0f64, f64::max)
-        })
-        .unwrap_or(0.0)
-}
-
-pub fn last_research_reset_board_seq(marker: &Value) -> i64 {
-    marker
-        .get("research_resets")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|ent| ent.get("board_head_seq").and_then(|v| v.as_i64()))
-                .fold(0i64, i64::max)
-        })
-        .unwrap_or(0)
-}
-
 pub fn active_marker_closure_halt(marker: &Value) -> Option<(usize, f64, Vec<String>)> {
     let ch = marker.get("closure_halt")?.as_object()?;
     let cnt = ch.get("blocked_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -5624,12 +4902,6 @@ pub fn active_marker_closure_halt(marker: &Value) -> Option<(usize, f64, Vec<Str
         return None;
     }
     let last_blk_ts = val_to_f64(ch.get("last_blocked_ts"));
-    let cycle_base_ts = val_to_f64(ch.get("cycle_base_ts"));
-    let rr_ts = last_research_reset_ts(marker);
-    // INVARIANT: A latched `closure_halt` is bound to `candidate_first_ts` and remains active until a verified `research_resets` entry advances `reset_ts` past `last_blocked_ts` or `cycle_base_ts`.
-    if rr_ts > 0.0 && (rr_ts > last_blk_ts || rr_ts > cycle_base_ts + TS_EPS) {
-        return None;
-    }
     let ids: Vec<String> = ch
         .get("blocked_review_ids")
         .and_then(|v| v.as_array())
@@ -5646,7 +4918,6 @@ pub fn active_marker_closure_halt(marker: &Value) -> Option<(usize, f64, Vec<Str
 pub struct ClosureHaltLatch<'a> {
     pub session: &'a str,
     pub expected_first_ts: f64,
-    pub expected_rr_ts: f64,
     pub expected_round_start_msg_id: i64,
     pub blocked_count: usize,
     pub last_blocked_ts: f64,
@@ -5658,7 +4929,6 @@ pub fn latch_marker_closure_halt(latch: ClosureHaltLatch<'_>) {
     let ClosureHaltLatch {
         session,
         expected_first_ts,
-        expected_rr_ts,
         expected_round_start_msg_id,
         blocked_count,
         last_blocked_ts,
@@ -5685,17 +4955,14 @@ pub fn latch_marker_closure_halt(latch: ClosureHaltLatch<'_>) {
         if !fresh.is_object() || json_truthy(fresh.get("closed")) {
             return false;
         }
-        // SAFETY: Re-verify candidate identity (`first_ts`) and cycle cursors (`last_research_reset_ts`, `round_start_msg_id`) under `marker_lock_path` so concurrent candidate turnover or `research-reset` never inherits a stale halt.
+        // SAFETY: Re-verify candidate identity (`first_ts`) and `round_start_msg_id` under `marker_lock_path` so concurrent candidate turnover never inherits a stale halt.
         let live_first_ts = val_to_f64(fresh.get("first_ts"));
-        let live_rr_ts = last_research_reset_ts(&fresh);
         let live_round_seq = fresh
             .get("round_start_msg_id")
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
         if (live_first_ts - expected_first_ts).abs() > TS_EPS
-            || (live_rr_ts - expected_rr_ts).abs() > TS_EPS
             || live_round_seq != expected_round_start_msg_id
-            || (live_rr_ts > 0.0 && (live_rr_ts > last_blocked_ts || live_rr_ts > cycle_base_ts + TS_EPS))
         {
             return false;
         }
@@ -5752,266 +5019,6 @@ pub fn enforcement_state_closed_ts(session: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
-const PRE_MARKER_PREPARE_MAX_AGE_SEC: f64 = 3600.0;
-const PRE_MARKER_VERIFIED_TTL_SEC: f64 = 120.0;
-
-fn simplify_lane_key(git_root: &str) -> String {
-    format!("{}|simplify", rio::fold_path(git_root))
-}
-
-fn unbound_simplify_last_entry<'a>(doc: &'a Value, lane_key: &str) -> Option<&'a Value> {
-    if val_to_f64(doc.get("marker_first_ts")) > 0.0 {
-        return None;
-    }
-    doc.get("lanes")
-        .and_then(Value::as_object)?
-        .get(lane_key)
-        .and_then(Value::as_array)?
-        .last()
-}
-
-pub fn has_unbound_pre_marker_simplify_rounds(session: &str) -> bool {
-    if session.trim().is_empty() {
-        return false;
-    }
-    let skey = rio::safe_key(session, "default");
-    let Some(doc) = rio::read_json(&swarm_rounds_path(&skey)) else {
-        return false;
-    };
-    if val_to_f64(doc.get("marker_first_ts")) > 0.0
-        || val_to_f64(doc.get("require_marker_cycle_ts")) > 0.0
-    {
-        return false;
-    }
-    doc.get("lanes")
-        .and_then(Value::as_object)
-        .is_some_and(|lm| {
-            lm.iter().any(|(k, v)| {
-                k.ends_with("|simplify") && v.as_array().is_some_and(|arr| !arr.is_empty())
-            })
-        })
-}
-
-pub fn read_pre_marker_simplify_prepare(
-    session: &str,
-    git_root: &str,
-    now: f64,
-    prior_closed_ts: f64,
-    expected_call_key: Option<&str>,
-) -> Option<(f64, String, Vec<String>)> {
-    if session.trim().is_empty() || git_root.trim().is_empty() {
-        return None;
-    }
-    let skey = rio::safe_key(session, "default");
-    let doc = rio::read_json(&swarm_rounds_path(&skey))?;
-    let folded_gr = rio::fold_path(git_root);
-    let last_ent = unbound_simplify_last_entry(&doc, &format!("{}|simplify", folded_gr))?;
-    let tree_oid = val_to_str(last_ent.get("tree_oid"));
-    if !is_git_oid(&tree_oid)
-        || !val_to_str(last_ent.get("diff_hash")).is_empty()
-        || val_to_str(last_ent.get("raw_worktree_digest")).is_empty()
-        || last_ent
-            .get("pre_marker_text_covered")
-            .and_then(Value::as_bool)
-            != Some(true)
-    {
-        return None;
-    }
-    // INVARIANT: Bind to `last_ent.ts` (never `min(ts)` over older abandoned prepares) so a stale earlier entry cannot poison a fresh pre-marker prepare.
-    let prep_ts = val_to_f64(last_ent.get("ts"));
-    if prep_ts <= 0.0
-        || prep_ts <= prior_closed_ts + TS_EPS
-        || prep_ts > now + TS_EPS
-        || (now - prep_ts) > PRE_MARKER_PREPARE_MAX_AGE_SEC
-    {
-        return None;
-    }
-    let mut pre_hashes: Vec<String> = Vec::new();
-    if let Some(exp_key) = expected_call_key.map(str::trim).filter(|k| !k.is_empty()) {
-        if let Some(pv) = doc
-            .get("pre_marker_verified")
-            .and_then(Value::as_object)
-        {
-            let pv_repo = val_to_str(pv.get("repo"));
-            let pv_prep_ts = val_to_f64(pv.get("prep_ts"));
-            let pv_ts = val_to_f64(pv.get("verified_ts"));
-            let pv_call_key = val_to_str(pv.get("call_key"));
-            if pv_repo == folded_gr
-                && pv_call_key == exp_key
-                && (pv_prep_ts - prep_ts).abs() <= TS_EPS
-                && pv_ts > 0.0
-                && (now - pv_ts) <= PRE_MARKER_VERIFIED_TTL_SEC
-            {
-                if let Some(arr) = pv.get("hashes").and_then(Value::as_array) {
-                    for v in arr {
-                        let s = val_to_str(Some(v)).trim().to_string();
-                        if !s.is_empty() && !pre_hashes.contains(&s) {
-                            pre_hashes.push(s);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Some((prep_ts, tree_oid, pre_hashes))
-}
-
-fn mutate_unbound_pre_marker_rounds(
-    session: &str,
-    git_root: &str,
-    prep_ts: f64,
-    mutate: impl FnOnce(&mut Map<String, Value>, &str, &str) -> bool,
-) -> bool {
-    if session.trim().is_empty() || git_root.trim().is_empty() || prep_ts <= 0.0 {
-        return false;
-    }
-    let skey = rio::safe_key(session, "default");
-    let rpath = swarm_rounds_path(&skey);
-    let folded_gr = rio::fold_path(git_root);
-    let lane_key = format!("{}|simplify", folded_gr);
-    // SAFETY: Acquire only `swarm_rounds_lock_path` (never nested inside `marker_lock_path`) to respect the strict `swarm_rounds_lock -> marker_lock` hierarchy.
-    rio::with_file_lock(&swarm_rounds_lock_path(&skey), 5.0, 30.0, |locked| {
-        if !locked {
-            return false;
-        }
-        let Some(mut doc) = rio::read_json(&rpath) else {
-            return false;
-        };
-        let Some(last_ent) = unbound_simplify_last_entry(&doc, &lane_key) else {
-            return false;
-        };
-        let ent_ts = val_to_f64(last_ent.get("ts"));
-        if ent_ts <= 0.0
-            || (ent_ts - prep_ts).abs() > TS_EPS
-            || !val_to_str(last_ent.get("diff_hash")).is_empty()
-        {
-            return false;
-        }
-        let Some(obj) = doc.as_object_mut() else {
-            return false;
-        };
-        if !mutate(obj, &folded_gr, &lane_key) {
-            return false;
-        }
-        rio::write_json(&rpath, &doc).is_ok()
-    })
-}
-
-pub fn record_pre_marker_verified_simplify(
-    session: &str,
-    git_root: &str,
-    prep_ts: f64,
-    now: f64,
-    call_key: &str,
-    hashes: &[String],
-) -> bool {
-    if hashes.is_empty() || call_key.trim().is_empty() {
-        return false;
-    }
-    mutate_unbound_pre_marker_rounds(session, git_root, prep_ts, |obj, folded_gr, _| {
-        obj.insert(
-            "pre_marker_verified".to_string(),
-            json!({
-                "repo": folded_gr,
-                "prep_ts": prep_ts,
-                "verified_ts": now,
-                "call_key": call_key,
-                "hashes": hashes,
-            }),
-        );
-        true
-    })
-}
-
-pub fn clear_pre_marker_verified_simplify(session: &str) -> bool {
-    if session.trim().is_empty() {
-        return false;
-    }
-    let skey = rio::safe_key(session, "default");
-    let rpath = swarm_rounds_path(&skey);
-    let has_pv = rio::read_json(&rpath)
-        .and_then(|d| d.get("pre_marker_verified").cloned())
-        .is_some();
-    if !has_pv {
-        return false;
-    }
-    rio::with_file_lock(&swarm_rounds_lock_path(&skey), 5.0, 30.0, |locked| {
-        if !locked {
-            return false;
-        }
-        let Some(mut doc) = rio::read_json(&rpath) else {
-            return false;
-        };
-        let Some(obj) = doc.as_object_mut() else {
-            return false;
-        };
-        if obj.remove("pre_marker_verified").is_none() {
-            return false;
-        }
-        rio::write_json(&rpath, &doc).is_ok()
-    })
-}
-
-pub fn finalize_pre_marker_simplify_adoption(session: &str, git_root: &str, prep_ts: f64) -> bool {
-    mutate_unbound_pre_marker_rounds(session, git_root, prep_ts, |obj, _, lane_key| {
-        let Some(last_ent) = obj
-            .get_mut("lanes")
-            .and_then(Value::as_object_mut)
-            .and_then(|lm| lm.get_mut(lane_key))
-            .and_then(Value::as_array_mut)
-            .and_then(|arr| arr.last_mut())
-            .and_then(Value::as_object_mut)
-        else {
-            return false;
-        };
-        last_ent.insert("pre_marker_adopted".to_string(), Value::Bool(true));
-        obj.insert("marker_first_ts".to_string(), json!(prep_ts));
-        obj.remove("pre_marker_verified");
-        true
-    })
-}
-
-pub fn active_pre_marker_tree_oid(session: &str, marker: &Value) -> String {
-    let gr = val_to_str(marker.get("git_root"));
-    if session.trim().is_empty() || gr.trim().is_empty() {
-        return String::new();
-    }
-    let skey = rio::safe_key(session, "default");
-    let Some(doc) = rio::read_json(&swarm_rounds_path(&skey)) else {
-        return String::new();
-    };
-    let doc_mts = val_to_f64(doc.get("marker_first_ts"));
-    let m_fts = marker_cycle_first_ts(marker);
-    if doc_mts <= 0.0 || (m_fts > 0.0 && cycle_ts_mismatch(doc_mts, m_fts)) {
-        return String::new();
-    }
-    let lane_key = simplify_lane_key(&gr);
-    let Some(last_ent) = doc
-        .get("lanes")
-        .and_then(Value::as_object)
-        .and_then(|lm| lm.get(&lane_key))
-        .and_then(Value::as_array)
-        .and_then(|arr| arr.last())
-    else {
-        return String::new();
-    };
-    if !json_truthy(last_ent.get("pre_marker_adopted"))
-        || val_to_str(last_ent.get("raw_worktree_digest")).is_empty()
-        || last_ent
-            .get("pre_marker_text_covered")
-            .and_then(Value::as_bool)
-            != Some(true)
-    {
-        return String::new();
-    }
-    let tree_oid = val_to_str(last_ent.get("tree_oid"));
-    if is_git_oid(&tree_oid) {
-        tree_oid
-    } else {
-        String::new()
-    }
-}
-
 pub fn latch_marker_closure_halt_for_marker(
     session: &str,
     marker: &Value,
@@ -6020,25 +5027,16 @@ pub fn latch_marker_closure_halt_for_marker(
     blocked_ids: &[String],
 ) {
     let exp_first_ts = val_to_f64(marker.get("first_ts"));
-    let exp_rr_ts = last_research_reset_ts(marker);
     let exp_round_seq = val_to_i64(marker.get("round_start_msg_id"));
     latch_marker_closure_halt(ClosureHaltLatch {
         session,
         expected_first_ts: exp_first_ts,
-        expected_rr_ts: exp_rr_ts,
         expected_round_start_msg_id: exp_round_seq,
         blocked_count,
         last_blocked_ts,
         blocked_ids,
-        cycle_base_ts: exp_first_ts.max(exp_rr_ts),
+        cycle_base_ts: exp_first_ts,
     });
-}
-
-pub fn research_reset_epoch(marker: &Value) -> usize {
-    marker
-        .get("research_resets")
-        .and_then(|v| v.as_array())
-        .map_or(0, |arr| arr.len())
 }
 
 pub fn active_marker_declared_risk(marker: &Value) -> String {
@@ -6048,12 +5046,6 @@ pub fn active_marker_declared_risk(marker: &Value) -> String {
     let dr_first_ts = val_to_f64(dr.get("candidate_first_ts"));
     let marker_first_ts = val_to_f64(marker.get("first_ts"));
     if marker_first_ts <= 0.0 || (dr_first_ts - marker_first_ts).abs() > TS_EPS {
-        return String::new();
-    }
-    let Some(dr_epoch) = dr.get("reset_epoch").and_then(|v| v.as_u64()) else {
-        return String::new();
-    };
-    if (dr_epoch as usize) != research_reset_epoch(marker) {
         return String::new();
     }
     let r = val_to_str(dr.get("risk")).to_uppercase();
@@ -6067,7 +5059,6 @@ pub fn active_marker_declared_risk(marker: &Value) -> String {
 pub fn latch_marker_declared_risk(
     session: &str,
     expected_first_ts: Option<f64>,
-    expected_reset_epoch: Option<usize>,
     risk: &str,
 ) -> bool {
     let risk_up = risk.trim().to_uppercase();
@@ -6088,19 +5079,13 @@ pub fn latch_marker_declared_risk(
         if !fresh.is_object() || json_truthy(fresh.get("closed")) {
             return false;
         }
-        // SAFETY: Bind cycle-escalated risk (`--xhigh` or cycle receipt) inside `marker.json` under `marker_lock_path` to `(candidate_first_ts, reset_epoch)` so concurrent `research-reset` can never erase a new cycle's risk or inherit a stale cycle's risk.
+        // SAFETY: Bind cycle-escalated risk (`--xhigh` or cycle receipt) inside `marker.json` under `marker_lock_path` to `candidate_first_ts` so concurrent candidate turnover never inherits a stale cycle's risk.
         let live_first_ts = val_to_f64(fresh.get("first_ts"));
         if live_first_ts <= 0.0 {
             return false;
         }
         if let Some(exp_fts) = expected_first_ts {
             if (live_first_ts - exp_fts).abs() > TS_EPS {
-                return false;
-            }
-        }
-        let live_epoch = research_reset_epoch(&fresh);
-        if let Some(exp_ep) = expected_reset_epoch {
-            if live_epoch != exp_ep {
                 return false;
             }
         }
@@ -6118,190 +5103,7 @@ pub fn latch_marker_declared_risk(
                 "cycle_declared_risk".to_string(),
                 json!({
                     "candidate_first_ts": live_first_ts,
-                    "reset_epoch": live_epoch,
                     "risk": merged_risk,
-                }),
-            );
-        }
-        if rio::write_json(&mpath, &fresh).is_ok() {
-            if !consumed_ids.is_empty() {
-                ack_pending_marker_deltas(&skey, &consumed_ids);
-            }
-            return true;
-        }
-        false
-    })
-}
-
-pub fn active_marker_fast_path_simplify(marker: &Value) -> Option<f64> {
-    let fp_obj = marker.get("simplify_fast_path_latched")?.as_object()?;
-    let fp_first_ts = val_to_f64(fp_obj.get("candidate_first_ts"));
-    let marker_first_ts = val_to_f64(marker.get("first_ts"));
-    if marker_first_ts <= 0.0 || (fp_first_ts - marker_first_ts).abs() > TS_EPS {
-        return None;
-    }
-    let fp_epoch = fp_obj.get("reset_epoch").and_then(Value::as_u64)? as usize;
-    if fp_epoch != research_reset_epoch(marker) {
-        return None;
-    }
-    let vts = val_to_f64(fp_obj.get("verified_ts"));
-    (vts > 0.0).then_some(vts)
-}
-
-pub fn latch_marker_fast_path_simplify(session: &str, verified_ts: f64) -> bool {
-    if session.trim().is_empty() || verified_ts <= 0.0 {
-        return false;
-    }
-    let skey = rio::safe_key(session, "default");
-    let mpath = marker_path(&skey);
-    rio::with_file_lock(&marker_lock_path(&skey), 5.0, 30.0, |locked| {
-        if !locked {
-            return false;
-        }
-        let raw = rio::read_json(&mpath);
-        let (merged_opt, consumed_ids) = apply_pending_marker_deltas(&skey, raw.as_ref());
-        let Some(mut fresh) = merged_opt else {
-            return false;
-        };
-        if !fresh.is_object() || json_truthy(fresh.get("closed")) {
-            return false;
-        }
-        let live_first_ts = val_to_f64(fresh.get("first_ts"));
-        if live_first_ts <= 0.0 {
-            return false;
-        }
-        let live_epoch = research_reset_epoch(&fresh);
-        if let Some(prev_vts) = active_marker_fast_path_simplify(&fresh) {
-            if prev_vts >= verified_ts - TS_EPS && consumed_ids.is_empty() {
-                return true;
-            }
-        }
-        // INVARIANT: Latch Fast-Path `SIMPLIFY_LENS: ALL` eligibility once review starts on an eligible `<= 2`-file / `<= 30`-line candidate so subsequent `REVISE` remediation edits touching a 3rd file never retroactively invalidate the completed candidate-bound simplify pass.
-        if let Some(mobj) = fresh.as_object_mut() {
-            mobj.insert(
-                "simplify_fast_path_latched".to_string(),
-                json!({
-                    "candidate_first_ts": live_first_ts,
-                    "reset_epoch": live_epoch,
-                    "verified_ts": verified_ts,
-                }),
-            );
-        }
-        if rio::write_json(&mpath, &fresh).is_ok() {
-            if !consumed_ids.is_empty() {
-                ack_pending_marker_deltas(&skey, &consumed_ids);
-            }
-            return true;
-        }
-        false
-    })
-}
-
-pub fn redesign_reset_count(marker: &Value) -> usize {
-    marker
-        .get("research_resets")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter(|ent| {
-                    let dec = val_to_str(ent.get("decision")).trim().to_ascii_lowercase();
-                    REDESIGN_RESET_DECISIONS.contains(&dec.as_str())
-                })
-                .count()
-        })
-        .unwrap_or(0)
-}
-
-pub fn active_marker_verified_simplify_hashes(marker: &Value) -> Vec<String> {
-    let Some(sv_obj) = marker
-        .get("simplify_verified_latched")
-        .and_then(Value::as_object)
-    else {
-        return Vec::new();
-    };
-    let live_first_ts = val_to_f64(marker.get("first_ts"));
-    let sv_first_ts = val_to_f64(sv_obj.get("candidate_first_ts"));
-    if live_first_ts <= 0.0 || sv_first_ts <= 0.0 || (sv_first_ts - live_first_ts).abs() > TS_EPS {
-        return Vec::new();
-    }
-    let sv_epoch = sv_obj
-        .get("reset_epoch")
-        .and_then(Value::as_u64)
-        .map(|u| u as usize)
-        .unwrap_or(usize::MAX);
-    if sv_epoch != research_reset_epoch(marker) {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    if let Some(arr) = sv_obj.get("verified_hashes").and_then(Value::as_array) {
-        for v in arr {
-            let s = val_to_str(Some(v)).trim().to_string();
-            if !s.is_empty() && !out.contains(&s) {
-                out.push(s);
-            }
-        }
-    }
-    out
-}
-
-pub fn latch_marker_verified_simplify(
-    session: &str,
-    verified_ts: f64,
-    expected_last_durable_ts: f64,
-    hashes: &[String],
-) -> bool {
-    if session.trim().is_empty() || verified_ts <= 0.0 || hashes.is_empty() {
-        return false;
-    }
-    let mut clean_hashes: Vec<String> = Vec::new();
-    for h in hashes {
-        let t = h.trim();
-        if !t.is_empty() && !clean_hashes.iter().any(|x| x == t) {
-            clean_hashes.push(t.to_string());
-        }
-    }
-    if clean_hashes.is_empty() {
-        return false;
-    }
-    let skey = rio::safe_key(session, "default");
-    let mpath = marker_path(&skey);
-    rio::with_file_lock(&marker_lock_path(&skey), 5.0, 30.0, |locked| {
-        if !locked {
-            return false;
-        }
-        let raw = rio::read_json(&mpath);
-        let (merged_opt, consumed_ids) = apply_pending_marker_deltas(&skey, raw.as_ref());
-        let Some(mut fresh) = merged_opt else {
-            return false;
-        };
-        if !fresh.is_object() || json_truthy(fresh.get("closed")) {
-            return false;
-        }
-        let live_first_ts = val_to_f64(fresh.get("first_ts"));
-        let live_last_dur = val_to_f64(fresh.get("last_durable_ts"));
-        if live_first_ts <= 0.0 || live_last_dur > expected_last_durable_ts + TS_EPS {
-            return false;
-        }
-        let live_epoch = research_reset_epoch(&fresh);
-        let mut merged = active_marker_verified_simplify_hashes(&fresh);
-        let prev_len = merged.len();
-        for h in &clean_hashes {
-            if !merged.contains(h) {
-                merged.push(h.clone());
-            }
-        }
-        if merged.len() == prev_len && prev_len > 0 && consumed_ids.is_empty() {
-            return true;
-        }
-        // INVARIANT: Forward-latch live-verified `swarm-cache prepare` simplify hashes onto `marker.json` while the worktree matches `raw_worktree_digest`, so later `REVISE` edits (including CRLF files outside `prepare`-time `marker.paths`) never break valid simplify while rejected pre-edit drift can never be resurrected.
-        if let Some(mobj) = fresh.as_object_mut() {
-            mobj.insert(
-                "simplify_verified_latched".to_string(),
-                json!({
-                    "candidate_first_ts": live_first_ts,
-                    "reset_epoch": live_epoch,
-                    "verified_ts": verified_ts,
-                    "verified_hashes": merged,
                 }),
             );
         }
@@ -6317,8 +5119,7 @@ pub fn latch_marker_verified_simplify(
 
 pub fn latch_marker_declared_risk_for_marker(session: &str, marker: &mut Value, risk: &str) -> bool {
     let exp_fts = val_to_f64(marker.get("first_ts"));
-    let exp_epoch = research_reset_epoch(marker);
-    if !latch_marker_declared_risk(session, Some(exp_fts), Some(exp_epoch), risk) {
+    if !latch_marker_declared_risk(session, Some(exp_fts), risk) {
         return false;
     }
     let risk_up = risk.trim().to_uppercase();
@@ -6333,116 +5134,11 @@ pub fn latch_marker_declared_risk_for_marker(session: &str, marker: &mut Value, 
             "cycle_declared_risk".to_string(),
             json!({
                 "candidate_first_ts": exp_fts,
-                "reset_epoch": exp_epoch,
                 "risk": merged_risk,
             }),
         );
     }
     true
-}
-
-pub fn pre_reset_worker_cids(marker: Option<&Value>) -> (bool, HashSet<String>) {
-    let mut has_snapshot = false;
-    let mut cids: HashSet<String> = HashSet::new();
-    let Some(arr) = marker
-        .and_then(|m| m.get("research_resets"))
-        .and_then(|v| v.as_array())
-    else {
-        return (false, cids);
-    };
-    for ent in arr {
-        if let Some(list) = ent.get("pre_reset_worker_cids").and_then(|v| v.as_array()) {
-            has_snapshot = true;
-            for item in list {
-                let s = val_to_str(Some(item)).trim().to_string();
-                if !s.is_empty() {
-                    cids.insert(s);
-                }
-            }
-        }
-    }
-    (has_snapshot, cids)
-}
-
-pub fn is_worker_spawned_before_reset(
-    wname: &str,
-    meta: Option<&Value>,
-    raw_board: &[Value],
-    rr_ts: f64,
-    rr_board_seq: i64,
-    marker: Option<&Value>,
-    brain_root: Option<&Path>,
-) -> bool {
-    if rr_ts <= 0.0 && rr_board_seq <= 0 {
-        return false;
-    }
-    let wcid = meta
-        .and_then(|m| m.get("conversation_id").or_else(|| m.get("conversationId")))
-        .map(|v| val_to_str(Some(v)).trim().to_string())
-        .unwrap_or_default();
-    let (has_cid_snap, old_cids) = pre_reset_worker_cids(marker);
-    if !wcid.is_empty() && old_cids.contains(&wcid) {
-        return true;
-    }
-    // INVARIANT: Bind post-reset worker freshness to the worker's own session (`conversation_id`, `created_at`, or worker transcript origin) so reusing a standard roster name like `simplify-reuse` never inherits a killed pre-reset worker's board mentions.
-    if let Some(m) = meta {
-        for key in ["created_at", "added_at", "started_at"] {
-            let cts = match m.get(key) {
-                Some(Value::String(s)) => rio::parse_iso_ts(s),
-                Some(v) => val_to_f64(Some(v)),
-                None => 0.0,
-            };
-            if rr_ts > 0.0 && cts > 0.0 {
-                return cts < rr_ts - 0.001;
-            }
-        }
-    }
-    if !wcid.is_empty() && rr_ts > 0.0 {
-        if let Some(br) = brain_root {
-            let head = rio::read_transcript_head(
-                &rio::member_transcript_path(br, &wcid).to_string_lossy(),
-                4,
-            );
-            let w_origin_ts = head
-                .iter()
-                .filter_map(|s| s.get("created_at").and_then(|v| v.as_str()).map(rio::parse_iso_ts))
-                .filter(|&ts| ts > 0.0)
-                .fold(f64::INFINITY, f64::min);
-            if w_origin_ts.is_finite() {
-                return w_origin_ts < rr_ts - 0.001;
-            }
-        }
-    }
-    if has_cid_snap && !wcid.is_empty() {
-        return false;
-    }
-    let clean_added = meta
-        .and_then(|m| m.get("added_by"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim();
-    for (idx, bp) in raw_board.iter().enumerate() {
-        let seq = extract_msg_seq(bp, (idx + 1) as i64);
-        let poster = val_to_str(bp.get("agent"));
-        let btext = val_to_str(bp.get("text"));
-        let is_assigner = poster.eq_ignore_ascii_case("coordinator")
-            || (!clean_added.is_empty() && poster == clean_added);
-        if is_assigner && rio::text_mentions_swarm_worker(&btext, wname) {
-            if rr_board_seq > 0 && seq <= rr_board_seq {
-                return true;
-            }
-            let bts = bp
-                .get("time")
-                .and_then(|v| v.as_str())
-                .map(rio::parse_iso_ts)
-                .unwrap_or(0.0);
-            if rr_ts > 0.0 && bts > 0.0 && bts <= rr_ts {
-                return true;
-            }
-            break;
-        }
-    }
-    false
 }
 
 #[derive(serde::Deserialize)]
@@ -6815,14 +5511,6 @@ fn verify_gap_windows_from_transcript_status(
     })
 }
 
-fn verify_gap_windows_from_transcript(
-    transcript_path: &str,
-    gap_windows: &[(f64, f64)],
-) -> Result<bool, ()> {
-    verify_gap_windows_from_transcript_status(transcript_path, gap_windows)
-        .map(|st| st == ResearchWindowStatus::Verified)
-}
-
 pub fn research_status_between(
     steps: Option<&[Value]>,
     transcript_path: Option<&str>,
@@ -6875,188 +5563,6 @@ pub fn research_status_between(
     ResearchWindowStatus::Incomplete
 }
 
-pub fn has_verified_research_between(
-    steps: Option<&[Value]>,
-    transcript_path: Option<&str>,
-    since_ts: f64,
-    until_ts: f64,
-) -> bool {
-    research_status_between(steps, transcript_path, since_ts, until_ts)
-        == ResearchWindowStatus::Verified
-}
-
-fn transcript_read_err() -> (f64, i64, Option<String>) {
-    (
-        0.0,
-        0,
-        Some("failed to read full transcript for `research_resets` verification".to_string()),
-    )
-}
-
-fn missing_post_blocked_research_err() -> (f64, i64, Option<String>) {
-    (
-        0.0,
-        0,
-        Some(
-            "`research_resets` entry lacks verified post-BLOCKED documentation/web research in transcript"
-                .to_string(),
-        ),
-    )
-}
-
-pub fn verified_research_reset_state_with_path(
-    marker: &Value,
-    steps: Option<&[Value]>,
-    transcript_path: Option<&str>,
-) -> (f64, i64, Option<String>) {
-    // INVARIANT: Exclude the synthetic `st[0]` prefix before a `has_prefix_slice_gap(st)` tail jump when computing `contig_earliest_ts`, require `contig_earliest_ts <= blk_ts` for in-memory window completeness, and stream-verify any gap-preceding `[blk_ts, r_ts]` windows directly from the transcript file when `transcript_path` is present.
-    let Some(arr) = marker.get("research_resets").and_then(|v| v.as_array()) else {
-        return (0.0, 0, None);
-    };
-    if arr.is_empty() {
-        return (0.0, 0, None);
-    }
-    let mut latest_ts = 0.0f64;
-    let mut latest_seq = 0i64;
-    let mut gap_windows: Vec<(f64, f64)> = Vec::new();
-    let tail_info = if let Some(st) = steps {
-        if st.is_empty() {
-            return (
-                0.0,
-                0,
-                Some("`research_resets` entry cannot be verified against an empty transcript".to_string()),
-            );
-        }
-        let has_gap = rio::has_prefix_slice_gap(st);
-        let drops_synthetic_head = st.len() > 1
-            && st[0].get("step_index").and_then(Value::as_i64) == Some(0)
-            && st[1]
-                .get("step_index")
-                .and_then(Value::as_i64)
-                .is_some_and(|i1| i1 > 1);
-        let contig_steps = if drops_synthetic_head { &st[1..] } else { st };
-        let contig_earliest_ts = if has_gap {
-            contig_steps
-                .iter()
-                .filter_map(|s| {
-                    s.get("created_at")
-                        .and_then(Value::as_str)
-                        .map(rio::parse_iso_ts)
-                })
-                .filter(|&ts| ts > 0.0)
-                .fold(f64::INFINITY, f64::min)
-        } else {
-            0.0
-        };
-        Some((has_gap, contig_steps, contig_earliest_ts))
-    } else {
-        None
-    };
-
-    let mut redesign_count = 0usize;
-    for ent in arr {
-        let dec = val_to_str(ent.get("decision")).trim().to_ascii_lowercase();
-        let findings = val_to_str(ent.get("findings")).trim().to_string();
-        let r_ts = val_to_f64(ent.get("reset_ts"));
-        let blk_ts = val_to_f64(ent.get("last_blocked_ts"));
-        if !RESEARCH_RESET_DECISIONS.contains(&dec.as_str())
-            || findings.chars().count() < 15
-            || r_ts <= 0.0
-            || blk_ts <= 0.0
-            || r_ts < blk_ts
-        {
-            return (
-                0.0,
-                0,
-                Some("invalid `research_resets` metadata in candidate marker".to_string()),
-            );
-        }
-        if REDESIGN_RESET_DECISIONS.contains(&dec.as_str()) {
-            redesign_count += 1;
-            if redesign_count > MAX_REDESIGN_RESETS {
-                return (
-                    0.0,
-                    0,
-                    Some(format!(
-                        "`research_resets` exceeded MAX_REDESIGN_RESETS={} per candidate",
-                        MAX_REDESIGN_RESETS
-                    )),
-                );
-            }
-        }
-        let has_recorded_tools = ent
-            .get("research_tools")
-            .and_then(|v| v.as_array())
-            .map_or(false, |a| !a.is_empty());
-        if !has_recorded_tools {
-            return (
-                0.0,
-                0,
-                Some("`research_resets` entry has empty `research_tools`".to_string()),
-            );
-        }
-        if let Some((has_gap, contig_steps, contig_earliest_ts)) = tail_info {
-            if !has_gap || (contig_earliest_ts.is_finite() && contig_earliest_ts <= blk_ts) {
-                if find_research_evidence_since(contig_steps, blk_ts, Some(r_ts + 1.0)).is_empty() {
-                    if transcript_path.is_some() {
-                        gap_windows.push((blk_ts, r_ts));
-                    } else {
-                        return missing_post_blocked_research_err();
-                    }
-                }
-            } else {
-                gap_windows.push((blk_ts, r_ts));
-            }
-        }
-        if r_ts >= latest_ts {
-            latest_ts = r_ts;
-            let bseq = ent
-                .get("board_head_seq")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            if bseq > latest_seq {
-                latest_seq = bseq;
-            }
-        }
-    }
-
-    if !gap_windows.is_empty() {
-        let Some(tp) = transcript_path else {
-            return transcript_read_err();
-        };
-        match verify_gap_windows_from_transcript(tp, &gap_windows) {
-            Ok(true) => {}
-            Ok(false) => return missing_post_blocked_research_err(),
-            Err(()) => return transcript_read_err(),
-        }
-    }
-    (latest_ts, latest_seq, None)
-}
-
-fn is_simplify_worker_identity(name_low: &str, mdl_low: &str, brief_low: &str) -> bool {
-    is_simplify_worker_name(name_low)
-        || !simplify_lens_from_worker_name(name_low).is_empty()
-        || mdl_low == SONNET_HIGH_MODEL
-        || brief_low.contains("simplify_lens:")
-        || brief_low.contains("simplify_verdict:")
-}
-
-pub fn is_review_swarm_worker(name: &str, meta: Option<&Value>) -> bool {
-    let low = name.trim().to_ascii_lowercase();
-    let mdl = meta
-        .and_then(|m| {
-            m.get("model")
-                .or_else(|| m.get("applied_model"))
-                .or_else(|| m.get("desired_model"))
-        })
-        .map(|v| val_to_str(Some(v)).trim().to_ascii_lowercase())
-        .unwrap_or_default();
-    if is_simplify_worker_identity(&low, &mdl, "") {
-        return false;
-    }
-    mdl == OPUS_HIGH_MODEL || is_review_worker_name(&low)
-}
-
 pub fn is_review_swarm_worker_with_brief(
     name: &str,
     meta: Option<&Value>,
@@ -7071,47 +5577,10 @@ pub fn is_review_swarm_worker_with_brief(
         })
         .map(|v| val_to_str(Some(v)).trim().to_ascii_lowercase())
         .unwrap_or_default();
-    let low_brief = brief.to_lowercase();
-    if is_simplify_worker_identity(&low, &mdl, &low_brief) {
-        return false;
-    }
     if mdl == OPUS_HIGH_MODEL || is_review_worker_name(&low) {
         return true;
     }
     !brief.trim().is_empty() && is_review_worker_hint(name, brief)
-}
-
-pub fn is_simplify_or_review_swarm_worker(name: &str, meta: Option<&Value>) -> bool {
-    let low = name.trim().to_ascii_lowercase();
-    if is_simplify_worker_name(&low) || !simplify_lens_from_worker_name(&low).is_empty() {
-        return true;
-    }
-    let mdl = meta
-        .and_then(|m| {
-            m.get("model")
-                .or_else(|| m.get("applied_model"))
-                .or_else(|| m.get("desired_model"))
-        })
-        .map(|v| val_to_str(Some(v)).trim().to_ascii_lowercase())
-        .unwrap_or_default();
-    mdl == OPUS_HIGH_MODEL || mdl == SONNET_HIGH_MODEL || is_review_worker_name(&low)
-}
-
-pub fn is_simplify_or_review_swarm_worker_with_brief(
-    name: &str,
-    meta: Option<&Value>,
-    brief: &str,
-) -> bool {
-    if is_simplify_or_review_swarm_worker(name, meta) {
-        return true;
-    }
-    if brief.trim().is_empty() {
-        return false;
-    }
-    let low = brief.to_lowercase();
-    is_review_worker_hint(name, brief)
-        || low.contains("simplify_lens:")
-        || low.contains("simplify_verdict:")
 }
 
 pub fn extract_worker_scoped_brief(
@@ -7537,11 +6006,6 @@ pub fn extract_worker_scoped_brief(
     out
 }
 
-pub fn active_simplify_or_review_workers(brain_root: &Path, session: &str) -> Vec<String> {
-    let members = rio::load_swarm_members(brain_root, session);
-    active_simplify_or_review_workers_with_members(brain_root, session, &members)
-}
-
 pub fn active_review_workers(brain_root: &Path, session: &str) -> Vec<String> {
     let members = rio::load_swarm_members(brain_root, session);
     active_review_workers_with_members(brain_root, session, &members)
@@ -7696,171 +6160,17 @@ pub fn iso_ts_is_coarse(raw: &str) -> bool {
         .is_some_and(|(_, frac)| frac.bytes().next().is_some_and(|b| b.is_ascii_digit()))
 }
 
-// INVARIANT: `board.jsonl` is append-only in `seq` order, so an exact later timestamp (`!raw_coarse`)
-// at or after previous lower bounds (`raw_ts >= *running_lb - TS_EPS`) tightens an earlier coarse
-// same-second upper bound without under-estimating under backward clock skew, while a later coarse
-// row retains its full upper bound (`max(*running_ub, raw_ub)`).
-pub fn advance_monotonic_ub(
-    raw_ts: f64,
-    raw_coarse: bool,
-    raw_ub: f64,
-    running_lb: &mut f64,
-    running_ub: &mut f64,
-) -> f64 {
-    if raw_ts <= 0.0 {
-        return 0.0;
-    }
-    if !raw_coarse && raw_ts >= *running_lb - TS_EPS {
-        *running_ub = raw_ub;
-    } else {
-        *running_ub = running_ub.max(raw_ub);
-    }
-    if raw_ts > *running_lb {
-        *running_lb = raw_ts;
-    }
-    *running_ub
-}
-
-pub fn advance_monotonic_board_ub(
-    raw_ts: f64,
-    raw_coarse: bool,
-    running_lb: &mut f64,
-    running_ub: &mut f64,
-) -> f64 {
-    advance_monotonic_ub(
-        raw_ts,
-        raw_coarse,
-        coarse_ts_upper_bound(raw_ts, raw_coarse),
-        running_lb,
-        running_ub,
-    )
-}
-
-// INVARIANT: Because `board.jsonl` is strictly append-only in `seq` order, any sequenced row
-// whose monotonic publication upper bound satisfies `pub_ord_ub <= rr_ts` proves that every row
-// at `s <= seq` was published at or before `reset_ts` (consistent causal prefix cut). Computing
-// `eff_rr_seq` before collecting briefs or attributing messages ensures an earlier coarse row
-// tightened by a later exact pre-reset row is never leaked into a post-reset worker.
-pub fn compute_effective_reset_board_seq<I>(rows: I, rr_seq: i64, rr_ts: f64) -> i64
-where
-    I: IntoIterator<Item = (i64, f64, bool)>,
-{
-    let mut eff_seq = rr_seq.max(0);
-    if rr_ts <= 0.0 {
-        return eff_seq;
-    }
-    let mut ordered: Vec<(i64, f64, bool)> =
-        rows.into_iter().filter(|&(seq, _, _)| seq > 0).collect();
-    ordered.sort_by_key(|&(seq, _, _)| seq);
-    let mut running_lb = 0.0f64;
-    let mut running_ub = 0.0f64;
-    for (seq, pub_ts, pub_coarse) in ordered {
-        let pub_ord_ub =
-            advance_monotonic_board_ub(pub_ts, pub_coarse, &mut running_lb, &mut running_ub);
-        if pub_ord_ub > 0.0 && pub_ord_ub <= rr_ts && seq > eff_seq {
-            eff_seq = seq;
-        }
-    }
-    eff_seq
-}
-
-// INVARIANT: A board row belongs to the pre-reset cycle if EITHER its sequence number is within
-// the precomputed causal prefix cutoff `eff_rr_seq` (`seq <= eff_rr_seq`) OR (for unsequenced
-// rows) its publication upper bound `pub_ord_ub` ended at or before `reset_ts`.
-pub fn is_board_row_before_reset(seq: i64, pub_ord_ub: f64, eff_rr_seq: i64, rr_ts: f64) -> bool {
-    (eff_rr_seq > 0 && seq > 0 && seq <= eff_rr_seq)
-        || (rr_ts > 0.0 && pub_ord_ub > 0.0 && pub_ord_ub <= rr_ts)
-}
-
-fn board_row_time_meta(bp: &Value) -> (f64, bool) {
-    let raw_time = bp.get("time").and_then(|v| v.as_str()).unwrap_or("");
-    let raw_ts = rio::parse_iso_ts(raw_time);
-    (raw_ts, raw_ts > 0.0 && iso_ts_is_coarse(raw_time))
-}
-
-struct BoardResetBoundary {
-    active: bool,
-    eff_rr_seq: i64,
-    rr_ts: f64,
-}
-
-impl BoardResetBoundary {
-    fn row_tuple(bp: &Value, fallback_ord: i64) -> (i64, f64, bool) {
-        let seq = extract_msg_seq(bp, fallback_ord);
-        let (raw_ts, raw_coarse) = board_row_time_meta(bp);
-        (seq, raw_ts, raw_coarse)
-    }
-
-    fn from_rows<I>(rows: I, active: bool, rr_seq: i64, rr_ts: f64) -> Self
-    where
-        I: IntoIterator<Item = (i64, f64, bool)>,
-    {
-        let eff_rr_seq = if !active {
-            0
-        } else if rr_ts <= 0.0 {
-            rr_seq.max(0)
-        } else {
-            compute_effective_reset_board_seq(rows, rr_seq, rr_ts)
-        };
-        Self {
-            active,
-            eff_rr_seq,
-            rr_ts,
-        }
-    }
-
-    fn new(raw_board: &[Value], active: bool, rr_seq: i64, rr_ts: f64) -> Self {
-        Self::from_rows(
-            raw_board
-                .iter()
-                .enumerate()
-                .map(|(bp_idx, bp)| Self::row_tuple(bp, (bp_idx + 1) as i64)),
-            active,
-            rr_seq,
-            rr_ts,
-        )
-    }
-
-    fn is_row_before_reset(&self, bp_idx: usize, bp: &Value) -> bool {
-        self.is_row_before_reset_with_ord((bp_idx + 1) as i64, bp)
-    }
-
-    fn is_row_before_reset_with_ord(&self, fallback_ord: i64, bp: &Value) -> bool {
-        if !self.active {
-            return false;
-        }
-        let seq = extract_msg_seq(bp, fallback_ord);
-        if seq > 0 {
-            return self.eff_rr_seq > 0 && seq <= self.eff_rr_seq;
-        }
-        let pub_ub = if self.rr_ts > 0.0 {
-            let (raw_ts, raw_coarse) = board_row_time_meta(bp);
-            coarse_ts_upper_bound(raw_ts, raw_coarse)
-        } else {
-            0.0
-        };
-        is_board_row_before_reset(seq, pub_ub, self.eff_rr_seq, self.rr_ts)
-    }
-}
-
 pub fn collect_coordinator_board_briefs(
     raw_board: &[Value],
     known_workers: &[&str],
     targets: &[&str],
-    rr_seq: i64,
-    rr_ts: f64,
 ) -> std::collections::HashMap<String, String> {
     let mut out: std::collections::HashMap<String, String> =
         std::collections::HashMap::with_capacity(targets.len());
     if targets.is_empty() || raw_board.is_empty() {
         return out;
     }
-    let has_reset = rr_seq > 0 || rr_ts > 0.0;
-    let reset_boundary = BoardResetBoundary::new(raw_board, has_reset, rr_seq, rr_ts);
-    for (bp_idx, bp) in raw_board.iter().enumerate() {
-        if reset_boundary.is_row_before_reset(bp_idx, bp) {
-            continue;
-        }
+    for bp in raw_board {
         if val_to_str(bp.get("agent")) == "coordinator" {
             let btext = val_to_str(bp.get("text"));
             append_coordinator_board_briefs(&btext, known_workers, targets, &mut out);
@@ -7869,46 +6179,11 @@ pub fn collect_coordinator_board_briefs(
     out
 }
 
-pub fn active_simplify_or_review_workers_with_members(
-    brain_root: &Path,
-    session: &str,
-    members: &Map<String, Value>,
-) -> Vec<String> {
-    active_simplify_or_review_workers_with_members_inner(brain_root, session, members, None, true)
-}
-
 pub fn active_review_workers_with_members(
     brain_root: &Path,
     session: &str,
     members: &Map<String, Value>,
 ) -> Vec<String> {
-    active_simplify_or_review_workers_with_members_inner(brain_root, session, members, None, false)
-}
-
-#[cfg(test)]
-fn active_simplify_or_review_workers_with_members_and_marker(
-    brain_root: &Path,
-    session: &str,
-    members: &Map<String, Value>,
-    marker: Option<&Value>,
-) -> Vec<String> {
-    active_simplify_or_review_workers_with_members_inner(brain_root, session, members, Some(marker), true)
-}
-
-fn active_simplify_or_review_workers_with_members_inner(
-    brain_root: &Path,
-    session: &str,
-    members: &Map<String, Value>,
-    marker_override: Option<Option<&Value>>,
-    include_simplify: bool,
-) -> Vec<String> {
-    let worker_matches = |name: &str, meta: Option<&Value>, brief: &str| -> bool {
-        if include_simplify {
-            is_simplify_or_review_swarm_worker_with_brief(name, meta, brief)
-        } else {
-            is_review_swarm_worker_with_brief(name, meta, brief)
-        }
-    };
     let known_workers = rio::swarm_worker_names(members);
     let mut alive: Vec<String> = Vec::new();
     let mut candidates: Vec<(&str, &Value)> = Vec::new();
@@ -7920,37 +6195,18 @@ fn active_simplify_or_review_workers_with_members_inner(
             continue;
         }
         let meta_brief = val_to_str(meta.get("brief"));
-        if worker_matches(name, Some(meta), &meta_brief) {
+        if is_review_swarm_worker_with_brief(name, Some(meta), &meta_brief) {
             alive.push(name.clone());
         } else {
             candidates.push((name.as_str(), meta));
         }
     }
     if !candidates.is_empty() {
-        let loaded_marker = if marker_override.is_none() {
-            read_active_marker_with_pending(session)
-        } else {
-            None
-        };
-        let marker = match marker_override {
-            Some(m) => m,
-            None => loaded_marker.as_ref(),
-        };
-        let rr_ts = marker.map_or(0.0, last_research_reset_ts);
-        let rr_seq = marker.map_or(0, last_research_reset_board_seq);
-        let has_reset = rr_ts > 0.0 || rr_seq > 0;
         let total_cands = candidates.len();
         let mut flagged = vec![false; total_cands];
         let mut flagged_count = 0usize;
-
-        let check_row = |orig_ord: i64,
-                         bp: &Value,
-                         boundary: &BoardResetBoundary,
-                         is_pre_reset: &[bool],
-                         flagged: &mut [bool],
-                         flagged_count: &mut usize|
-         -> bool {
-            let row_before_reset = boundary.is_row_before_reset_with_ord(orig_ord, bp);
+        // INVARIANT: Scan `board.jsonl` in a single O(1)-memory streaming pass with early exit once every live candidate is classified.
+        for_each_swarm_board_row(brain_root, session, |_orig_ord, bp| {
             let poster = val_to_str(bp.get("agent"));
             let btext = val_to_str(bp.get("text"));
             if btext.trim().is_empty() {
@@ -7960,173 +6216,31 @@ fn active_simplify_or_review_workers_with_members_inner(
                 let mentions_all = rio::text_contains_mention(&btext, "all");
                 for (c_idx, &(cname, cmeta)) in candidates.iter().enumerate() {
                     if flagged[c_idx]
-                        || (row_before_reset && !is_pre_reset[c_idx])
                         || (!mentions_all && !rio::text_mentions_swarm_worker(&btext, cname))
                     {
                         continue;
                     }
                     let scoped = extract_worker_scoped_brief(&btext, cname, &known_workers);
                     if !scoped.is_empty()
-                        && worker_matches(cname, Some(cmeta), &scoped)
+                        && is_review_swarm_worker_with_brief(cname, Some(cmeta), &scoped)
                     {
                         flagged[c_idx] = true;
-                        *flagged_count += 1;
+                        flagged_count += 1;
                     }
                 }
             } else {
-                for (c_idx, &(cname, cmeta)) in candidates.iter().enumerate() {
-                    if flagged[c_idx] || (row_before_reset && !is_pre_reset[c_idx]) {
+                for (c_idx, &(cname, _cmeta)) in candidates.iter().enumerate() {
+                    if flagged[c_idx] {
                         continue;
                     }
-                    let is_simp_name = is_simplify_worker_identity(
-                        &cname.trim().to_ascii_lowercase(),
-                        &cmeta
-                            .get("model")
-                            .or_else(|| cmeta.get("applied_model"))
-                            .or_else(|| cmeta.get("desired_model"))
-                            .map(|v| val_to_str(Some(v)).trim().to_ascii_lowercase())
-                            .unwrap_or_default(),
-                        "",
-                    );
-                    if poster == cname
-                        && ((!is_simp_name && extract_review_decision(&btext).0.is_some())
-                            || (include_simplify
-                                && !val_to_str(parse_simplify_verdict(&btext, None).get("verdict"))
-                                    .is_empty()))
-                    {
+                    if poster == cname && extract_review_decision(&btext).0.is_some() {
                         flagged[c_idx] = true;
-                        *flagged_count += 1;
+                        flagged_count += 1;
                     }
                 }
             }
-            *flagged_count < total_cands
-        };
-
-        if !has_reset {
-            // INVARIANT: Without an active research-reset boundary, scan `board.jsonl` in a single
-            // O(1)-memory streaming pass with early exit once every live candidate is classified.
-            let inactive = BoardResetBoundary {
-                active: false,
-                eff_rr_seq: 0,
-                rr_ts: 0.0,
-            };
-            let no_pre = vec![false; total_cands];
-            for_each_swarm_board_row(brain_root, session, |orig_ord, bp| {
-                check_row(
-                    orig_ord,
-                    &bp,
-                    &inactive,
-                    &no_pre,
-                    &mut flagged,
-                    &mut flagged_count,
-                )
-            });
-        } else {
-            // INVARIANT: With an active research-reset boundary, stream the bounded tail while
-            // preserving each live candidate's earliest assigner row and full-board causal reset
-            // timestamps; if the board exceeded `SWARM_BOARD_TAIL_LIMIT`, stream all rows so a live
-            // Neon reviewer whose brief/verdict scrolled past 400 rows is never missed.
-            let mut all_reset_rows: Vec<(i64, f64, bool)> = Vec::new();
-            let mut first_assign_rows: Vec<Option<Value>> = vec![None; total_cands];
-            let mut first_assign_found = 0usize;
-            let cand_added_by: Vec<(&str, &str)> = candidates
-                .iter()
-                .map(|&(cname, cmeta)| {
-                    let added = cmeta
-                        .get("added_by")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .trim();
-                    (cname, added)
-                })
-                .collect();
-
-            let (raw_board, total_rows) =
-                stream_swarm_board_tail(brain_root, session, |valid_ord, val| {
-                    if rr_ts > 0.0 {
-                        all_reset_rows.push(BoardResetBoundary::row_tuple(val, valid_ord));
-                    }
-                    if first_assign_found < total_cands {
-                        let poster = val_to_str(val.get("agent"));
-                        let btext = val_to_str(val.get("text"));
-                        if !btext.trim().is_empty() {
-                            for (c_idx, &(cname, added_by)) in cand_added_by.iter().enumerate() {
-                                if first_assign_rows[c_idx].is_some() {
-                                    continue;
-                                }
-                                let is_assigner = poster.eq_ignore_ascii_case("coordinator")
-                                    || (!added_by.is_empty() && poster == added_by);
-                                if is_assigner && rio::text_mentions_swarm_worker(&btext, cname) {
-                                    let mut cloned = val.clone();
-                                    stamp_board_row_seq(valid_ord, &mut cloned);
-                                    first_assign_rows[c_idx] = Some(cloned);
-                                    first_assign_found += 1;
-                                }
-                            }
-                        }
-                    }
-                });
-
-            if total_rows == 0 {
-                alive.sort();
-                return alive;
-            }
-            let was_truncated = (total_rows as usize) > raw_board.len();
-            let mut is_pre_reset = vec![false; total_cands];
-            let mut pre_reset_count = 0usize;
-            for (c_idx, &(cname, cmeta)) in candidates.iter().enumerate() {
-                let probe_board: &[Value] = if was_truncated {
-                    first_assign_rows[c_idx]
-                        .as_ref()
-                        .map_or(raw_board.as_slice(), std::slice::from_ref)
-                } else {
-                    raw_board.as_slice()
-                };
-                if is_worker_spawned_before_reset(
-                    cname,
-                    Some(cmeta),
-                    probe_board,
-                    rr_ts,
-                    rr_seq,
-                    marker,
-                    Some(brain_root),
-                ) {
-                    is_pre_reset[c_idx] = true;
-                    pre_reset_count += 1;
-                }
-            }
-            let reset_boundary = BoardResetBoundary::from_rows(
-                all_reset_rows,
-                pre_reset_count < total_cands,
-                rr_seq,
-                rr_ts,
-            );
-            if was_truncated {
-                for_each_swarm_board_row(brain_root, session, |orig_ord, bp| {
-                    check_row(
-                        orig_ord,
-                        &bp,
-                        &reset_boundary,
-                        &is_pre_reset,
-                        &mut flagged,
-                        &mut flagged_count,
-                    )
-                });
-            } else {
-                for (bp_idx, bp) in raw_board.iter().enumerate() {
-                    if !check_row(
-                        (bp_idx + 1) as i64,
-                        bp,
-                        &reset_boundary,
-                        &is_pre_reset,
-                        &mut flagged,
-                        &mut flagged_count,
-                    ) {
-                        break;
-                    }
-                }
-            }
-        }
+            flagged_count < total_cands
+        });
         for (c_idx, (cname, _)) in candidates.into_iter().enumerate() {
             if flagged[c_idx] {
                 alive.push(cname.to_string());
@@ -8158,112 +6272,12 @@ mod tests {
         let _ = codex_cli_wrapper_re();
         let _ = swarm_mention_line_re();
         let _ = json_array_start_re();
-        let _ = simplify_template_pair_re();
-        let _ = simplify_verdict_core_re();
-        let _ = simplify_lens_core_re();
-        let _ = simplify_combined_lens_core_re();
-        let _ = simplify_alt_tail_re();
         let _ = review_tier_xhigh_re();
-        let _ = diff_hash_re();
         let _ = flash_model_re();
-        let _ = compact_simplify_worker_re();
 
-        assert_eq!(extract_diff_hash("DIFF_HASH: abc_123:def"), "abc_123:def");
         assert!(is_flash_model("gemini-3-flash-lite"));
         assert!(!is_flash_model(SONNET_HIGH_MODEL));
         assert!(is_review_tier_xhigh("REVIEW_TIER: XHIGH"));
-        assert!(is_simplify_worker_name("simp-efficie"));
-        assert_eq!(simplify_lens_from_worker_name("simp-efficie"), "efficiency");
-        assert!(is_simplify_worker_name("simp-eff-2"));
-        assert_eq!(simplify_lens_from_worker_name("simp-eff-2"), "efficiency");
-        assert!(is_simplify_worker_name("simp-qual-48e3"));
-        assert_eq!(simplify_lens_from_worker_name("simp-qual-48e3"), "quality");
-        assert!(is_simplify_worker_name("simp-reuse-2"));
-        assert_eq!(simplify_lens_from_worker_name("simp-reuse-2"), "reuse");
-        assert!(is_simplify_subagent_call("custom:research", "simplify-reuse"));
-    }
-
-    #[test]
-    fn test_parse_simplify_verdict_and_template_filtering() {
-        let template_only = "Reply with SIMPLIFY_LENS: REUSE (or QUALITY / EFFICIENCY) and SIMPLIFY_VERDICT: CLEAN | FINDINGS_REPORTED.";
-        let parsed_tpl = parse_simplify_verdict(template_only, None);
-        assert_eq!(parsed_tpl["verdict"], "");
-        assert_eq!(parsed_tpl["clean"], false);
-
-        let bare_verdict_tpl = "Post VERDICT: CLEAN | ACTIONABLE_FIXES or VERDICT: FINDINGS_REPORTED.";
-        assert_eq!(parse_simplify_verdict(bare_verdict_tpl, None)["verdict"], "");
-
-        let review_verdict = "VERDICT: APPROVED\nNo critical defects.";
-        assert_eq!(parse_simplify_verdict(review_verdict, None)["verdict"], "");
-
-        let bare_actionable = "@coordinator\nSIMPLIFY_LENS: QUALITY\nVERDICT: ACTIONABLE_FIXES\n- simplify branch";
-        let parsed_bare = parse_simplify_verdict(bare_actionable, None);
-        assert_eq!(parsed_bare["verdict"], "ACTIONABLE_FIXES");
-        assert_eq!(parsed_bare["clean"], false);
-        assert_eq!(parsed_bare["lens"], "quality");
-
-        let anom_3e5cd389_eff = "@coordinator [done] SIMPLIFY_LENS: EFFICIENCY findings:\n1. `antigravity-tunnels.ps1:51-77` — Serial startup & polling.";
-        let parsed_eff = parse_simplify_verdict(anom_3e5cd389_eff, None);
-        assert_eq!(parsed_eff["verdict"], "FINDINGS_REPORTED");
-        assert_eq!(parsed_eff["clean"], false);
-        assert_eq!(parsed_eff["lens"], "efficiency");
-        assert_eq!(parse_simplify_window_spans(anom_3e5cd389_eff).0.len(), 1);
-
-        let anom_3e5cd389_reuse = "@coordinator [done] SIMPLIFY_LENS: REUSE findings:\n1. `antigravity-tunnels.ps1:17-33` — 7 base SSH flags copy-pasted.";
-        let parsed_reuse = parse_simplify_verdict(anom_3e5cd389_reuse, None);
-        assert_eq!(parsed_reuse["verdict"], "FINDINGS_REPORTED");
-        assert_eq!(parsed_reuse["clean"], false);
-        assert_eq!(parsed_reuse["lens"], "reuse");
-
-        let anom_3e5cd389_qual = "@coordinator [done] Quality review findings:\n- `mcp_config.json` (L255-390): valid JSON.\n- `antigravity-tunnels.ps1:80-85` [HIGH]: check PID.";
-        let parsed_qual = parse_simplify_verdict(anom_3e5cd389_qual, Some("quality"));
-        assert_eq!(parsed_qual["verdict"], "FINDINGS_REPORTED");
-        assert_eq!(parsed_qual["clean"], false);
-        assert_eq!(parsed_qual["lens"], "quality");
-        assert_eq!(parse_simplify_window_spans(anom_3e5cd389_qual).0.len(), 1);
-
-        let clean_then_prose = parse_simplify_window_spans_messages(&[
-            "SIMPLIFY_LENS: QUALITY\nSIMPLIFY_VERDICT: CLEAN",
-            anom_3e5cd389_qual,
-        ]);
-        assert_eq!(clean_then_prose.0.len(), 2);
-        assert!(clean_then_prose.0[0].2);
-        assert!(!clean_then_prose.0[1].2);
-
-        let brief_prose_only = "Please post @coordinator [done] Quality review findings:\n- Do not skip checks.";
-        assert_eq!(parse_simplify_verdict(brief_prose_only, Some("quality"))["verdict"], "");
-
-        let real_msg = "Checked diff.\n__SIMPLIFY_LENS: EFFICIENCY__\n**SIMPLIFY_VERDICT: CLEAN** // ok";
-        let parsed_real = parse_simplify_verdict(real_msg, None);
-        assert_eq!(parsed_real["verdict"], "CLEAN");
-        assert_eq!(parsed_real["clean"], true);
-        assert_eq!(parsed_real["lens"], "efficiency");
-        assert_eq!(parsed_real["explicit_lenses"], json!(["efficiency"]));
-
-        let combined = "SIMPLIFY_LENS: ALL\nSIMPLIFY_VERDICT: ACTIONABLE_FIXES";
-        let parsed_all = parse_simplify_verdict(combined, None);
-        assert_eq!(parsed_all["has_explicit_all"], true);
-        assert_eq!(parsed_all["lens"], "all");
-        assert_eq!(parsed_all["verdict"], "ACTIONABLE_FIXES");
-
-        let pair_msg = "Format: SIMPLIFY_VERDICT: CLEAN or SIMPLIFY_VERDICT: FINDINGS_REPORTED\nActual:\nSIMPLIFY_VERDICT: CLEAN";
-        let parsed_pair = parse_simplify_verdict(pair_msg, Some("reuse"));
-        assert_eq!(parsed_pair["verdict"], "CLEAN");
-        assert_eq!(parsed_pair["lens"], "reuse");
-
-        let anom_d6ceeff0 = "@coordinator\nAll flags and tokens (`DIFF_HASH: <current_diff_hash>`, `VERDICT: APPROVED`, `SIMPLIFY_LENS: ALL`, `CLOSURE_VALIDATION: READY|BLOCKED`) are consistent.\nDIFF_HASH: 061484edee70341e\nSIMPLIFY_LENS: REUSE\nSIMPLIFY_VERDICT: CLEAN";
-        let parsed_anom = parse_simplify_verdict(anom_d6ceeff0, None);
-        assert_eq!(parsed_anom["lens"], "reuse");
-        assert_eq!(parsed_anom["has_explicit_all"], false);
-        assert_eq!(parsed_anom["combined"], false);
-        assert_eq!(parsed_anom["clean"], true);
-        assert_eq!(extract_diff_hash(anom_d6ceeff0), "061484edee70341e");
-
-        let ru_prose = "Проверьте SIMPLIFY_VERDICT: CLEAN и `SIMPLIFY_LENS: ALL` в строке.\nSIMPLIFY_LENS: QUALITY\nSIMPLIFY_VERDICT: CLEAN";
-        let parsed_ru = parse_simplify_verdict(ru_prose, None);
-        assert_eq!(parsed_ru["lens"], "quality");
-        assert_eq!(parsed_ru["has_explicit_all"], false);
-        assert_eq!(parsed_ru["clean"], true);
     }
 
     #[test]
@@ -8306,21 +6320,22 @@ mod tests {
         assert!(globs_may_overlap("src/**/*.rs", "src/hooks/*.rs", None));
         assert!(!globs_may_overlap("src/hooks/*.rs", "tests/*.rs", None));
         assert!(glob_matches_path("rust/src/**", "rust/src/cwg_common.rs"));
-        assert!(is_ephemeral_path(
-            "c:/repo/worktree/.mcp.json.tokenade-original"
+        assert!(is_scratch_or_ephemeral(
+            "c:/repo/worktree/.mcp.json.tokenade-original",
+            "",
+            &[],
+            "",
         ));
-        assert!(!is_ephemeral_path("c:/repo/worktree/.mcp.json"));
+        assert!(!is_scratch_or_ephemeral(
+            "c:/repo/worktree/.mcp.json",
+            "",
+            &[],
+            "",
+        ));
     }
 
     #[test]
     fn test_neon_model_constants_and_receipt_routing() {
-        assert_eq!(SIMPLIFY_FALLBACK_MODEL, NEON_XHIGH_MODEL);
-        assert!(SIMPLIFY_FALLBACK_MODELS.contains(&NEON_XHIGH_MODEL));
-        assert!(SIMPLIFY_FALLBACK_MODELS.contains(&HYDROGEN_XHIGH_MODEL));
-        assert!(is_simplify_allowed_model(SONNET_HIGH_MODEL));
-        assert!(is_simplify_allowed_model(NEON_XHIGH_MODEL));
-        assert!(is_simplify_allowed_model(HYDROGEN_XHIGH_MODEL));
-        assert!(!is_simplify_allowed_model(CARBON_HIGH_MODEL));
         assert!(!is_review_worker_hint(
             "root-cause-debugger",
             "Investigate race. NEVER post VERDICT:/CLOSURE_VALIDATION:."
@@ -8346,12 +6361,12 @@ mod tests {
         )));
 
         let neon_meta = json!({"role": "worker", "model": NEON_XHIGH_MODEL, "killed": false});
-        assert!(is_simplify_or_review_swarm_worker_with_brief(
+        assert!(is_review_swarm_worker_with_brief(
             "neon-audit",
             Some(&neon_meta),
             "Reply VERDICT: APPROVED"
         ));
-        assert!(!is_simplify_or_review_swarm_worker_with_brief(
+        assert!(!is_review_swarm_worker_with_brief(
             "neon-builder",
             Some(&neon_meta),
             "Do not emit VERDICT:"
@@ -8596,21 +6611,6 @@ mod tests {
         assert!(iso_ts_is_coarse("1.760000000e9"));
         assert!(!iso_ts_is_coarse("2026-11-19T10:00:06.300Z"));
         assert!(iso_ts_is_coarse("2026-11-19T10:00:06Z"));
-        assert_eq!(
-            compute_effective_reset_board_seq(
-                [
-                    (6, rio::parse_iso_ts("1760000000"), iso_ts_is_coarse("1760000000")),
-                    (
-                        7,
-                        rio::parse_iso_ts("1.7600000000000005e9"),
-                        iso_ts_is_coarse("1.7600000000000005e9"),
-                    ),
-                ],
-                5,
-                1760000000.500,
-            ),
-            7
-        );
 
         let root = std::env::temp_dir().join(format!("cwg-common-neon-audit-{}", std::process::id()));
         let sess = "sess-neon-audit";
@@ -8645,108 +6645,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            active_simplify_or_review_workers(&root, sess),
+            active_review_workers(&root, sess),
             vec!["neon-audit".to_string(), "neon-trailing".to_string()]
-        );
-
-        // Post-research-reset worker reusing roster name `neon-audit` as a builder must NOT inherit
-        // pre-reset reviewer board briefs/verdicts, while an unkilled pre-reset reviewer IS still caught.
-        let rr_ts = rio::parse_iso_ts("2026-11-19T20:25:30Z");
-        let rr_marker = json!({
-            "closed": false,
-            "research_resets": [{
-                "reset_ts": rr_ts,
-                "board_head_seq": 5,
-                "pre_reset_worker_cids": ["cid-pre-rev"]
-            }]
-        });
-        let sess_rr = "sess-neon-audit-rr";
-        let sdir_rr = rio::swarm_dir(&root, sess_rr);
-        std::fs::create_dir_all(&sdir_rr).unwrap();
-        let rr_members_val = json!({
-            "neon-audit": {
-                "role": "worker",
-                "conversation_id": "cid-post-builder",
-                "model": NEON_XHIGH_MODEL,
-                "created_at": "2026-11-19T20:25:45Z",
-                "killed": false
-            },
-            "stale-pre-rev": {
-                "role": "worker",
-                "conversation_id": "cid-pre-rev",
-                "model": NEON_XHIGH_MODEL,
-                "killed": false
-            }
-        });
-        std::fs::write(
-            sdir_rr.join("board.jsonl"),
-            [
-                json!({"seq": 1, "agent": "coordinator", "time": "2026-11-19T20:25:00Z", "text": "@neon-audit Return VERDICT: APPROVED\n@stale-pre-rev Return VERDICT: APPROVED"}),
-                json!({"seq": 2, "agent": "neon-audit", "time": "2026-11-19T20:25:10Z", "text": "VERDICT: APPROVED"}),
-                json!({"seq": 6, "agent": "coordinator", "time": "2026-11-19T20:25:50Z", "text": "@neon-audit Implement parser module"}),
-            ]
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join("\n")
-                + "\n",
-        )
-        .unwrap();
-        assert_eq!(
-            active_simplify_or_review_workers_with_members_and_marker(
-                &root,
-                sess_rr,
-                rr_members_val.as_object().unwrap(),
-                Some(&rr_marker),
-            ),
-            vec!["stale-pre-rev".to_string()]
-        );
-
-        // Coarse pre-reset row seq=6 (`20:25:30Z`) tightened by later exact pre-reset row seq=7 (`20:25:30.300Z <= 20:25:30.500Z`)
-        // must be excluded as part of the pre-reset causal prefix so post-reset builder `neon-audit` is NOT flagged.
-        let rr_half_ts = rio::parse_iso_ts("2026-11-19T20:25:30.500Z");
-        let rr_half_marker = json!({
-            "closed": false,
-            "research_resets": [{
-                "reset_ts": rr_half_ts,
-                "board_head_seq": 5,
-                "pre_reset_worker_cids": ["cid-pre-rev"]
-            }]
-        });
-        let sess_rr_prefix = "sess-neon-audit-rr-prefix";
-        let sdir_rr_p = rio::swarm_dir(&root, sess_rr_prefix);
-        std::fs::create_dir_all(&sdir_rr_p).unwrap();
-        let rr_prefix_members = json!({
-            "neon-audit": {
-                "role": "worker",
-                "conversation_id": "cid-post-builder-prefix",
-                "model": NEON_XHIGH_MODEL,
-                "created_at": "2026-11-19T20:25:30.600Z",
-                "killed": false
-            }
-        });
-        std::fs::write(
-            sdir_rr_p.join("board.jsonl"),
-            [
-                json!({"seq": 6, "agent": "coordinator", "time": "2026-11-19T20:25:30Z", "text": "@neon-audit Return VERDICT: APPROVED"}),
-                json!({"seq": 7, "agent": "coordinator", "time": "2026-11-19T20:25:30.300Z", "text": "@other-worker sync"}),
-                json!({"seq": 8, "agent": "coordinator", "time": "2026-11-19T20:25:30Z", "text": "@neon-audit Implement parser module"}),
-            ]
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join("\n")
-                + "\n",
-        )
-        .unwrap();
-        assert!(
-            active_simplify_or_review_workers_with_members_and_marker(
-                &root,
-                sess_rr_prefix,
-                rr_prefix_members.as_object().unwrap(),
-                Some(&rr_half_marker),
-            )
-            .is_empty()
         );
 
         // Split two-message review revoker helper coverage (prose, closure, split JSON, and non-crossing guard).
@@ -8930,47 +6830,20 @@ mod tests {
             }
         });
         assert_eq!(
-            active_simplify_or_review_workers_with_members_and_marker(
+            active_review_workers_with_members(
                 &root,
                 sess_long,
                 long_live_members.as_object().unwrap(),
-                None,
             ),
             vec!["neon-audit".to_string()]
-        );
-        let long_rr_marker = json!({
-            "closed": false,
-            "research_resets": [{
-                "reset_ts": rio::parse_iso_ts("2026-11-19T20:20:00Z"),
-                "board_head_seq": 20,
-                "pre_reset_worker_cids": ["cid-old-long"]
-            }]
-        });
-        let long_post_builder = json!({
-            "neon-audit": {
-                "role": "worker",
-                "conversation_id": "cid-new-long-builder",
-                "model": NEON_XHIGH_MODEL,
-                "created_at": "2026-11-19T20:25:00Z",
-                "killed": false
-            }
-        });
-        assert!(
-            active_simplify_or_review_workers_with_members_and_marker(
-                &root,
-                sess_long,
-                long_post_builder.as_object().unwrap(),
-                Some(&long_rr_marker),
-            )
-            .is_empty()
         );
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn test_verified_research_reset_state_prefix_gap_and_window_stream() {
+    fn test_find_research_evidence_since_async_and_window_status() {
         let tmp = std::env::temp_dir().join(format!(
-            "cwg-rr-gap-{}-{}",
+            "cwg-res-win-{}-{}",
             std::process::id(),
             (now_sec() * 1000.0) as u64
         ));
@@ -8984,296 +6857,31 @@ mod tests {
         let rst2 = rio::parse_iso_ts("2026-11-20T01:02:00Z");
 
         let compact_lines = [
-            json!({
-                "step_index": 0,
-                "source": "SYSTEM_SDK",
-                "type": "SYSTEM_MESSAGE",
-                "created_at": "2026-11-17T06:00:00Z",
-                "content": "init"
-            }),
-            json!({
-                "step_index": 100,
-                "source": "MODEL",
-                "type": "PLANNER_RESPONSE",
-                "status": "DONE",
-                "created_at": "2026-11-18T10:01:00Z",
-                "truncated_fields": ["tool_calls"],
-                "tool_calls": []
-            }),
-            json!({
-                "step_index": 101,
-                "source": "MODEL",
-                "type": "GENERIC",
-                "status": "DONE",
-                "created_at": "2026-11-18T10:01:05Z",
-                "content": "ok"
-            }),
-            json!({
-                "step_index": 5000,
-                "source": "MODEL",
-                "type": "PLANNER_RESPONSE",
-                "status": "DONE",
-                "created_at": "2026-11-20T01:01:00Z",
-                "tool_calls": [{"name": "search_web", "args": {"query": "\"rust\"wal"}}]
-            }),
-            json!({
-                "step_index": 5001,
-                "source": "MODEL",
-                "type": "GENERIC",
-                "status": "DONE",
-                "created_at": "2026-11-20T01:01:05Z",
-                "content": "ok"
-            }),
+            json!({"step_index": 0, "source": "SYSTEM_SDK", "type": "SYSTEM_MESSAGE", "created_at": "2026-11-17T06:00:00Z", "content": "init"}),
+            json!({"step_index": 100, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-18T10:01:00Z", "truncated_fields": ["tool_calls"], "tool_calls": []}),
+            json!({"step_index": 101, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": "2026-11-18T10:01:05Z", "content": "ok"}),
         ];
         let full_lines = [
             compact_lines[0].clone(),
-            json!({
-                "step_index": 100,
-                "source": "MODEL",
-                "type": "PLANNER_RESPONSE",
-                "status": "DONE",
-                "created_at": "2026-11-18T10:01:00Z",
-                "tool_calls": [{"name": "search_web", "args": {"query": "atomic swap"}}]
-            }),
+            json!({"step_index": 100, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-18T10:01:00Z", "tool_calls": [{"name": "search_web", "args": {"query": "atomic swap"}}]}),
             compact_lines[2].clone(),
-            json!({
-                "step_index": 5000,
-                "source": "MODEL",
-                "type": "PLANNER_RESPONSE",
-                "status": "DONE",
-                "created_at": "2026-11-20T01:01:00Z",
-                "tool_calls": [{"name": "search_web", "args": {"query": "rust wal"}}]
-            }),
-            compact_lines[4].clone(),
         ];
-
         let compact_p = logs_dir.join("transcript.jsonl");
         let full_p = logs_dir.join("transcript_full.jsonl");
         fs::write(
             &compact_p,
-            compact_lines
-                .iter()
-                .map(Value::to_string)
-                .collect::<Vec<_>>()
-                .join("\n")
-                + "\n",
+            compact_lines.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n",
         )
         .unwrap();
         fs::write(
             &full_p,
-            full_lines
-                .iter()
-                .map(Value::to_string)
-                .collect::<Vec<_>>()
-                .join("\n")
-                + "\n",
+            full_lines.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n",
         )
         .unwrap();
-
-        let tail_slice = vec![full_lines[0].clone(), full_lines[3].clone(), full_lines[4].clone()];
-        assert!(rio::has_prefix_slice_gap(&tail_slice));
-
-        let valid_marker = json!({
-            "research_resets": [
-                {
-                    "decision": "refine",
-                    "findings": "Researched atomic directory swap patterns and POSIX/Win32 journal invariants.",
-                    "last_blocked_ts": blk1,
-                    "reset_ts": rst1,
-                    "board_head_seq": 120,
-                    "research_tools": ["search_web"]
-                },
-                {
-                    "decision": "refine",
-                    "findings": "Researched second cycle state machine idempotency and lock ordering.",
-                    "last_blocked_ts": blk2,
-                    "reset_ts": rst2,
-                    "board_head_seq": 452,
-                    "research_tools": ["search_web"]
-                }
-            ]
-        });
-
-        let (got_ts, got_seq, got_err) = verified_research_reset_state_with_path(
-            &valid_marker,
-            Some(&tail_slice),
-            Some(&compact_p.to_string_lossy()),
+        assert_eq!(
+            research_status_between(None, Some(&compact_p.to_string_lossy()), blk1, rst1),
+            ResearchWindowStatus::Verified
         );
-        assert!(got_err.is_none(), "unexpected error: {:?}", got_err);
-        assert!((got_ts - rst2).abs() < 0.001);
-        assert_eq!(got_seq, 452);
-
-        let forged_marker = json!({
-            "research_resets": [
-                {
-                    "decision": "refine",
-                    "findings": "Forged historical entry in dropped prefix gap with no research call.",
-                    "last_blocked_ts": rio::parse_iso_ts("2026-11-18T14:00:00Z"),
-                    "reset_ts": rio::parse_iso_ts("2026-11-18T14:02:00Z"),
-                    "board_head_seq": 130,
-                    "research_tools": ["search_web"]
-                }
-            ]
-        });
-        let (_, _, forged_err) = verified_research_reset_state_with_path(
-            &forged_marker,
-            Some(&tail_slice),
-            Some(&compact_p.to_string_lossy()),
-        );
-        assert!(
-            forged_err
-                .as_deref()
-                .unwrap_or("")
-                .contains("lacks verified post-BLOCKED"),
-            "forged gap entry must fail closed against transcript file: {:?}",
-            forged_err
-        );
-
-        let missing_tp = tmp.join("nonexistent-dir").join("transcript.jsonl");
-        let (_, _, missing_err) = verified_research_reset_state_with_path(
-            &valid_marker,
-            Some(&tail_slice),
-            Some(&missing_tp.to_string_lossy()),
-        );
-        assert!(
-            missing_err
-                .as_deref()
-                .unwrap_or("")
-                .contains("failed to read full transcript"),
-            "missing transcript file on gapped slice must fail closed: {:?}",
-            missing_err
-        );
-        let (_, _, none_tp_err) =
-            verified_research_reset_state_with_path(&valid_marker, Some(&tail_slice), None);
-        assert!(
-            none_tp_err
-                .as_deref()
-                .unwrap_or("")
-                .contains("failed to read full transcript"),
-            "omitted transcript_path on gapped slice must fail closed: {:?}",
-            none_tp_err
-        );
-
-        let cross_win_dir = tmp.join("cross-win").join(".system_generated").join("logs");
-        fs::create_dir_all(&cross_win_dir).unwrap();
-        let cross_p = cross_win_dir.join("transcript_full.jsonl");
-        let cross_lines = [
-            json!({"step_index": 0, "source": "SYSTEM_SDK", "type": "SYSTEM_MESSAGE", "created_at": "2026-11-17T06:00:00Z"}),
-            json!({"step_index": 48, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-18T08:00:55Z", "tool_calls": [{"name": "search_web", "args": {"query": "win1-valid"}}]}),
-            json!({"step_index": 49, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": "2026-11-18T08:00:56Z", "content": "ok"}),
-            json!({"step_index": 50, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-18T08:01:05Z", "tool_calls": [{"name": "search_web", "args": {"query": "win1-unpaired"}}]}),
-            json!({"step_index": 51, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": "2026-11-18T08:15:00Z", "content": "skipped middle turn"}),
-            json!({"step_index": 200, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-18T11:50:00Z", "tool_calls": [{"name": "read_file", "args": {"Path": "a.rs"}}]}),
-            json!({"step_index": 201, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": "2026-11-18T12:01:05Z", "content": "late generic"}),
-            full_lines[3].clone(),
-            full_lines[4].clone(),
-        ];
-        fs::write(
-            &cross_p,
-            cross_lines
-                .iter()
-                .map(Value::to_string)
-                .collect::<Vec<_>>()
-                .join("\n")
-                + "\n",
-        )
-        .unwrap();
-        let cross_marker = json!({
-            "research_resets": [
-                {
-                    "decision": "refine",
-                    "findings": "Window 1 had failed search_web only before skipped middle lines.",
-                    "last_blocked_ts": rio::parse_iso_ts("2026-11-18T08:00:50Z"),
-                    "reset_ts": rio::parse_iso_ts("2026-11-18T08:01:10Z"),
-                    "board_head_seq": 10,
-                    "research_tools": ["search_web"]
-                },
-                {
-                    "decision": "refine",
-                    "findings": "Window 2 only has an orphaned GENERIC from an earlier read_file outside window.",
-                    "last_blocked_ts": rio::parse_iso_ts("2026-11-18T12:01:00Z"),
-                    "reset_ts": rio::parse_iso_ts("2026-11-18T12:01:20Z"),
-                    "board_head_seq": 20,
-                    "research_tools": ["search_web"]
-                }
-            ]
-        });
-        let (_, _, cross_err) = verified_research_reset_state_with_path(
-            &cross_marker,
-            Some(&tail_slice),
-            Some(&cross_p.to_string_lossy()),
-        );
-        assert!(
-            cross_err
-                .as_deref()
-                .unwrap_or("")
-                .contains("lacks verified post-BLOCKED"),
-            "orphaned GENERIC across skipped lines must never glue to earlier PLANNER_RESPONSE: {:?}",
-            cross_err
-        );
-
-        let lag_dir = tmp.join("lagging-compact").join(".system_generated").join("logs");
-        fs::create_dir_all(&lag_dir).unwrap();
-        let lag_compact = lag_dir.join("transcript.jsonl");
-        let lag_full = lag_dir.join("transcript_full.jsonl");
-        fs::write(&lag_compact, format!("{}\n", full_lines[0])).unwrap();
-        fs::write(
-            &lag_full,
-            full_lines
-                .iter()
-                .map(Value::to_string)
-                .collect::<Vec<_>>()
-                .join("\n")
-                + "\n",
-        )
-        .unwrap();
-        for lag_tp in [&lag_compact, &lag_full] {
-            let (lag_ts, lag_seq, lag_err) = verified_research_reset_state_with_path(
-                &valid_marker,
-                Some(&tail_slice),
-                Some(&lag_tp.to_string_lossy()),
-            );
-            assert!(
-                lag_err.is_none(),
-                "lagging/empty compact transcript.jsonl must fall back to transcript_full.jsonl ({:?}): {:?}",
-                lag_tp,
-                lag_err
-            );
-            assert!((lag_ts - rst2).abs() < 0.001 && lag_seq == 452);
-        }
-
-        let long_span_p = tmp.join("long_span_transcript_full.jsonl");
-        let long_span_lines = [
-            json!({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-18T09:30:00Z", "tool_calls": [
-                {"name": "read_file", "args": {"Path": "src/lib.rs"}},
-                {"name": "invoke_subagent", "args": {"TypeName": "research", "Role": "Deep Spec Researcher", "Prompt": "Verify RFC 6479"}}
-            ]}),
-            json!({"step_index": 2, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": "2026-11-18T09:30:01Z", "content": "file body"}),
-            json!({"step_index": 3, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": "2026-11-18T10:01:02Z", "content": "research completed"}),
-            full_lines[3].clone(),
-            full_lines[4].clone(),
-        ];
-        fs::write(
-            &long_span_p,
-            long_span_lines
-                .iter()
-                .map(Value::to_string)
-                .collect::<Vec<_>>()
-                .join("\n")
-                + "\n",
-        )
-        .unwrap();
-        let (ls_ts, ls_seq, ls_err) = verified_research_reset_state_with_path(
-            &valid_marker,
-            Some(&tail_slice),
-            Some(&long_span_p.to_string_lossy()),
-        );
-        assert!(
-            ls_err.is_none(),
-            "long-running (>300s) research call completing inside post-BLOCKED window must survive window stream: {:?}",
-            ls_err
-        );
-        assert!((ls_ts - rst2).abs() < 0.001 && ls_seq == 452);
 
         // INVARIANT: Async `invoke_subagent` returning `conversationId` and backgrounded `run_command` tasks only count as completed research once their matching `SYSTEM_MESSAGE` completion arrives with zero exit code inside `(since_ts, until_ts]`, even when launched prior to `since_ts`.
         let uncompleted_async_steps = vec![
@@ -9345,10 +6953,12 @@ mod tests {
         assert!(high_summary.contains("APPROVED closes gate"));
         assert!(high_summary.contains("focused research -> fix + re-test -> <=2 `--closure` passes"));
         assert!(!high_summary.contains("simplify once"));
+        assert!(!high_summary.contains("redesign-reset"));
 
         let xhigh_summary = receipt_requirements_summary("XHIGH", None, false);
         assert!(xhigh_summary.contains("primary XHIGH APPROVED review"));
         assert!(!xhigh_summary.contains("simplify once"));
+        assert!(!xhigh_summary.contains("redesign-reset"));
 
         for srv in [
             "exa",

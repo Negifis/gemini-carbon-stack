@@ -17,6 +17,7 @@ use std::os::windows::io::AsRawHandle;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+#[cfg(test)]
 pub static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn now_sec() -> f64 {
@@ -743,7 +744,6 @@ struct SqliteApi {
     bind_blob: unsafe extern "C" fn(SqliteStmt, c_int, *const c_void, c_int, isize) -> c_int,
     bind_int64: unsafe extern "C" fn(SqliteStmt, c_int, i64) -> c_int,
     bind_double: unsafe extern "C" fn(SqliteStmt, c_int, c_double) -> c_int,
-    bind_null: unsafe extern "C" fn(SqliteStmt, c_int) -> c_int,
     errmsg: unsafe extern "C" fn(SqliteDb) -> *const c_char,
     changes: unsafe extern "C" fn(SqliteDb) -> c_int,
 }
@@ -800,7 +800,6 @@ fn bind_sqlite_symbols(
             bind_blob: cast_sym(&resolve, b"sqlite3_bind_blob\0")?,
             bind_int64: cast_sym(&resolve, b"sqlite3_bind_int64\0")?,
             bind_double: cast_sym(&resolve, b"sqlite3_bind_double\0")?,
-            bind_null: cast_sym(&resolve, b"sqlite3_bind_null\0")?,
             errmsg: cast_sym(&resolve, b"sqlite3_errmsg\0")?,
             changes: cast_sym(&resolve, b"sqlite3_changes\0")?,
         })
@@ -959,7 +958,6 @@ pub fn probe_sqlite_runtime() -> Result<(), String> {
 
 #[derive(Debug, Clone)]
 pub enum SqlParam {
-    Null,
     Int(i64),
     Float(f64),
     Text(String),
@@ -1104,7 +1102,6 @@ impl SqliteConn {
             for (idx, param) in params.iter().enumerate() {
                 let pos = (idx + 1) as c_int;
                 let brc = match param {
-                    SqlParam::Null => (self.api.bind_null)(stmt, pos),
                     SqlParam::Int(v) => (self.api.bind_int64)(stmt, pos, *v),
                     SqlParam::Float(v) => (self.api.bind_double)(stmt, pos, *v),
                     SqlParam::Text(s) => (self.api.bind_text)(

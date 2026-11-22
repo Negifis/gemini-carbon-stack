@@ -1163,6 +1163,7 @@ fn copy_clean_tree_with_retire(
     prune_stale_tree_entries(src, dst, is_windows, external_retired_dirs)
 }
 
+#[cfg(test)]
 pub fn copy_clean_tree(src: &Path, dst: &Path) -> Result<(), String> {
     copy_clean_tree_for_os(src, dst, cfg!(windows))
 }

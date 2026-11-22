@@ -599,18 +599,6 @@ pub fn rust_fallback_search(root_path: &Path, opts: &SearchOptions, jev_availabl
     })
 }
 
-pub fn text_search(pattern: &str, cwd: &str, limit: usize, fixed: bool, ext: &str) -> Value {
-    let opts = SearchOptions {
-        pattern: pattern.to_string(),
-        cwd: cwd.to_string(),
-        limit,
-        fixed,
-        ext: ext.to_string(),
-        ..SearchOptions::default()
-    };
-    text_search_with_options(&opts)
-}
-
 fn indent_width(indent: &str) -> usize {
     indent
         .chars()

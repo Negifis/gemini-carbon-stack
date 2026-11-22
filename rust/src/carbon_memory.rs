@@ -853,28 +853,6 @@ pub fn recall_entries(
     Ok(rows.iter().map(|r| row_to_memory_json(r)).collect())
 }
 
-pub fn startup_memory_card(cwd: &str, limit: i64) -> String {
-    let Ok(items) = recall_entries("", cwd, limit, false) else {
-        return String::new();
-    };
-    if items.is_empty() {
-        return String::new();
-    }
-    let mut lines = vec!["[Project Memory] Подтверждённые инженерные факты проекта:".to_string()];
-    for item in items {
-        let scope_tag = if item.get("scope").and_then(|v| v.as_str()) == Some("global") {
-            "global"
-        } else {
-            "project"
-        };
-        let cat = item.get("category").and_then(|v| v.as_str()).unwrap_or("");
-        let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        let content = item.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        lines.push(format!("- [{}] ({}, {}) {}", cat, id, scope_tag, content));
-    }
-    lines.join("\n")
-}
-
 pub fn export_notebooklm_bundle(cwd: &str) -> Result<Value, String> {
     let pkey = if cwd.trim().is_empty() {
         String::new()
@@ -1467,10 +1445,6 @@ mod tests {
         let found = recall_entries("win32 job wrapper", &proj_s, 8, false).unwrap();
         assert!(!found.is_empty());
         assert_eq!(found[0]["id"], json!(mem_id));
-
-        let card = startup_memory_card(&proj_s, 5);
-        assert!(card.contains("[Project Memory]"));
-        assert!(card.contains(&mem_id));
 
         let sup = supersede_entry(
             &mem_id,

@@ -265,10 +265,6 @@ pub fn decode_varint(buf: &[u8], pos: usize) -> Result<(u64, usize), String> {
     }
 }
 
-pub fn parse_varint_at(buf: &[u8], pos: usize) -> Result<(u64, usize), String> {
-    decode_varint(buf, pos)
-}
-
 pub fn field_varint(fn_num: u32, value: i64, force: bool) -> Vec<u8> {
     if value == 0 && !force {
         return Vec::new();
@@ -278,6 +274,7 @@ pub fn field_varint(fn_num: u32, value: i64, force: bool) -> Vec<u8> {
     out
 }
 
+#[cfg(test)]
 pub fn field_bool(fn_num: u32, value: bool, force: bool) -> Vec<u8> {
     field_varint(fn_num, if value { 1 } else { 0 }, force)
 }
@@ -553,9 +550,7 @@ pub struct ConversationTurn {
 #[derive(Debug, Clone)]
 pub struct ParsedSession {
     pub project_folder: String,
-    pub filepath: PathBuf,
     pub session_id: String,
-    pub raw_title: Option<String>,
     pub resolved_title: String,
     pub cwd: String,
     pub created_sec: i64,
@@ -563,9 +558,6 @@ pub struct ParsedSession {
     pub last_mod_sec: i64,
     pub last_mod_nanos: i64,
     pub turns: Vec<ConversationTurn>,
-    pub human_user_count: usize,
-    pub assistant_record_count: usize,
-    pub user_uuids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -819,7 +811,6 @@ pub fn parse_claude_session(project_folder: &str, filepath: &Path) -> Option<Par
 
     let mut human_user_count: usize = 0;
     let mut assistant_record_count: usize = 0;
-    let mut user_uuids: Vec<String> = Vec::new();
 
     let mut raw_buf: Vec<u8> = Vec::new();
     loop {
@@ -946,7 +937,6 @@ pub fn parse_claude_session(project_folder: &str, filepath: &Path) -> Option<Par
                     .unwrap_or_else(|| {
                         stable_uuid(&format!("{}:user:{}", session_id, human_user_count))
                     });
-                user_uuids.push(u_uuid.clone());
                 let joined_user = human_texts.join("\n\n");
                 let is_cont = joined_user.starts_with(SYNTHETIC_CONTINUATION_PREFIX);
 
@@ -1110,9 +1100,7 @@ pub fn parse_claude_session(project_folder: &str, filepath: &Path) -> Option<Par
 
     Some(ParsedSession {
         project_folder: project_folder.to_string(),
-        filepath: filepath.to_path_buf(),
         session_id,
-        raw_title,
         resolved_title,
         cwd: resolved_cwd,
         created_sec,
@@ -1120,9 +1108,6 @@ pub fn parse_claude_session(project_folder: &str, filepath: &Path) -> Option<Par
         last_mod_sec,
         last_mod_nanos,
         turns,
-        human_user_count,
-        assistant_record_count,
-        user_uuids,
     })
 }
 

@@ -842,7 +842,8 @@ fn trip_breaker_locked(reason: &str, ttl: i64, explicit_now: Option<f64>) {
     }
 }
 
-pub fn trip_breaker_at(reason: &str, ttl: i64, now: f64) {
+#[cfg(test)]
+fn trip_breaker_at(reason: &str, ttl: i64, now: f64) {
     trip_breaker_locked(reason, ttl, Some(now));
 }
 
@@ -934,6 +935,7 @@ pub fn reset_breaker_for_probe(max_tripped_at: f64, recovery_ts: f64) {
     }
 }
 
+#[cfg(test)]
 pub fn reset_breaker_at(now: f64) {
     reset_breaker_locked(Some((now, now)));
 }
@@ -1390,16 +1392,6 @@ fn match_typed_lane_map(
     }
 }
 
-fn session_last_research_reset_ts(session: &str) -> f64 {
-    if session.is_empty() {
-        return 0.0;
-    }
-    cwg_common::read_marker_with_pending(session)
-        .filter(|m| !json_truthy(m.get("closed")))
-        .map(|m| cwg_common::last_research_reset_ts(&m))
-        .unwrap_or(0.0)
-}
-
 pub fn active_thread_state_for_lane(
     session: &str,
     git_root: &str,
@@ -1429,7 +1421,6 @@ fn active_thread_state_for_lane_with_epoch(
     live_goal_gen: u64,
     live_goal_ts: f64,
 ) -> Option<Map<String, Value>> {
-    let rr_ts = session_last_research_reset_ts(session);
     let req_mdl = if model.trim().is_empty() {
         cwg_common::CODEX_SOL_MODEL
     } else {
@@ -1462,14 +1453,10 @@ fn active_thread_state_for_lane_with_epoch(
             }
             _ => None,
         })
-    }
-    .filter(|m| rr_ts <= 0.0 || val_to_f64(m.get("updated_ts")) >= rr_ts);
+    };
     let Some(def_map) = legacy_def else {
         return typed_hit;
     };
-    if rr_ts > 0.0 && val_to_f64(def_map.get("updated_ts")) < rr_ts {
-        return typed_hit;
-    }
     match classify_legacy_default_from_raw(
         def_map,
         session,
@@ -1495,13 +1482,13 @@ fn active_thread_state_for_lane_with_epoch(
     }
 }
 
-pub fn active_thread_state(
+#[cfg(test)]
+fn active_thread_state(
     session: &str,
     git_root: &str,
     candidate_first_ts_opt: Option<f64>,
 ) -> Option<Map<String, Value>> {
     let cand_ts = candidate_first_ts_opt.unwrap_or_else(|| candidate_first_ts(session));
-    let rr_ts = session_last_research_reset_ts(session);
     let (live_goal_gen, live_goal_ts) = markerless_goal_epoch(git_root, session, cand_ts);
     let now = now_sec();
     let fold_root = rio::fold_path(git_root);
@@ -1524,9 +1511,6 @@ pub fn active_thread_state(
             let Some(Value::Object(saved)) = rio::read_json(&ent_res.path()) else {
                 continue;
             };
-            if rr_ts > 0.0 && val_to_f64(saved.get("updated_ts")) < rr_ts {
-                continue;
-            }
             if is_default && is_legacy_untyped_thread(&saved) {
                 legacy_raw = Some(saved);
                 continue;
@@ -1881,7 +1865,8 @@ fn build_packet_doc(
     })
 }
 
-pub fn record_packet(
+#[cfg(test)]
+fn record_packet(
     review_id: &str,
     prompt_text: &str,
     cwd: &str,
@@ -3374,121 +3359,6 @@ fn unwrap_primary_session_id(sid: &str, since_ts: f64) -> String {
     String::new()
 }
 
-pub fn rollout_session_origin_ts(session_id: &str, rollout_path: &str, since_hint_ts: f64) -> f64 {
-    let probe_file = |p: &Path| -> f64 {
-        let Ok(f) = fs::File::open(p) else {
-            return 0.0;
-        };
-        let reader = BufReader::new(f);
-        for line_res in reader.lines().take(12) {
-            let Ok(line) = line_res else {
-                break;
-            };
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
-                let ts = v
-                    .get("timestamp")
-                    .and_then(|x| x.as_str())
-                    .map(rio::parse_iso_ts)
-                    .unwrap_or(0.0);
-                if ts > 0.0 {
-                    return ts;
-                }
-            }
-        }
-        0.0
-    };
-
-    if !rollout_path.trim().is_empty() {
-        let p = Path::new(rollout_path.trim());
-        if p.is_file() {
-            let ts = probe_file(p);
-            if ts > 0.0 {
-                return ts;
-            }
-        }
-    }
-    let clean_sid = session_id.trim();
-    if clean_sid.is_empty() {
-        return 0.0;
-    }
-    let mut checked: HashSet<PathBuf> = HashSet::new();
-    for rf in recent_rollout_files((since_hint_ts - 86400.0).max(0.0), 80, true) {
-        checked.insert(rf.clone());
-        let meta = read_rollout_session_meta(&rf);
-        let mid = val_to_str(meta.get("id").or_else(|| meta.get("session_id")));
-        if mid.trim() == clean_sid {
-            let ts = probe_file(&rf);
-            if ts > 0.0 {
-                return ts;
-            }
-        }
-    }
-    let root = codex_sessions_dir();
-    if safe_sid_re().is_match(clean_sid) && root.is_dir() {
-        let mut sid_files = Vec::new();
-        collect_jsonl_files_rec(&root, None, Some(clean_sid), 8, &mut sid_files);
-        for rf in sid_files {
-            if checked.contains(&rf) {
-                continue;
-            }
-            let meta = read_rollout_session_meta(&rf);
-            let mid = val_to_str(meta.get("id").or_else(|| meta.get("session_id")));
-            if mid.trim() == clean_sid {
-                let ts = probe_file(&rf);
-                if ts > 0.0 {
-                    return ts;
-                }
-            }
-        }
-    }
-    0.0
-}
-
-pub fn is_post_reset_codex_session_proven(
-    session_id: &str,
-    rollout_path: &str,
-    cutoff_ts: f64,
-    since_hint_ts: f64,
-) -> bool {
-    if cutoff_ts <= 0.0 {
-        return true;
-    }
-    // SAFETY: Fail closed after `research-reset` unless the unwrapped primary Codex session has a verified rollout origin strictly at/after `cutoff_ts`.
-    let clean_raw = session_id.trim();
-    let mut seed_sid = clean_raw.to_string();
-    if !rollout_path.trim().is_empty() {
-        let rp = Path::new(rollout_path.trim());
-        if rp.is_file() {
-            let rp_meta = read_rollout_session_meta(rp);
-            if is_subagent_rollout_meta(&rp_meta) {
-                let parent_sid = extract_subagent_parent_id(&rp_meta);
-                if parent_sid.is_empty() {
-                    return false;
-                }
-                seed_sid = parent_sid;
-            }
-        }
-    }
-    if seed_sid.is_empty() {
-        return false;
-    }
-    let unwrapped = unwrap_primary_session_id(&seed_sid, 0.0);
-    if unwrapped.is_empty() {
-        return false;
-    }
-    let eff_rpath = if !clean_raw.is_empty() && unwrapped == clean_raw {
-        rollout_path
-    } else {
-        ""
-    };
-    let origin = rollout_session_origin_ts(&unwrapped, eff_rpath, since_hint_ts);
-    origin > 0.0 && origin >= cutoff_ts - 0.001
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct ClosureCycleSummary {
     pub live_blocked_count: usize,
@@ -3506,15 +3376,6 @@ pub struct ClosureCycleSummary {
     pub has_post_escalate_research: bool,
     pub legacy_three_round_closure_active: bool,
     pub has_fresh_ordinary_approved: bool,
-    pub needs_simplify: bool,
-    pub simplify_started_in_cycle: bool,
-}
-
-impl ClosureCycleSummary {
-    fn has_redesign_trigger(&self) -> bool {
-        (self.has_round_cap_escalate && self.escalate_verdict_ts > 0.0)
-            || (self.legacy_three_round_closure_active && self.last_blocked_ts > 0.0)
-    }
 }
 
 pub fn active_cycle_closure_summary_for_marker(
@@ -3573,25 +3434,6 @@ pub fn active_cycle_closure_summary(
     transcript_path: &str,
 ) -> ClosureCycleSummary {
     active_cycle_closure_summary_with_risk(session, git_root, transcript_path, "")
-}
-
-pub fn active_cycle_closure_blocks_for_marker(
-    marker: &Value,
-    session: &str,
-    git_root: &str,
-    transcript_path: &str,
-) -> (usize, f64, Vec<String>) {
-    let s = active_cycle_closure_summary_for_marker(marker, session, git_root, transcript_path);
-    (s.blocked_count, s.last_blocked_ts, s.blocked_ids)
-}
-
-pub fn active_cycle_closure_blocks(
-    session: &str,
-    git_root: &str,
-    transcript_path: &str,
-) -> (usize, f64, Vec<String>) {
-    let s = active_cycle_closure_summary(session, git_root, transcript_path);
-    (s.blocked_count, s.last_blocked_ts, s.blocked_ids)
 }
 
 #[derive(Copy, Clone)]
@@ -3850,14 +3692,7 @@ fn resolve_resume_session_with_saved(
     if force_new {
         return String::new();
     }
-    let rr_ts = if !session.is_empty() {
-        cwg_common::read_marker_with_pending(session)
-            .map(|m| cwg_common::last_research_reset_ts(&m))
-            .unwrap_or(0.0)
-    } else {
-        0.0
-    };
-    let min_since_ts = candidate_first_ts.max(rr_ts);
+    let min_since_ts = candidate_first_ts;
     let owned_saved = if preloaded_saved.is_none() {
         active_thread_state_for_lane(session, git_root, Some(candidate_first_ts), model, effort)
     } else {
@@ -3871,11 +3706,6 @@ fn resolve_resume_session_with_saved(
     if !exp.is_empty() {
         let unwrapped = unwrap_primary_session_id(exp, min_since_ts);
         if unwrapped.is_empty() {
-            return String::new();
-        }
-        if rr_ts > 0.0
-            && !is_post_reset_codex_session_proven(&unwrapped, "", rr_ts, candidate_first_ts)
-        {
             return String::new();
         }
         if candidate_first_ts <= 0.0 {
@@ -3897,15 +3727,11 @@ fn resolve_resume_session_with_saved(
         return unwrapped;
     }
     if let Some(saved) = saved_ref {
-        if rr_ts <= 0.0 || val_to_f64(saved.get("updated_ts")) >= rr_ts {
-            let raw_sid = val_to_str(saved.get("session_id"));
-            if !raw_sid.is_empty() {
-                let unwrapped = unwrap_primary_session_id(&raw_sid, min_since_ts);
-                if !unwrapped.is_empty()
-                    && is_post_reset_codex_session_proven(&unwrapped, "", rr_ts, candidate_first_ts)
-                {
-                    return unwrapped;
-                }
+        let raw_sid = val_to_str(saved.get("session_id"));
+        if !raw_sid.is_empty() {
+            let unwrapped = unwrap_primary_session_id(&raw_sid, min_since_ts);
+            if !unwrapped.is_empty() {
+                return unwrapped;
             }
         }
     }
@@ -3919,15 +3745,9 @@ fn resolve_resume_session_with_saved(
                 continue;
             }
             let raw_sid = val_to_str(prev.get("session_id")).trim().to_string();
-            let rpath = val_to_str(prev.get("rollout_path"));
-            if !is_post_reset_codex_session_proven(&raw_sid, &rpath, rr_ts, candidate_first_ts) {
-                continue;
-            }
             if !raw_sid.is_empty() {
                 let sid = unwrap_primary_session_id(&raw_sid, min_since_ts);
-                if !sid.is_empty()
-                    && is_post_reset_codex_session_proven(&sid, "", rr_ts, candidate_first_ts)
-                {
+                if !sid.is_empty() {
                     return sid;
                 }
             }
@@ -4414,7 +4234,6 @@ fn load_active_dispositions(
     session: &str,
     git_root: &str,
     cand_first_ts: f64,
-    research_reset_ts: f64,
     active_thread_sid: &str,
     force_new: bool,
 ) -> Vec<Value> {
@@ -4429,14 +4248,10 @@ fn load_active_dispositions(
         return Vec::new();
     };
     let stored_cts = val_to_f64(obj.get("candidate_first_ts"));
-    let stored_rr = val_to_f64(obj.get("research_reset_ts"));
     let stored_tsid = val_to_str(obj.get("thread_session_id")).trim().to_string();
-    // INVARIANT: Strictly isolate dispositions to `(candidate_first_ts, research_reset_ts)` for open candidates or to `thread_session_id` for markerless reviews; never cross between marker and markerless runs or across `--new-session`.
+    // INVARIANT: Strictly isolate dispositions to `candidate_first_ts` for open candidates or to `thread_session_id` for markerless reviews; never cross between marker and markerless runs or across `--new-session`.
     if cand_first_ts > 0.0 {
-        if stored_cts <= 0.0
-            || (stored_cts - cand_first_ts).abs() > 1.0
-            || (stored_rr - research_reset_ts).abs() > 1.0
-        {
+        if stored_cts <= 0.0 || (stored_cts - cand_first_ts).abs() > 1.0 {
             return Vec::new();
         }
     } else {
@@ -5328,414 +5143,6 @@ fn exec_codex_once(spec: CodexExecSpec<'_>) -> Option<CodexExecResult> {
     })
 }
 
-fn purge_session_lane_threads_unlocked(session: &str, git_root: &str) {
-    let root_dig = session_root_digest(session, git_root);
-    let default_name = format!("{}.json", root_dig);
-    let lane_prefix = format!("{}-", root_dig);
-    if let Ok(entries) = fs::read_dir(threads_dir()) {
-        for ent in entries.flatten() {
-            let fname_os = ent.file_name();
-            let Some(fname) = fname_os.to_str() else {
-                continue;
-            };
-            if fname == default_name || (fname.starts_with(&lane_prefix) && fname.ends_with(".json"))
-            {
-                unlink_quiet(&ent.path());
-            }
-        }
-    }
-}
-
-struct ResearchResetArgs {
-    cwd: String,
-    session: String,
-    decision: String,
-    findings: String,
-    transcript: String,
-    pretty: bool,
-}
-
-fn cmd_research_reset(args: &ResearchResetArgs) -> i32 {
-    // INVARIANT: Allow at most `MAX_REDESIGN_RESETS = 1` finite architectural `REDESIGN` reset per candidate after Round 4 `ESCALATE` + verified post-`ESCALATE` research (clearing saved Codex threads, round counters, and simplify latches so the redesigned architecture starts in fresh reviewer/simplify sessions), while keeping `REMEDIATE` in the current Codex session (`max 2` `--closure` passes) and terminating finitely via `[gate] draft-blocked` when exhausted.
-    let dec = args.decision.trim().to_ascii_lowercase();
-    if !cwg_common::REDESIGN_RESET_DECISIONS.contains(&dec.as_str()) {
-        rio::print_cli_json(
-            &json!({
-                "ok": false,
-                "error": "invalid_decision",
-                "hint": "Only architectural REDESIGN resets rounds and reviewer sessions (--decision redesign|refactor, max 1 per candidate). Targeted REMEDIATE stays in the current Codex session via `carbon-stack codex-lane review --closure` (max 2 passes).",
-            }),
-            args.pretty,
-        );
-        return 2;
-    }
-    let clean_findings = args.findings.trim();
-    if clean_findings.chars().count() < 15 {
-        rio::print_cli_json(
-            &json!({
-                "ok": false,
-                "error": "insufficient_findings",
-                "hint": "Provide a concrete --findings summary (>= 15 chars) of the researched documentation/best practices and architectural REDESIGN decision.",
-            }),
-            args.pretty,
-        );
-        return 2;
-    }
-    let cwd_raw = if args.cwd.trim().is_empty() {
-        env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .to_string_lossy()
-            .into_owned()
-    } else {
-        args.cwd.clone()
-    };
-    let cwd = abs_path_from_str(&cwd_raw).to_string_lossy().into_owned();
-    let git_root = rio::git_toplevel(&cwd, false).unwrap_or_else(|| cwd.clone());
-    let eff_session = if args.session.trim().is_empty() {
-        infer_single_open_session(&cwd)
-    } else {
-        args.session.trim().to_string()
-    };
-    if eff_session.is_empty() {
-        rio::print_cli_json(
-            &json!({
-                "ok": false,
-                "error": "missing_session",
-                "hint": "Pass --session <conversation-id> explicitly.",
-            }),
-            args.pretty,
-        );
-        return 2;
-    }
-    let _flight_lock = match try_acquire_review_flight_lock(&eff_session, &git_root) {
-        FlightLockResult::Acquired(fh) => fh,
-        FlightLockResult::Busy => {
-            rio::print_cli_json(
-                &json!({
-                    "ok": false,
-                    "review_in_progress": true,
-                    "error": "concurrent_review_in_flight",
-                    "hint": "Wait for the running `carbon-stack codex-lane review` to finish before running `redesign-reset`.",
-                }),
-                args.pretty,
-            );
-            return 2;
-        }
-        FlightLockResult::Io(detail) => {
-            rio::print_cli_json(
-                &json!({
-                    "ok": false,
-                    "sandbox_blocked": true,
-                    "detail": detail,
-                    "error": "CARBON_STACK_HOME is not writable in sandbox; re-run `carbon-stack codex-lane redesign-reset` with BypassSandbox=true",
-                }),
-                args.pretty,
-            );
-            return 2;
-        }
-    };
-    let skey = rio::safe_key(&eff_session, "default");
-    let mpath = cwg_common::marker_path(&skey);
-    let raw_marker = rio::read_json(&mpath);
-    let (merged_m_opt, _) = cwg_common::apply_pending_marker_deltas(&skey, raw_marker.as_ref());
-    let Some(marker) = merged_m_opt else {
-        rio::print_cli_json(
-            &json!({
-                "ok": false,
-                "error": "no_open_candidate",
-                "session": eff_session,
-            }),
-            args.pretty,
-        );
-        return 2;
-    };
-    if !marker.is_object() || json_truthy(marker.get("closed")) {
-        rio::print_cli_json(
-            &json!({
-                "ok": false,
-                "error": "no_open_candidate",
-                "session": eff_session,
-            }),
-            args.pretty,
-        );
-        return 2;
-    }
-    let pre_lock_rr_ts = cwg_common::last_research_reset_ts(&marker);
-    let pre_lock_rr_seq = cwg_common::last_research_reset_board_seq(&marker);
-    let used_redesigns = cwg_common::redesign_reset_count(&marker);
-    let tp_buf = if !args.transcript.trim().is_empty() {
-        PathBuf::from(args.transcript.trim())
-    } else {
-        rio::member_transcript_path(&rio::resolve_brain_root(""), &eff_session)
-    };
-    let tp_str = tp_buf.to_string_lossy().into_owned();
-    let cls_summary = active_cycle_closure_summary(&eff_session, &git_root, &tp_str);
-    let closure_exhausted = cls_summary.effective_pass_count
-        >= cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE
-        || cls_summary.blocked_count >= cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE;
-    if used_redesigns >= cwg_common::MAX_REDESIGN_RESETS {
-        rio::print_cli_json(
-            &json!({
-                "ok": false,
-                "error": "redesign_reset_limit_reached",
-                "redesign_resets_used": used_redesigns,
-                "max_redesign_resets": cwg_common::MAX_REDESIGN_RESETS,
-                "terminal_draft_blocked": closure_exhausted,
-                "hint": format!(
-                    "Current candidate already consumed MAX_REDESIGN_RESETS={0}/{0}. Complete via `--closure` (max {1} passes) or terminate finitely with `[gate] draft-blocked: <exact blocker and handoff>`.",
-                    cwg_common::MAX_REDESIGN_RESETS,
-                    cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE,
-                ),
-            }),
-            args.pretty,
-        );
-        return 2;
-    }
-    if cls_summary.has_fresh_ordinary_approved || cls_summary.has_fresh_ready {
-        rio::print_cli_json(
-            &json!({
-                "ok": false,
-                "error": "already_terminal_approved_or_ready",
-                "hint": "Current candidate already has a fresh APPROVED/READY verdict; close the gate instead of resetting.",
-            }),
-            args.pretty,
-        );
-        return 2;
-    }
-    if closure_exhausted {
-        rio::print_cli_json(
-            &json!({
-                "ok": false,
-                "error": "closure_budget_exhausted",
-                "terminal_draft_blocked": true,
-                "blocked_closure_passes": cls_summary.blocked_count,
-                "effective_closure_passes": cls_summary.effective_pass_count,
-                "hint": format!(
-                    "All {0}/{0} closure passes were already consumed or halted by 2x BLOCKED; finish finitely with `[gate] draft-blocked: <exact blocker and handoff>`.",
-                    cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE,
-                ),
-            }),
-            args.pretty,
-        );
-        return 2;
-    }
-    if !cls_summary.has_redesign_trigger() {
-        rio::print_cli_json(
-            &json!({
-                "ok": false,
-                "error": "redesign_requires_escalate",
-                "counted_ordinary_rounds": cls_summary.counted_ordinary_rounds,
-                "hint": format!(
-                    "`redesign-reset` is allowed only after Round {0} ESCALATE + focused research when choosing architectural REDESIGN (max {1} per candidate).",
-                    crate::cwg_stop::MAX_REVIEW_ROUNDS,
-                    cwg_common::MAX_REDESIGN_RESETS,
-                ),
-            }),
-            args.pretty,
-        );
-        return 2;
-    }
-    let halt_floor_ts = cls_summary
-        .escalate_verdict_ts
-        .max(cls_summary.last_blocked_ts);
-    let steps = rio::read_transcript_steps(&tp_str, 4000);
-    let research_tools = cwg_common::find_research_evidence_since(&steps, halt_floor_ts, None);
-    if research_tools.is_empty() {
-        rio::print_cli_json(
-            &json!({
-                "ok": false,
-                "error": "missing_post_escalate_research",
-                "escalate_verdict_ts": halt_floor_ts,
-                "hint": "Execute focused external/docs research AFTER Round 4 ESCALATE (`search_web`, `context7`, `exa`, `fetch`, `tokenade search|web`, or `research` subagent) before running `redesign-reset`.",
-            }),
-            args.pretty,
-        );
-        return 2;
-    }
-    let brain_root = rio::swarm_brain_and_cid(&tp_str, &eff_session)
-        .0
-        .unwrap_or_else(|| rio::resolve_brain_root(""));
-    let alive_workers = cwg_common::active_simplify_or_review_workers(&brain_root, &eff_session);
-    if !alive_workers.is_empty() {
-        rio::print_cli_json(
-            &json!({
-                "ok": false,
-                "error": "active_swarm_workers_present",
-                "workers": alive_workers,
-                "hint": "Kill all waiting/active simplify and review swarm workers via swarm(action='kill', ...) before `redesign-reset` so the redesigned cycle starts in fresh sessions.",
-            }),
-            args.pretty,
-        );
-        return 2;
-    }
-
-    let pre_members = rio::load_swarm_members(&brain_root, &eff_session);
-    let mut pre_cids: Vec<String> = pre_members
-        .values()
-        .filter_map(|m| m.get("conversation_id").or_else(|| m.get("conversationId")))
-        .map(|v| val_to_str(Some(v)).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    pre_cids.sort();
-    pre_cids.dedup();
-    let board_head_live = cwg_common::swarm_board_head_seq(&eff_session, &git_root, &tp_str, None);
-    let now = now_sec().max(halt_floor_ts + 0.002);
-
-    // SAFETY: Lock `marker_lock_path` and `thread_lock_path`, re-verify `MAX_REDESIGN_RESETS` and `ESCALATE` invariants under lock, persist `research_resets` BEFORE purging lane threads, and clear stale simplify latches so the redesigned candidate gets one fresh cycle.
-    let commit_res: Result<(i64, Value), &'static str> =
-        rio::with_file_lock(&cwg_common::marker_lock_path(&skey), 5.0, 30.0, |m_locked| {
-            if !m_locked {
-                return Err("marker_lock_failed");
-            }
-            let raw_fresh = rio::read_json(&mpath);
-            let (fresh_opt, consumed_ids) =
-                cwg_common::apply_pending_marker_deltas(&skey, raw_fresh.as_ref());
-            let Some(mut fresh_marker) = fresh_opt else {
-                return Err("no_open_candidate");
-            };
-            if !fresh_marker.is_object() || json_truthy(fresh_marker.get("closed")) {
-                return Err("no_open_candidate");
-            }
-            if cwg_common::redesign_reset_count(&fresh_marker) >= cwg_common::MAX_REDESIGN_RESETS {
-                return Err("redesign_reset_limit_reached");
-            }
-            if cwg_common::last_research_reset_ts(&fresh_marker) != pre_lock_rr_ts
-                || cwg_common::last_research_reset_board_seq(&fresh_marker) != pre_lock_rr_seq
-            {
-                return Err("redesign_requires_escalate");
-            }
-            let (live_halt_ts, live_blocked_ids, eff_res_tools) = if fresh_marker == marker {
-                (
-                    halt_floor_ts,
-                    cls_summary.blocked_ids.clone(),
-                    research_tools.clone(),
-                )
-            } else {
-                let live_sum = active_cycle_closure_summary_for_marker(
-                    &fresh_marker,
-                    &eff_session,
-                    &git_root,
-                    &tp_str,
-                );
-                if live_sum.has_fresh_ordinary_approved || live_sum.has_fresh_ready {
-                    return Err("already_terminal_approved_or_ready");
-                }
-                if live_sum.effective_pass_count >= cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE
-                    || live_sum.blocked_count >= cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE
-                {
-                    return Err("closure_budget_exhausted");
-                }
-                if !live_sum.has_redesign_trigger() {
-                    return Err("redesign_requires_escalate");
-                }
-                let h_ts = live_sum.escalate_verdict_ts.max(live_sum.last_blocked_ts);
-                let mut r_tools = research_tools.clone();
-                if h_ts > halt_floor_ts {
-                    let fresh_steps = rio::read_transcript_steps(&tp_str, 4000);
-                    r_tools = cwg_common::find_research_evidence_since(&fresh_steps, h_ts, None);
-                    if r_tools.is_empty() {
-                        return Err("missing_post_escalate_research");
-                    }
-                }
-                (h_ts, live_sum.blocked_ids, r_tools)
-            };
-            if !cwg_common::active_simplify_or_review_workers(&brain_root, &eff_session).is_empty()
-            {
-                return Err("active_swarm_workers_present");
-            }
-            let eff_now = now.max(live_halt_ts + 0.002);
-            let board_head_seq = fresh_marker
-                .get("round_start_msg_id")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0)
-                .max(board_head_live);
-            let reset_entry = json!({
-                "reset_ts": eff_now,
-                "last_blocked_ts": live_halt_ts,
-                "blocked_review_ids": live_blocked_ids,
-                "decision": dec,
-                "findings": clean_findings,
-                "research_tools": eff_res_tools,
-                "board_head_seq": board_head_seq,
-                "pre_reset_worker_cids": pre_cids,
-            });
-            if let Some(mobj) = fresh_marker.as_object_mut() {
-                let arr_val = mobj
-                    .entry("research_resets".to_string())
-                    .or_insert_with(|| Value::Array(Vec::new()));
-                if !arr_val.is_array() {
-                    *arr_val = Value::Array(Vec::new());
-                }
-                if let Some(arr) = arr_val.as_array_mut() {
-                    arr.push(reset_entry.clone());
-                }
-                mobj.insert("round_start_msg_id".to_string(), json!(board_head_seq));
-                mobj.insert(
-                    "gate_max_review_rounds".to_string(),
-                    json!(cwg_common::MAX_ORDINARY_REVIEW_ROUNDS),
-                );
-                mobj.remove("closure_halt");
-                mobj.remove("cycle_declared_risk");
-                mobj.remove("simplify_fast_path_latched");
-                mobj.remove("simplify_verified_latched");
-            }
-            rio::with_file_lock(&thread_lock_path(&eff_session, &git_root), 5.0, 30.0, |t_locked| {
-                if !t_locked {
-                    return Err("thread_purge_lock_failed");
-                }
-                if rio::read_json(&mpath) != raw_fresh {
-                    return Err("concurrent_marker_mutation");
-                }
-                if rio::write_json(&mpath, &fresh_marker).is_err() {
-                    return Err("marker_write_failed");
-                }
-                if !consumed_ids.is_empty() {
-                    cwg_common::ack_pending_marker_deltas(&skey, &consumed_ids);
-                }
-                purge_session_lane_threads_unlocked(&eff_session, &git_root);
-                if let Some(dp) = dispositions_state_path(&eff_session, &git_root, 1.0, "") {
-                    unlink_quiet(&dp);
-                }
-                unlink_quiet(&cwg_common::swarm_rounds_path(&skey));
-                Ok((board_head_seq, reset_entry))
-            })
-        });
-
-    let (board_head_seq, reset_entry) = match commit_res {
-        Ok(pair) => pair,
-        Err(err_code) => {
-            rio::print_cli_json(
-                &json!({
-                    "ok": false,
-                    "error": err_code,
-                    "terminal_draft_blocked": err_code == "closure_budget_exhausted",
-                    "session": eff_session,
-                }),
-                args.pretty,
-            );
-            return 2;
-        }
-    };
-
-    rio::log_hook_event("gate-events", "redesign_cycle_reset", reset_entry.clone());
-    rio::print_cli_json(
-        &json!({
-            "ok": true,
-            "session": eff_session,
-            "decision": dec,
-            "redesign_resets_used": used_redesigns + 1,
-            "max_redesign_resets": cwg_common::MAX_REDESIGN_RESETS,
-            "research_tools": reset_entry.get("research_tools").cloned().unwrap_or_else(|| json!(research_tools)),
-            "reset_ts": reset_entry.get("reset_ts").cloned().unwrap_or_else(|| json!(now)),
-            "board_head_seq": board_head_seq,
-            "round_counters_reset": true,
-            "fresh_sessions_enforced": true,
-        }),
-        args.pretty,
-    );
-    0
-}
-
 struct PacketCleanupGuard {
     review_id: String,
     owner_nonce: String,
@@ -5815,11 +5222,6 @@ fn cmd_dispose(args: &DisposeArgs) -> i32 {
         args.session.trim().to_string()
     };
     let cand_first_ts = candidate_first_ts(&eff_session);
-    let last_rr_ts = if cand_first_ts > 0.0 {
-        session_last_research_reset_ts(&eff_session)
-    } else {
-        0.0
-    };
     let active_thread_sid = if cand_first_ts <= 0.0 {
         active_markerless_thread_sid(&eff_session, &git_root, &args.model, args.xhigh)
     } else {
@@ -5832,7 +5234,6 @@ fn cmd_dispose(args: &DisposeArgs) -> i32 {
             &eff_session,
             &git_root,
             cand_first_ts,
-            last_rr_ts,
             &active_thread_sid,
             false,
         );
@@ -5935,7 +5336,6 @@ fn cmd_dispose(args: &DisposeArgs) -> i32 {
             &eff_session,
             &git_root,
             cand_first_ts,
-            last_rr_ts,
             &active_thread_sid,
             false,
         );
@@ -5961,7 +5361,6 @@ fn cmd_dispose(args: &DisposeArgs) -> i32 {
             "session": eff_session,
             "git_root": rio::normalize_path(&git_root),
             "candidate_first_ts": cand_first_ts,
-            "research_reset_ts": last_rr_ts,
             "thread_session_id": active_thread_sid,
             "updated_ts": now_sec(),
             "items": items,
@@ -6196,7 +5595,7 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
     if args.xhigh
         && !eff_session.is_empty()
         && candidate_first_ts(&eff_session) > 0.0
-        && !cwg_common::latch_marker_declared_risk(&eff_session, None, None, "XHIGH")
+        && !cwg_common::latch_marker_declared_risk(&eff_session, None, "XHIGH")
     {
         rio::print_cli_json(
             &json!({
@@ -6232,7 +5631,7 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
                 "blocked_review_ids": blocked_cls_ids,
                 "error": "max_closure_blocks_reached",
                 "hint": format!(
-                    "After {}/{} CLOSURE_VALIDATION: BLOCKED passes, the closure budget is exhausted. Do NOT restart review or simplify: preserve completed work and finish finitely with `[gate] draft-blocked: <exact blocker and handoff>`.",
+                    "After {}/{} CLOSURE_VALIDATION: BLOCKED passes, the closure budget is exhausted. Do NOT restart review: preserve completed work and finish finitely with `[gate] draft-blocked: <exact blocker and handoff>`.",
                     blocked_cls_n,
                     cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE,
                 ),
@@ -6272,7 +5671,7 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
                 "round_consumed": false,
                 "already_approved": true,
                 "error": "already_ordinary_approved",
-                "hint": "Current candidate already has a fresh valid `VERDICT: APPROVED`: close the gate immediately with `[gate] verified: ...` (never run post-approval simplify or `--closure`).",
+                "hint": "Current candidate already has a fresh valid `VERDICT: APPROVED`: close the gate immediately with `[gate] verified: ...` (never run `--closure` after approval).",
             }),
             args.pretty,
         );
@@ -6282,24 +5681,11 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
         if cls_summary.ordinary_cap_reached {
             let terminal_no_escalate = !cls_summary.has_round_cap_escalate;
             let ord_cap_hint = if cls_summary.has_round_cap_escalate {
-                let can_redesign = cwg_common::read_marker_with_pending(&eff_session)
-                    .map(|m| cwg_common::redesign_reset_count(&m) < cwg_common::MAX_REDESIGN_RESETS)
-                    .unwrap_or(false);
-                if can_redesign {
-                    format!(
-                        "All {0}/{0} ordinary review rounds have been used (ending in ESCALATE): perform one focused research pass, then either (a) REMEDIATE in the same Codex session via `carbon-stack codex-lane review --closure` (max {1} passes), or (b) for an architectural REDESIGN (max {2} per candidate) kill swarm workers and run `carbon-stack codex-lane redesign-reset --cwd <repo> --session <sid> --findings \"<summary>\"` to reset rounds and start fresh simplify + review sessions.",
-                        crate::cwg_stop::MAX_REVIEW_ROUNDS,
-                        cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE,
-                        cwg_common::MAX_REDESIGN_RESETS,
-                    )
-                } else {
-                    format!(
-                        "All {0}/{0} ordinary review rounds have been used (ending in ESCALATE; {2}/{2} REDESIGN reset already used): perform one focused research pass, run tests, and run `carbon-stack codex-lane review --closure` (max {1} passes), or finish finitely with `[gate] draft-blocked`.",
-                        crate::cwg_stop::MAX_REVIEW_ROUNDS,
-                        cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE,
-                        cwg_common::MAX_REDESIGN_RESETS,
-                    )
-                }
+                format!(
+                    "All {0}/{0} ordinary review rounds have been used (ending in ESCALATE): perform one focused research pass, run tests, and run `carbon-stack codex-lane review --closure` (max {1} passes), or finish finitely with `[gate] draft-blocked: <exact blocker and handoff>`.",
+                    crate::cwg_stop::MAX_REVIEW_ROUNDS,
+                    cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE,
+                )
             } else {
                 format!(
                     "All {0}/{0} ordinary review rounds have been exhausted without `ESCALATE` (`--closure` is unavailable): finish finitely with `[gate] draft-blocked: <exact blocker and handoff>`.",
@@ -6330,7 +5716,7 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
                     "round_consumed": false,
                     "blocked_closure_passes": blocked_cls_n,
                     "error": "closure_phase_active",
-                    "hint": "Candidate is already in `--closure` after Pass 1/2 BLOCKED: apply one bounded REMEDIATE/REDESIGN + tests and run `carbon-stack codex-lane review --closure` (Pass 2/2), or finish with `[gate] draft-blocked`.",
+                    "hint": "Candidate is already in `--closure` after Pass 1/2 BLOCKED: apply one bounded remediation + tests and run `carbon-stack codex-lane review --closure` (Pass 2/2), or finish with `[gate] draft-blocked`.",
                 }),
                 args.pretty,
             );
@@ -6387,27 +5773,6 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
                 return 2;
             }
         }
-    }
-    let last_rr_ts = if !eff_session.is_empty() {
-        cwg_common::read_marker_with_pending(&eff_session)
-            .map(|m| cwg_common::last_research_reset_ts(&m))
-            .unwrap_or(0.0)
-    } else {
-        0.0
-    };
-    if !args.resume.trim().is_empty()
-        && last_rr_ts > 0.0
-        && !is_post_reset_codex_session_proven(args.resume.trim(), "", last_rr_ts, cand_first_ts)
-    {
-        rio::print_cli_json(
-            &json!({
-                "ok": false,
-                "error": "pre_research_reset_session_forbidden",
-                "hint": "Resuming a pre-research-reset or unverified Codex session after research-reset is forbidden; omit --resume so the new cycle starts in a fresh review session.",
-            }),
-            args.pretty,
-        );
-        return 2;
     }
     let curr_worktree_tree = if resolved_diff_file.is_empty()
         && !git_root.is_empty()
@@ -6509,7 +5874,7 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
             );
             return 2;
         }
-        let mut cur_resume_sid = resolve_resume_session_with_saved(
+        let cur_resume_sid = resolve_resume_session_with_saved(
             ResumeSessionQuery {
                 git_root: &git_root,
                 session: &eff_session,
@@ -6521,23 +5886,6 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
             },
             Some(cur_saved_thread.as_ref()),
         );
-        if !cur_resume_sid.is_empty()
-            && last_rr_ts > 0.0
-            && !is_post_reset_codex_session_proven(&cur_resume_sid, "", last_rr_ts, cand_first_ts)
-        {
-            if !args.resume.trim().is_empty() {
-                rio::print_cli_json(
-                    &json!({
-                        "ok": false,
-                        "error": "pre_research_reset_session_forbidden",
-                        "hint": "Resuming a pre-research-reset or unverified Codex session after research-reset is forbidden; omit --resume so the new cycle starts in a fresh review session.",
-                    }),
-                    args.pretty,
-                );
-                return 2;
-            }
-            cur_resume_sid.clear();
-        }
 
         let cur_prior_ledger = cur_saved_thread
             .as_ref()
@@ -6863,7 +6211,6 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
             &eff_session,
             &git_root,
             cand_first_ts,
-            last_rr_ts,
             cur_resume_sid,
             attempt_force_new,
         );
@@ -7268,7 +6615,7 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
             );
         }
         if phase == "closure" && !eff_session.is_empty() {
-            let _ = active_cycle_closure_blocks(&eff_session, &git_root, "");
+            let _ = active_cycle_closure_summary(&eff_session, &git_root, "");
         }
     }
 
@@ -7360,7 +6707,7 @@ pub fn run_cli(args: &[String]) -> i32 {
     if args.is_empty() {
         let _ = writeln!(
             std::io::stderr(),
-            "usage: codex_lane <check|status|reset|breaker|scan|review|dispose|redesign-reset|research-reset> [args...]"
+            "usage: codex_lane <check|status|reset|breaker|scan|review|dispose> [args...]"
         );
         return 2;
     }
@@ -7728,65 +7075,10 @@ pub fn run_cli(args: &[String]) -> i32 {
             }
             cmd_dispose(&dargs)
         }
-        "redesign-reset" | "research-reset" => {
-            let mut rr = ResearchResetArgs {
-                cwd: String::new(),
-                session: String::new(),
-                decision: if sub == "redesign-reset" {
-                    "redesign".to_string()
-                } else {
-                    String::new()
-                },
-                findings: String::new(),
-                transcript: String::new(),
-                pretty: false,
-            };
-            let mut i = 0usize;
-            while i < rest.len() {
-                let tok = &rest[i];
-                if tok == "--pretty" {
-                    rr.pretty = true;
-                    i += 1;
-                    continue;
-                }
-                let mut str_flags = [
-                    ("--cwd", &mut rr.cwd),
-                    ("--session", &mut rr.session),
-                    ("--decision", &mut rr.decision),
-                    ("--findings", &mut rr.findings),
-                    ("--transcript", &mut rr.transcript),
-                ];
-                match parse_str_flag_table(rest, &mut i, tok, &mut str_flags) {
-                    Ok(true) => continue,
-                    Ok(false) => {}
-                    Err(e) => {
-                        let _ = writeln!(std::io::stderr(), "{}", e);
-                        return 2;
-                    }
-                }
-                let mut hex_flags = [
-                    ("--cwd-hex", &mut rr.cwd),
-                    ("--session-hex", &mut rr.session),
-                    ("--findings-hex", &mut rr.findings),
-                    ("--transcript-hex", &mut rr.transcript),
-                ];
-                match parse_hex_flag_table(rest, &mut i, tok, &mut hex_flags) {
-                    Ok(true) => continue,
-                    Ok(false) => {}
-                    Err(e) => {
-                        let _ = writeln!(std::io::stderr(), "{}", e);
-                        return 2;
-                    }
-                }
-                let _ = writeln!(std::io::stderr(), "error: unrecognized arguments: {}", tok);
-                return 2;
-            }
-            cmd_research_reset(&rr)
-        }
         other => {
             let _ = writeln!(
                 std::io::stderr(),
-                "usage: codex_lane <check|status|reset|breaker|scan|review|dispose|redesign-reset|research-reset> (invalid choice: '{}')",
+                "usage: codex_lane <check|status|reset|breaker|scan|review|dispose> (invalid choice: '{}')",
                 other
             );
             2
@@ -8579,38 +7871,11 @@ exit 0
             FlightLockResult::Acquired(_)
         ));
 
-        // SAFETY: Valid `APPROVED -> simplify #1 -> BLOCKED -> simplify #2 -> READY` yields `effective_pass_count == 2, has_fresh_ready == true`, while pre-simplify `BLOCKED` and declared-`XHIGH` wrong-tier `READY` both yield `has_fresh_ready == false` and unlock `research-reset` cleanly.
+        // SAFETY: Valid `APPROVED -> BLOCKED -> READY` yields `effective_pass_count == 2, has_fresh_ready == true`, while premature `ESCALATE -> BLOCKED -> READY` and declared-`XHIGH` wrong-tier `READY` both yield `has_fresh_ready == false`.
         let brain_dir = tmp.0.join("brain");
         let _benv = EnvVarGuard::set(&[("ANTIGRAVITY_BRAIN_ROOT", Some(&brain_dir.to_string_lossy()))]);
         let sess_cap = "sess-cls-cap-2";
-        let sw_dir = brain_dir.join(sess_cap).join(".system_generated").join("swarm");
-        fs::create_dir_all(&sw_dir).unwrap();
-        let sim_members = json!({
-            "members": {
-                "sim-r": {"model": "claude-sonnet-5-5-high", "state": "killed", "killed": true},
-                "sim-q": {"model": "claude-sonnet-5-5-high", "state": "killed", "killed": true},
-                "sim-e": {"model": "claude-sonnet-5-5-high", "state": "killed", "killed": true}
-            }
-        });
-        rio::write_json(&sw_dir.join("members.json"), &sim_members).unwrap();
         let base_t = now_sec() - 30.0;
-        let t_sim1 = crate::win32_sqlite::format_iso_utc(base_t + 2.5);
-        let t_sim2 = crate::win32_sqlite::format_iso_utc(base_t + 8.0);
-        let two_sim_board_rows = [
-            json!({"seq": 1, "agent": "coordinator", "time": t_sim1, "text": "@sim-r @sim-q @sim-e initial simplify"}),
-            json!({"seq": 2, "agent": "sim-r", "time": t_sim1, "text": "SIMPLIFY_LENS: REUSE\nSIMPLIFY_VERDICT: CLEAN"}),
-            json!({"seq": 3, "agent": "sim-q", "time": t_sim1, "text": "SIMPLIFY_LENS: QUALITY\nSIMPLIFY_VERDICT: CLEAN"}),
-            json!({"seq": 4, "agent": "sim-e", "time": t_sim1, "text": "SIMPLIFY_LENS: EFFICIENCY\nSIMPLIFY_VERDICT: CLEAN"}),
-            json!({"seq": 5, "agent": "coordinator", "time": t_sim2, "text": "@sim-r @sim-q @sim-e post-blocked simplify"}),
-            json!({"seq": 6, "agent": "sim-r", "time": t_sim2, "text": "SIMPLIFY_LENS: REUSE\nSIMPLIFY_VERDICT: CLEAN"}),
-            json!({"seq": 7, "agent": "sim-q", "time": t_sim2, "text": "SIMPLIFY_LENS: QUALITY\nSIMPLIFY_VERDICT: CLEAN"}),
-            json!({"seq": 8, "agent": "sim-e", "time": t_sim2, "text": "SIMPLIFY_LENS: EFFICIENCY\nSIMPLIFY_VERDICT: CLEAN"}),
-        ];
-        fs::write(
-            sw_dir.join("board.jsonl"),
-            two_sim_board_rows.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
-        )
-        .unwrap();
         let cap_auth = repo_dir.join("auth.rs");
         fs::write(&cap_auth, "pub fn check() {}\n").unwrap();
         let cap_auth_norm = rio::normalize_path(&cap_auth.to_string_lossy());
@@ -8678,22 +7943,8 @@ exit 0
         ]);
         assert_eq!(rc_3rd_cls, 2);
 
-        // SAFETY: Sub-case A (`APPROVED -> pre-simplify BLOCKED -> simplify -> READY`) has `has_fresh_ready == false` (matching `Stop`) and is accepted by `research-reset`.
+        // SAFETY: Sub-case A (premature round-1 `ESCALATE -> BLOCKED -> READY`) has `has_fresh_ready == false` (matching `Stop`), and editing a durable file after the rejected `READY` must NOT clear the 2/2 closure counter.
         let sess_early_blk = "sess-early-blk-nosim";
-        let sw_early = brain_dir.join(sess_early_blk).join(".system_generated").join("swarm");
-        fs::create_dir_all(&sw_early).unwrap();
-        rio::write_json(&sw_early.join("members.json"), &sim_members).unwrap();
-        let one_sim_board_rows = [
-            json!({"seq": 1, "agent": "coordinator", "time": t_sim2, "text": "@sim-r @sim-q @sim-e audit only after blocked pass 1"}),
-            json!({"seq": 2, "agent": "sim-r", "time": t_sim2, "text": "SIMPLIFY_LENS: REUSE\nSIMPLIFY_VERDICT: CLEAN"}),
-            json!({"seq": 3, "agent": "sim-q", "time": t_sim2, "text": "SIMPLIFY_LENS: QUALITY\nSIMPLIFY_VERDICT: CLEAN"}),
-            json!({"seq": 4, "agent": "sim-e", "time": t_sim2, "text": "SIMPLIFY_LENS: EFFICIENCY\nSIMPLIFY_VERDICT: CLEAN"}),
-        ];
-        fs::write(
-            sw_early.join("board.jsonl"),
-            one_sim_board_rows.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
-        )
-        .unwrap();
         rio::write_json(
             &cwg_common::marker_path(sess_early_blk),
             &json!({
@@ -8740,7 +7991,7 @@ exit 0
         assert_eq!(sum_eb.blocked_count, 1);
         assert_eq!(sum_eb.effective_pass_count, 2);
         assert!(!sum_eb.has_fresh_ready);
-        // SAFETY: Editing a durable file after the rejected `READY` must NOT trigger automatic cycle turnover or clear the 2/2 closure counter without `research-reset`.
+        // SAFETY: Editing a durable file after the rejected `READY` must NOT trigger automatic cycle turnover or clear the 2/2 closure counter.
         fs::write(&cap_auth, "pub fn check() -> bool { false }\n").unwrap();
         let cap_fp_edited = cwg_common::content_fingerprint(
             std::slice::from_ref(&cap_auth_norm),
@@ -8783,45 +8034,11 @@ exit 0
             2
         );
         fs::write(&cap_auth, "pub fn check() {}\n").unwrap();
-        let tp_eb = tmp.0.join("transcript-eb.jsonl");
-        let eb_res_steps = [
-            json!({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": crate::win32_sqlite::format_iso_utc(base_t + 15.0), "tool_calls": [{"name": "search_web", "args": {"query": "sandwich gate order"}}]}),
-            json!({"step_index": 2, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(base_t + 16.0), "content": "ok"}),
-        ];
-        fs::write(
-            &tp_eb,
-            eb_res_steps.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
-        )
-        .unwrap();
-        assert_eq!(
-            run_cli(&[
-                "research-reset".to_string(),
-                "--cwd".to_string(),
-                repo_str.clone(),
-                "--session".to_string(),
-                sess_early_blk.to_string(),
-                "--decision".to_string(),
-                "refine".to_string(),
-                "--findings".to_string(),
-                "Resetting cycle after premature pre-simplify BLOCKED pass.".to_string(),
-                "--transcript".to_string(),
-                tp_eb.to_string_lossy().into_owned(),
-            ]),
-            2
-        );
 
-        // SAFETY: Sub-case B (`HIGH` path floor escalated via `--xhigh` or `XHIGH -> HIGH` receipt transition in same cycle after Sol `READY`) blocks `Stop` (`verified: HIGH` & `pr-ready: HIGH`), keeps `has_fresh_ready == false`, and unlocks `research-reset`.
+        // SAFETY: Sub-case B (`HIGH` path floor escalated via `--xhigh` or `XHIGH -> HIGH` receipt transition in same cycle after Sol `READY`) blocks `Stop` (`verified: HIGH` & `pr-ready: HIGH`) and keeps `has_fresh_ready == false`.
         let sess_decl_xh = "sess-decl-xhigh-on-high";
-        let sw_dxh = brain_dir.join(sess_decl_xh).join(".system_generated").join("swarm");
         let log_dxh = brain_dir.join(sess_decl_xh).join(".system_generated").join("logs");
-        fs::create_dir_all(&sw_dxh).unwrap();
         fs::create_dir_all(&log_dxh).unwrap();
-        rio::write_json(&sw_dxh.join("members.json"), &sim_members).unwrap();
-        fs::write(
-            sw_dxh.join("board.jsonl"),
-            two_sim_board_rows.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
-        )
-        .unwrap();
         rio::write_json(
             &cwg_common::marker_path(sess_decl_xh),
             &json!({
@@ -8876,10 +8093,9 @@ exit 0
         .unwrap();
         let tp_dxh = log_dxh.join("transcript.jsonl");
         fs::write(&tp_dxh, "").unwrap();
-        // SAFETY: First verify `--xhigh` latched inside `marker.json` (`cycle_declared_risk` at `reset_epoch == 0`) blocks `[gate] verified: HIGH` and `[gate] pr-ready: HIGH` in `decide_stop`.
+        // SAFETY: First verify `--xhigh` latched inside `marker.json` (`cycle_declared_risk`) blocks `[gate] verified: HIGH` and `[gate] pr-ready: HIGH` in `decide_stop`.
         assert!(cwg_common::latch_marker_declared_risk(
             sess_decl_xh,
-            None,
             None,
             "XHIGH",
         ));
@@ -8943,96 +8159,6 @@ exit 0
         assert_eq!(sum_dxh.blocked_count, 1);
         assert_eq!(sum_dxh.effective_pass_count, 2);
         assert!(!sum_dxh.has_fresh_ready);
-        // SAFETY: While `review_flight_lock` is held, `research-reset` fails closed (`2`) without mutating `marker.json`; once released, `research-reset` and concurrent new-cycle `--xhigh` latching serialize cleanly on `marker_lock_path` + `reset_epoch`.
-        {
-            let fl_rr = match try_acquire_review_flight_lock(sess_decl_xh, &repo_str) {
-                FlightLockResult::Acquired(fh) => fh,
-                _ => panic!("expected flight lock to be free"),
-            };
-            assert_eq!(
-                run_cli(&[
-                    "research-reset".to_string(),
-                    "--cwd".to_string(),
-                    repo_str.clone(),
-                    "--session".to_string(),
-                    sess_decl_xh.to_string(),
-                    "--decision".to_string(),
-                    "refine".to_string(),
-                    "--findings".to_string(),
-                    "Must reject while review is in flight.".to_string(),
-                    "--transcript".to_string(),
-                    tp_dxh.to_string_lossy().into_owned(),
-                ]),
-                2
-            );
-            drop(fl_rr);
-        }
-        let bar_rr = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let repo_t = repo_str.clone();
-        let tp_dxh_t = tp_dxh.to_string_lossy().into_owned();
-        let bar_rr_c = std::sync::Arc::clone(&bar_rr);
-        let rr_handle = std::thread::spawn(move || {
-            bar_rr_c.wait();
-            run_cli(&[
-                "research-reset".to_string(),
-                "--cwd".to_string(),
-                repo_t,
-                "--session".to_string(),
-                sess_decl_xh.to_string(),
-                "--decision".to_string(),
-                "refine".to_string(),
-                "--findings".to_string(),
-                "Resetting cycle after declared XHIGH receipt rejected Sol READY.".to_string(),
-                "--transcript".to_string(),
-                tp_dxh_t,
-            ])
-        });
-        bar_rr.wait();
-        let rc_rr_done = rr_handle.join().unwrap();
-        assert_eq!(rc_rr_done, 2);
-        let mut m_after_rr = rio::read_json(&cwg_common::marker_path(sess_decl_xh)).unwrap();
-        assert_eq!(cwg_common::research_reset_epoch(&m_after_rr), 0);
-        assert_eq!(cwg_common::active_marker_declared_risk(&m_after_rr), "XHIGH");
-        m_after_rr["research_resets"] = json!([{
-            "decision": "refine",
-            "findings": "Legacy pre-migration reset fixture for epoch fencing test.",
-            "last_blocked_ts": base_t + 5.0,
-            "reset_ts": base_t + 16.5,
-            "board_head_seq": 4,
-            "research_tools": ["search_web"]
-        }]);
-        rio::write_json(&cwg_common::marker_path(sess_decl_xh), &m_after_rr).unwrap();
-        assert_eq!(cwg_common::research_reset_epoch(&m_after_rr), 1);
-        assert_eq!(cwg_common::active_marker_declared_risk(&m_after_rr), "");
-        // INVARIANT: Stale epoch `0` latch cannot pollute epoch `1`, while new-cycle `--xhigh` (`None` epoch -> live epoch `1`) persists `XHIGH` on epoch `1` and blocks `[gate] verified: HIGH` in `Stop`.
-        assert!(!cwg_common::latch_marker_declared_risk(
-            sess_decl_xh,
-            Some(base_t),
-            Some(0),
-            "XHIGH",
-        ));
-        assert!(cwg_common::latch_marker_declared_risk(
-            sess_decl_xh,
-            None,
-            None,
-            "XHIGH",
-        ));
-        let m_new_cycle_xh = rio::read_json(&cwg_common::marker_path(sess_decl_xh)).unwrap();
-        assert_eq!(cwg_common::active_marker_declared_risk(&m_new_cycle_xh), "XHIGH");
-        let stop_new_cycle_downgrade = crate::cwg_stop::decide_stop(&json!({
-            "conversationId": sess_decl_xh,
-            "cwd": repo_str,
-            "transcriptPath": tp_dxh.to_string_lossy(),
-            "lastAssistantMessage": "New cycle attempt.\n[gate] verified: HIGH; must stay XHIGH in new cycle",
-            "fullyIdle": true,
-        }));
-        assert!(
-            stop_new_cycle_downgrade
-                .as_deref()
-                .is_some_and(|m| m.contains("below active cycle escalated risk")),
-            "expected new cycle XHIGH to block HIGH receipt: {:?}",
-            stop_new_cycle_downgrade
-        );
 
         // SAFETY: Invoking `review --xhigh` via CLI when `check_health()` returns `available: false` (e.g. open breaker) STILL latches `cycle_declared_risk == "XHIGH"` so an already-valid `HIGH` (`Sol`) `READY` on `sess_cap` cannot close as `HIGH`.
         rio::write_json(
@@ -9141,80 +8267,23 @@ exit 0
         assert_eq!(rc_4th_ord, 2);
         let inv_after_4th = fs::read_to_string(&inv_log).unwrap_or_default().lines().count();
         assert_eq!(inv_after_4th, inv_before_4th);
-        // INVARIANT: Completing `simplify` after `MAX_REVIEW_ROUNDS` (4) ordinary rounds MUST NOT un-count those 4 rounds: `cmd_review` still rejects a 5th ordinary round (`rc == 2`), and `validate_candidate_closure` rejects closing on an over-cap 5th ordinary `APPROVED`.
+        // INVARIANT: `validate_candidate_closure` rejects closing on an over-cap 5th ordinary `APPROVED` after `MAX_REVIEW_ROUNDS` (4) ordinary rounds.
         let ord3_brain = rio::resolve_brain_root("");
         let ord3_tp = ord3_brain
             .join(sess_ord3)
             .join(".system_generated")
             .join("logs")
             .join("transcript.jsonl");
-        let ord3_board = ord3_brain
-            .join(sess_ord3)
-            .join(".system_generated")
-            .join("swarm")
-            .join("board.jsonl");
-        let ord3_members = ord3_brain
-            .join(sess_ord3)
-            .join(".system_generated")
-            .join("swarm")
-            .join("members.json");
         fs::create_dir_all(ord3_tp.parent().unwrap()).unwrap();
-        fs::create_dir_all(ord3_board.parent().unwrap()).unwrap();
         fs::write(&ord3_tp, "").unwrap();
-        fs::write(
-            &ord3_members,
-            json!([
-                {"name": "simp-r", "model": cwg_common::SONNET_HIGH_MODEL, "state": "killed", "killed": true},
-                {"name": "simp-q", "model": cwg_common::SONNET_HIGH_MODEL, "state": "killed", "killed": true},
-                {"name": "simp-e", "model": cwg_common::SONNET_HIGH_MODEL, "state": "killed", "killed": true}
-            ])
-            .to_string(),
-        )
-        .unwrap();
-        let sim_t_str = crate::win32_sqlite::format_iso_utc(base_t + 8.2);
-        let sim_end_str = crate::win32_sqlite::format_iso_utc(base_t + 8.6);
-        let ord3_board_lines = [
-            json!({"seq": 1, "agent": "coordinator", "time": sim_t_str, "text": "@simp-r @simp-q @simp-e simplify"}),
-            json!({"seq": 2, "agent": "simp-r", "time": sim_end_str, "text": format!("@coordinator\nDIFF_HASH: {}\nSIMPLIFY_LENS: REUSE\nSIMPLIFY_VERDICT: CLEAN", cap_fp)}),
-            json!({"seq": 3, "agent": "simp-q", "time": sim_end_str, "text": format!("@coordinator\nDIFF_HASH: {}\nSIMPLIFY_LENS: QUALITY\nSIMPLIFY_VERDICT: CLEAN", cap_fp)}),
-            json!({"seq": 4, "agent": "simp-e", "time": sim_end_str, "text": format!("@coordinator\nDIFF_HASH: {}\nSIMPLIFY_LENS: EFFICIENCY\nSIMPLIFY_VERDICT: CLEAN", cap_fp)}),
-        ];
-        fs::write(
-            &ord3_board,
-            ord3_board_lines.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
-        )
-        .unwrap();
-        let mut m_ord3 = rio::read_json(&cwg_common::marker_path(sess_ord3)).unwrap();
-        m_ord3["current_diff_hash"] = json!(cap_fp);
-        rio::write_json(&cwg_common::marker_path(sess_ord3), &m_ord3).unwrap();
-        assert_eq!(
-            run_cli(&[
-                "review".to_string(),
-                "--cwd".to_string(),
-                repo_str.clone(),
-                "--session".to_string(),
-                sess_ord3.to_string(),
-                "--diff-file".to_string(),
-                diff_p.to_string_lossy().into_owned(),
-                "--summary".to_string(),
-                "4th ordinary round AFTER simplify must STILL be rejected".to_string(),
-            ]),
-            2
-        );
-        assert_eq!(
-            fs::read_to_string(&inv_log).unwrap_or_default().lines().count(),
-            inv_before_4th
-        );
+        let m_ord3 = rio::read_json(&cwg_common::marker_path(sess_ord3)).unwrap();
         let ord3_tp_str = ord3_tp.to_string_lossy().into_owned();
-        let sw_ord3 = crate::cwg_stop::scan_swarm_activity_with_reset(crate::cwg_stop::SwarmScanInput {
+        let sw_ord3 = crate::cwg_stop::scan_swarm_activity(crate::cwg_stop::SwarmScanInput {
             steps: &[],
             transcript_path: Some(&ord3_tp_str),
             first_ts: base_t,
             round_start_msg_id: 0,
-            current_diff_hash: &cap_fp,
             cwd: &repo_str,
-            research_reset_ts: 0.0,
-            research_reset_seq: 0,
             marker: Some(&m_ord3),
         });
         let mut revs_4th_app = scan_verified_codex_reviews(
@@ -9257,11 +8326,11 @@ exit 0
         assert!(!ok_4th_app);
         assert!(
             why_4th_app.contains("exceeded MAX_REVIEW_ROUNDS"),
-            "expected 4th ordinary APPROVED after simplify to fail round cap, got: {}",
+            "expected over-cap 5th ordinary APPROVED to fail round cap, got: {}",
             why_4th_app
         );
 
-        // INVARIANT: Under the finite gate, premature `--closure` before Round 4 `ESCALATE` is rejected (`closure_requires_escalate`), `--closure` after Round 4 `ESCALATE` rejects unkilled `waiting` simplify workers (`active_swarm_workers_present`), and killing them unlocks `--closure`.
+        // INVARIANT: Under the finite gate, premature `--closure` before Round 4 `ESCALATE` is rejected (`closure_requires_escalate`), missing post-`ESCALATE` research blocks `--closure`, unkilled `waiting` review workers block `--closure` (`active_swarm_workers_present`), and killing them unlocks `--closure`.
         let sess_sw_guard = "sess-finite-cli-guards";
         rio::write_json(
             &cwg_common::marker_path(sess_sw_guard),
@@ -9275,7 +8344,6 @@ exit 0
                 "content_marks": [
                     {"ts": base_t, "fp": cap_fp.clone(), "unknown": false}
                 ],
-                "current_diff_hash": cap_fp.clone(),
                 "closed": false,
             }),
         )
@@ -9288,16 +8356,9 @@ exit 0
         fs::write(
             swg_dir.join("members.json"),
             json!([
-                {"name": "simp-r", "model": cwg_common::SONNET_HIGH_MODEL, "state": "killed", "killed": true},
-                {"name": "simp-q", "model": cwg_common::SONNET_HIGH_MODEL, "state": "killed", "killed": true},
-                {"name": "simp-e", "model": cwg_common::SONNET_HIGH_MODEL, "state": "killed", "killed": true}
+                {"name": "reviewer-1", "model": cwg_common::OPUS_HIGH_MODEL, "state": "killed", "killed": true}
             ])
             .to_string(),
-        )
-        .unwrap();
-        fs::write(
-            swg_dir.join("board.jsonl"),
-            ord3_board_lines.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
         )
         .unwrap();
         let inv_before_swg = fs::read_to_string(&inv_log).unwrap_or_default().lines().count();
@@ -9344,45 +8405,6 @@ exit 0
             swg_rows.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
         )
         .unwrap();
-        fs::write(
-            swg_dir.join("members.json"),
-            json!([
-                {"name": "simp-r", "model": cwg_common::SONNET_HIGH_MODEL, "state": "waiting", "killed": false},
-                {"name": "simp-q", "model": cwg_common::SONNET_HIGH_MODEL, "state": "killed", "killed": true},
-                {"name": "simp-e", "model": cwg_common::SONNET_HIGH_MODEL, "state": "killed", "killed": true}
-            ])
-            .to_string(),
-        )
-        .unwrap();
-        assert_eq!(
-            run_cli(&[
-                "review".to_string(),
-                "--closure".to_string(),
-                "--cwd".to_string(),
-                repo_str.clone(),
-                "--session".to_string(),
-                sess_sw_guard.to_string(),
-                "--diff-file".to_string(),
-                diff_p.to_string_lossy().into_owned(),
-                "--summary".to_string(),
-                "Waiting simplify worker must block --closure".to_string(),
-            ]),
-            2
-        );
-        assert_eq!(
-            fs::read_to_string(&inv_log).unwrap_or_default().lines().count(),
-            inv_before_swg
-        );
-        fs::write(
-            swg_dir.join("members.json"),
-            json!([
-                {"name": "simp-r", "model": cwg_common::SONNET_HIGH_MODEL, "state": "killed", "killed": true},
-                {"name": "simp-q", "model": cwg_common::SONNET_HIGH_MODEL, "state": "killed", "killed": true},
-                {"name": "simp-e", "model": cwg_common::SONNET_HIGH_MODEL, "state": "killed", "killed": true}
-            ])
-            .to_string(),
-        )
-        .unwrap();
         assert_eq!(
             run_cli(&[
                 "review".to_string(),
@@ -9421,6 +8443,14 @@ exit 0
             swg_res_steps.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n",
         )
         .unwrap();
+        fs::write(
+            swg_dir.join("members.json"),
+            json!([
+                {"name": "reviewer-1", "model": cwg_common::OPUS_HIGH_MODEL, "state": "waiting", "killed": false}
+            ])
+            .to_string(),
+        )
+        .unwrap();
         assert_eq!(
             run_cli(&[
                 "review".to_string(),
@@ -9432,7 +8462,34 @@ exit 0
                 "--diff-file".to_string(),
                 diff_p.to_string_lossy().into_owned(),
                 "--summary".to_string(),
-                "All simplify workers killed + verified post-ESCALATE research unlocks --closure".to_string(),
+                "Waiting review worker must block --closure".to_string(),
+            ]),
+            2
+        );
+        assert_eq!(
+            fs::read_to_string(&inv_log).unwrap_or_default().lines().count(),
+            inv_before_swg
+        );
+        fs::write(
+            swg_dir.join("members.json"),
+            json!([
+                {"name": "reviewer-1", "model": cwg_common::OPUS_HIGH_MODEL, "state": "killed", "killed": true}
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            run_cli(&[
+                "review".to_string(),
+                "--closure".to_string(),
+                "--cwd".to_string(),
+                repo_str.clone(),
+                "--session".to_string(),
+                sess_sw_guard.to_string(),
+                "--diff-file".to_string(),
+                diff_p.to_string_lossy().into_owned(),
+                "--summary".to_string(),
+                "All review workers killed + verified post-ESCALATE research unlocks --closure".to_string(),
             ]),
             0
         );
@@ -9968,7 +9025,7 @@ exit 0
         );
         assert_eq!(decode_utf8_hex(&encode_utf8_hex(raw_sum)).unwrap(), raw_sum);
 
-        // INVARIANT: 2-block closure halt, `research-reset`, and fresh-session enforcement hold in Rust.
+        // INVARIANT: 2-block closure halt summary holds in Rust.
         let sess_rr = "sess-rr-rust";
         let mpath_rr = cwg_common::marker_path(sess_rr);
         let _ = rio::write_json(
@@ -10015,244 +9072,14 @@ exit 0
             rr_lines.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
         )
         .unwrap();
-        let (blk_cnt, _last_blk_ts, blk_ids) = active_cycle_closure_blocks(sess_rr, &repo_str, "");
-        assert_eq!(blk_cnt, 2);
-        assert_eq!(blk_ids, vec!["cwg-rr-b1".to_string(), "cwg-rr-b2".to_string()]);
-
-        // INVARIANT: Under the finite gate, `redesign-reset` / `research-reset` rejects `--decision refine` (`rc == 2`) and rejects reset after 2/2 closure exhaustion (`rc == 2`), preserving saved threads and terminating in `[gate] draft-blocked`.
-        let tp_rr = Path::new(&repo_str).join("rr-transcript.jsonl");
-        let research_steps = [
-            json!({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": "2099-01-01T00:00:01Z", "tool_calls": [{"name": "search_web", "args": {"query": "gate verification docs"}}]}),
-            json!({"step_index": 2, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": "2099-01-01T00:00:02Z", "content": "ok"}),
-        ];
-        fs::write(
-            &tp_rr,
-            research_steps.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
-        )
-        .unwrap();
-        save_lane_thread_state(
-            sess_rr,
-            &repo_str,
-            cand_ts,
-            "gpt-6.2-sol",
-            "high",
-            json!({
-                "session_id": "sid-finite-kept",
-                "candidate_first_ts": cand_ts,
-                "model": "gpt-6.2-sol",
-                "effort": "high",
-                "xhigh": false,
-                "updated_ts": now + 100.0,
-            }),
-        );
+        let sum_rr = active_cycle_closure_summary(sess_rr, &repo_str, "");
+        assert_eq!(sum_rr.blocked_count, 2);
         assert_eq!(
-            run_cli(&[
-                "research-reset".to_string(),
-                "--cwd".to_string(),
-                repo_str.clone(),
-                "--session".to_string(),
-                sess_rr.to_string(),
-                "--decision".to_string(),
-                "refine".to_string(),
-                "--findings-hex".to_string(),
-                encode_utf8_hex("Verified \"official\" docs & refined closure state machine."),
-                "--transcript".to_string(),
-                tp_rr.to_string_lossy().into_owned(),
-            ]),
-            2
-        );
-        assert_eq!(
-            run_cli(&[
-                "redesign-reset".to_string(),
-                "--cwd".to_string(),
-                repo_str.clone(),
-                "--session".to_string(),
-                sess_rr.to_string(),
-                "--findings-hex".to_string(),
-                encode_utf8_hex("Attempted redesign after 2/2 BLOCKED closure exhaustion."),
-                "--transcript".to_string(),
-                tp_rr.to_string_lossy().into_owned(),
-            ]),
-            2
-        );
-        let kept_saved = active_thread_state(sess_rr, &repo_str, Some(cand_ts)).unwrap();
-        assert_eq!(val_to_str(kept_saved.get("session_id")), "sid-finite-kept");
-        let unchanged_marker = rio::read_json(&mpath_rr).unwrap();
-        assert!(unchanged_marker.get("research_resets").is_none());
-
-        // INVARIANT: After Round 4 `ESCALATE` + verified post-`ESCALATE` research (before 2/2 closure exhaustion), `redesign-reset` succeeds at most ONCE (`MAX_REDESIGN_RESETS = 1`), purging saved threads + simplify latches so the redesigned candidate runs in fresh sessions, and rejects any 2nd reset attempt (`rc == 2`).
-        let sess_red = "sess-redesign-once";
-        let mpath_red = cwg_common::marker_path(sess_red);
-        let cand_ts_red = now - 120.0;
-        rio::write_json(
-            &mpath_red,
-            &json!({
-                "session": sess_red,
-                "class": cwg_common::WORK_PERSISTENT,
-                "closed": false,
-                "first_ts": cand_ts_red,
-                "last_durable_ts": cand_ts_red,
-                "last_ts": cand_ts_red,
-                "edits": 1,
-                "cwd": rio::normalize_path(&repo_str),
-                "git_root": rio::normalize_path(&repo_str),
-                "paths": [rio::normalize_path(&Path::new(&repo_str).join("rust/src/a.rs").to_string_lossy())],
-                "content_marks": [{"ts": cand_ts_red, "fp": "1122334455667788", "unknown": false}],
-                "declared_risk": "HIGH",
-                "round_start_msg_id": 5,
-                "simplify_verified_latched": {
-                    "candidate_first_ts": cand_ts_red,
-                    "reset_epoch": 0,
-                    "verified_ts": cand_ts_red + 1.0,
-                    "verified_hashes": ["h-old"],
-                },
-            }),
-        )
-        .unwrap();
-        let esc_rid = "cwg-redesign-r4-esc";
-        let esc_sid = "sid-redesign-old";
-        let esc_roll = sessions_dir.join("rollout-redesign-esc.jsonl");
-        let base_esc_ts = cand_ts_red + 5.0;
-        let mut esc_lines: Vec<String> = vec![json!({
-            "type": "session_meta",
-            "timestamp": crate::win32_sqlite::format_iso_utc(base_esc_ts),
-            "payload": {"id": esc_sid, "session_id": esc_sid, "source": "exec", "thread_source": "user"}
-        })
-        .to_string()];
-        for r_idx in 1..=4usize {
-            let rid_i = if r_idx == 4 {
-                esc_rid.to_string()
-            } else {
-                format!("cwg-redesign-r{}", r_idx)
-            };
-            let v_str = if r_idx == 4 { "ESCALATE" } else { "REVISE" };
-            let ts_i = base_esc_ts + (r_idx as f64) * 5.0;
-            record_packet(
-                &rid_i,
-                &format!("REVIEW_ID: {}", rid_i),
-                &repo_str,
-                "high",
-                "ordinary",
-                sess_red,
-            );
-            let p_path = packet_path(&rid_i);
-            if let Some(mut pd) = rio::read_json(&p_path) {
-                pd["created_ts"] = json!(ts_i);
-                let _ = rio::write_json(&p_path, &pd);
-            }
-            esc_lines.push(
-                json!({
-                    "type": "turn_context",
-                    "timestamp": crate::win32_sqlite::format_iso_utc(ts_i + 1.0),
-                    "payload": {"model": "gpt-6.2-sol", "effort": "high"}
-                })
-                .to_string(),
-            );
-            esc_lines.push(
-                json!({
-                    "type": "response_item",
-                    "timestamp": crate::win32_sqlite::format_iso_utc(ts_i + 2.0),
-                    "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": format!("REVIEW_ID: {}", rid_i)}]}
-                })
-                .to_string(),
-            );
-            esc_lines.push(
-                json!({
-                    "type": "event_msg",
-                    "timestamp": crate::win32_sqlite::format_iso_utc(ts_i + 3.0),
-                    "payload": {"type": "task_complete", "last_agent_message": format!("VERDICT: {}", v_str)}
-                })
-                .to_string(),
-            );
-        }
-        fs::write(&esc_roll, esc_lines.join("\n") + "\n").unwrap();
-        save_lane_thread_state(
-            sess_red,
-            &repo_str,
-            cand_ts_red,
-            "gpt-6.2-sol",
-            "high",
-            json!({
-                "session_id": esc_sid,
-                "candidate_first_ts": cand_ts_red,
-                "model": "gpt-6.2-sol",
-                "effort": "high",
-                "xhigh": false,
-                "updated_ts": base_esc_ts + 24.0,
-            }),
-        );
-        let tp_red = Path::new(&repo_str).join("redesign-transcript.jsonl");
-        let red_steps = [
-            json!({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": crate::win32_sqlite::format_iso_utc(base_esc_ts + 30.0), "tool_calls": [{"name": "search_web", "args": {"query": "redesign architecture docs"}}]}),
-            json!({"step_index": 2, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(base_esc_ts + 31.0), "content": "ok"}),
-        ];
-        fs::write(
-            &tp_red,
-            red_steps.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
-        )
-        .unwrap();
-        // INVARIANT: A latched `closure_halt` (2x `BLOCKED`) blocks `redesign-reset` even when live closure rollout records were evicted while the 4 ordinary rounds + `ESCALATE` remain visible.
-        let mut halted_red_marker = rio::read_json(&mpath_red).unwrap();
-        halted_red_marker["closure_halt"] = json!({
-            "candidate_first_ts": cand_ts_red,
-            "blocked_count": 2,
-            "last_blocked_ts": base_esc_ts + 25.0,
-            "blocked_review_ids": ["cwg-evicted-b1", "cwg-evicted-b2"],
-        });
-        rio::write_json(&mpath_red, &halted_red_marker).unwrap();
-        assert_eq!(
-            run_cli(&[
-                "redesign-reset".to_string(),
-                "--cwd".to_string(),
-                repo_str.clone(),
-                "--session".to_string(),
-                sess_red.to_string(),
-                "--findings-hex".to_string(),
-                encode_utf8_hex("Attempted redesign while latched 2x BLOCKED closure_halt is active."),
-                "--transcript".to_string(),
-                tp_red.to_string_lossy().into_owned(),
-            ]),
-            2
-        );
-        let still_halted = rio::read_json(&mpath_red).unwrap();
-        assert!(still_halted.get("closure_halt").is_some());
-        halted_red_marker.as_object_mut().unwrap().remove("closure_halt");
-        rio::write_json(&mpath_red, &halted_red_marker).unwrap();
-
-        assert_eq!(
-            run_cli(&[
-                "redesign-reset".to_string(),
-                "--cwd".to_string(),
-                repo_str.clone(),
-                "--session".to_string(),
-                sess_red.to_string(),
-                "--findings-hex".to_string(),
-                encode_utf8_hex("Architectural redesign replacing retrospective digest reconstruction with forward latch."),
-                "--transcript".to_string(),
-                tp_red.to_string_lossy().into_owned(),
-            ]),
-            0
-        );
-        assert!(active_thread_state(sess_red, &repo_str, Some(cand_ts_red)).is_none());
-        let marker_after_red = rio::read_json(&mpath_red).unwrap();
-        assert_eq!(cwg_common::redesign_reset_count(&marker_after_red), 1);
-        assert!(marker_after_red.get("simplify_verified_latched").is_none());
-        assert_eq!(
-            run_cli(&[
-                "redesign-reset".to_string(),
-                "--cwd".to_string(),
-                repo_str.clone(),
-                "--session".to_string(),
-                sess_red.to_string(),
-                "--findings-hex".to_string(),
-                encode_utf8_hex("Second redesign attempt must fail closed under MAX_REDESIGN_RESETS=1."),
-                "--transcript".to_string(),
-                tp_red.to_string_lossy().into_owned(),
-            ]),
-            2
+            sum_rr.blocked_ids,
+            vec!["cwg-rr-b1".to_string(), "cwg-rr-b2".to_string()]
         );
 
-        // INVARIANT: Pre-upgrade 3-round sessions that already entered `--closure` (`3x REVISE` + Pass 1 verified `codex` `BLOCKED`) avoid the 3->4 Finite Gate mutual deadlock across `safety_guards`, `codex-lane review --closure`, `redesign-reset`, and `Stop`, while post-upgrade 3-round sessions (`gate_max_review_rounds >= 4` or without a verified `codex` closure pass) remain fail-closed.
+        // INVARIANT: Pre-upgrade 3-round sessions that already entered `--closure` (`3x REVISE` + Pass 1 verified `codex` `BLOCKED`) avoid the 3->4 Finite Gate mutual deadlock across `safety_guards`, `codex-lane review --closure`, and `Stop`, while post-upgrade 3-round sessions (`gate_max_review_rounds >= 4` or without a verified `codex` closure pass) remain fail-closed.
         let leg_mock_bin = write_mock_codex_bin(&tmp.0);
         let _leg_codex_env = EnvVarGuard::set(&[
             ("CARBON_CODEX_BIN", Some(&leg_mock_bin.to_string_lossy())),
@@ -10281,7 +9108,6 @@ exit 0
                 "git_root": rio::normalize_path(&repo_str),
                 "paths": [leg_a_path.clone()],
                 "content_marks": [{"ts": cand_ts_leg, "fp": leg_fp, "unknown": false}],
-                "current_diff_hash": leg_fp,
                 "declared_risk": "HIGH",
             }),
         )
@@ -10307,19 +9133,6 @@ exit 0
             lines.push(json!({"type": "turn_context", "timestamp": crate::win32_sqlite::format_iso_utc(ts + 1.0), "payload": {"model": "gpt-6.2-sol", "effort": "high"}}).to_string());
             lines.push(json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(ts + 2.0), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": format!("REVIEW_ID: {}", rid)}]}}).to_string());
             lines.push(json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(ts + 3.0), "payload": {"type": "task_complete", "last_agent_message": msg}}).to_string());
-        };
-        let run_leg_redesign = |findings: &str| -> i32 {
-            run_cli(&[
-                "redesign-reset".to_string(),
-                "--cwd".to_string(),
-                repo_str.clone(),
-                "--session".to_string(),
-                sess_leg.to_string(),
-                "--findings-hex".to_string(),
-                encode_utf8_hex(findings),
-                "--transcript".to_string(),
-                tp_leg.to_string_lossy().into_owned(),
-            ])
         };
         for r_idx in 1..=3usize {
             append_leg_turn(
@@ -10347,7 +9160,6 @@ exit 0
             ]),
             2
         );
-        assert_eq!(run_leg_redesign("Pre-closure round 3 redesign must fail."), 2);
 
         let cls1_ts = base_leg_ts + 25.0;
         append_leg_turn(&mut leg_lines, "cwg-leg3-cls1", "closure", cls1_ts, "CLOSURE_VALIDATION: BLOCKED");
@@ -10370,7 +9182,6 @@ exit 0
             ]),
             2
         );
-        assert_eq!(run_leg_redesign("Missing post-BLOCKED research must fail closed."), 2);
 
         let leg_marker = rio::read_json(&mpath_leg).unwrap();
         let leg_codex_p1 = scan_verified_codex_reviews(cand_ts_leg, sess_leg, &repo_str);
@@ -10542,7 +9353,6 @@ exit 0
                 "git_root": rio::normalize_path(&repo_str),
                 "paths": [leg_a_path.clone()],
                 "content_marks": [{"ts": cand_ts_leg, "fp": leg_fp, "unknown": false}],
-                "current_diff_hash": leg_fp,
                 "gate_max_review_rounds": cwg_common::MAX_ORDINARY_REVIEW_ROUNDS,
                 "declared_risk": "HIGH",
             }),
@@ -10724,7 +9534,6 @@ exit 0
                 "git_root": rio::normalize_path(&repo_str),
                 "paths": [leg_a_path.clone()],
                 "content_marks": [{"ts": cand_ts_leg, "fp": leg_fp, "unknown": false}],
-                "current_diff_hash": leg_fp,
                 "gate_max_review_rounds": cwg_common::MAX_ORDINARY_REVIEW_ROUNDS,
                 "declared_risk": "HIGH",
             }),
@@ -10770,7 +9579,7 @@ exit 0
             &tp_leg.to_string_lossy(),
         );
         assert_eq!(v2_probe.blocked_count, 2);
-        // INVARIANT: Legacy Sandwich `APPROVED -> simplify (no edits) -> fallback closure BLOCKED/READY` keeps the fallback closure pass eligible, clearing `has_fresh_ordinary_approved` and allowing `draft-blocked` or `verified`/`pr-ready`.
+        // INVARIANT: Legacy `APPROVED -> fallback closure BLOCKED/READY` keeps the fallback closure pass eligible, clearing `has_fresh_ordinary_approved` and allowing `draft-blocked` or `verified`/`pr-ready`.
         let ord_app_leg = json!({
             "kind": "ordinary",
             "verdict": "APPROVED",
@@ -10821,7 +9630,7 @@ exit 0
         assert!(check_leg_close(&rec_ver, &fallback_swarm, &fb_app_p2).0);
         assert!(check_leg_close(&rec_pr, &fallback_swarm, &fb_app_p2).0);
 
-        // INVARIANT: Legacy Sandwich `APPROVED -> simplify (no edits) -> closure BLOCKED` clears `has_fresh_ordinary_approved` so Pass 2 `--closure`, `redesign-reset`, and `draft-blocked` never deadlock against `APPROVED`.
+        // INVARIANT: Legacy `APPROVED -> closure BLOCKED` clears `has_fresh_ordinary_approved` so Pass 2 `--closure` and `draft-blocked` never deadlock against `APPROVED`.
         let sess_app_blk = "sess-legacy-app-blk";
         let mpath_ab = cwg_common::marker_path(sess_app_blk);
         rio::write_json(
@@ -10836,9 +9645,8 @@ exit 0
                 "edits": 1,
                 "cwd": rio::normalize_path(&repo_str),
                 "git_root": rio::normalize_path(&repo_str),
-                "paths": [leg_a_path.clone()],
+                "paths": [leg_a_path],
                 "content_marks": [{"ts": cand_ts_leg, "fp": leg_fp, "unknown": false}],
-                "current_diff_hash": leg_fp,
                 "declared_risk": "HIGH",
             }),
         )
@@ -10913,113 +9721,7 @@ exit 0
             .0
         );
 
-        let sess_leg_red = "sess-legacy-3round-redesign";
-        let mpath_lr = cwg_common::marker_path(sess_leg_red);
-        rio::write_json(
-            &mpath_lr,
-            &json!({
-                "session": sess_leg_red,
-                "class": cwg_common::WORK_PERSISTENT,
-                "closed": false,
-                "first_ts": cand_ts_leg,
-                "last_durable_ts": cand_ts_leg,
-                "last_ts": cand_ts_leg,
-                "edits": 1,
-                "cwd": rio::normalize_path(&repo_str),
-                "git_root": rio::normalize_path(&repo_str),
-                "paths": [leg_a_path],
-                "content_marks": [{"ts": cand_ts_leg, "fp": leg_fp, "unknown": false}],
-                "current_diff_hash": leg_fp,
-                "declared_risk": "HIGH",
-            }),
-        )
-        .unwrap();
-        let lr_roll = sessions_dir.join("rollout-legacy-3round-redesign.jsonl");
-        let lr_sid = "sid-legacy-3round-redesign";
-        let mut lr_lines = vec![json!({
-            "type": "session_meta",
-            "timestamp": crate::win32_sqlite::format_iso_utc(base_leg_ts),
-            "payload": {"id": lr_sid, "session_id": lr_sid, "source": "exec", "thread_source": "user"}
-        })
-        .to_string()];
-        let append_lr = |lines: &mut Vec<String>, rid: &str, phase: &str, ts: f64, msg: &str| {
-            record_packet(rid, &format!("REVIEW_ID: {}", rid), &repo_str, "high", phase, sess_leg_red);
-            let p_path = packet_path(rid);
-            if let Some(mut pd) = rio::read_json(&p_path) {
-                pd["created_ts"] = json!(ts);
-                let _ = rio::write_json(&p_path, &pd);
-            }
-            lines.push(json!({"type": "turn_context", "timestamp": crate::win32_sqlite::format_iso_utc(ts + 1.0), "payload": {"model": "gpt-6.2-sol", "effort": "high"}}).to_string());
-            lines.push(json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(ts + 2.0), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": format!("REVIEW_ID: {}", rid)}]}}).to_string());
-            lines.push(json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(ts + 3.0), "payload": {"type": "task_complete", "last_agent_message": msg}}).to_string());
-        };
-        for r_idx in 1..=3usize {
-            append_lr(&mut lr_lines, &format!("cwg-lr-r{}", r_idx), "ordinary", base_leg_ts + (r_idx as f64) * 5.0, "VERDICT: REVISE");
-        }
-        append_lr(&mut lr_lines, "cwg-lr-cls1", "closure", cls1_ts, "CLOSURE_VALIDATION: BLOCKED");
-        fs::write(&lr_roll, lr_lines.join("\n") + "\n").unwrap();
-        let leg_res_steps = [
-            json!({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": crate::win32_sqlite::format_iso_utc(cls1_ts + 6.0), "tool_calls": [{"name": "search_web", "args": {"query": "legacy 3-round redesign docs"}}]}),
-            json!({"step_index": 2, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(cls1_ts + 7.0), "content": "ok"}),
-        ];
-        fs::write(
-            &tp_leg,
-            leg_res_steps.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
-        )
-        .unwrap();
-        assert_eq!(
-            run_cli(&[
-                "redesign-reset".to_string(),
-                "--cwd".to_string(),
-                repo_str.clone(),
-                "--session".to_string(),
-                sess_leg_red.to_string(),
-                "--findings-hex".to_string(),
-                encode_utf8_hex("Architectural redesign after legacy 3-round Pass 1 BLOCKED + research."),
-                "--transcript".to_string(),
-                tp_leg.to_string_lossy().into_owned(),
-            ]),
-            0
-        );
-        let lr_after = rio::read_json(&mpath_lr).unwrap();
-        assert_eq!(cwg_common::redesign_reset_count(&lr_after), 1);
-        assert_eq!(
-            lr_after.get("gate_max_review_rounds").and_then(|v| v.as_u64()),
-            Some(cwg_common::MAX_ORDINARY_REVIEW_ROUNDS as u64)
-        );
-
-        // INVARIANT: Legacy markers that already contain historical `research_resets` still enforce `is_post_reset_codex_session_proven` against pre-reset subagent rollouts, while `build_adversarial_prompt` enforces `BLOCKING_THRESHOLD = HIGH`, interdiff, finding ledger, and Settled-Scope Freeze on Round 2+.
-        let rr_cutoff = rio::parse_iso_ts("2099-01-01T00:10:00Z");
-        assert!(!is_post_reset_codex_session_proven(
-            "sid-nonexistent-missing",
-            "",
-            rr_cutoff,
-            cand_ts
-        ));
-        let child_of_old = sessions_dir.join("rollout-sid-child-of-old.jsonl");
-        fs::write(
-            &child_of_old,
-            json!({
-                "type": "session_meta",
-                "timestamp": "2099-01-01T00:05:00Z",
-                "payload": {
-                    "id": "sid-child-of-old",
-                    "session_id": "sid-child-of-old",
-                    "source": {"subagent": {"thread_spawn": {"parent_thread_id": rr_old_sid}}},
-                    "thread_source": "subagent"
-                }
-            })
-            .to_string()
-                + "\n",
-        )
-        .unwrap();
-        assert!(!is_post_reset_codex_session_proven(
-            "sid-child-of-old",
-            &child_of_old.to_string_lossy(),
-            rr_cutoff,
-            cand_ts
-        ));
-
+        // INVARIANT: `build_adversarial_prompt` enforces `BLOCKING_THRESHOLD = HIGH`, interdiff, finding ledger, and Settled-Scope Freeze on Round 2+.
         let p_r1 = build_adversarial_prompt(PromptBuildSpec {
             review_id: "cwg-r1",
             packet_nonce: "111122223333",
@@ -11201,7 +9903,7 @@ exit 0
             ]),
             0
         );
-        let active_disp = load_active_dispositions(sess, &repo_s, 5000.0, 0.0, "", false);
+        let active_disp = load_active_dispositions(sess, &repo_s, 5000.0, "", false);
         assert_eq!(active_disp.len(), 1);
         assert_eq!(active_disp[0]["category"], "intent-conflict");
 
@@ -11226,10 +9928,9 @@ exit 0
         assert!(p_r2.contains("[intent-conflict] Switch to local-only LLM and block outbound internet"));
         assert!(p_r2.contains("SETTLED_BY_DISPOSITION"));
 
-        // Isolate across candidate timestamps, reset epochs, and closed->markerless transitions.
-        assert!(load_active_dispositions(sess, &repo_s, 6000.0, 0.0, "", false).is_empty());
-        assert!(load_active_dispositions(sess, &repo_s, 5000.0, 5500.0, "", false).is_empty());
-        assert!(load_active_dispositions(sess, &repo_s, 0.0, 0.0, "thread-a", false).is_empty());
+        // Isolate across candidate timestamps and closed->markerless transitions.
+        assert!(load_active_dispositions(sess, &repo_s, 6000.0, "", false).is_empty());
+        assert!(load_active_dispositions(sess, &repo_s, 0.0, "thread-a", false).is_empty());
 
         // Markerless disposition binds strictly to its review thread (including Astra `--xhigh`) and Sol/Astra threads never overwrite or unlink each other.
         let sol_model = resolve_review_model("", false);
@@ -11315,8 +10016,8 @@ exit 0
             ]),
             0
         );
-        let sol_items = load_active_dispositions(sess, &repo_s, 0.0, 0.0, "thread-sol-1", false);
-        let astra_items = load_active_dispositions(sess, &repo_s, 0.0, 0.0, "thread-astra-1", false);
+        let sol_items = load_active_dispositions(sess, &repo_s, 0.0, "thread-sol-1", false);
+        let astra_items = load_active_dispositions(sess, &repo_s, 0.0, "thread-astra-1", false);
         assert_eq!(sol_items.len(), 1);
         assert_eq!(sol_items[0]["finding"], "Sol-only settled item");
         assert_eq!(astra_items.len(), 1);
@@ -11332,15 +10033,15 @@ exit 0
             ]),
             0
         );
-        assert!(load_active_dispositions(sess, &repo_s, 0.0, 0.0, "thread-sol-1", false).is_empty());
+        assert!(load_active_dispositions(sess, &repo_s, 0.0, "thread-sol-1", false).is_empty());
         assert_eq!(
-            load_active_dispositions(sess, &repo_s, 0.0, 0.0, "thread-astra-1", false).len(),
+            load_active_dispositions(sess, &repo_s, 0.0, "thread-astra-1", false).len(),
             1,
             "clearing Sol markerless dispositions must NOT wipe Astra's active thread dispositions"
         );
-        assert!(load_active_dispositions(sess, &repo_s, 0.0, 0.0, "thread-b", false).is_empty());
-        assert!(load_active_dispositions(sess, &repo_s, 0.0, 0.0, "thread-astra-1", true).is_empty());
-        assert!(load_active_dispositions(sess, &repo_s, 0.0, 0.0, "", true).is_empty());
+        assert!(load_active_dispositions(sess, &repo_s, 0.0, "thread-b", false).is_empty());
+        assert!(load_active_dispositions(sess, &repo_s, 0.0, "thread-astra-1", true).is_empty());
+        assert!(load_active_dispositions(sess, &repo_s, 0.0, "", true).is_empty());
         rio::write_json(
             &mpath,
             &json!({
@@ -11354,7 +10055,7 @@ exit 0
         )
         .unwrap();
         assert_eq!(
-            load_active_dispositions(sess, &repo_s, 5000.0, 0.0, "thread-astra-1", false).len(),
+            load_active_dispositions(sess, &repo_s, 5000.0, "thread-astra-1", false).len(),
             1
         );
 
@@ -11377,7 +10078,7 @@ exit 0
             ]),
             0
         );
-        assert!(load_active_dispositions(sess, &repo_s, 5000.0, 0.0, "", false).is_empty());
+        assert!(load_active_dispositions(sess, &repo_s, 5000.0, "", false).is_empty());
 
         // Secret redaction (incl. pathless `?code=...` URLs and multi-pair `Cookie:` headers) + operational follow-up filtering + partial handoff isolation.
         let brain = tmp.0.join("brain");
@@ -11800,7 +10501,7 @@ exit 0
             assert_ne!(rc_fail, 0, "mock failing --new-session review must fail");
         }
         let preserved_disps =
-            load_active_dispositions(ml_sess, &ml_repo_s, 0.0, 0.0, "ml-thread-task2", false);
+            load_active_dispositions(ml_sess, &ml_repo_s, 0.0, "ml-thread-task2", false);
         assert_eq!(
             preserved_disps.len(),
             1,

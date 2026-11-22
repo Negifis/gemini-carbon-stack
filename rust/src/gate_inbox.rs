@@ -73,7 +73,7 @@ fn bus_report_keyword_re() -> &'static Regex {
 }
 
 pub fn is_valid_anomaly_bus_body(body: &str) -> bool {
-    // INVARIANT: Share one canonical anomaly-body predicate across `unhandled_bus_reports`, `bus_has_anomaly_notification`, and `cwg_stop` transcript verification so coordination/resolved status messages (`[NEON_DONE]`, `[REPORT_DONE]`, `[REPORT_RESOLVED]`, etc.) never count as handler notifications while dropped by the inbox.
+    // INVARIANT: Share one canonical anomaly-body predicate across `unhandled_bus_reports` and `cwg_stop` transcript verification so coordination/resolved status messages (`[NEON_DONE]`, `[REPORT_DONE]`, `[REPORT_RESOLVED]`, etc.) never count as handler notifications while dropped by the inbox.
     let trimmed = body.trim();
     if trimmed.is_empty() || bus_resolved_prefix_re().is_match(trimmed) {
         return false;
@@ -88,15 +88,6 @@ pub fn is_valid_anomaly_bus_body(body: &str) -> bool {
     has_explicit_anomaly_tag(trimmed) || bus_report_keyword_re().is_match(trimmed)
 }
 
-pub fn is_valid_anomaly_notification(body: &str, report_id: &str) -> bool {
-    let rid = report_id.trim();
-    !rid.is_empty()
-        && is_valid_anomaly_bus_body(body)
-        && anom_id_re()
-            .find_iter(body)
-            .any(|m| m.as_str().eq_ignore_ascii_case(rid))
-}
-
 fn anom_id_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?i)\banom-[0-9a-f]{6,}\b").expect("anom_id_re"))
@@ -106,125 +97,6 @@ fn eprintln_str(msg: &str) {
     let mut err = std::io::stderr().lock();
     let _ = err.write_all(msg.as_bytes());
     let _ = err.flush();
-}
-
-pub fn validate_warm_worker_verdicts(
-    messages: &[Value],
-    round_start_msg_id: i64,
-    current_diff_hash: &str,
-    members: Option<&Map<String, Value>>,
-    fast_path: bool,
-) -> Value {
-    let mut lenses: Map<String, Value> = Map::new();
-    let mut combined: Option<Value> = None;
-    let mut all_verdicts: Vec<Value> = Vec::new();
-    let mut stale_rejected: usize = 0;
-    let mut multi_lens_spoof = false;
-    let target_hash = current_diff_hash.trim();
-
-    for (idx, raw) in messages.iter().enumerate() {
-        let Some(obj) = raw.as_object() else {
-            continue;
-        };
-        let agent = val_to_str(
-            obj.get("agent")
-                .or_else(|| obj.get("worker"))
-                .or_else(|| obj.get("sender")),
-        )
-        .trim()
-        .to_string();
-        let mut role = val_to_str(obj.get("role")).trim().to_lowercase();
-        if role.is_empty() {
-            if let Some(mem_map) = members {
-                if let Some(m_meta) = mem_map.get(&agent).and_then(|v| v.as_object()) {
-                    role = val_to_str(m_meta.get("role")).trim().to_lowercase();
-                }
-            }
-        }
-        if role == "coordinator" || agent.eq_ignore_ascii_case("coordinator") {
-            continue;
-        }
-
-        let seq = cwg_common::extract_msg_seq(raw, (idx + 1) as i64);
-        if round_start_msg_id > 0 && seq <= round_start_msg_id {
-            stale_rejected += 1;
-            continue;
-        }
-
-        let text = val_to_str(obj.get("text").or_else(|| obj.get("content")));
-        let explicit_hash = val_to_str(
-            obj.get("diff_hash")
-                .or_else(|| obj.get("current_diff_hash")),
-        )
-        .trim()
-        .to_string();
-        let msg_hash = if explicit_hash.is_empty() {
-            cwg_common::extract_diff_hash(&text)
-        } else {
-            explicit_hash
-        };
-        if !target_hash.is_empty() && !msg_hash.is_empty() && msg_hash != target_hash {
-            stale_rejected += 1;
-            continue;
-        }
-
-        let default_lens = cwg_common::simplify_lens_from_worker_name(&agent);
-        let parsed = cwg_common::parse_simplify_verdict(&text, Some(&default_lens));
-        if val_to_str(parsed.get("verdict")).is_empty() {
-            continue;
-        }
-        let mut entry = match parsed {
-            Value::Object(m) => m,
-            _ => continue,
-        };
-        entry.insert("agent".to_string(), Value::String(agent));
-        entry.insert("seq".to_string(), json!(seq));
-        entry.insert("diff_hash".to_string(), Value::String(msg_hash));
-        entry.insert("ts".to_string(), json!(val_to_f64(obj.get("ts"))));
-
-        let entry_val = Value::Object(entry.clone());
-        all_verdicts.push(entry_val.clone());
-
-        if json_truthy(entry.get("multi_lens_spoof")) {
-            multi_lens_spoof = true;
-            continue;
-        }
-        let is_clean = json_truthy(entry.get("clean"));
-        let has_explicit_all = json_truthy(entry.get("has_explicit_all"));
-        let lens = val_to_str(entry.get("lens"));
-        if is_clean {
-            if has_explicit_all {
-                combined = Some(entry_val);
-            } else if cwg_common::SIMPLIFY_LENSES.contains(&lens.as_str()) {
-                lenses.insert(lens, entry_val);
-            }
-        } else if has_explicit_all || lens.is_empty() {
-            combined = None;
-        } else if cwg_common::SIMPLIFY_LENSES.contains(&lens.as_str()) {
-            lenses.remove(&lens);
-        }
-    }
-
-    let missing_lenses: Vec<String> = cwg_common::SIMPLIFY_LENSES
-        .iter()
-        .filter(|&&l| !lenses.contains_key(l))
-        .map(|&l| l.to_string())
-        .collect();
-    let combined_clean = combined
-        .as_ref()
-        .map_or(false, |c| json_truthy(c.get("clean")));
-    let satisfied =
-        !multi_lens_spoof && (missing_lenses.is_empty() || (fast_path && combined_clean));
-
-    json!({
-        "lenses": Value::Object(lenses),
-        "combined": combined.unwrap_or(Value::Null),
-        "all_verdicts": all_verdicts,
-        "stale_rejected": stale_rejected,
-        "missing_lenses": missing_lenses,
-        "multi_lens_spoof": multi_lens_spoof,
-        "satisfied": satisfied,
-    })
 }
 
 pub fn inbox_dir() -> PathBuf {
@@ -533,53 +405,6 @@ pub fn unhandled_bus_reports(handler_session: &str) -> Vec<Value> {
     unhandled_bus_reports_limited(Some(handler_session), 10)
 }
 
-pub fn bus_has_anomaly_notification(
-    from_session: &str,
-    handler_session: &str,
-    since_ts: f64,
-    report_id: &str,
-) -> bool {
-    let fsess = rio::safe_key(from_session, "");
-    let hsess = rio::safe_key(handler_session, "");
-    let rid_low = report_id.trim().to_lowercase();
-    if fsess.is_empty() || hsess.is_empty() || rid_low.is_empty() {
-        return false;
-    }
-    let Some(db_path) = readonly_chat_bus_db_path() else {
-        return false;
-    };
-    let Ok(conn) = SqliteConn::open(&db_path, SQLITE_OPEN_READONLY) else {
-        return false;
-    };
-    let sql = "SELECT body FROM messages WHERE from_id = ? AND to_id = ? AND created_ts >= ? AND LOWER(body) LIKE ? ORDER BY created_ts DESC, rowid DESC LIMIT 64 OFFSET ?";
-    let since_bound = (since_ts - 5.0).max(0.0);
-    let like_pat = format!("%{}%", rid_low);
-    let mut offset: i64 = 0;
-    loop {
-        let params = [
-            SqlParam::Text(fsess.clone()),
-            SqlParam::Text(hsess.clone()),
-            SqlParam::Float(since_bound),
-            SqlParam::Text(like_pat.clone()),
-            SqlParam::Int(offset),
-        ];
-        let Ok(rows) = conn.query(sql, &params) else {
-            return false;
-        };
-        if rows.iter().any(|r| {
-            r.first()
-                .map(|cell| cell.as_str())
-                .is_some_and(|body| is_valid_anomaly_notification(&body, &rid_low))
-        }) {
-            return true;
-        }
-        if rows.len() < 64 {
-            return false;
-        }
-        offset = offset.saturating_add(64);
-    }
-}
-
 pub fn format_handler_digest(limit: usize, cfg: Option<&Value>) -> String {
     let owned_cfg;
     let eff_cfg = match cfg {
@@ -658,23 +483,6 @@ pub fn format_handler_digest(limit: usize, cfg: Option<&Value>) -> String {
     lines.join("\n")
 }
 
-pub fn format_handler_banner(handler_session: &str) -> Option<String> {
-    let mut cfg = match get_handler_config() {
-        Value::Object(m) => m,
-        _ => Map::new(),
-    };
-    let clean = rio::safe_key(handler_session, "");
-    if !clean.is_empty() {
-        cfg.insert("handler_session".to_string(), Value::String(clean));
-    }
-    let digest = format_handler_digest(10, Some(&Value::Object(cfg)));
-    if digest.is_empty() {
-        None
-    } else {
-        Some(digest)
-    }
-}
-
 fn discover_session_transcript(session: &str) -> String {
     if session.is_empty() || session == "unknown" {
         return String::new();
@@ -724,7 +532,7 @@ where
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(format!(".{}.lock", stem));
-    // SAFETY: Serialize concurrent report updates (`mark_handler_notified` vs `resolve_report`) to prevent lost fields.
+    // SAFETY: Serialize concurrent report updates (`resolve_report`) to prevent lost fields.
     rio::with_file_lock(&lock_path, 3.0, 30.0, |acquired| {
         if !acquired {
             return (None, "lock_timeout");
@@ -737,17 +545,6 @@ where
         }
         (Some(rec), "ok")
     })
-}
-
-pub fn mark_handler_notified(report_id: &str) {
-    let _ = mutate_report(report_id, |rec| {
-        if json_truthy(rec.get("notified_handler")) {
-            return false;
-        }
-        rec.insert("notified_handler".to_string(), Value::Bool(true));
-        rec.insert("notified_ts".to_string(), json!(now_sec()));
-        true
-    });
 }
 
 pub fn verify_anomaly_report(
@@ -1282,50 +1079,10 @@ mod tests {
         assert_eq!(got[0]["msg_id"], json!("m-real"));
         assert_eq!(got[1]["msg_id"], json!("m-handoff-anom"));
         assert_eq!(got[2]["msg_id"], json!("m-handoff-rep"));
-        assert!(
-            !bus_has_anomaly_notification("w1", handler_id, 5.0, "anom-693fb707"),
-            "coordination [NEON_DONE]/[INFO] mentioning anom-id must not satisfy handler notification"
-        );
-        assert!(
-            !bus_has_anomaly_notification("w1", handler_id, 5.0, "anom-bbbbbb22"),
-            "[*_RESOLVED] messages must not satisfy handler notification"
-        );
-        assert!(
-            bus_has_anomaly_notification("w3", handler_id, 5.0, "anom-1234abcd"),
-            "explicit [GATE_ANOMALY ...] handoff must satisfy handler notification"
-        );
-        {
-            let conn = SqliteConn::open(&db_path, SQLITE_OPEN_READWRITE).unwrap();
-            for idx in 0..70 {
-                conn.execute(
-                    "INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    &[
-                        SqlParam::Text(format!("m-noise-{}", idx)),
-                        SqlParam::Text("t3".to_string()),
-                        SqlParam::Text("w3".to_string()),
-                        SqlParam::Text("Peer".to_string()),
-                        SqlParam::Text(handler_id.to_string()),
-                        SqlParam::Text("[NEON_DONE] follow-up status mentioning anom-1234abcd".to_string()),
-                        SqlParam::Text("unread".to_string()),
-                        SqlParam::Float(0.0),
-                        SqlParam::Float(20.0 + idx as f64),
-                    ],
-                )
-                .unwrap();
-            }
-        }
-        assert!(
-            bus_has_anomaly_notification("w3", handler_id, 5.0, "anom-1234abcd"),
-            ">25 newer filtered status messages mentioning same anom-id must not hide delivered anomaly notification"
-        );
-        assert!(
-            bus_has_anomaly_notification("w1", handler_id, 5.0, "anom-cccccc33"),
-            "explicit [GATE_ANOMALY ...] notification remains valid even after handler acks it"
-        );
-        let banner = format_handler_banner(handler_id).unwrap();
-        assert!(banner.contains("m-real"));
-        assert!(banner.contains("m-handoff-anom"));
-        assert!(banner.contains("m-handoff-rep"));
+        let digest = format_handler_digest(10, None);
+        assert!(digest.contains("m-real"));
+        assert!(digest.contains("m-handoff-anom"));
+        assert!(digest.contains("m-handoff-rep"));
         let summary = unresolved_summary(handler_id);
         assert_eq!(summary["bus_count"], json!(3));
 

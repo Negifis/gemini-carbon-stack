@@ -31,7 +31,7 @@ pub fn base_worker_name(worker_name: &str) -> String {
 }
 
 pub fn rotated_worker_name(base_name: &str, round_num: i64) -> String {
-    // INVARIANT: Native Antigravity `swarm(action="add")` rejects worker names > 24 chars; keep full `<lens>` intact via `simp-<lens>-<hash>-r<N>`.
+    // INVARIANT: Native Antigravity `swarm(action="add")` rejects worker names > 24 chars.
     let suffix = format!("-r{}", round_num);
     let limit = MAX_SWARM_WORKER_NAME_LEN.saturating_sub(suffix.len()).max(1);
     let raw_base = if base_name.is_empty() {
@@ -41,20 +41,7 @@ pub fn rotated_worker_name(base_name: &str, round_num: i64) -> String {
     };
     let stripped = base_worker_name(raw_base);
     let trimmed = stripped.trim_end_matches('-');
-    let mut stem = if trimmed.is_empty() {
-        "w".to_string()
-    } else {
-        trimmed.to_string()
-    };
-    let mut low_stem = stem.to_lowercase();
-    if low_stem.starts_with("simplify-efficie-") && stem.chars().count() == 21 {
-        let tail: String = stem
-            .chars()
-            .skip(stem.chars().count().saturating_sub(4))
-            .collect();
-        stem = format!("simp-efficiency-{}", tail);
-        low_stem = stem.to_lowercase();
-    }
+    let stem = if trimmed.is_empty() { "w" } else { trimmed };
     if stem.chars().count() <= limit {
         return format!("{}{}", stem, suffix);
     }
@@ -64,20 +51,6 @@ pub fn rotated_worker_name(base_name: &str, round_num: i64) -> String {
     }
     let full_hex = rio::sha256_hex(stem.as_bytes());
     let digest = &full_hex[..4];
-    if cwg_common::is_simplify_worker_name(&low_stem) {
-        let raw_tag = cwg_common::simplify_lens_from_worker_name(&low_stem);
-        let tag = if raw_tag.is_empty() {
-            "all"
-        } else {
-            raw_tag.as_str()
-        };
-        for dlen in [4usize, 3, 2] {
-            let compact = format!("simp-{}-{}", tag, &digest[..dlen]);
-            if compact.chars().count() <= limit {
-                return format!("{}{}", compact, suffix);
-            }
-        }
-    }
     let raw_prefix: String = stem.chars().take(limit - 5).collect();
     let trimmed_prefix = raw_prefix.trim_end_matches('-');
     let prefix = if trimmed_prefix.is_empty() {
@@ -99,23 +72,12 @@ fn matches_label(worker_name: &str, label: &str, model: &str, brief: &str) -> bo
     }
     let low = worker_name.trim().to_lowercase();
     let model_low = model.trim().to_lowercase();
-    let is_simplify = cwg_common::is_simplify_worker_name(&low)
-        || !cwg_common::simplify_lens_from_worker_name(&low).is_empty();
-    if clean == "simplify" {
-        if !is_simplify {
-            return false;
-        }
-        return model_low.is_empty() || cwg_common::is_simplify_allowed_model(&model_low);
-    }
     if clean == "review" {
         // INVARIANT: Align Warm Pool review-worker selection with the gate (`cwg_stop` /
         // `cwg_common`): allow only gate review models (`opus-high`, `carbon-high`, `neon-xhigh`,
         // or unset), and require role confirmation via name or assignment brief for multi-role
         // models (`carbon-high`, `neon-xhigh`) so Carbon builders never trigger `resume_in_place`
         // while brief-assigned Neon reviewers (e.g. `neon-audit`) are included.
-        if is_simplify {
-            return false;
-        }
         if model_low == cwg_common::OPUS_HIGH_MODEL {
             return true;
         }
@@ -216,71 +178,17 @@ pub fn inspect_swarm_workers(
     now_ts: Option<f64>,
     current_round: i64,
 ) -> Value {
-    inspect_swarm_workers_inner(
-        session,
-        brain_root,
-        ttl_seconds,
-        label,
-        now_ts,
-        current_round,
-        None,
-    )
-}
-
-fn inspect_swarm_workers_with_marker(
-    session: &str,
-    brain_root: &Path,
-    ttl_seconds: u64,
-    label: &str,
-    now_ts: Option<f64>,
-    current_round: i64,
-    marker: Option<&Value>,
-) -> Value {
-    inspect_swarm_workers_inner(
-        session,
-        brain_root,
-        ttl_seconds,
-        label,
-        now_ts,
-        current_round,
-        Some(marker),
-    )
-}
-
-fn inspect_swarm_workers_inner(
-    session: &str,
-    brain_root: &Path,
-    ttl_seconds: u64,
-    label: &str,
-    now_ts: Option<f64>,
-    current_round: i64,
-    marker_override: Option<Option<&Value>>,
-) -> Value {
     let now = now_ts.unwrap_or_else(now_sec);
     let members = rio::load_swarm_members(brain_root, session);
     let mut names: Vec<&String> = members.keys().collect();
     names.sort();
 
     let label_low = label.trim().to_lowercase();
-    let is_gated_lane = label_low == "simplify" || label_low == "review";
-    let loaded_marker = if marker_override.is_none() && is_gated_lane && !members.is_empty() {
-        cwg_common::read_active_marker_with_pending(session)
-    } else {
-        None
-    };
-    let marker = match marker_override {
-        Some(m) => m,
-        None => loaded_marker.as_ref(),
-    };
-    let rr_ts = marker.map_or(0.0, cwg_common::last_research_reset_ts);
-    let rr_seq = marker.map_or(0, cwg_common::last_research_reset_board_seq);
-    let has_reset = rr_ts > 0.0 || rr_seq > 0;
     let known_workers = if label_low == "review" {
         rio::swarm_worker_names(&members)
     } else {
         Vec::new()
     };
-    let mut raw_board_cache: Option<Vec<Value>> = None;
     let mut board_briefs_cache: Option<std::collections::HashMap<String, String>> = None;
 
     let mut active: Vec<Value> = Vec::new();
@@ -304,36 +212,15 @@ fn inspect_swarm_workers_inner(
         if !direct_match && !can_match_via_board {
             continue;
         }
-        // INVARIANT: Align Warm Pool selection with `cwg_stop`'s `research-reset` cycle boundary:
-        // ignore pre-reset simplify/review workers (fresh sessions enforced) and never inherit
-        // pre-reset coordinator board briefs when a post-reset worker reuses the same roster name.
-        if has_reset && is_gated_lane {
-            let raw_board = raw_board_cache
-                .get_or_insert_with(|| cwg_common::read_swarm_board_tail(brain_root, session));
-            if cwg_common::is_worker_spawned_before_reset(
-                name,
-                Some(meta),
-                raw_board,
-                rr_ts,
-                rr_seq,
-                marker,
-                Some(brain_root),
-            ) {
-                continue;
-            }
-        }
         let matched = if direct_match {
             true
         } else {
             let briefs = board_briefs_cache.get_or_insert_with(|| {
-                let raw_board = raw_board_cache
-                    .get_or_insert_with(|| cwg_common::read_swarm_board_tail(brain_root, session));
+                let raw_board = cwg_common::read_swarm_board_tail(brain_root, session);
                 cwg_common::collect_coordinator_board_briefs(
-                    raw_board,
+                    &raw_board,
                     &known_workers,
                     &known_workers,
-                    rr_seq,
-                    rr_ts,
                 )
             });
             briefs
@@ -902,13 +789,8 @@ where
     })
 }
 
-fn marker_cycle_or_reset_mismatch(
-    cur_m: &Value,
-    expected_cycle_ts: f64,
-    expected_rr_ts: f64,
-) -> bool {
+fn marker_cycle_mismatch(cur_m: &Value, expected_cycle_ts: f64) -> bool {
     cwg_common::cycle_ts_mismatch(cwg_common::marker_cycle_first_ts(cur_m), expected_cycle_ts)
-        || (cwg_common::last_research_reset_ts(cur_m) - expected_rr_ts).abs() > cwg_common::TS_EPS
 }
 
 fn stamp_marker_prepare_cycle_ts(obj: &mut Map<String, Value>, cycle_ts: f64, fallback_ts: f64) {
@@ -973,7 +855,6 @@ struct MarkerRepoPrepUpdate<'a> {
     mfile: &'a Path,
     folded_git_root: &'a str,
     expected_cycle_ts: f64,
-    expected_research_reset_ts: f64,
     expected_last_durable_ts: f64,
     expected_dpaths: &'a [String],
     expected_diff_hash: &'a str,
@@ -1042,7 +923,7 @@ fn persist_marker_repo_prepare_state(
     rounds_file: &Path,
     rounds_doc: Option<&Value>,
 ) -> Result<Option<Value>, String> {
-    // INVARIANT: Re-verify marker identity, `research_resets` cursor, pending hook deltas, durable path list, and measured fingerprint under `marker_lock_path`, and commit `rounds.json` inside the same lock so concurrent `research-reset` or candidate turnover cannot race `prepare`.
+    // INVARIANT: Re-verify marker identity, pending hook deltas, durable path list, and measured fingerprint under `marker_lock_path`, and commit `rounds.json` inside the same lock so concurrent candidate turnover cannot race `prepare`.
     with_locked_marker(upd.skey, upd.mfile, |raw_m, merged_opt, consumed_ids| {
         let (mut next_m, ack_ids) = if strict_commit {
             if !consumed_ids.is_empty() {
@@ -1053,11 +934,7 @@ fn persist_marker_repo_prepare_state(
             };
             let live_dur = val_to_f64(cur_m.get("last_durable_ts"));
             if !is_active_same_repo_marker(&cur_m, upd.folded_git_root)
-                || marker_cycle_or_reset_mismatch(
-                    &cur_m,
-                    upd.expected_cycle_ts,
-                    upd.expected_research_reset_ts,
-                )
+                || marker_cycle_mismatch(&cur_m, upd.expected_cycle_ts)
                 || (live_dur - upd.expected_last_durable_ts).abs() > cwg_common::TS_EPS
                 || cwg_common::durable_paths_from_val(cur_m.get("paths")) != upd.expected_dpaths
                 || val_to_str(cur_m.get("current_diff_hash")) != upd.expected_diff_hash
@@ -1079,11 +956,7 @@ fn persist_marker_repo_prepare_state(
                 return Err("concurrent_worktree_mutation".to_string());
             };
             if !cwg_common::is_active_marker(&cur_m)
-                || marker_cycle_or_reset_mismatch(
-                    &cur_m,
-                    upd.expected_cycle_ts,
-                    upd.expected_research_reset_ts,
-                )
+                || marker_cycle_mismatch(&cur_m, upd.expected_cycle_ts)
             {
                 return Err("concurrent_worktree_mutation".to_string());
             }
@@ -1291,7 +1164,6 @@ struct UncoveredFailInput<'a> {
     mfile: &'a Path,
     rounds_file: &'a Path,
     marker_first_ts: f64,
-    expected_rr_ts: f64,
     cur_tree_oid: &'a str,
     marker_upd: Option<MarkerRepoPrepUpdate<'a>>,
 }
@@ -1329,11 +1201,7 @@ fn record_uncovered_and_fail(
                 return Err("concurrent_worktree_mutation".to_string());
             };
             if !cwg_common::is_active_marker(&cur_m)
-                || marker_cycle_or_reset_mismatch(
-                    &cur_m,
-                    inp.marker_first_ts,
-                    inp.expected_rr_ts,
-                )
+                || marker_cycle_mismatch(&cur_m, inp.marker_first_ts)
             {
                 return Err("concurrent_worktree_mutation".to_string());
             }
@@ -1545,9 +1413,6 @@ fn prepare_round_locked(ctx: PrepareLockedCtx<'_>) -> Value {
         same_repo_diff_hash: cov_fp_for_prov,
         had_prior_cycle_prepare,
     });
-    let marker_rr_ts = marker
-        .as_ref()
-        .map_or(0.0, cwg_common::last_research_reset_ts);
     let marker_last_durable_ts = marker
         .as_ref()
         .map_or(0.0, |m| val_to_f64(m.get("last_durable_ts")));
@@ -1556,7 +1421,6 @@ fn prepare_round_locked(ctx: PrepareLockedCtx<'_>) -> Value {
         mfile: &mfile,
         folded_git_root,
         expected_cycle_ts: marker_first_ts,
-        expected_research_reset_ts: marker_rr_ts,
         expected_last_durable_ts: marker_last_durable_ts,
         expected_dpaths: &dpaths_for_cov,
         expected_diff_hash: &same_repo_diff_hash,
@@ -1593,7 +1457,7 @@ fn prepare_round_locked(ctx: PrepareLockedCtx<'_>) -> Value {
     let has_existing_cycle_prepare = initial_had_cycle_prepare.unwrap_or(false)
         || disk_requires_explicit_hash
         || cwg_common::has_active_rounds_in_doc(&state, marker.as_ref());
-    // INVARIANT: Only latch `uncovered_prepare` / `swarm_prepare_cycle_ts` when the caller requested a partial `--paths` slice or the cycle already had a prior `prepare` round; a fresh full-repo `prepare` that emits zero diff artifacts must stay cleanly eligible for direct file-reading simplify.
+    // INVARIANT: Only latch `uncovered_prepare` / `swarm_prepare_cycle_ts` when the caller requested a partial `--paths` slice or the cycle already had a prior `prepare` round; a fresh full-repo `prepare` that emits zero diff artifacts must stay cleanly eligible for direct file reading.
     let latch_uncovered_failure = !rel_paths.is_empty() || has_existing_cycle_prepare;
     let fail_uncovered = |st: &mut Map<String, Value>| -> Value {
         if !latch_uncovered_failure {
@@ -1606,7 +1470,6 @@ fn prepare_round_locked(ctx: PrepareLockedCtx<'_>) -> Value {
                 mfile: &mfile,
                 rounds_file: &rounds_file,
                 marker_first_ts,
-                expected_rr_ts: marker_rr_ts,
                 cur_tree_oid: &cur_tree_oid,
                 marker_upd,
             },
@@ -1887,15 +1750,13 @@ fn prepare_round_locked(ctx: PrepareLockedCtx<'_>) -> Value {
         });
     }
 
-    let active_marker = marker.as_ref().filter(|m| cwg_common::is_active_marker(m));
-    let worker_status = inspect_swarm_workers_with_marker(
+    let worker_status = inspect_swarm_workers(
         input.session,
         input.brain_root,
         input.ttl_seconds,
         clean_label,
         Some(now),
         cur_round,
-        active_marker,
     );
 
     let mut next_names = Map::new();
@@ -1923,8 +1784,6 @@ fn prepare_round_locked(ctx: PrepareLockedCtx<'_>) -> Value {
         input.cwd
     };
     let diff_metrics = cwg_common::compute_diff_metrics(&marker_doc, eff_repo_root, None);
-    let fast_path_eligible =
-        cwg_common::is_simplify_fast_path_eligible(&json!({}), None, Some(&diff_metrics), "");
 
     let overall_action = val_to_str(worker_status.get("overall_action"));
     json!({
@@ -1943,7 +1802,6 @@ fn prepare_round_locked(ctx: PrepareLockedCtx<'_>) -> Value {
         "incremental_diff_path": diff_res.incremental_diff_path,
         "incremental_stat": diff_res.incremental_stat,
         "diff_metrics": diff_metrics,
-        "fast_path_eligible": fast_path_eligible,
         "overall_action": overall_action,
         "next_worker_names": next_names,
         "worker_status": worker_status,
@@ -1952,11 +1810,11 @@ fn prepare_round_locked(ctx: PrepareLockedCtx<'_>) -> Value {
 
 pub fn prepare_round(input: PrepareRoundInput<'_>) -> Value {
     let raw_label = if input.label.is_empty() {
-        "simplify"
+        "review"
     } else {
         input.label
     };
-    let clean_label = rio::safe_key(raw_label, "simplify");
+    let clean_label = rio::safe_key(raw_label, "review");
 
     let eff_cwd = if input.cwd.trim().is_empty() {
         "."
@@ -2074,7 +1932,7 @@ fn parse_prepare_args(args: &[String]) -> Result<PrepareArgs, String> {
     let mut out = PrepareArgs {
         session: String::new(),
         cwd: ".".to_string(),
-        label: "simplify".to_string(),
+        label: "review".to_string(),
         ttl: cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
         brain_root: String::new(),
         reset: false,
@@ -2219,16 +2077,11 @@ mod tests {
     fn test_regex_and_worker_name_rotation() {
         assert!(round_suffix_re().is_match("worker-r12"));
         assert!(!round_suffix_re().is_match("worker-r"));
-        assert_eq!(base_worker_name("simp-reuse-abcd-r3"), "simp-reuse-abcd");
+        assert_eq!(base_worker_name("rev-audit-abcd-r3"), "rev-audit-abcd");
 
-        let healed = rotated_worker_name("simplify-efficie-abcd", 2);
-        assert!(healed.len() <= MAX_SWARM_WORKER_NAME_LEN);
-        assert_eq!(healed, "simp-efficiency-abcd-r2");
-
-        let long_simp = rotated_worker_name("simplify-efficiency-reviewer-extra-long", 12);
-        assert!(long_simp.len() <= MAX_SWARM_WORKER_NAME_LEN);
-        assert!(long_simp.starts_with("simp-efficiency-"));
-        assert!(long_simp.ends_with("-r12"));
+        let short = rotated_worker_name("review-opus", 2);
+        assert!(short.len() <= MAX_SWARM_WORKER_NAME_LEN);
+        assert_eq!(short, "review-opus-r2");
 
         let long_other = rotated_worker_name("very-long-adversarial-reviewer-worker-name", 4);
         assert!(long_other.len() <= MAX_SWARM_WORKER_NAME_LEN);
@@ -2247,10 +2100,10 @@ mod tests {
         let members = json!({
             "members": {
                 "coordinator": {"role": "coordinator", "conversation_id": session},
-                "simp-reuse-r1": {"role": "worker", "model": cwg_common::SONNET_HIGH_MODEL, "conversation_id": worker_cid},
-                "simp-quality-r1": {"role": "worker", "model": cwg_common::SONNET_HIGH_MODEL, "conversation_id": warm_cid},
-                "simp-efficiency-r1": {"role": "worker", "model": cwg_common::SIMPLIFY_FALLBACK_MODEL, "conversation_id": worker_cid},
-                "simplify-efficiency-r0": {"role": "worker", "model": cwg_common::SONNET_HIGH_MODEL, "killed": true}
+                "review-opus-r1": {"role": "worker", "model": cwg_common::OPUS_HIGH_MODEL, "conversation_id": worker_cid},
+                "review-opus-warm-r1": {"role": "worker", "model": cwg_common::OPUS_HIGH_MODEL, "conversation_id": warm_cid},
+                "review-neon-r1": {"role": "worker", "model": cwg_common::NEON_XHIGH_MODEL, "conversation_id": worker_cid},
+                "review-old-r0": {"role": "worker", "model": cwg_common::OPUS_HIGH_MODEL, "killed": true}
             }
         });
         fs::write(
@@ -2286,20 +2139,23 @@ mod tests {
             session,
             &brain,
             cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
-            "simplify",
+            "review",
             Some(now),
             1,
         );
         assert_eq!(res["active_count"], json!(3));
         assert_eq!(res["killed_count"], json!(1));
         assert_eq!(res["overall_action"], json!("rotate_incremental"));
-        assert_eq!(res["expired_workers"], json!(["simp-reuse-r1"]));
-        assert_eq!(res["warm_workers"], json!(["simp-efficiency-r1", "simp-quality-r1"]));
+        assert_eq!(res["expired_workers"], json!(["review-opus-r1"]));
+        assert_eq!(
+            res["warm_workers"],
+            json!(["review-neon-r1", "review-opus-warm-r1"])
+        );
 
         let workers = res["workers"].as_array().unwrap();
         let w_warm = workers
             .iter()
-            .find(|w| w["name"] == "simp-quality-r1")
+            .find(|w| w["name"] == "review-opus-warm-r1")
             .unwrap();
         assert_eq!(w_warm["last_input_tokens"], json!(50));
         assert_eq!(w_warm["last_cache_read_tokens"], json!(500));
@@ -2324,7 +2180,7 @@ mod tests {
             session: "sess-nongit",
             cwd: &non_git_s,
             brain_root: &brain,
-            label: "simplify",
+            label: "review",
             ttl_seconds: 270,
             paths: &[],
             reset: false,
@@ -2351,7 +2207,7 @@ mod tests {
                 session: "sess-git",
                 cwd: &repo_s,
                 brain_root: &brain,
-                label: "simplify",
+                label: "review",
                 ttl_seconds: 270,
                 paths: &[],
                 reset: false,
@@ -2359,7 +2215,7 @@ mod tests {
             });
             assert_eq!(r1["ok"], json!(true));
             assert_eq!(r1["round"], json!(1));
-            assert_eq!(r1["fast_path_eligible"], json!(true));
+            assert!(r1.get("fast_path_eligible").is_none());
             assert!(Path::new(r1["full_diff_path"].as_str().unwrap()).is_file());
 
             fs::write(repo.join("a.txt"), "one\ntwo\nthree\n").unwrap();
@@ -2367,7 +2223,7 @@ mod tests {
                 session: "sess-git",
                 cwd: &repo_s,
                 brain_root: &brain,
-                label: "simplify",
+                label: "review",
                 ttl_seconds: 270,
                 paths: &[],
                 reset: false,
@@ -2386,18 +2242,6 @@ mod tests {
 
     #[test]
     fn test_matches_label_neon_routing() {
-        assert!(matches_label(
-            "simplify-reuse-r1",
-            "simplify",
-            cwg_common::NEON_XHIGH_MODEL,
-            ""
-        ));
-        assert!(matches_label(
-            "simplify-quality-r1",
-            "simplify",
-            cwg_common::HYDROGEN_XHIGH_MODEL,
-            ""
-        ));
         assert!(matches_label(
             "internal-reviewer",
             "review",
@@ -2542,652 +2386,6 @@ mod tests {
         assert_eq!(res_neon["warm_workers"], json!(["neon-audit"]));
         assert_eq!(res_neon["overall_action"], json!("resume_in_place"));
 
-        // Case 3: After `research-reset`, a new post-reset Neon builder reusing roster name `neon-audit`
-        // must NOT inherit pre-reset reviewer board briefs (must stay `initial_spawn`, not `resume_in_place`).
-        let rr_ts = rio::parse_iso_ts("2026-11-19T20:25:30Z");
-        let rr_marker = json!({
-            "closed": false,
-            "research_resets": [{
-                "reset_ts": rr_ts,
-                "board_head_seq": 5,
-                "pre_reset_worker_cids": ["cid-neon-audit-pre-reset"]
-            }]
-        });
-        let sess_rr_reuse = "sess-neon-audit-post-reset-builder-reuse";
-        let sw_rr = rio::swarm_dir(&brain, sess_rr_reuse);
-        fs::create_dir_all(&sw_rr).unwrap();
-        write_warm_worker("cid-neon-builder-post-reset");
-        fs::write(
-            sw_rr.join("members.json"),
-            serde_json::to_string(&json!({
-                "members": {
-                    "neon-audit": {
-                        "role": "worker",
-                        "conversation_id": "cid-neon-builder-post-reset",
-                        "model": cwg_common::NEON_XHIGH_MODEL,
-                        "created_at": "2026-11-19T20:25:45Z",
-                        "killed": false
-                    }
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            sw_rr.join("board.jsonl"),
-            [
-                json!({
-                    "seq": 1,
-                    "agent": "coordinator",
-                    "time": "2026-11-19T20:25:00Z",
-                    "text": "@neon-audit Adversarial audit of diff; report VERDICT: APPROVED or REVISE."
-                }),
-                json!({
-                    "seq": 6,
-                    "agent": "coordinator",
-                    "time": "2026-11-19T20:25:50Z",
-                    "text": "@neon-audit Implement parser module in src/parser.rs."
-                }),
-            ]
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join("\n")
-                + "\n",
-        )
-        .unwrap();
-        let res_rr_builder = inspect_swarm_workers_with_marker(
-            sess_rr_reuse,
-            &brain,
-            cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
-            "review",
-            Some(now),
-            1,
-            Some(&rr_marker),
-        );
-        assert_eq!(res_rr_builder["active_count"], json!(0));
-        assert_eq!(res_rr_builder["overall_action"], json!("initial_spawn"));
-
-        // Case 4: Pre-reset unkilled reviewer `neon-audit` (`cid` in `pre_reset_worker_cids`) must NOT
-        // trigger Warm Pool `resume_in_place` after `research-reset`.
-        let sess_rr_pre = "sess-neon-audit-pre-reset-stale";
-        let sw_rr_pre = rio::swarm_dir(&brain, sess_rr_pre);
-        fs::create_dir_all(&sw_rr_pre).unwrap();
-        write_warm_worker("cid-neon-audit-pre-reset");
-        fs::write(
-            sw_rr_pre.join("members.json"),
-            serde_json::to_string(&json!({
-                "members": {
-                    "neon-audit": {
-                        "role": "worker",
-                        "conversation_id": "cid-neon-audit-pre-reset",
-                        "model": cwg_common::NEON_XHIGH_MODEL,
-                        "killed": false
-                    }
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            sw_rr_pre.join("board.jsonl"),
-            format!(
-                "{}\n",
-                json!({
-                    "seq": 1,
-                    "agent": "coordinator",
-                    "time": "2026-11-19T20:25:00Z",
-                    "text": "@neon-audit Adversarial audit of diff; report VERDICT: APPROVED or REVISE."
-                })
-            ),
-        )
-        .unwrap();
-        let res_rr_pre = inspect_swarm_workers_with_marker(
-            sess_rr_pre,
-            &brain,
-            cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
-            "review",
-            Some(now),
-            1,
-            Some(&rr_marker),
-        );
-        assert_eq!(res_rr_pre["active_count"], json!(0));
-        assert_eq!(res_rr_pre["overall_action"], json!("initial_spawn"));
-
-        // Case 5: Post-reset Neon reviewer `neon-audit` assigned AFTER `research-reset` MUST trigger `resume_in_place`.
-        let sess_rr_post_rev = "sess-neon-audit-post-reset-reviewer";
-        let sw_rr_post = rio::swarm_dir(&brain, sess_rr_post_rev);
-        fs::create_dir_all(&sw_rr_post).unwrap();
-        write_warm_worker("cid-neon-reviewer-post-reset");
-        fs::write(
-            sw_rr_post.join("members.json"),
-            serde_json::to_string(&json!({
-                "members": {
-                    "neon-audit": {
-                        "role": "worker",
-                        "conversation_id": "cid-neon-reviewer-post-reset",
-                        "model": cwg_common::NEON_XHIGH_MODEL,
-                        "created_at": "2026-11-19T20:25:45Z",
-                        "killed": false
-                    }
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            sw_rr_post.join("board.jsonl"),
-            format!(
-                "{}\n",
-                json!({
-                    "seq": 6,
-                    "agent": "coordinator",
-                    "time": "2026-11-19T20:25:50Z",
-                    "text": "@neon-audit Adversarial audit of diff; report VERDICT: APPROVED or REVISE."
-                })
-            ),
-        )
-        .unwrap();
-        let res_rr_post = inspect_swarm_workers_with_marker(
-            sess_rr_post_rev,
-            &brain,
-            cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
-            "review",
-            Some(now),
-            1,
-            Some(&rr_marker),
-        );
-        assert_eq!(res_rr_post["active_count"], json!(1));
-        assert_eq!(res_rr_post["warm_workers"], json!(["neon-audit"]));
-        assert_eq!(res_rr_post["overall_action"], json!("resume_in_place"));
-
-        // Case 6: Post-reset Neon reviewer assigned with `seq > board_head_seq` and a coarse same-second
-        // board timestamp (`20:25:30Z` vs `reset_ts = 20:25:30.500Z`) MUST be preserved (`resume_in_place`),
-        // matching `cwg_stop` when `board_head_seq` proves the row is post-reset.
-        let rr_half_sec = rio::parse_iso_ts("2026-11-19T20:25:30.500Z");
-        let rr_half_marker = json!({
-            "closed": false,
-            "research_resets": [{
-                "reset_ts": rr_half_sec,
-                "board_head_seq": 5,
-                "pre_reset_worker_cids": ["cid-neon-audit-pre-reset"]
-            }]
-        });
-        let sess_rr_samesec = "sess-neon-audit-post-reset-same-second-coarse";
-        let sw_rr_ss = rio::swarm_dir(&brain, sess_rr_samesec);
-        fs::create_dir_all(&sw_rr_ss).unwrap();
-        write_warm_worker("cid-neon-reviewer-samesec");
-        fs::write(
-            sw_rr_ss.join("members.json"),
-            serde_json::to_string(&json!({
-                "members": {
-                    "neon-audit": {
-                        "role": "worker",
-                        "conversation_id": "cid-neon-reviewer-samesec",
-                        "model": cwg_common::NEON_XHIGH_MODEL,
-                        "created_at": "2026-11-19T20:25:30.600Z",
-                        "killed": false
-                    }
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            sw_rr_ss.join("board.jsonl"),
-            format!(
-                "{}\n",
-                json!({
-                    "seq": 6,
-                    "agent": "coordinator",
-                    "time": "2026-11-19T20:25:30Z",
-                    "text": "@neon-audit Adversarial audit of diff; report VERDICT: APPROVED or REVISE."
-                })
-            ),
-        )
-        .unwrap();
-        let res_rr_ss = inspect_swarm_workers_with_marker(
-            sess_rr_samesec,
-            &brain,
-            cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
-            "review",
-            Some(now),
-            1,
-            Some(&rr_half_marker),
-        );
-        assert_eq!(res_rr_ss["active_count"], json!(1));
-        assert_eq!(res_rr_ss["warm_workers"], json!(["neon-audit"]));
-        assert_eq!(res_rr_ss["overall_action"], json!("resume_in_place"));
-
-        // Case 7: Pre-reset row appended between `board_head_seq` snapshot (`seq=5`) and `reset_ts`
-        // (`20:25:30.500Z`) has `seq=6 > rr_seq` but exact timestamp `20:25:30.200Z <= reset_ts`;
-        // MUST be filtered out so a post-reset Neon builder reusing `neon-audit` stays `initial_spawn`,
-        // while a subsequent post-reset coarse same-second row (`seq=7`, `20:25:30Z`) retains its
-        // full upper bound (`20:25:31Z > 20:25:30.500Z`) and is preserved when assigning a reviewer.
-        let sess_rr_gap_b = "sess-neon-audit-pre-reset-gap-builder";
-        let sw_rr_gb = rio::swarm_dir(&brain, sess_rr_gap_b);
-        fs::create_dir_all(&sw_rr_gb).unwrap();
-        write_warm_worker("cid-neon-builder-gap");
-        fs::write(
-            sw_rr_gb.join("members.json"),
-            serde_json::to_string(&json!({
-                "members": {
-                    "neon-audit": {
-                        "role": "worker",
-                        "conversation_id": "cid-neon-builder-gap",
-                        "model": cwg_common::NEON_XHIGH_MODEL,
-                        "created_at": "2026-11-19T20:25:30.600Z",
-                        "killed": false
-                    }
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            sw_rr_gb.join("board.jsonl"),
-            [
-                json!({
-                    "seq": 6,
-                    "agent": "coordinator",
-                    "time": "2026-11-19T20:25:30.200Z",
-                    "text": "@neon-audit Adversarial audit of diff; report VERDICT: APPROVED or REVISE."
-                }),
-                json!({
-                    "seq": 7,
-                    "agent": "coordinator",
-                    "time": "2026-11-19T20:25:30Z",
-                    "text": "@neon-audit Implement parser module in src/parser.rs."
-                }),
-            ]
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join("\n")
-                + "\n",
-        )
-        .unwrap();
-        let res_rr_gb = inspect_swarm_workers_with_marker(
-            sess_rr_gap_b,
-            &brain,
-            cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
-            "review",
-            Some(now),
-            1,
-            Some(&rr_half_marker),
-        );
-        assert_eq!(res_rr_gb["active_count"], json!(0));
-        assert_eq!(res_rr_gb["overall_action"], json!("initial_spawn"));
-
-        let sess_rr_gap_r = "sess-neon-audit-pre-reset-gap-then-post-coarse-rev";
-        let sw_rr_gr = rio::swarm_dir(&brain, sess_rr_gap_r);
-        fs::create_dir_all(&sw_rr_gr).unwrap();
-        write_warm_worker("cid-neon-rev-after-gap");
-        fs::write(
-            sw_rr_gr.join("members.json"),
-            serde_json::to_string(&json!({
-                "members": {
-                    "neon-audit": {
-                        "role": "worker",
-                        "conversation_id": "cid-neon-rev-after-gap",
-                        "model": cwg_common::NEON_XHIGH_MODEL,
-                        "created_at": "2026-11-19T20:25:30.600Z",
-                        "killed": false
-                    }
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            sw_rr_gr.join("board.jsonl"),
-            [
-                json!({
-                    "seq": 6,
-                    "agent": "coordinator",
-                    "time": "2026-11-19T20:25:30.200Z",
-                    "text": "@neon-audit Implement old cycle builder."
-                }),
-                json!({
-                    "seq": 7,
-                    "agent": "coordinator",
-                    "time": "2026-11-19T20:25:30Z",
-                    "text": "@neon-audit Adversarial audit of diff; report VERDICT: APPROVED or REVISE."
-                }),
-            ]
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join("\n")
-                + "\n",
-        )
-        .unwrap();
-        let res_rr_gr = inspect_swarm_workers_with_marker(
-            sess_rr_gap_r,
-            &brain,
-            cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
-            "review",
-            Some(now),
-            1,
-            Some(&rr_half_marker),
-        );
-        assert_eq!(res_rr_gr["active_count"], json!(1));
-        assert_eq!(res_rr_gr["warm_workers"], json!(["neon-audit"]));
-        assert_eq!(res_rr_gr["overall_action"], json!("resume_in_place"));
-
-        // Case 8: Coarse pre-reset row `seq=6` (`20:25:30Z`, `@neon-audit VERDICT: APPROVED`) followed by
-        // exact pre-reset row `seq=7` (`20:25:30.300Z <= reset_ts 20:25:30.500Z`) proves BOTH `seq=6` and
-        // `seq=7` preceded reset via append-only causal prefix tightening; post-reset Neon builder reusing
-        // `neon-audit` (`seq=8` coarse `20:25:30Z`) MUST stay `initial_spawn` (not `resume_in_place`),
-        // while a post-reset reviewer assigned at `seq=8` (coarse `20:25:30Z`) IS still preserved.
-        let sess_rr_cp_b = "sess-neon-audit-causal-prefix-builder";
-        let sw_rr_cpb = rio::swarm_dir(&brain, sess_rr_cp_b);
-        fs::create_dir_all(&sw_rr_cpb).unwrap();
-        write_warm_worker("cid-neon-builder-cp");
-        fs::write(
-            sw_rr_cpb.join("members.json"),
-            serde_json::to_string(&json!({
-                "members": {
-                    "neon-audit": {
-                        "role": "worker",
-                        "conversation_id": "cid-neon-builder-cp",
-                        "model": cwg_common::NEON_XHIGH_MODEL,
-                        "created_at": "2026-11-19T20:25:30.600Z",
-                        "killed": false
-                    }
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            sw_rr_cpb.join("board.jsonl"),
-            [
-                json!({
-                    "seq": 6,
-                    "agent": "coordinator",
-                    "time": "2026-11-19T20:25:30Z",
-                    "text": "@neon-audit Adversarial audit of diff; report VERDICT: APPROVED or REVISE."
-                }),
-                json!({
-                    "seq": 7,
-                    "agent": "coordinator",
-                    "time": "2026-11-19T20:25:30.300Z",
-                    "text": "@other-worker sync"
-                }),
-                json!({
-                    "seq": 8,
-                    "agent": "coordinator",
-                    "time": "2026-11-19T20:25:30Z",
-                    "text": "@neon-audit Implement parser module in src/parser.rs."
-                }),
-            ]
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join("\n")
-                + "\n",
-        )
-        .unwrap();
-        let res_rr_cpb = inspect_swarm_workers_with_marker(
-            sess_rr_cp_b,
-            &brain,
-            cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
-            "review",
-            Some(now),
-            1,
-            Some(&rr_half_marker),
-        );
-        assert_eq!(res_rr_cpb["active_count"], json!(0));
-        assert_eq!(res_rr_cpb["overall_action"], json!("initial_spawn"));
-
-        let sess_rr_cp_r = "sess-neon-audit-causal-prefix-reviewer";
-        let sw_rr_cpr = rio::swarm_dir(&brain, sess_rr_cp_r);
-        fs::create_dir_all(&sw_rr_cpr).unwrap();
-        write_warm_worker("cid-neon-reviewer-cp");
-        fs::write(
-            sw_rr_cpr.join("members.json"),
-            serde_json::to_string(&json!({
-                "members": {
-                    "neon-audit": {
-                        "role": "worker",
-                        "conversation_id": "cid-neon-reviewer-cp",
-                        "model": cwg_common::NEON_XHIGH_MODEL,
-                        "created_at": "2026-11-19T20:25:30.600Z",
-                        "killed": false
-                    }
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            sw_rr_cpr.join("board.jsonl"),
-            [
-                json!({
-                    "seq": 6,
-                    "agent": "coordinator",
-                    "time": "2026-11-19T20:25:30Z",
-                    "text": "@neon-audit Implement old cycle builder."
-                }),
-                json!({
-                    "seq": 7,
-                    "agent": "coordinator",
-                    "time": "2026-11-19T20:25:30.300Z",
-                    "text": "@other-worker sync"
-                }),
-                json!({
-                    "seq": 8,
-                    "agent": "coordinator",
-                    "time": "2026-11-19T20:25:30Z",
-                    "text": "@neon-audit Adversarial audit of diff; report VERDICT: APPROVED or REVISE."
-                }),
-            ]
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join("\n")
-                + "\n",
-        )
-        .unwrap();
-        let res_rr_cpr = inspect_swarm_workers_with_marker(
-            sess_rr_cp_r,
-            &brain,
-            cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
-            "review",
-            Some(now),
-            1,
-            Some(&rr_half_marker),
-        );
-        assert_eq!(res_rr_cpr["active_count"], json!(1));
-        assert_eq!(res_rr_cpr["warm_workers"], json!(["neon-audit"]));
-        assert_eq!(res_rr_cpr["overall_action"], json!("resume_in_place"));
-
-        // Case 9: Tail truncation (>400 board rows without explicit `seq`/`msg_id`/`id`) must preserve
-        // true full-board ordinal seq so row 401 after `board_head_seq=400` is NOT dropped into the old cycle.
-        let sess_rr_tail = "sess-neon-audit-tail-401-no-seq";
-        let sw_rr_tail = rio::swarm_dir(&brain, sess_rr_tail);
-        fs::create_dir_all(&sw_rr_tail).unwrap();
-        write_warm_worker("cid-neon-rev-tail401");
-        fs::write(
-            sw_rr_tail.join("members.json"),
-            serde_json::to_string(&json!({
-                "members": {
-                    "neon-audit": {
-                        "role": "worker",
-                        "conversation_id": "cid-neon-rev-tail401",
-                        "model": cwg_common::NEON_XHIGH_MODEL,
-                        "created_at": "2026-11-19T20:25:35Z",
-                        "killed": false
-                    }
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let mut tail_lines: Vec<String> = Vec::with_capacity(401);
-        for i in 1..=400 {
-            tail_lines.push(
-                json!({
-                    "agent": "coordinator",
-                    "time": "2026-11-19T20:20:00Z",
-                    "text": format!("@other-worker note {}", i)
-                })
-                .to_string(),
-            );
-        }
-        tail_lines.push(
-            json!({
-                "agent": "coordinator",
-                "time": "2026-11-19T20:25:40.000Z",
-                "text": "@neon-audit Adversarial audit of diff; report VERDICT: APPROVED or REVISE."
-            })
-            .to_string(),
-        );
-        fs::write(sw_rr_tail.join("board.jsonl"), tail_lines.join("\n") + "\n").unwrap();
-        let rr_tail_marker = json!({
-            "closed": false,
-            "research_resets": [{
-                "reset_ts": rr_half_sec,
-                "board_head_seq": 400,
-                "pre_reset_worker_cids": ["cid-neon-audit-pre-reset"]
-            }]
-        });
-        let res_rr_tail = inspect_swarm_workers_with_marker(
-            sess_rr_tail,
-            &brain,
-            cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
-            "review",
-            Some(now),
-            1,
-            Some(&rr_tail_marker),
-        );
-        assert_eq!(res_rr_tail["active_count"], json!(1));
-        assert_eq!(res_rr_tail["warm_workers"], json!(["neon-audit"]));
-        assert_eq!(res_rr_tail["overall_action"], json!("resume_in_place"));
-
-        // Case 10: Fractional Unix string timestamp `"1795119930.300"` (<= `reset_ts = 1795119930.500`)
-        // must be classified as exact (not coarse) so it excludes itself and earlier coarse seq=6 from Warm Pool.
-        let sess_rr_unix = "sess-neon-audit-unix-frac-reset";
-        let sw_rr_unix = rio::swarm_dir(&brain, sess_rr_unix);
-        fs::create_dir_all(&sw_rr_unix).unwrap();
-        write_warm_worker("cid-neon-builder-unix");
-        fs::write(
-            sw_rr_unix.join("members.json"),
-            serde_json::to_string(&json!({
-                "members": {
-                    "neon-audit": {
-                        "role": "worker",
-                        "conversation_id": "cid-neon-builder-unix",
-                        "model": cwg_common::NEON_XHIGH_MODEL,
-                        "created_at": "2026-11-19T20:25:30.600Z",
-                        "killed": false
-                    }
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let rr_sec_int = rr_half_sec.floor() as i64;
-        fs::write(
-            sw_rr_unix.join("board.jsonl"),
-            [
-                json!({
-                    "seq": 6,
-                    "agent": "coordinator",
-                    "time": format!("{}", rr_sec_int),
-                    "text": "@neon-audit Adversarial audit of diff; report VERDICT: APPROVED or REVISE."
-                }),
-                json!({
-                    "seq": 7,
-                    "agent": "coordinator",
-                    "time": format!("{}.300", rr_sec_int),
-                    "text": "@other-worker sync"
-                }),
-                json!({
-                    "seq": 8,
-                    "agent": "coordinator",
-                    "time": format!("{}", rr_sec_int),
-                    "text": "@neon-audit Implement parser module."
-                }),
-            ]
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join("\n")
-                + "\n",
-        )
-        .unwrap();
-        let res_rr_unix = inspect_swarm_workers_with_marker(
-            sess_rr_unix,
-            &brain,
-            cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
-            "review",
-            Some(now),
-            1,
-            Some(&rr_half_marker),
-        );
-        assert_eq!(res_rr_unix["active_count"], json!(0));
-        assert_eq!(res_rr_unix["overall_action"], json!("initial_spawn"));
-
-        // Case 11: Non-object JSONL rows (`null`, `[1, 2]`) before the 400th object in an old cycle
-        // must NOT inflate fallback ordinal `seq` in `read_swarm_board_tail` past `board_head_seq=400`.
-        let sess_rr_nonobj = "sess-neon-audit-nonobj-jsonl-ordinal";
-        let sw_rr_no = rio::swarm_dir(&brain, sess_rr_nonobj);
-        fs::create_dir_all(&sw_rr_no).unwrap();
-        write_warm_worker("cid-neon-builder-nonobj");
-        fs::write(
-            sw_rr_no.join("members.json"),
-            serde_json::to_string(&json!({
-                "members": {
-                    "neon-audit": {
-                        "role": "worker",
-                        "conversation_id": "cid-neon-builder-nonobj",
-                        "model": cwg_common::NEON_XHIGH_MODEL,
-                        "created_at": "2026-11-19T20:25:30.600Z",
-                        "killed": false
-                    }
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let mut nonobj_lines: Vec<String> = Vec::with_capacity(403);
-        nonobj_lines.push("null".to_string());
-        nonobj_lines.push("[1, 2]".to_string());
-        nonobj_lines.push("{\"text\":\"\\uD800\"}".to_string());
-        for i in 1..=399 {
-            nonobj_lines.push(
-                json!({
-                    "agent": "coordinator",
-                    "time": "2026-11-19T20:20:00Z",
-                    "text": format!("@other-worker note {}", i)
-                })
-                .to_string(),
-            );
-        }
-        // 400th JSON object (same second as reset_ts 20:25:30.500Z, pre-reset under board_head_seq=400):
-        nonobj_lines.push(
-            json!({
-                "agent": "coordinator",
-                "time": "2026-11-19T20:25:30Z",
-                "text": "@neon-audit Adversarial audit of diff; report VERDICT: APPROVED or REVISE."
-            })
-            .to_string(),
-        );
-        fs::write(sw_rr_no.join("board.jsonl"), nonobj_lines.join("\n") + "\n").unwrap();
-        let res_rr_no = inspect_swarm_workers_with_marker(
-            sess_rr_nonobj,
-            &brain,
-            cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
-            "review",
-            Some(now),
-            1,
-            Some(&rr_tail_marker),
-        );
-        assert_eq!(res_rr_no["active_count"], json!(0));
-        assert_eq!(res_rr_no["overall_action"], json!("initial_spawn"));
-
         let _ = fs::remove_dir_all(&brain);
     }
 
@@ -3232,7 +2430,6 @@ mod tests {
             mfile: &mfile,
             folded_git_root: &folded_gr,
             expected_cycle_ts: 1000.0,
-            expected_research_reset_ts: 0.0,
             expected_last_durable_ts: 1005.0,
             expected_dpaths: &dpaths,
             expected_diff_hash: &fp1,
@@ -3257,28 +2454,6 @@ mod tests {
             "concurrent_worktree_mutation",
             "unlinked rounds.json during non-mutating prepare must fail closed"
         );
-
-        let mut reset_marker = base_marker.clone();
-        reset_marker
-            .as_object_mut()
-            .unwrap()
-            .insert("research_resets".to_string(), json!([{"reset_ts": 990.0}]));
-        rio::write_json(&mfile, &reset_marker).unwrap();
-        assert_eq!(
-            persist_marker_repo_prepare_state(upd, true, true, &rfile, Some(&sample_rounds))
-                .unwrap_err(),
-            "concurrent_worktree_mutation"
-        );
-        assert_eq!(
-            persist_marker_repo_prepare_state(upd, false, true, &rfile, Some(&sample_rounds))
-                .unwrap_err(),
-            "concurrent_worktree_mutation"
-        );
-        assert!(
-            !rfile.exists(),
-            "aborted prepare after concurrent research-reset must not recreate rounds.json"
-        );
-        rio::write_json(&mfile, &base_marker).unwrap();
 
         let pdir = cwg_common::marker_pending_dir(skey);
         fs::create_dir_all(&pdir).unwrap();

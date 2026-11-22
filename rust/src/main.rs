@@ -1,26 +1,25 @@
-pub mod carbon_memory;
-pub mod chip_handoff;
-pub mod chip_hooks;
-pub mod claude_importer;
-pub mod code_search;
-pub mod codex_lane;
-pub mod comment_density_guard;
-pub mod continuity_hook;
-pub mod cwg_common;
-pub mod cwg_mark;
-pub mod cwg_pre_invocation;
-pub mod cwg_stop;
-pub mod gate_inbox;
-pub mod hook_dispatch;
-pub mod installer;
-pub mod rio;
-pub mod safety_guards;
-pub mod stack_doctor;
-pub mod swarm_cache;
-pub mod swarm_ctl;
-pub mod tokenade_hook;
-pub mod win32_sqlite;
-pub mod worktree_guard;
+mod carbon_memory;
+mod chip_handoff;
+mod chip_hooks;
+mod claude_importer;
+mod code_search;
+mod codex_lane;
+mod comment_density_guard;
+mod continuity_hook;
+mod cwg_common;
+mod cwg_mark;
+mod cwg_pre_invocation;
+mod cwg_stop;
+mod gate_inbox;
+mod hook_dispatch;
+mod installer;
+mod rio;
+mod safety_guards;
+mod stack_doctor;
+mod swarm_cache;
+mod swarm_ctl;
+mod win32_sqlite;
+mod worktree_guard;
 
 use std::env;
 use std::process;
@@ -47,7 +46,7 @@ fn print_help() {
             "  --version, version    Print version and exit\n",
             "  --help, -h, help      Show this help message and exit\n\n",
             "Internal hook entrypoints:\n",
-            "  safety-guards, comment-density-guard, tokenade-hook, chip-hooks,\n",
+            "  safety-guards, comment-density-guard, chip-hooks,\n",
             "  cwg-pre-invocation, cwg-mark, cwg-stop\n\n",
             "Run 'carbon-stack <command> --help' for command-specific options."
         ),
@@ -59,7 +58,7 @@ fn main() {
     let all_args: Vec<String> = env::args().collect();
     if all_args.len() < 2 {
         eprintln!(
-            "usage: carbon-stack <install|hook|safety-guards|comment-density-guard|tokenade-hook|continuity|chip-hooks|cwg-pre-invocation|cwg-mark|cwg-stop|codex-lane|gate-inbox|swarm-cache|swarm-ctl|worktree-guard|carbon-memory|chip-handoff|code-search|stack-doctor|claude-chat-importer|--version|--help> [args...]"
+            "usage: carbon-stack <install|hook|safety-guards|comment-density-guard|continuity|chip-hooks|cwg-pre-invocation|cwg-mark|cwg-stop|codex-lane|gate-inbox|swarm-cache|swarm-ctl|worktree-guard|carbon-memory|chip-handoff|code-search|stack-doctor|claude-chat-importer|--version|--help> [args...]"
         );
         process::exit(2);
     }
@@ -78,7 +77,6 @@ fn main() {
         "hook" => hook_dispatch::run_unified_hook(rest),
         "safety-guards" | "safety_guards" => safety_guards::run_cli(rest),
         "comment-density-guard" | "comment_density_guard" => comment_density_guard::run_cli(rest),
-        "tokenade-hook" | "tokenade_hook" => tokenade_hook::run_cli(rest),
         "continuity" => continuity_hook::run_cli(rest),
         "chip-hooks" | "chip_hooks" => chip_hooks::run_cli(rest),
         "cwg-pre-invocation" | "cwg_pre_invocation" => cwg_pre_invocation::run_cli(rest),
