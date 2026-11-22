@@ -247,9 +247,8 @@ fn validation_non_runner_re() -> &'static Regex {
         let node = exe_pat_followed_by_space("node", r"(?:\.exe)?", false);
         let pkg_script =
             r"(?:[A-Za-z0-9_.-]+:)*(?:test|tests|lint|build|typecheck|check)(?:[:_-][A-Za-z0-9_:.-]+)*";
-        let npx_flags = r#"(?:(?:--no-install|--no|(?:-w|--workspace)(?:=|\s+)(?:'[^'\r\n]+'|"[^"`$\r\n]+"|[A-Za-z0-9_@./\\:][A-Za-z0-9_@./\\:-]*))\s+)*(?:--\s+)?"#;
         let pat = format!(
-            r#"(?i)\A\s*(?:\$null\s*\|\s*)?(?:&\s*)?(?:{ruff}\s+check\b|{py}\s+(?:-(?:X\s+utf8|[uBEsSO])\s+)*(?:-m\s+(?:pytest|unittest|py_compile|compileall|mypy|ruff|flake8)\b|{inst}\s+(?:[^\r\n|;&]*\s)?(?:--diagnose|--dry-run)(?:\z|[\s|;&])|{mcp}\s+--semgrep-scan\b)|{cs}\s+install\s+(?:[^\r\n|;&]*\s)?(?:--diagnose|--dry-run)(?:\z|[\s|;&])|(?:uvx(?:\.exe)?\s+(?:--offline\s+)?--from\s+semgrep\s+)?semgrep(?:\.exe)?\s+(?:--legacy\s+)?scan\b|{node}\s+(?:(?:--no-warnings|--experimental-[A-Za-z0-9_-]+)\s+)*(?:(?:--test|--check)(?:\z|[\s|;&])|["']?(?:\.[/\\])?(?:[A-Za-z0-9_][A-Za-z0-9_.-]*[/\\])*(?:test[-_][A-Za-z0-9_.-]*|[A-Za-z0-9_][A-Za-z0-9_.-]*[-_.]tests?|[A-Za-z0-9_][A-Za-z0-9_.-]*\.spec)\.(?:c?js|mjs)["']?(?:\z|[\s|;&]))|bun(?:\.exe)?\s+(?:test(?:\z|[\s|;&])|run\s+{pkg_s}\b)|deno(?:\.exe)?\s+(?:test|check|lint)(?:\z|[\s|;&])|npm(?:\.cmd)?\s+(?:test\b|run\s+{pkg_s}\b)|(?:pnpm|yarn)(?:\.cmd)?\s+(?:run\s+)?(?:test\b|{pkg_s}\b)|npx(?:\.cmd)?\s+{npx_f}(?:tsc|vitest|jest|eslint|playwright\s+test)\b|(?:flutter|dart)(?:\.bat|\.exe)?\s+(?:test|analyze)\b|cargo(?:\.exe)?\s+(?:\+[A-Za-z0-9._-]+\s+)?(?:test|check|clippy)\b|go(?:\.exe)?\s+(?:test|vet)\b|dotnet(?:\.exe)?\s+(?:test|build)\b|{agy}\s+plugin\s+validate\b)"#,
+            r#"(?i)\A\s*(?:\$null\s*\|\s*)?(?:&\s*)?(?:{ruff}\s+check\b|{py}\s+(?:-(?:X\s+utf8|[uBEsSO])\s+)*(?:-m\s+(?:pytest|unittest|py_compile|compileall|mypy|ruff|flake8)\b|{inst}\s+(?:[^\r\n|;&]*\s)?(?:--diagnose|--dry-run)(?:\z|[\s|;&])|{mcp}\s+--semgrep-scan\b)|{cs}\s+install\s+(?:[^\r\n|;&]*\s)?(?:--diagnose|--dry-run)(?:\z|[\s|;&])|(?:uvx(?:\.exe)?\s+(?:--offline\s+)?--from\s+semgrep\s+)?semgrep(?:\.exe)?\s+(?:--legacy\s+)?scan\b|{node}\s+(?:(?:--no-warnings|--experimental-[A-Za-z0-9_-]+)\s+)*(?:(?:--test|--check)(?:\z|[\s|;&])|["']?(?:\.[/\\])?(?:[A-Za-z0-9_][A-Za-z0-9_.-]*[/\\])*(?:test[-_][A-Za-z0-9_.-]*|[A-Za-z0-9_][A-Za-z0-9_.-]*[-_.]tests?|[A-Za-z0-9_][A-Za-z0-9_.-]*\.spec)\.(?:c?js|mjs)["']?(?:\z|[\s|;&]))|bun(?:\.exe)?\s+(?:test(?:\z|[\s|;&])|run\s+{pkg_s}\b)|deno(?:\.exe)?\s+(?:test|check|lint)(?:\z|[\s|;&])|npm(?:\.cmd)?\s+(?:test\b|run\s+{pkg_s}\b)|(?:pnpm|yarn)(?:\.cmd)?\s+(?:run\s+)?(?:test\b|{pkg_s}\b)|(?:flutter|dart)(?:\.bat|\.exe)?\s+(?:test|analyze)\b|cargo(?:\.exe)?\s+(?:\+[A-Za-z0-9._-]+\s+)?(?:test|check|clippy)\b|go(?:\.exe)?\s+(?:test|vet)\b|dotnet(?:\.exe)?\s+(?:test|build)\b|{agy}\s+plugin\s+validate\b)"#,
             ruff = ruff,
             py = py,
             inst = install,
@@ -258,7 +257,6 @@ fn validation_non_runner_re() -> &'static Regex {
             agy = agy,
             node = node,
             pkg_s = pkg_script,
-            npx_f = npx_flags,
         );
         Regex::new(&pat).expect("validation_non_runner_re")
     })
@@ -697,7 +695,7 @@ fn is_benign_ps_env_assign(seg: &str) -> bool {
         && !up.starts_with("NPM_CONFIG_")
 }
 
-fn tokenize_validation_segment(seg: &str) -> Vec<String> {
+fn tokenize_validation_segment(seg: &str) -> Option<Vec<String>> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;
@@ -731,25 +729,71 @@ fn tokenize_validation_segment(seg: &str) -> Vec<String> {
             cur.push(ch);
         }
     }
+    if quote.is_some() {
+        return None;
+    }
     if !cur.is_empty() {
         out.push(cur);
     }
-    out
+    Some(out)
 }
 
-fn has_non_executing_validation_arg(seg: &str) -> bool {
-    // SAFETY: Reject test/check runner discovery-only, config-dump, help/version, and no-run flags structurally on quote-unwrapped tokens so commands that exit 0 without executing tests/checks (e.g. `jest --listTests`, `vitest list`, `pytest --collect-only`, `cargo test --no-run`, `playwright test --list`, `tsc --showConfig`) can never clear a failed check or satisfy the gate.
-    let raw_tokens = tokenize_validation_segment(seg);
-    let mut idx = 0usize;
-    while idx < raw_tokens.len() {
-        let t = raw_tokens[idx].as_str();
-        if t.eq_ignore_ascii_case("$null") || t == "|" || t == "&" {
-            idx += 1;
+fn parse_npx_validation_runner(tokens: &[String]) -> Option<(&'static str, usize)> {
+    // INVARIANT: Single unified parser for `npx` validation admission AND runner-specific argument filtering so the admitted runner name (rejecting `@version`, unknown pre-flags, or empty workspaces) can never diverge from the non-executing flag filter.
+    let head = tokens.first()?;
+    if !matches!(head.to_ascii_lowercase().as_str(), "npx" | "npx.cmd") {
+        return None;
+    }
+    let mut i = 1usize;
+    while i < tokens.len() {
+        let t = tokens[i].to_ascii_lowercase();
+        if matches!(t.as_str(), "--no" | "--no-install") {
+            i += 1;
             continue;
+        }
+        if t == "-w" || t == "--workspace" {
+            let ws = tokens.get(i + 1)?;
+            if ws.is_empty() || ws.starts_with('-') {
+                return None;
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(ws) = t.strip_prefix("-w=").or_else(|| t.strip_prefix("--workspace=")) {
+            if ws.is_empty() || ws.starts_with('-') {
+                return None;
+            }
+            i += 1;
+            continue;
+        }
+        if t == "--" {
+            i += 1;
+            break;
+        }
+        if t.starts_with('-') {
+            return None;
         }
         break;
     }
-    let tokens = &raw_tokens[idx..];
+    let runner = tokens.get(i)?.to_ascii_lowercase();
+    match runner.as_str() {
+        "tsc" => Some(("tsc", i + 1)),
+        "vitest" => Some(("vitest", i + 1)),
+        "jest" => Some(("jest", i + 1)),
+        "eslint" => Some(("eslint", i + 1)),
+        "playwright" => tokens
+            .get(i + 1)
+            .is_some_and(|t| t.eq_ignore_ascii_case("test"))
+            .then_some(("playwright", i + 2)),
+        _ => None,
+    }
+}
+
+fn has_non_executing_validation_arg_tokens(
+    tokens: &[String],
+    npx_runner: Option<(&'static str, usize)>,
+) -> bool {
+    // SAFETY: Reject test/check runner discovery-only, config-dump, help/version, and no-run flags structurally on quote-unwrapped tokens using the exact same runner parse as admission.
     if tokens.is_empty() {
         return false;
     }
@@ -768,49 +812,44 @@ fn has_non_executing_validation_arg(seg: &str) -> bool {
         });
     let is_dotnet = matches!(cmd_base.as_str(), "dotnet" | "dotnet.exe");
     let is_go = matches!(cmd_base.as_str(), "go" | "go.exe");
-    let is_npx = matches!(cmd_base.as_str(), "npx" | "npx.cmd");
-    let mut is_jest = matches!(cmd_base.as_str(), "jest" | "jest.cmd");
-    let mut is_vitest = matches!(cmd_base.as_str(), "vitest" | "vitest.cmd");
-    let mut is_tsc = matches!(cmd_base.as_str(), "tsc" | "tsc.cmd");
-    let mut is_eslint = matches!(cmd_base.as_str(), "eslint" | "eslint.cmd");
-    let mut is_js_v_version = is_jest || is_vitest || is_eslint || is_tsc;
-    let mut arg_start = 1usize;
-    if is_npx {
-        let mut i = 1usize;
-        while i < tokens.len() {
-            let t = tokens[i].to_ascii_lowercase();
-            if matches!(t.as_str(), "--no" | "--no-install" | "--") {
-                i += 1;
-                continue;
-            }
-            if t == "-w" || t == "--workspace" {
-                i += 2;
-                continue;
-            }
-            if t.starts_with("-w=") || t.starts_with("--workspace=") {
-                i += 1;
-                continue;
-            }
-            break;
-        }
-        if let Some(runner) = tokens.get(i) {
-            let r = runner.to_ascii_lowercase();
-            is_jest = r == "jest";
-            is_vitest = r == "vitest";
-            is_tsc = r == "tsc";
-            is_eslint = r == "eslint";
-            is_js_v_version = is_jest || is_vitest || is_eslint || is_tsc;
-            arg_start = i + 1;
-        }
-    }
+    let is_node = matches!(cmd_base.as_str(), "node" | "node.exe");
+    let is_pkg_mgr = matches!(
+        cmd_base.as_str(),
+        "npm" | "npm.cmd" | "pnpm" | "pnpm.cmd" | "yarn" | "yarn.cmd" | "bun" | "bun.exe"
+    );
+    let (is_jest, is_vitest, is_tsc, is_eslint, arg_start) = match npx_runner {
+        Some((r, start)) => (r == "jest", r == "vitest", r == "tsc", r == "eslint", start),
+        None => (
+            matches!(cmd_base.as_str(), "jest" | "jest.cmd"),
+            matches!(cmd_base.as_str(), "vitest" | "vitest.cmd"),
+            matches!(cmd_base.as_str(), "tsc" | "tsc.cmd"),
+            matches!(cmd_base.as_str(), "eslint" | "eslint.cmd"),
+            1usize,
+        ),
+    };
+    let is_js_v_version = is_jest || is_vitest || is_eslint || is_tsc;
+    let is_node_flag_mode = is_node
+        && tokens
+            .iter()
+            .skip(1)
+            .take_while(|t| t.starts_with('-'))
+            .any(|t| matches!(t.to_ascii_lowercase().as_str(), "--test" | "--check"));
     let mut vitest_saw_run = false;
     let mut saw_build_flag = false;
+    let mut saw_double_dash = false;
     for tok in tokens.iter().skip(arg_start) {
+        if tok == "--" {
+            saw_double_dash = true;
+            continue;
+        }
         let key_raw = tok.split_once('=').map_or(tok.as_str(), |(k, _)| k);
         if matches!(key_raw, "-h" | "-?" | "-V") {
             return true;
         }
         if is_js_v_version && key_raw == "-v" {
+            return true;
+        }
+        if (is_pkg_mgr || is_node_flag_mode) && !saw_double_dash && key_raw == "-v" {
             return true;
         }
         if is_jest && key_raw == "-o" {
@@ -931,10 +970,24 @@ fn is_validation_segment_with_mode(
         // SAFETY: `--if-present` lets npm/pnpm/yarn/bun exit 0 without executing a missing script.
         return false;
     }
-    if has_non_executing_validation_arg(seg) {
+    let Some(raw_tokens) = tokenize_validation_segment(seg) else {
+        return false;
+    };
+    let mut start = 0usize;
+    while start < raw_tokens.len() {
+        let t = raw_tokens[start].as_str();
+        if t.eq_ignore_ascii_case("$null") || t == "|" || t == "&" {
+            start += 1;
+            continue;
+        }
+        break;
+    }
+    let tokens = &raw_tokens[start..];
+    let npx_runner = parse_npx_validation_runner(tokens);
+    if has_non_executing_validation_arg_tokens(tokens, npx_runner) {
         return false;
     }
-    if validation_non_runner_re().is_match(seg) {
+    if npx_runner.is_some() || validation_non_runner_re().is_match(seg) {
         return true;
     }
     if allow_extended
@@ -4741,6 +4794,13 @@ mod tests {
             ("npx --workspace backend jest --listTests=true", "UNCERTAIN"),
             ("npx --workspace backend jest --showConfig", "UNCERTAIN"),
             ("npx --workspace backend jest -v", "UNCERTAIN"),
+            ("npx --workspace backend jest@29.7.0 -v", "UNCERTAIN"),
+            (r#"npx --workspace backend "jest" -v"#, "UNCERTAIN"),
+            ("npx --workspace backend jest@29.7.0 src/__tests__/foo.test.ts", "UNCERTAIN"),
+            ("npx -- --workspace backend jest", "UNCERTAIN"),
+            ("npm test -v", "UNCERTAIN"),
+            ("node --test -v", "UNCERTAIN"),
+            ("node --check -v", "UNCERTAIN"),
             ("npx --workspace backend jest --passWithNoTests", "UNCERTAIN"),
             ("npm test -w backend -- --listTests", "UNCERTAIN"),
             ("npx --workspace backend vitest list", "UNCERTAIN"),

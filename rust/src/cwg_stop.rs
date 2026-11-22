@@ -8970,6 +8970,46 @@ mod tests {
             "`npx --workspace backend tsc --build --dry` exiting 0 must keep the gate blocked after a prior test failure"
         );
 
+        let mut steps_with_pinned_ver = base_steps.clone();
+        steps_with_pinned_ver.extend([
+            json!({
+                "step_index": 11495,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-22T16:04:07Z",
+                "tool_calls": [{"name": "run_command", "args": {"CommandLine": "$null | npx --workspace backend jest@29.7.0 -v"}}]
+            }),
+            json!({
+                "step_index": 11496,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": "2026-11-22T16:04:08Z",
+                "content": "Command exited with code 0.\n\nCommand output:\n29.7.0\n"
+            }),
+        ]);
+        let ev_pinned_ver = read_checks_evidence_with_steps_in_cwd(sess, first_ts, &steps_with_pinned_ver, "");
+        assert!(
+            ev_pinned_ver.passed_count == 0 && ev_pinned_ver.latest_fail_ts > ev_pinned_ver.latest_pass_ts,
+            "`npx --workspace backend jest@29.7.0 -v` must NEVER be credited as a passing verification run or clear a prior failure: {:?}",
+            ev_pinned_ver
+        );
+        let (ok_pinned_ver, _) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_std),
+            marker_in: &marker,
+            checks_ev: &ev_pinned_ver,
+            sub_ev: &SubagentEvidence::default(),
+            swarm_ev: &SwarmEvidence::default(),
+            codex_reviews: &[],
+            ctx: None,
+            steps: None,
+            transcript_path: None,
+        });
+        assert!(
+            !ok_pinned_ver,
+            "`npx --workspace backend jest@29.7.0 -v` exiting 0 must keep the gate blocked after a prior test failure"
+        );
+
         let mut steps_with_standalone = base_steps;
         steps_with_standalone.extend([
             json!({
