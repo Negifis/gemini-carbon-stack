@@ -464,7 +464,7 @@ fn expand_home_prefix(raw: &str, home: &str, is_windows: bool) -> String {
     let ht = home.trim_end_matches('/');
     if matches!(s.as_str(), "~" | "$HOME" | "${HOME}") || (is_windows && s.eq_ignore_ascii_case("%userprofile%")) { return ht.to_string(); }
     for p in ["~/", "$HOME/", "${HOME}/"] { if let Some(r) = s.strip_prefix(p) { return format!("{}/{}", ht, r); } }
-    if is_windows && s.len() >= 14 && s[..14].eq_ignore_ascii_case("%userprofile%/") { return format!("{}/{}", ht, &s[14..]); }
+    if is_windows && s.get(..14).is_some_and(|p| p.eq_ignore_ascii_case("%userprofile%/")) { return format!("{}/{}", ht, &s[14..]); }
     s
 }
 
@@ -679,12 +679,12 @@ fn shell_segments_with_tokens(cmd: &str, depth: u8) -> Vec<Vec<String>> {
             '"' if in_dq => in_dq = false,
             '\\' if in_dq && matches!(chars.peek(), Some('"' | '\\')) => { cur.push(chars.next().unwrap()); }
             _ if in_dq => cur.push(ch),
-            c if c.is_whitespace() => { if has_tok { seg.push(std::mem::take(&mut cur)); has_tok = false; } }
             ';' | '|' | '&' | '\n' | '\r' => {
                 if has_tok { seg.push(std::mem::take(&mut cur)); has_tok = false; }
                 if ch == '&' && seg.is_empty() && chars.peek().is_some_and(|c| c.is_whitespace()) { continue; }
                 if !seg.is_empty() { segs.push(std::mem::take(&mut seg)); }
             }
+            c if c.is_whitespace() => { if has_tok { seg.push(std::mem::take(&mut cur)); has_tok = false; } }
             '\'' => { in_sq = true; has_tok = true; }
             '"' => { in_dq = true; has_tok = true; }
             _ => { cur.push(ch); has_tok = true; }
@@ -1630,8 +1630,6 @@ fn compare_and_replace_file(target: &Path, expected_sha: &str, new_bytes: &[u8])
     static SWAP_SEQ: AtomicU64 = AtomicU64::new(1);
     if win32_sqlite::is_link_or_junction(target) { return Err(format!("Refusing symlink/junction {}", target.display())); }
     let parent = target.parent().ok_or_else(|| format!("Invalid target path {}", target.display()))?;
-    #[cfg(unix)]
-    let orig_mode = { use std::os::unix::fs::PermissionsExt; fs::symlink_metadata(target).map_err(|e| format!("Cannot stat {}: {}", target.display(), e))?.permissions().mode() & 0o777 };
     let (seq, pid) = (SWAP_SEQ.fetch_add(1, Ordering::Relaxed), std::process::id());
     let (stage, disp_slot, rev_slot) = (parent.join(format!(".hooks.stage.{}.{}.tmp", pid, seq)), parent.join(format!(".hooks.disp.{}.{}.tmp", pid, seq)), parent.join(format!(".hooks.rev.{}.{}.tmp", pid, seq)));
     let mut oo = fs::OpenOptions::new();
@@ -1639,7 +1637,7 @@ fn compare_and_replace_file(target: &Path, expected_sha: &str, new_bytes: &[u8])
     #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; oo.mode(0o600); }
     let write_res = oo.open(&stage).and_then(|mut f| {
         f.write_all(new_bytes)?;
-        #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; f.set_permissions(fs::Permissions::from_mode(orig_mode))?; }
+        #[cfg(unix)] { win32_sqlite::preserve_unix_access_or_refuse(target, &f)?; }
         f.sync_all()
     });
     if let Err(e) = write_res { let _ = fs::remove_file(&stage); return Err(format!("Stage {} failed: {}", target.display(), e)); }
@@ -2652,9 +2650,33 @@ mod tests {
             Some("hooks/audit.py"),
             "quoted path with spaces targeting this profile must be caught"
         );
+        // Codex C1b Closure #4 & #7: multiline `sh -c "cd ...\npython ../plugins/..."` MUST fail closed, AND Windows Cyrillic path `C:/Users/Анна/...` MUST NOT panic on `%userprofile%/` prefix check!
+        let multiline_rel = json!({
+            "u": { "PreToolUse": [{"type": "command", "command": format!("sh -c \"cd '{}/rules'\npython ../plugins/gemini-carbon-stack/hooks/tokenade_hook.py\"", cfg.to_string_lossy().replace('\\', "/")), "timeout": 10}] }
+        });
+        assert_eq!(
+            find_dangling_plugin_hook_ref(&multiline_rel, &cfg, &target_plug, Some(&src_mf), cfg!(windows)).as_deref(),
+            Some("hooks/tokenade_hook.py"),
+            "multiline sh -c with cd + relative ../plugins must fail closed"
+        );
+        let win_cyr_hooks = json!({
+            "win-cyr": { "PreToolUse": [{"type": "command", "command": "python \"C:/Users/Анна/.gemini/config/plugins/gemini-carbon-stack/hooks/audit.py\"", "timeout": 10}] }
+        });
+        assert_eq!(
+            find_dangling_plugin_hook_ref(
+                &win_cyr_hooks,
+                Path::new("C:/Users/Анна/.gemini/config"),
+                Path::new("C:/Users/Анна/.gemini/config/plugins/gemini-carbon-stack"),
+                Some(&src_mf),
+                true,
+            ).as_deref(),
+            Some("hooks/audit.py"),
+            "Windows Cyrillic path must not panic and must catch target-profile dangling ref"
+        );
         let other_cd_hooks = json!({
             "other-cd": { "PreToolUse": [{"type": "command", "command": "sh -c \"cd '/other-profile/.gemini/config/rules' && python ../plugins/gemini-carbon-stack/hooks/audit.py\"", "timeout": 10}] },
-            "other-cyrillic": { "PreToolUse": [{"type": "command", "command": "python \"/home/иван/plugins/gemini-carbon-stack/hooks/audit.py\"", "timeout": 10}] }
+            "other-cyrillic": { "PreToolUse": [{"type": "command", "command": "python \"/home/иван/plugins/gemini-carbon-stack/hooks/audit.py\"", "timeout": 10}] },
+            "other-win-cyr": { "PreToolUse": [{"type": "command", "command": "python \"C:/Users/Анна/.gemini/config/plugins/gemini-carbon-stack/hooks/audit.py\"", "timeout": 10}] }
         });
         fs::write(&hooks_path, serde_json::to_string_pretty(&other_cd_hooks).unwrap()).unwrap();
         let ok_other = perform_install(&repo, &cfg, &shome, false, true);

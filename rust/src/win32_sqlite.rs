@@ -1315,6 +1315,47 @@ pub(crate) fn atomic_swap_capturing_displaced(_target: &Path, _replacement: &Pat
 }
 
 #[cfg(unix)]
+pub(crate) fn preserve_unix_access_or_refuse(src_target: &Path, stage_file: &fs::File) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::io::AsRawFd;
+    // INVARIANT: Never widen Unix access on `hooks.json` replacement: preserve original group (`fchown` when group bits are non-zero and gid differs), refuse replacing files carrying extended POSIX/macOS ACLs, and apply exact `orig_mode & 0o777`.
+    let orig_meta = fs::symlink_metadata(src_target)?;
+    let orig_mode = orig_meta.mode() & 0o777;
+    let orig_gid = orig_meta.gid();
+    #[cfg(target_os = "linux")]
+    {
+        extern "C" { fn lgetxattr(path: *const c_char, name: *const c_char, value: *mut c_void, size: usize) -> isize; }
+        let tc = path_cstr(src_target)?;
+        // SAFETY: Valid NUL-terminated paths; `size == 0` queries length without writing.
+        if unsafe { lgetxattr(tc.as_ptr(), b"system.posix_acl_access\0".as_ptr() as *const c_char, ptr::null_mut(), 0) } > 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "global hooks.json has extended POSIX ACL; refusing to replace"));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn acl_get_link_np(path: *const c_char, acl_type: c_int) -> *mut c_void;
+            fn acl_free(obj_p: *mut c_void) -> c_int;
+        }
+        let tc = path_cstr(src_target)?;
+        // SAFETY: Valid NUL-terminated path; `0x100` is `ACL_TYPE_EXTENDED` on Darwin; non-null handle is freed immediately.
+        let acl = unsafe { acl_get_link_np(tc.as_ptr(), 0x100) };
+        if !acl.is_null() {
+            unsafe { acl_free(acl); }
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "global hooks.json has extended ACL; refusing to replace"));
+        }
+    }
+    if (orig_mode & 0o070) != 0 && stage_file.metadata()?.gid() != orig_gid {
+        extern "C" { fn fchown(fd: c_int, owner: u32, group: u32) -> c_int; }
+        // SAFETY: Valid open fd; `u32::MAX` (`-1`) leaves owner unchanged and sets group to `orig_gid`.
+        if unsafe { fchown(stage_file.as_raw_fd(), u32::MAX, orig_gid) } != 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "cannot preserve original group ownership of global hooks.json"));
+        }
+    }
+    stage_file.set_permissions(fs::Permissions::from_mode(orig_mode))
+}
+
+#[cfg(unix)]
 fn file_identity(path: &Path) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     let m = fs::symlink_metadata(path).ok()?;
