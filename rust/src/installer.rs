@@ -5435,8 +5435,41 @@ pub fn list_backups_strict(stack_home: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(out)
 }
 
+fn is_completed_backup_manifest(manifest: &Value) -> bool {
+    let Some(targets) = manifest.get("targets").and_then(|v| v.as_object()) else {
+        return false;
+    };
+    let Some(p_info) = targets.get("plugin_dir").and_then(|v| v.as_object()) else {
+        return false;
+    };
+    let Some(r_info) = targets.get("glob_rule").and_then(|v| v.as_object()) else {
+        return false;
+    };
+    if p_info.get("existed").and_then(|v| v.as_bool()).is_none()
+        || r_info.get("existed").and_then(|v| v.as_bool()).is_none()
+    {
+        return false;
+    }
+    let p_path = p_info.get("path").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let r_path = r_info.get("path").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if p_path.is_empty() || r_path.is_empty() {
+        return false;
+    }
+    if let Some(h_val) = targets.get("global_hooks") {
+        let Some(h_obj) = h_val.as_object() else {
+            return false;
+        };
+        let has_current = h_obj.get("migrations").and_then(|v| v.as_array()).is_some();
+        let has_legacy = h_obj.get("existed").and_then(|v| v.as_bool()).is_some();
+        if !has_current && !has_legacy {
+            return false;
+        }
+    }
+    true
+}
+
 fn prune_old_install_backups(stack_home: &Path, keep: usize) -> usize {
-    // INVARIANT: Count and prune ONLY completed `install-*` backup directories that satisfy the exact rollback validity predicate (`validate_backup_entry_strict == Ok(true)`), so incomplete/manifest-less directories can never displace valid rollback points; never follow symlinks/junctions or fail install on I/O errors.
+    // INVARIANT: Count and prune ONLY completed `install-*` backup directories that satisfy both `validate_backup_entry_strict == Ok(true)` and valid rollback-schema `manifest.json` parsing (`is_completed_backup_manifest`), so missing or truncated/corrupt manifests can never displace valid rollback points; never follow symlinks/junctions or fail install on I/O errors.
     if has_dot_components(stack_home) || win32_sqlite::is_link_or_junction(stack_home) {
         return 0;
     }
@@ -5464,7 +5497,11 @@ fn prune_old_install_backups(stack_home: &Path, keep: usize) -> usize {
             continue;
         }
         let p = ent.path();
-        if matches!(validate_backup_entry_strict(&p), Ok(true)) {
+        if matches!(validate_backup_entry_strict(&p), Ok(true))
+            && rio::read_json(&p.join("manifest.json"))
+                .as_ref()
+                .is_some_and(is_completed_backup_manifest)
+        {
             install_dirs.push((name.to_string(), p));
         }
     }
@@ -11278,14 +11315,27 @@ mod tests {
         let broot = shome.join("backups");
         fs::create_dir_all(&broot).unwrap();
 
+        let valid_manifest = |legacy: bool| -> String {
+            if legacy {
+                r#"{"targets":{"plugin_dir":{"path":"/cfg/plugins/gemini-carbon-stack","existed":false},"glob_rule":{"path":"/cfg/rules/uiux-design.md","existed":false},"global_hooks":{"path":"/cfg/hooks.json","existed":false}}}"#.to_string()
+            } else {
+                r#"{"targets":{"plugin_dir":{"path":"/cfg/plugins/gemini-carbon-stack","existed":false},"glob_rule":{"path":"/cfg/rules/uiux-design.md","existed":false},"global_hooks":{"path":"/cfg/hooks.json","migrations":[]}}}"#.to_string()
+            }
+        };
         for day in 1..=14u32 {
             let bdir = broot.join(format!("install-202611{:02}-120000", day));
             fs::create_dir_all(&bdir).unwrap();
-            fs::write(bdir.join("manifest.json"), "{}\n").unwrap();
+            fs::write(bdir.join("manifest.json"), valid_manifest(day <= 2)).unwrap();
         }
-        // Wave A2 R1 #2: newer incomplete `install-*` directory without `manifest.json` must NOT displace valid rollback backups.
+        // Wave A2 R1/R2 #2: newer incomplete (no manifest) AND truncated/corrupt manifest dirs must NOT displace valid rollback backups.
         let incomplete_dir = broot.join("install-20261199-235959");
         fs::create_dir_all(&incomplete_dir).unwrap();
+        let corrupt_dir = broot.join("install-20261198-235959");
+        fs::create_dir_all(&corrupt_dir).unwrap();
+        fs::write(corrupt_dir.join("manifest.json"), "{\"targets\":{\"plugin_dir\":").unwrap();
+        let schema_bad_dir = broot.join("install-20261197-235959");
+        fs::create_dir_all(&schema_bad_dir).unwrap();
+        fs::write(schema_bad_dir.join("manifest.json"), "{}\n").unwrap();
         let manual_dir = broot.join("manual-snapshot");
         fs::create_dir_all(&manual_dir).unwrap();
         fs::write(manual_dir.join("keep.txt"), "do-not-delete\n").unwrap();
@@ -11302,12 +11352,13 @@ mod tests {
             assert!(broot.join(format!("install-202611{:02}-120000", day)).is_dir());
         }
         assert!(incomplete_dir.is_dir());
-        assert_eq!(list_backups_strict(&shome).unwrap().len(), MAX_INSTALL_BACKUPS);
+        assert!(corrupt_dir.is_dir());
+        assert!(schema_bad_dir.is_dir());
         assert!(manual_dir.join("keep.txt").is_file());
         assert!(stray_file.is_file());
         assert_eq!(prune_old_install_backups(&shome, MAX_INSTALL_BACKUPS), 0);
 
-        // Wave A2 R1 #3: `already_up_to_date` install path must still rotate excess valid backups.
+        // Wave A2 R1 #3 & R2 #2: `already_up_to_date` install path must still rotate excess valid backups (cross-platform binary header).
         let repo_up = tmp.0.join("repo-up");
         let cfg_up = tmp.0.join("cfg-up");
         let shome_up = tmp.0.join("shome-up");
@@ -11335,14 +11386,19 @@ mod tests {
         )
         .unwrap();
         let bin_rel = platform_hook_binary_rel(cfg!(windows));
-        fs::write(repo_up.join("plugin").join(bin_rel), b"MZ-mock-binary-payload").unwrap();
+        let stub_bytes: &[u8] = if cfg!(windows) {
+            b"MZ\x90\x00stub-hook-bin"
+        } else {
+            b"\x7fELFstub-hook-bin"
+        };
+        fs::write(repo_up.join("plugin").join(bin_rel), stub_bytes).unwrap();
         let first_up = perform_install(&repo_up, &cfg_up, &shome_up, false, true);
         assert_eq!(first_up["ok"], true, "{:?}", first_up);
         let broot_up = shome_up.join("backups");
         for day in 1..=12u32 {
             let bdir = broot_up.join(format!("install-202501{:02}-000000", day));
             fs::create_dir_all(&bdir).unwrap();
-            fs::write(bdir.join("manifest.json"), "{}\n").unwrap();
+            fs::write(bdir.join("manifest.json"), valid_manifest(false)).unwrap();
         }
         assert!(list_backups_strict(&shome_up).unwrap().len() > MAX_INSTALL_BACKUPS);
         let second_up = perform_install(&repo_up, &cfg_up, &shome_up, false, false);
