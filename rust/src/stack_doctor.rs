@@ -911,51 +911,77 @@ fn collect_engineering_suite_status(
     }
 
     let global_cfg_json = rio::read_json(&gemini_dir.join("config").join("config.json"));
-    let plugins_root = gemini_dir.join("config").join("plugins");
-    if let Ok(rd) = fs::read_dir(&plugins_root) {
-        let mut plugin_dirs: Vec<(String, PathBuf)> = rd
-            .flatten()
-            .filter_map(|ent| {
-                let p = ent.path();
-                if !p.is_dir() {
-                    return None;
-                }
-                let name = ent.file_name().to_string_lossy().into_owned();
-                Some((name, p))
-            })
-            .collect();
-        plugin_dirs.sort_by(|a, b| a.0.cmp(&b.0));
+    let cli_cfg_json = rio::read_json(&gemini_dir.join("antigravity-cli").join("config.json"));
+    let cli_settings_json =
+        rio::read_json(&gemini_dir.join("antigravity-cli").join("settings.json"));
 
-        for (plug_name, plug_dir) in plugin_dirs {
-            if is_plugin_disabled_in_config(global_cfg_json.as_ref(), &plug_name) {
-                continue;
-            }
-            let prefix = format!("plugin:{}:", plug_name);
-            let plug_mcp = plug_dir.join("mcp_config.json");
-            if plug_mcp.is_file() {
-                checked_mcp_configs.push(rio::normalize_path(&plug_mcp.to_string_lossy()));
-                if let Some(val) = rio::read_json(&plug_mcp) {
-                    if let Some(servers) = val.get("mcpServers").and_then(|v| v.as_object()) {
-                        audit_mcp_servers_map(
-                            servers,
-                            &prefix,
-                            &mut non_lazy_mcp_set,
-                            &mut per_tool_eager_set,
-                        );
+    let plugin_roots: Vec<(PathBuf, &str, Vec<Option<&Value>>)> = vec![
+        (
+            gemini_dir.join("config").join("plugins"),
+            "plugin:",
+            vec![global_cfg_json.as_ref()],
+        ),
+        (
+            gemini_dir.join("antigravity-cli").join("plugins"),
+            "antigravity-cli-plugin:",
+            vec![
+                cli_cfg_json.as_ref(),
+                cli_settings_json.as_ref(),
+                global_cfg_json.as_ref(),
+            ],
+        ),
+    ];
+
+    for (plugins_root, prefix_base, disable_cfgs) in plugin_roots {
+        if let Ok(rd) = fs::read_dir(&plugins_root) {
+            let mut plugin_dirs: Vec<(String, PathBuf)> = rd
+                .flatten()
+                .filter_map(|ent| {
+                    let p = ent.path();
+                    if !p.is_dir() {
+                        return None;
+                    }
+                    let name = ent.file_name().to_string_lossy().into_owned();
+                    Some((name, p))
+                })
+                .collect();
+            plugin_dirs.sort_by(|a, b| a.0.cmp(&b.0));
+
+            for (plug_name, plug_dir) in plugin_dirs {
+                let disabled = disable_cfgs
+                    .iter()
+                    .any(|cfg_opt| is_plugin_disabled_in_config(*cfg_opt, &plug_name));
+                if disabled {
+                    continue;
+                }
+                let prefix = format!("{}{}:", prefix_base, plug_name);
+                let plug_mcp = plug_dir.join("mcp_config.json");
+                if plug_mcp.is_file() {
+                    checked_mcp_configs.push(rio::normalize_path(&plug_mcp.to_string_lossy()));
+                    if let Some(val) = rio::read_json(&plug_mcp) {
+                        if let Some(servers) = val.get("mcpServers").and_then(|v| v.as_object()) {
+                            audit_mcp_servers_map(
+                                servers,
+                                &prefix,
+                                &mut non_lazy_mcp_set,
+                                &mut per_tool_eager_set,
+                            );
+                        }
                     }
                 }
-            }
-            let plug_ext = plug_dir.join("gemini-extension.json");
-            if plug_ext.is_file() {
-                if let Some(val) = rio::read_json(&plug_ext) {
-                    if let Some(servers) = val.get("mcpServers").and_then(|v| v.as_object()) {
-                        checked_mcp_configs.push(rio::normalize_path(&plug_ext.to_string_lossy()));
-                        audit_mcp_servers_map(
-                            servers,
-                            &prefix,
-                            &mut non_lazy_mcp_set,
-                            &mut per_tool_eager_set,
-                        );
+                let plug_ext = plug_dir.join("gemini-extension.json");
+                if plug_ext.is_file() {
+                    if let Some(val) = rio::read_json(&plug_ext) {
+                        if let Some(servers) = val.get("mcpServers").and_then(|v| v.as_object()) {
+                            checked_mcp_configs
+                                .push(rio::normalize_path(&plug_ext.to_string_lossy()));
+                            audit_mcp_servers_map(
+                                servers,
+                                &prefix,
+                                &mut non_lazy_mcp_set,
+                                &mut per_tool_eager_set,
+                            );
+                        }
                     }
                 }
             }
@@ -1479,14 +1505,37 @@ pub fn format_doctor_text(report: &Value) -> String {
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
     let suite_line = match report.get("engineering_suite") {
-        Some(s) => format!(
-            "engineering_suite: active_mcp={}, disabled_mcp={}, all_lazy={}, cli_ready={}/{}\n",
-            s.get("active_mcp_count").and_then(|v| v.as_u64()).unwrap_or(0),
-            s.get("disabled_mcp_count").and_then(|v| v.as_u64()).unwrap_or(0),
-            s.get("all_lazy_eager_false").and_then(|v| v.as_bool()).unwrap_or(false),
-            s.get("cli_ready").and_then(|v| v.as_u64()).unwrap_or(0),
-            s.get("cli_total").and_then(|v| v.as_u64()).unwrap_or(0),
-        ),
+        Some(s) => {
+            let servers_lazy = s
+                .get("all_lazy_eager_false")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let tools_lazy = s
+                .get("all_tools_lazy_eager_false")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(servers_lazy);
+            let eager_tools: Vec<&str> = s
+                .get("per_tool_eager_mcp")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            let eager_tools_suffix = if eager_tools.is_empty() {
+                String::new()
+            } else {
+                format!(", per_tool_eager=[{}]", eager_tools.join(", "))
+            };
+            format!(
+                "engineering_suite: active_mcp={}, disabled_mcp={}, all_lazy={}, servers_lazy={}, all_tools_lazy={}{}, cli_ready={}/{}\n",
+                s.get("active_mcp_count").and_then(|v| v.as_u64()).unwrap_or(0),
+                s.get("disabled_mcp_count").and_then(|v| v.as_u64()).unwrap_or(0),
+                servers_lazy && tools_lazy,
+                servers_lazy,
+                tools_lazy,
+                eager_tools_suffix,
+                s.get("cli_ready").and_then(|v| v.as_u64()).unwrap_or(0),
+                s.get("cli_total").and_then(|v| v.as_u64()).unwrap_or(0),
+            )
+        }
         None => String::new(),
     };
     format!(
@@ -1911,7 +1960,29 @@ mod tests {
         fs::create_dir_all(gdir.join("config").join("plugins").join("implicit-plug")).unwrap();
         fs::create_dir_all(gdir.join("config").join("plugins").join("chat-bus")).unwrap();
         fs::create_dir_all(gdir.join("antigravity")).unwrap();
-        fs::create_dir_all(gdir.join("antigravity-cli")).unwrap();
+        fs::create_dir_all(gdir.join("antigravity-cli").join("plugins").join("cli-active")).unwrap();
+        fs::create_dir_all(gdir.join("antigravity-cli").join("plugins").join("cli-disabled")).unwrap();
+        fs::write(
+            gdir.join("antigravity-cli").join("config.json"),
+            r#"{"plugins":{"cli-disabled":{"enabled":false}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            gdir.join("antigravity-cli")
+                .join("plugins")
+                .join("cli-active")
+                .join("mcp_config.json"),
+            r#"{"mcpServers":{"gh":{"serverUrl":"https://api.example.com"}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            gdir.join("antigravity-cli")
+                .join("plugins")
+                .join("cli-disabled")
+                .join("mcp_config.json"),
+            r#"{"mcpServers":{"cli_skip":{"eager":true}}}"#,
+        )
+        .unwrap();
 
         fs::write(
             gdir.join("config").join("mcp_config.json"),
@@ -1990,6 +2061,7 @@ mod tests {
         assert_eq!(
             suite["non_lazy_mcp_servers"],
             json!([
+                "antigravity-cli-plugin:cli-active:gh",
                 "antigravity-cli:cli_eager",
                 "antigravity:ag_missing",
                 "plugin:active-plug:no_eager",
@@ -2044,6 +2116,14 @@ mod tests {
         )
         .unwrap();
         fs::write(
+            gdir.join("antigravity-cli")
+                .join("plugins")
+                .join("cli-active")
+                .join("mcp_config.json"),
+            r#"{"mcpServers":{"gh":{"eager":false}}}"#,
+        )
+        .unwrap();
+        fs::write(
             gdir.join("config")
                 .join("plugins")
                 .join("implicit-plug")
@@ -2063,6 +2143,16 @@ mod tests {
                 "plugin:chat-bus:peers.chat_search",
             ])
         );
+        // Wave A2 R1 #5: `--text` must NOT claim `all_lazy=true` when per-tool `eager:true` exists.
+        let txt_partial = format_doctor_text(&json!({"ok": true, "engineering_suite": suite2}));
+        assert!(txt_partial.contains("all_lazy=false"), "{}", txt_partial);
+        assert!(txt_partial.contains("servers_lazy=true"), "{}", txt_partial);
+        assert!(txt_partial.contains("all_tools_lazy=false"), "{}", txt_partial);
+        assert!(
+            txt_partial.contains("per_tool_eager=[plugin:chat-bus:peers.chat_reply, plugin:chat-bus:peers.chat_search]"),
+            "{}",
+            txt_partial
+        );
 
         // Now mark per-tool eager: false as well.
         fs::write(
@@ -2077,5 +2167,8 @@ mod tests {
         assert_eq!(suite3["all_lazy_eager_false"], true);
         assert_eq!(suite3["all_tools_lazy_eager_false"], true);
         assert_eq!(suite3["per_tool_eager_mcp"], json!([]));
+        let txt_full = format_doctor_text(&json!({"ok": true, "engineering_suite": suite3}));
+        assert!(txt_full.contains("all_lazy=true"), "{}", txt_full);
+        assert!(!txt_full.contains("per_tool_eager="), "{}", txt_full);
     }
 }

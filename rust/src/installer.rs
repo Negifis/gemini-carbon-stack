@@ -3736,6 +3736,7 @@ pub(crate) fn perform_install_with_drain_timeout(
         sweep_retired_bins_dir(&target_plugin_dir.join("bin").join(RETIRED_BINS_DIR_NAME));
         sweep_retired_bins_dir(&state_root.join(RETIRED_BINS_DIR_NAME));
         sweep_retired_bins_dir(&config_dir.join(RETIRED_BINS_DIR_NAME));
+        let _ = prune_old_install_backups(stack_home, MAX_INSTALL_BACKUPS);
         return json!({
             "ok": true,
             "dry_run": false,
@@ -5435,7 +5436,7 @@ pub fn list_backups_strict(stack_home: &Path) -> Result<Vec<PathBuf>, String> {
 }
 
 fn prune_old_install_backups(stack_home: &Path, keep: usize) -> usize {
-    // INVARIANT: Only prune regular `install-*` directories directly inside `<stack_home>/backups` (never symlinks/junctions, never other directories); retain the `keep` lexicographically newest backups and never fail install on I/O errors.
+    // INVARIANT: Count and prune ONLY completed `install-*` backup directories that satisfy the exact rollback validity predicate (`validate_backup_entry_strict == Ok(true)`), so incomplete/manifest-less directories can never displace valid rollback points; never follow symlinks/junctions or fail install on I/O errors.
     if has_dot_components(stack_home) || win32_sqlite::is_link_or_junction(stack_home) {
         return 0;
     }
@@ -5463,13 +5464,7 @@ fn prune_old_install_backups(stack_home: &Path, keep: usize) -> usize {
             continue;
         }
         let p = ent.path();
-        if win32_sqlite::is_link_or_junction(&p) {
-            continue;
-        }
-        if fs::symlink_metadata(&p)
-            .map(|m| m.file_type().is_dir())
-            .unwrap_or(false)
-        {
+        if matches!(validate_backup_entry_strict(&p), Ok(true)) {
             install_dirs.push((name.to_string(), p));
         }
     }
@@ -11288,6 +11283,9 @@ mod tests {
             fs::create_dir_all(&bdir).unwrap();
             fs::write(bdir.join("manifest.json"), "{}\n").unwrap();
         }
+        // Wave A2 R1 #2: newer incomplete `install-*` directory without `manifest.json` must NOT displace valid rollback backups.
+        let incomplete_dir = broot.join("install-20261199-235959");
+        fs::create_dir_all(&incomplete_dir).unwrap();
         let manual_dir = broot.join("manual-snapshot");
         fs::create_dir_all(&manual_dir).unwrap();
         fs::write(manual_dir.join("keep.txt"), "do-not-delete\n").unwrap();
@@ -11303,8 +11301,53 @@ mod tests {
         for day in 5..=14u32 {
             assert!(broot.join(format!("install-202611{:02}-120000", day)).is_dir());
         }
+        assert!(incomplete_dir.is_dir());
+        assert_eq!(list_backups_strict(&shome).unwrap().len(), MAX_INSTALL_BACKUPS);
         assert!(manual_dir.join("keep.txt").is_file());
         assert!(stray_file.is_file());
         assert_eq!(prune_old_install_backups(&shome, MAX_INSTALL_BACKUPS), 0);
+
+        // Wave A2 R1 #3: `already_up_to_date` install path must still rotate excess valid backups.
+        let repo_up = tmp.0.join("repo-up");
+        let cfg_up = tmp.0.join("cfg-up");
+        let shome_up = tmp.0.join("shome-up");
+        fs::create_dir_all(repo_up.join("plugin").join("rules")).unwrap();
+        fs::create_dir_all(repo_up.join("plugin").join("bin")).unwrap();
+        fs::create_dir_all(repo_up.join("rules")).unwrap();
+        fs::write(
+            repo_up.join("plugin").join("plugin.json"),
+            r#"{"name":"gemini-carbon-stack","version":"0.2.0"}"#,
+        )
+        .unwrap();
+        fs::write(
+            repo_up.join("plugin").join("hooks.json"),
+            r#"{"carbon-stack":{"enabled":true,"SessionStart":[{"type":"command","command":"bin/carbon-stack hook --event SessionStart"}]}}"#,
+        )
+        .unwrap();
+        fs::write(
+            repo_up.join("plugin").join("rules").join("AGENTS.md"),
+            "# Constitution\n",
+        )
+        .unwrap();
+        fs::write(
+            repo_up.join("rules").join("uiux-design.md"),
+            "# Frontend UI/UX & Live Browser Verification Rules\n",
+        )
+        .unwrap();
+        let bin_rel = platform_hook_binary_rel(cfg!(windows));
+        fs::write(repo_up.join("plugin").join(bin_rel), b"MZ-mock-binary-payload").unwrap();
+        let first_up = perform_install(&repo_up, &cfg_up, &shome_up, false, true);
+        assert_eq!(first_up["ok"], true, "{:?}", first_up);
+        let broot_up = shome_up.join("backups");
+        for day in 1..=12u32 {
+            let bdir = broot_up.join(format!("install-202501{:02}-000000", day));
+            fs::create_dir_all(&bdir).unwrap();
+            fs::write(bdir.join("manifest.json"), "{}\n").unwrap();
+        }
+        assert!(list_backups_strict(&shome_up).unwrap().len() > MAX_INSTALL_BACKUPS);
+        let second_up = perform_install(&repo_up, &cfg_up, &shome_up, false, false);
+        assert_eq!(second_up["ok"], true, "{:?}", second_up);
+        assert_eq!(second_up["already_up_to_date"], true);
+        assert_eq!(list_backups_strict(&shome_up).unwrap().len(), MAX_INSTALL_BACKUPS);
     }
 }
