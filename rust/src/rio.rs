@@ -829,6 +829,18 @@ pub fn append_jsonl(path: &Path, record: &Value, max_bytes: u64) -> Result<(), S
 }
 
 pub fn log_hook_event(stream: &str, event_type: &str, extra: Value) {
+    #[cfg(test)]
+    {
+        // INVARIANT: Unit/integration tests must never append to the live user's `~/.gemini/carbon-stack/state/logs/*.jsonl`.
+        let cur = match env::var("CARBON_STACK_HOME") {
+            Ok(val) if !val.trim().is_empty() => PathBuf::from(val.trim()),
+            _ => return,
+        };
+        let prod = home_dir().join(".gemini").join("carbon-stack");
+        if fold_path(&cur.to_string_lossy()) == fold_path(&prod.to_string_lossy()) {
+            return;
+        }
+    }
     let mut rec = Map::new();
     let ts_ms = (now_sec() * 1000.0).round() / 1000.0;
     rec.insert("ts".to_string(), json!(ts_ms));
@@ -3331,5 +3343,45 @@ mod tests {
             None
         );
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_log_hook_event_blocked_on_prod_home_in_tests() {
+        let _guard = crate::win32_sqlite::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = env::var_os("CARBON_STACK_HOME");
+        let prod_log = home_dir()
+            .join(".gemini")
+            .join("carbon-stack")
+            .join("state")
+            .join("logs")
+            .join("test-iso-prod-guard.jsonl");
+        let prod_before = fs::metadata(&prod_log).map(|m| m.len()).unwrap_or(0);
+
+        unsafe { env::remove_var("CARBON_STACK_HOME") };
+        log_hook_event("test-iso-prod-guard", "should_ignore", json!({"n": 1}));
+        let prod_dir = home_dir().join(".gemini").join("carbon-stack");
+        unsafe { env::set_var("CARBON_STACK_HOME", &prod_dir) };
+        log_hook_event("test-iso-prod-guard", "should_ignore_prod", json!({"n": 2}));
+
+        assert_eq!(
+            fs::metadata(&prod_log).map(|m| m.len()).unwrap_or(0),
+            prod_before
+        );
+
+        let tmp_home = env::temp_dir().join(format!("carbon-rio-iso-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp_home);
+        unsafe { env::set_var("CARBON_STACK_HOME", &tmp_home) };
+        log_hook_event("test-iso", "allowed_in_tmp", json!({"ok": true}));
+        let tmp_log = tmp_home.join("state").join("logs").join("test-iso.jsonl");
+        let content = fs::read_to_string(&tmp_log).unwrap();
+        assert!(content.contains("allowed_in_tmp"));
+
+        match prev {
+            Some(v) => unsafe { env::set_var("CARBON_STACK_HOME", v) },
+            None => unsafe { env::remove_var("CARBON_STACK_HOME") },
+        }
+        let _ = fs::remove_dir_all(&tmp_home);
     }
 }

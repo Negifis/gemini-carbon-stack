@@ -2228,6 +2228,25 @@ pub fn run_cli(_args: &[String]) -> i32 {
 mod tests {
     use super::*;
 
+    struct HomeGuard(Option<std::ffi::OsString>);
+
+    impl HomeGuard {
+        fn enter(temp_home: &Path) -> Self {
+            let guard = Self(env::var_os("CARBON_STACK_HOME"));
+            unsafe { env::set_var("CARBON_STACK_HOME", temp_home) };
+            guard
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => unsafe { env::set_var("CARBON_STACK_HOME", v) },
+                None => unsafe { env::remove_var("CARBON_STACK_HOME") },
+            }
+        }
+    }
+
     #[test]
     fn test_all_regexes_compile() {
         let _ = bare_worktree_remove_re();
@@ -2346,6 +2365,13 @@ mod tests {
 
     #[test]
     fn test_shell_classification_and_ownership_guard() {
+        let _guard = crate::win32_sqlite::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = env::temp_dir().join(format!("carbon-own-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let _home_guard = HomeGuard::enter(&root.join("carbon-home"));
+
         assert_eq!(classify_shell_command("git status; Get-Content src/main.rs"), "READ_ONLY");
         assert_eq!(classify_shell_command("$null | cargo test"), "VALIDATION");
         assert_eq!(
@@ -2361,8 +2387,6 @@ mod tests {
             "MUTATING"
         );
 
-        let root = env::temp_dir().join(format!("carbon-own-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join(".swarm").join("artifacts")).unwrap();
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(
@@ -2433,6 +2457,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let root = env::temp_dir().join(format!("carbon-swg-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
+        let _home_guard = HomeGuard::enter(&root.join("carbon-home"));
         let sid = format!("test-swg-sess-{}", std::process::id());
         let brain_root = root.join("brain");
         let tp = brain_root
@@ -2512,21 +2537,10 @@ mod tests {
         let _guard = crate::win32_sqlite::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        struct HomeGuard(Option<std::ffi::OsString>);
-        impl Drop for HomeGuard {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(v) => unsafe { env::set_var("CARBON_STACK_HOME", v) },
-                    None => unsafe { env::remove_var("CARBON_STACK_HOME") },
-                }
-            }
-        }
-        let _home_guard = HomeGuard(env::var_os("CARBON_STACK_HOME"));
-
         let root = env::temp_dir().join(format!("carbon-swg-multi-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let carbon_home = root.join("carbon-home");
-        unsafe { env::set_var("CARBON_STACK_HOME", &carbon_home) };
+        let _home_guard = HomeGuard::enter(&carbon_home);
 
         let sid = format!("test-swg-multi-{}", std::process::id());
         let brain_root = root.join("brain");
