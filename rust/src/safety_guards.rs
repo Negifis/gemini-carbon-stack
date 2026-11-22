@@ -345,6 +345,12 @@ pub fn guard_swarm_wait(payload: &Value, args: Option<&Value>) -> (String, Optio
             continue;
         }
         active_workers.push(mname.clone());
+        let mstate = val_to_str(minfo.get("state")).trim().to_ascii_lowercase();
+        if mstate == "working" {
+            // INVARIANT: A worker still in `state == "working"` after a peer-to-peer board post remains in-flight (subject to `detect_stalled_workers` below), not finished.
+            in_flight.push(mname.clone());
+            continue;
+        }
         let added_by = minfo
             .get("added_by")
             .and_then(|v| v.as_str())
@@ -678,6 +684,86 @@ mod tests {
         let (dec_wait, reason_wait, _) = evaluate_pre_tool_use(&sw_wait);
         assert_eq!(dec_wait, "deny");
         assert!(reason_wait.unwrap().contains("Swarm Wait Guard"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_guard_swarm_wait_working_after_peer_post_and_waiting_deadlock() {
+        let _guard = crate::win32_sqlite::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = env::temp_dir().join(format!("carbon-swg-working-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let _home_guard = HomeGuard::enter(&root.join("carbon-home"));
+        let sid = format!("test-swg-work-{}", std::process::id());
+        let brain_root = root.join("brain");
+        let tp = brain_root
+            .join(&sid)
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl");
+        let swarm_path = brain_root
+            .join(&sid)
+            .join(".system_generated")
+            .join("swarm");
+        fs::create_dir_all(tp.parent().unwrap()).unwrap();
+        fs::create_dir_all(&swarm_path).unwrap();
+        fs::write(
+            &tp,
+            "{\"step_index\":0,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"Run\"}\n",
+        )
+        .unwrap();
+
+        let now_iso = crate::win32_sqlite::format_iso_utc(crate::win32_sqlite::now_sec());
+        let fresh_board = format!(
+            "{{\"seq\":1,\"agent\":\"coordinator\",\"time\":\"{0}\",\"text\":\"@worker-a implement module and sync with @worker-b\"}}\n\
+             {{\"seq\":2,\"agent\":\"worker-a\",\"time\":\"{0}\",\"text\":\"@worker-b schema ready, continuing implementation\"}}\n",
+            now_iso
+        );
+        fs::write(swarm_path.join("board.jsonl"), &fresh_board).unwrap();
+
+        let payload = json!({
+            "conversationId": sid,
+            "cwd": root.to_string_lossy(),
+            "transcriptPath": tp.to_string_lossy(),
+        });
+        let args = json!({"since": 2});
+
+        // Active worker still in `state == "working"` after a peer-to-peer post (`last_reply_seq >= last_assign_seq`) -> allow.
+        fs::write(
+            swarm_path.join("members.json"),
+            r#"{"members":{"worker-a":{"role":"worker","state":"working"}}}"#,
+        )
+        .unwrap();
+        let (dec_work, reason_work) = guard_swarm_wait(&payload, Some(&args));
+        assert_eq!(dec_work, "allow");
+        assert!(reason_work.is_none());
+
+        // Same peer-to-peer board once worker finishes into `state == "waiting"` -> deny (deadlock prevention preserved).
+        fs::write(
+            swarm_path.join("members.json"),
+            r#"{"members":{"worker-a":{"role":"worker","state":"waiting"}}}"#,
+        )
+        .unwrap();
+        let (dec_wait, reason_wait) = guard_swarm_wait(&payload, Some(&args));
+        assert_eq!(dec_wait, "deny");
+        assert!(reason_wait.unwrap().contains("Swarm Wait Guard"));
+
+        // Truly stalled `"working"` worker still triggers `[Swarm Stall Watchdog]`.
+        fs::write(
+            swarm_path.join("members.json"),
+            r#"{"members":{"worker-a":{"role":"worker","state":"working"}}}"#,
+        )
+        .unwrap();
+        let stale_board = concat!(
+            "{\"seq\":1,\"agent\":\"coordinator\",\"time\":\"2020-01-01T00:00:00Z\",\"text\":\"@worker-a implement module\"}\n",
+            "{\"seq\":2,\"agent\":\"worker-a\",\"time\":\"2020-01-01T00:00:10Z\",\"text\":\"@worker-b schema ready\"}\n"
+        );
+        fs::write(swarm_path.join("board.jsonl"), stale_board).unwrap();
+        let (dec_stall, reason_stall) = guard_swarm_wait(&payload, Some(&args));
+        assert_eq!(dec_stall, "deny");
+        assert!(reason_stall.unwrap().contains("Swarm Stall Watchdog"));
 
         let _ = fs::remove_dir_all(&root);
     }

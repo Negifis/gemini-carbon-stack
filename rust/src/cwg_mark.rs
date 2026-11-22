@@ -2095,6 +2095,53 @@ fn git_entry_unchanged_on_disk(path: &str, b_tok: &str, a_tok: Option<&str>) -> 
     file_entry_token(p, "", Some(&st)) == b_ctok
 }
 
+fn is_clean_upstream_ff_reflog_transition(root: &str, bh: &str, ah: &str) -> bool {
+    // INVARIANT: Prove a clean fast-forward onto an existing remote-tracking commit directly from git ancestry, `refs/remotes/`, and reflog (independent of read-only sibling shell commands like `git symbolic-ref`).
+    if bh.is_empty() || ah.is_empty() || bh == ah {
+        return false;
+    }
+    if rio::run_git(root, &["merge-base", "--is-ancestor", bh, ah], 3.0).0 != 0 {
+        return false;
+    }
+    let (rc_ref, ref_out, _) = rio::run_git(
+        root,
+        &["for-each-ref", &format!("--contains={}", ah), "refs/remotes/"],
+        3.0,
+    );
+    if rc_ref != 0 || ref_out.trim().is_empty() {
+        return false;
+    }
+    let (rc_rl, rl_out, _) = rio::run_git(
+        root,
+        &["reflog", "show", "-n", "10", "--format=%H %gs", "HEAD"],
+        3.0,
+    );
+    if rc_rl != 0 {
+        return false;
+    }
+    let mut saw_ff = false;
+    for (idx, line) in rl_out.lines().enumerate() {
+        let Some((oid, subj)) = line.split_once(' ') else {
+            return false;
+        };
+        if idx == 0 && oid != ah {
+            return false;
+        }
+        if oid == bh {
+            return saw_ff;
+        }
+        let is_ff = (subj.starts_with("merge ") || subj.starts_with("pull "))
+            && subj.contains(": Fast-forward");
+        let is_move = subj.starts_with("checkout: moving from ");
+        if is_ff {
+            saw_ff = true;
+        } else if !is_move {
+            return false;
+        }
+    }
+    false
+}
+
 fn clean_integration_rel_paths(root: &str, bh: &str, ah: &str, cmd: &str, no_dirty: bool) -> Option<HashSet<String>> {
     if let (0, po, _) = rio::run_git(root, &["rev-list", "--parents", "-n", "1", ah], 3.0) {
         let oids: Vec<&str> = po.split_whitespace().collect();
@@ -2110,7 +2157,11 @@ fn clean_integration_rel_paths(root: &str, bh: &str, ah: &str, cmd: &str, no_dir
             return None;
         }
     }
-    if !no_dirty || cmd.trim().is_empty() { return None; }
+    if !no_dirty { return None; }
+    if is_clean_upstream_ff_reflog_transition(root, bh, ah) {
+        return Some(HashSet::new());
+    }
+    if cmd.trim().is_empty() { return None; }
     let mut saw = false;
     for (_, seg) in split_shell_segments(cmd, false) {
         let s = seg.trim();
@@ -2128,7 +2179,12 @@ fn clean_integration_rel_paths(root: &str, bh: &str, ah: &str, cmd: &str, no_dir
         };
         if sub == "commit" || toks[i + 1..].iter().any(|x| x.eq_ignore_ascii_case("--amend")) { return None; }
         if matches!(sub.as_str(), "pull" | "merge" | "checkout" | "switch" | "rebase") { saw = true; }
-        else if !matches!(sub.as_str(), "status" | "fetch" | "rev-parse" | "branch" | "log" | "show" | "diff") { return None; }
+        else if sub == "symbolic-ref" {
+            let tail = &toks[i + 1..];
+            let pos = tail.iter().filter(|x| !x.starts_with('-')).count();
+            if pos > 1 || tail.iter().any(|x| matches!(x.as_str(), "-d" | "--delete")) { return None; }
+        }
+        else if !matches!(sub.as_str(), "status" | "fetch" | "rev-parse" | "rev-list" | "branch" | "log" | "show" | "diff" | "describe" | "merge-base" | "for-each-ref" | "name-rev" | "shortlog" | "ls-remote") { return None; }
     }
     saw.then(HashSet::new)
 }
@@ -4898,5 +4954,111 @@ mod tests {
             None => std::env::remove_var("CARBON_STACK_HOME"),
         }
         let _ = fs::remove_dir_all(&tmp_home);
+    }
+
+    #[test]
+    fn test_anom_bb48796c_clean_upstream_ff_with_sibling_commands_and_preexisting_untracked() {
+        let _lock = crate::win32_sqlite::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("carbon-cwg-ff-anom-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let bare = root.join("origin.git");
+        let repo = root.join("repo");
+        let upstream = root.join("upstream");
+        fs::create_dir_all(&bare).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        let run_g = |dir: &Path, args: &[&str]| -> String {
+            let (rc, out, err) = rio::run_git(&dir.to_string_lossy(), args, 5.0);
+            assert_eq!(rc, 0, "git {:?} in {:?} failed: {} {}", args, dir, out, err);
+            out
+        };
+        run_g(&bare, &["init", "--bare"]);
+        run_g(&repo, &["init"]);
+        run_g(&repo, &["config", "user.email", "t@example.com"]);
+        run_g(&repo, &["config", "user.name", "Test"]);
+        fs::write(repo.join("base.txt"), "base\n").unwrap();
+        run_g(&repo, &["add", "-A"]);
+        run_g(&repo, &["commit", "-m", "base"]);
+        let branch = run_g(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).trim().to_string();
+        run_g(&repo, &["remote", "add", "origin", &bare.to_string_lossy()]);
+        run_g(&repo, &["push", "-u", "origin", &branch]);
+
+        // Advance upstream in a separate clone and fetch into repo.
+        run_g(&root, &["clone", &bare.to_string_lossy(), &upstream.to_string_lossy()]);
+        run_g(&upstream, &["config", "user.email", "u@example.com"]);
+        run_g(&upstream, &["config", "user.name", "Upstream"]);
+        fs::write(upstream.join("up_a.txt"), "upstream a\n").unwrap();
+        fs::write(upstream.join("up_b.txt"), "upstream b\n").unwrap();
+        run_g(&upstream, &["add", "-A"]);
+        run_g(&upstream, &["commit", "-m", "upstream commits"]);
+        run_g(&upstream, &["push", "origin", &branch]);
+        run_g(&repo, &["fetch", "--all", "--prune"]);
+
+        // Pre-existing untracked file (mirrors `.mcp.json.tokenade-original` from anom-bb48796c).
+        fs::write(repo.join(".mcp.json.tokenade-original"), "{}\n").unwrap();
+        let repo_s = repo.to_string_lossy().into_owned();
+        let before_ff = take_git_snapshot(&repo_s, "", &[], None);
+        run_g(&repo, &["merge", "--ff-only", &format!("origin/{}", branch)]);
+        let after_ff = take_git_snapshot(&repo_s, "", &[], None);
+        let cmd = format!(
+            "git symbolic-ref refs/remotes/origin/HEAD; git merge --ff-only origin/{}; git log --oneline -n 5 HEAD; git status --short; echo done",
+            branch
+        );
+        let (ff_chg, ff_unm) = diff_git_snapshots_for_cmd(Some(&before_ff), Some(&after_ff), &cmd);
+        assert!(!ff_unm);
+        assert!(
+            ff_chg.is_empty(),
+            "clean upstream fast-forward must not attribute upstream files: {:?}",
+            ff_chg
+        );
+
+        // Local working-tree edit alongside the same fast-forward MUST still be detected.
+        fs::write(repo.join("local_edit.txt"), "edited\n").unwrap();
+        let after_ff_dirty = take_git_snapshot(&repo_s, "", &[], None);
+        let (dirty_chg, _) = diff_git_snapshots_for_cmd(Some(&before_ff), Some(&after_ff_dirty), &cmd);
+        assert_eq!(dirty_chg.len(), 1, "expected only local_edit.txt, got: {:?}", dirty_chg);
+        assert!(dirty_chg[0].ends_with("/local_edit.txt"));
+        fs::remove_file(repo.join("local_edit.txt")).unwrap();
+
+        // Negative 1: local-only unpushed fast-forward under a non-git sibling command must NOT be exempted.
+        run_g(&repo, &["checkout", "-b", "local-only"]);
+        fs::write(repo.join("local_only.txt"), "local\n").unwrap();
+        run_g(&repo, &["add", "local_only.txt"]);
+        run_g(&repo, &["commit", "-m", "local only"]);
+        run_g(&repo, &["checkout", &branch]);
+        let before_local_ff = take_git_snapshot(&repo_s, "", &[], None);
+        run_g(&repo, &["merge", "--ff-only", "local-only"]);
+        let after_local_ff = take_git_snapshot(&repo_s, "", &[], None);
+        let (local_chg, _) = diff_git_snapshots_for_cmd(
+            Some(&before_local_ff),
+            Some(&after_local_ff),
+            "echo prep; git merge --ff-only local-only",
+        );
+        assert!(
+            local_chg.iter().any(|p| p.ends_with("/local_only.txt")),
+            "local unpushed ff must not bypass remote-ref structural check: {:?}",
+            local_chg
+        );
+
+        // Negative 2: local commit + push puts HEAD in refs/remotes/ but reflog is `commit:`, so it must NOT be exempted.
+        let before_cp = take_git_snapshot(&repo_s, "", &[], None);
+        fs::write(repo.join("committed_pushed.txt"), "x\n").unwrap();
+        run_g(&repo, &["add", "committed_pushed.txt"]);
+        run_g(&repo, &["commit", "-m", "local commit"]);
+        run_g(&repo, &["push", "origin", &branch]);
+        let after_cp = take_git_snapshot(&repo_s, "", &[], None);
+        let (cp_chg, _) = diff_git_snapshots_for_cmd(
+            Some(&before_cp),
+            Some(&after_cp),
+            "git add committed_pushed.txt; git commit -m x; git push",
+        );
+        assert!(
+            cp_chg.iter().any(|p| p.ends_with("/committed_pushed.txt")),
+            "local commit+push must never look like an upstream fast-forward: {:?}",
+            cp_chg
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
