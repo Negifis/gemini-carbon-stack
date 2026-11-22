@@ -3,13 +3,11 @@ use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::rio;
 use crate::win32_sqlite;
 
 const SNAPSHOT_PROBE_TIMEOUT: f64 = 60.0;
-static SNAPSHOT_SEQ: AtomicU64 = AtomicU64::new(1);
 
 fn eprintln_line(msg: &str) {
     let mut err = std::io::stderr().lock();
@@ -98,6 +96,76 @@ fn git_out(p: &str, a: &[&str]) -> Result<String, String> {
     if rc == 0 { Ok(o) } else { Err(if e.trim().is_empty() { format!("exit_{}", rc) } else { e.trim().into() }) }
 }
 fn pending_files(p: &str) -> Result<Vec<String>, String> { Ok(git_out(p, &["status", "--porcelain"])?.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect()) }
+fn commit_tree_obj(top: &str, tree: &str, parent: Option<&str>, msg: &str) -> Result<String, String> {
+    let mut args: Vec<&str> = vec!["commit-tree", tree];
+    if let Some(p) = parent.filter(|s| !s.trim().is_empty()) {
+        args.push("-p");
+        args.push(p);
+    }
+    args.push("-m");
+    args.push(msg);
+    let (rc, out, err) = rio::run_git(top, &args, 15.0);
+    let oid = out.trim().to_string();
+    if rc != 0 || oid.is_empty() {
+        Err(if err.trim().is_empty() {
+            "git commit-tree failed".into()
+        } else {
+            truncate_chars(err.trim(), 160).to_string()
+        })
+    } else {
+        Ok(oid)
+    }
+}
+
+fn capture_snapshot_commits(
+    top: &str,
+    head: Option<&str>,
+    msg: &str,
+) -> Result<(String, Option<String>), String> {
+    // SAFETY: Capture staged index BEFORE working-tree snapshot via read-only `git write-tree` so staged-only changes (even when working tree was reverted to HEAD) survive in the commit chain without mutating `.git/index`.
+    let (rc_u, out_u, err_u) = rio::run_git(top, &["ls-files", "-u"], 10.0);
+    if rc_u != 0 {
+        return Err(format!("git ls-files failed: {}", truncate_chars(err_u.trim(), 120)));
+    }
+    let mut idx_tree = String::new();
+    let mut idx_commit: Option<String> = None;
+    if out_u.trim().is_empty() {
+        let (rc_wt, out_wt, err_wt) = rio::run_git(top, &["write-tree"], 30.0);
+        if rc_wt == 0 {
+            let candidate_idx_tree = out_wt.trim().to_string();
+            let staged_differs = if let Some(h) = head {
+                let ht_ref = format!("{}^{{tree}}", h);
+                let (rc_ht, out_ht, _) = rio::run_git(top, &["rev-parse", "--verify", "-q", &ht_ref], 5.0);
+                rc_ht == 0 && !candidate_idx_tree.is_empty() && candidate_idx_tree != out_ht.trim()
+            } else {
+                let (rc_ls, out_ls, _) = rio::run_git(top, &["ls-files", "--cached", "-z"], 10.0);
+                rc_ls == 0 && !out_ls.is_empty() && !candidate_idx_tree.is_empty()
+            };
+            if staged_differs {
+                idx_tree = candidate_idx_tree;
+                let idx_msg = format!("staged index before {}", msg);
+                idx_commit = Some(commit_tree_obj(top, &idx_tree, head, &idx_msg)?);
+            }
+        } else if !err_wt.trim().is_empty() {
+            return Err(format!("git write-tree failed: {}", truncate_chars(err_wt.trim(), 120)));
+        }
+    }
+
+    let wt_tree = rio::capture_worktree_tree_oid(top, SNAPSHOT_PROBE_TIMEOUT);
+    if wt_tree.is_empty() {
+        return Err("capture_worktree_tree_oid_failed".into());
+    }
+    if let Some(ref ic) = idx_commit {
+        if wt_tree == idx_tree {
+            return Ok((ic.clone(), idx_commit));
+        }
+        let wt_commit = commit_tree_obj(top, &wt_tree, Some(ic.as_str()), msg)?;
+        return Ok((wt_commit, idx_commit));
+    }
+    let wt_commit = commit_tree_obj(top, &wt_tree, head, msg)?;
+    Ok((wt_commit, None))
+}
+
 pub fn snapshot_for_removal(p: &str, name: Option<&str>, br: Option<&str>) -> Option<Value> {
     if p.trim().is_empty() || !Path::new(p).is_dir() || git_out(p, &["rev-parse", "--git-dir"]).is_err() { return None; }
     let err = |m: String| Some(json!({"error": m}));
@@ -123,30 +191,22 @@ pub fn snapshot_for_removal(p: &str, name: Option<&str>, br: Option<&str>) -> Op
     let Some(target) = (0..50).filter(|&i| i != 1).map(|i| if i == 0 { base.clone() } else { format!("{}-{}", base, i) }).find(|c| rio::run_git(p, &["rev-parse", "--verify", "--quiet", c], 5.0).0 != 0) else { return err(format!("no free wip/ branch name for {}", lbl)); };
     let head = ne(git_out(p, &["rev-parse", "HEAD"]));
     if head.is_none() && pend.is_empty() { return None; }
-    let (mode, files, commit) = if pend.is_empty() { ("ref", 0, head.unwrap_or_default()) } else {
-        // SAFETY: Stage into an isolated scratch index so worktree HEAD, real index staged/unstaged split, and merge state stay untouched.
-        let idx = env::temp_dir().join(format!("cwg-snapshot-{}-{}.index", std::process::id(), SNAPSHOT_SEQ.fetch_add(1, Ordering::Relaxed)));
-        let idx_s = idx.to_string_lossy().into_owned();
-        let ge = [("GIT_INDEX_FILE", idx_s.as_str())];
-        let ge_run = |a: &[&str], to| rio::run_git_env(p, a, to, &ge);
-        let tr: Result<String, &'static str> = (|| {
-            if let Some(ref h) = head { if ge_run(&["read-tree", h], 30.0).0 != 0 { return Err("git read-tree failed, so the snapshot would drop tracked-but-ignored files"); } }
-            if ge_run(&["add", "-A"], 60.0).0 != 0 { return Err("git add failed (locked index, or a path git refuses)"); }
-            let (rc, o, _) = ge_run(&["write-tree"], 30.0);
-            let t = o.trim().to_string();
-            if rc != 0 || t.is_empty() { Err("git write-tree failed") } else { Ok(t) }
-        })();
-        let _ = fs::remove_file(&idx);
-        let tree = match tr { Ok(t) => t, Err(m) => return err(m.into()) };
+    let (mode, files, commit, staged_commit) = if pend.is_empty() {
+        ("ref", 0, head.unwrap_or_default(), None)
+    } else {
         let msg = format!("snapshot: unfinished work from worktree {}", lbl);
-        let mut ca = vec!["commit-tree", tree.as_str()];
-        if let Some(ref h) = head { ca.extend(["-p", h.as_str()]); }
-        ca.extend(["-m", msg.as_str()]);
-        let Some(c) = ne(git_out(p, &ca)) else { return err("git commit-tree failed".into()); };
-        ("commit", pend.len(), c)
+        let (wt_c, st_c) = match capture_snapshot_commits(p, head.as_deref(), &msg) {
+            Ok(pair) => pair,
+            Err(m) => return err(m),
+        };
+        ("commit", pend.len(), wt_c, st_c)
     };
     if rio::run_git(p, &["branch", &target, &commit], 10.0).0 != 0 { return err(format!("could not create branch {}", target)); }
-    Some(json!({"branch": target, "mode": mode, "files": files, "ahead": ahead, "head": commit}))
+    let mut out = json!({"branch": target, "mode": mode, "files": files, "ahead": ahead, "head": commit});
+    if let Some(sc) = staged_commit {
+        out["staged_commit"] = Value::String(sc);
+    }
+    Some(out)
 }
 pub fn evaluate_worktree_remove(payload: &Value) {
     let p = payload.get("worktree_path").or_else(|| payload.get("worktreePath")).or_else(|| payload.get("path")).and_then(|v| v.as_str()).unwrap_or("").trim();
@@ -157,7 +217,7 @@ pub fn evaluate_worktree_remove(payload: &Value) {
         rio::log_hook_event("worktree-snapshots", "snapshot_failed", json!({"session_id": sid, "worktree": p, "removed_branch": br, "failed": err}));
         eprintln_line(&format!("Could NOT save unfinished work from {}: {}. The worktree is being removed anyway.", p, err));
     } else {
-        rio::log_hook_event("worktree-snapshots", "snapshot_saved", json!({"session_id": sid, "worktree": p, "removed_branch": br, "saved_to": res["branch"], "mode": res["mode"], "files": res["files"], "ahead": res["ahead"], "head": res["head"]}));
+        rio::log_hook_event("worktree-snapshots", "snapshot_saved", json!({"session_id": sid, "worktree": p, "removed_branch": br, "saved_to": res["branch"], "mode": res["mode"], "files": res["files"], "ahead": res["ahead"], "head": res["head"], "staged_commit": res.get("staged_commit").cloned().unwrap_or(Value::Null)}));
     }
 }
 
@@ -177,33 +237,22 @@ pub fn snapshot_dirty_worktree(worktree_dir: &str, label: &str) -> Value {
     }
 
     let parent_sha = rio::git_head_oid(&top);
-    let tree_sha = rio::capture_worktree_tree_oid(&top, 15.0);
-    if tree_sha.is_empty() {
-        return json!({"ok": false, "error": "capture_worktree_tree_oid_failed"});
-    }
-
+    let head_opt = (!parent_sha.is_empty()).then_some(parent_sha.as_str());
     let now = win32_sqlite::now_sec();
     let commit_msg = format!(
         "WIP snapshot ({}) at {}",
         label,
         win32_sqlite::format_iso_utc(now)
     );
-    let mut commit_args: Vec<&str> = vec!["commit-tree", &tree_sha];
-    if !parent_sha.is_empty() {
-        commit_args.push("-p");
-        commit_args.push(&parent_sha);
-    }
-    commit_args.push("-m");
-    commit_args.push(&commit_msg);
-
-    let (rc3, commit_out, err3) = rio::run_git(&top, &commit_args, 15.0);
-    let commit_sha = commit_out.trim().to_string();
-    if rc3 != 0 || commit_sha.is_empty() {
-        return json!({
-            "ok": false,
-            "error": format!("git_commit_tree_failed:{}", truncate_chars(err3.trim(), 160)),
-        });
-    }
+    let (commit_sha, staged_commit) = match capture_snapshot_commits(&top, head_opt, &commit_msg) {
+        Ok(pair) => pair,
+        Err(err_s) => {
+            return json!({
+                "ok": false,
+                "error": format!("git_commit_tree_failed:{}", truncate_chars(&err_s, 160)),
+            });
+        }
+    };
 
     let raw_lbl = rio::safe_key(label, "wip");
     let safe_lbl = truncate_chars(&raw_lbl, 32);
@@ -216,13 +265,17 @@ pub fn snapshot_dirty_worktree(worktree_dir: &str, label: &str) -> Value {
         });
     }
 
-    json!({
+    let mut out = json!({
         "ok": true,
         "clean": false,
         "ref": ref_name,
         "commit": commit_sha,
         "worktree": rio::normalize_path(&top),
-    })
+    });
+    if let Some(sc) = staged_commit {
+        out["staged_commit"] = Value::String(sc);
+    }
+    out
 }
 
 pub fn safe_remove_worktree(worktree_dir: &str, repo_dir: &str, snapshot_dirty: bool) -> Value {
@@ -268,6 +321,17 @@ pub fn safe_remove_worktree(worktree_dir: &str, repo_dir: &str, snapshot_dirty: 
             });
         }
         snap_info = Some(snap);
+    } else if snapshot_dirty {
+        if let Some(res) = snapshot_for_removal(&wt, None, None) {
+            if let Some(err_s) = res.get("error").and_then(|v| v.as_str()) {
+                return json!({
+                    "ok": false,
+                    "error": format!("clean_ahead_snapshot_failed:{}", err_s),
+                    "worktree": wt_norm,
+                });
+            }
+            snap_info = Some(res);
+        }
     }
 
     // SAFETY: Unlink directory links/junctions BEFORE `git worktree remove` touches the tree.
@@ -643,6 +707,7 @@ pub fn run_cli(args: &[String]) -> i32 {
 mod tests {
     use super::*;
     use crate::win32_sqlite::TEST_ENV_LOCK;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -821,6 +886,61 @@ mod tests {
             .unwrap_or_default();
             assert!(snap_log.contains("\"mode\":\"commit\""));
             assert!(snap_log.contains("\"mode\":\"ref\""));
+
+            // 2b. Staged index (V2) + worktree reverted to HEAD (V1) preserves BOTH V1 and V2 in both snapshot_for_removal and safe_remove_worktree!
+            let wt_staged_hook = base.join("wt-staged-hook");
+            let wt_staged_hook_s = wt_staged_hook.to_string_lossy().into_owned();
+            assert_eq!(
+                rio::run_git(&repo_s, &["worktree", "add", "-b", "feat/staged-hook", &wt_staged_hook_s], 5.0).0,
+                0
+            );
+            fs::write(wt_staged_hook.join("base.txt"), "staged-v2\n").unwrap();
+            assert_eq!(rio::run_git(&wt_staged_hook_s, &["add", "base.txt"], 5.0).0, 0);
+            fs::write(wt_staged_hook.join("base.txt"), "base\n").unwrap();
+            let snap_hook = snapshot_for_removal(&wt_staged_hook_s, Some("staged-hook"), Some("feat/staged-hook")).unwrap();
+            let tip_hook = snap_hook["head"].as_str().unwrap().to_string();
+            let st_hook = snap_hook["staged_commit"].as_str().unwrap().to_string();
+            assert_ne!(tip_hook, st_hook);
+            assert_eq!(rio::run_git(&repo_s, &["show", &format!("{}:base.txt", tip_hook)], 5.0).1, "base\n");
+            assert_eq!(rio::run_git(&repo_s, &["show", &format!("{}:base.txt", st_hook)], 5.0).1, "staged-v2\n");
+
+            let wt_staged_rm = base.join("wt-staged-rm");
+            let wt_staged_rm_s = wt_staged_rm.to_string_lossy().into_owned();
+            assert_eq!(
+                rio::run_git(&repo_s, &["worktree", "add", "-b", "feat/staged-rm", &wt_staged_rm_s], 5.0).0,
+                0
+            );
+            fs::write(wt_staged_rm.join("base.txt"), "staged-rm-v2\n").unwrap();
+            assert_eq!(rio::run_git(&wt_staged_rm_s, &["add", "base.txt"], 5.0).0, 0);
+            fs::write(wt_staged_rm.join("base.txt"), "base\n").unwrap();
+            let rm_res = safe_remove_worktree(&wt_staged_rm_s, &repo_s, true);
+            assert_eq!(rm_res["ok"], json!(true), "{}", rm_res);
+            assert!(!wt_staged_rm.exists());
+            let tip_rm = rm_res["snapshot"]["commit"].as_str().unwrap().to_string();
+            let st_rm = rm_res["snapshot"]["staged_commit"].as_str().unwrap().to_string();
+            assert_eq!(rio::run_git(&repo_s, &["show", &format!("{}:base.txt", tip_rm)], 5.0).1, "base\n");
+            assert_eq!(rio::run_git(&repo_s, &["show", &format!("{}:base.txt", st_rm)], 5.0).1, "staged-rm-v2\n");
+
+            // 2c. Clean detached-HEAD worktree with unreachable local commit is snapshotted before safe_remove_worktree deletes it.
+            let wt_detached = base.join("wt-detached-ahead");
+            let wt_detached_s = wt_detached.to_string_lossy().into_owned();
+            assert_eq!(
+                rio::run_git(&repo_s, &["worktree", "add", "--detach", &wt_detached_s, "HEAD"], 5.0).0,
+                0
+            );
+            let _ = rio::run_git(&wt_detached_s, &["config", "user.email", "t@example.com"], 5.0);
+            let _ = rio::run_git(&wt_detached_s, &["config", "user.name", "Test"], 5.0);
+            fs::write(wt_detached.join("detached.txt"), "keep-commit\n").unwrap();
+            assert_eq!(rio::run_git(&wt_detached_s, &["add", "detached.txt"], 5.0).0, 0);
+            assert_eq!(rio::run_git(&wt_detached_s, &["commit", "-m", "detached ahead"], 5.0).0, 0);
+            let detached_oid = rio::git_head_oid(&wt_detached_s);
+            let rm_det = safe_remove_worktree(&wt_detached_s, &repo_s, true);
+            assert_eq!(rm_det["ok"], json!(true), "{}", rm_det);
+            assert!(!wt_detached.exists());
+            assert_eq!(rm_det["snapshot"]["mode"], json!("ref"));
+            assert_eq!(rm_det["snapshot"]["head"], json!(detached_oid));
+            let snap_br = rm_det["snapshot"]["branch"].as_str().unwrap();
+            assert_eq!(rio::run_git(&repo_s, &["show", &format!("{}:detached.txt", snap_br)], 5.0).1, "keep-commit\n");
         }
 
         // 3. Non-repo path in safe_remove_worktree fails closed with git_status_failed instead of clean.

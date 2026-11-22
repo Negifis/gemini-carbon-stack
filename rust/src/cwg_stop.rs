@@ -5594,12 +5594,12 @@ fn validate_candidate_closure_inner(
                     .0
                     .unwrap_or_else(|| rio::resolve_brain_root(""));
                 let alive_workers =
-                    cwg_common::active_simplify_or_review_workers(&brain_root, &marker_sess);
+                    cwg_common::active_review_workers(&brain_root, &marker_sess);
                 if !alive_workers.is_empty() {
                     return (
                         false,
                         format!(
-                            "waiting/active simplify or review swarm workers ({}) must be killed via `swarm(action=\"kill\", ...)` before closing the gate",
+                            "waiting/active review swarm workers ({}) must be killed via `swarm(action=\"kill\", ...)` before closing the gate",
                             alive_workers.join(", ")
                         ),
                     );
@@ -10779,6 +10779,91 @@ mod tests {
         });
         assert!(ok, "HIGH visual candidate must close without simplify or Design Gate: {}", res);
         assert_eq!(res, "verified");
+
+        let mut m_simp = marker.clone();
+        let sess_simp = "sess-stage2-waiting-simplify";
+        m_simp["session"] = json!(sess_simp);
+        let brain_simp = tmp.path.join("brain");
+        let tp_simp = setup_neon_session_env(
+            &brain_simp,
+            sess_simp,
+            "",
+            json!({
+                "members": {
+                    "simplify-reviewer": {
+                        "role": "worker",
+                        "conversation_id": "cid-simp-wait",
+                        "model": cwg_common::SONNET_HIGH_MODEL,
+                        "killed": false
+                    },
+                    "helper-1": {
+                        "role": "worker",
+                        "conversation_id": "cid-simp-helper",
+                        "model": cwg_common::SONNET_HIGH_MODEL,
+                        "killed": false
+                    }
+                }
+            }),
+            &[
+                json!({"seq": 1, "agent": "simplify-reviewer", "time": "2026-11-22T10:00:00Z", "text": "SIMPLIFY_LENS: ALL\nSIMPLIFY_VERDICT: CLEAN"}),
+                json!({"seq": 2, "agent": "helper-1", "time": "2026-11-22T10:00:05Z", "text": "SIMPLIFY_VERDICT: ACTIONABLE_FIXES"}),
+            ],
+            &[],
+        );
+        let tp_simp_str = tp_simp.to_string_lossy().into_owned();
+        assert!(cwg_common::active_review_workers(&brain_simp, sess_simp).is_empty());
+        let (ok_simp, res_simp) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&receipt),
+            marker_in: &m_simp,
+            checks_ev: &checks_ev,
+            sub_ev: &SubagentEvidence::default(),
+            swarm_ev: &SwarmEvidence::default(),
+            codex_reviews: &codex_reviews,
+            ctx: None,
+            steps: None,
+            transcript_path: Some(&tp_simp_str),
+        });
+        assert!(ok_simp, "waiting simplify worker must not block APPROVED Stop: {}", res_simp);
+        assert_eq!(res_simp, "verified");
+
+        let sess_rev = "sess-stage2-waiting-reviewer";
+        let mut m_rev = marker.clone();
+        m_rev["session"] = json!(sess_rev);
+        let tp_rev = setup_neon_session_env(
+            &brain_simp,
+            sess_rev,
+            "",
+            json!({
+                "members": {
+                    "adversarial-reviewer": {
+                        "role": "worker",
+                        "conversation_id": "cid-rev-wait",
+                        "model": cwg_common::OPUS_HIGH_MODEL,
+                        "killed": false
+                    }
+                }
+            }),
+            &[],
+            &[],
+        );
+        let tp_rev_str = tp_rev.to_string_lossy().into_owned();
+        assert_eq!(
+            cwg_common::active_review_workers(&brain_simp, sess_rev),
+            vec!["adversarial-reviewer".to_string()]
+        );
+        let (ok_rev, res_rev) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&receipt),
+            marker_in: &m_rev,
+            checks_ev: &checks_ev,
+            sub_ev: &SubagentEvidence::default(),
+            swarm_ev: &SwarmEvidence::default(),
+            codex_reviews: &codex_reviews,
+            ctx: None,
+            steps: None,
+            transcript_path: Some(&tp_rev_str),
+        });
+        assert!(!ok_rev);
+        assert!(res_rev.contains("review swarm workers"), "{}", res_rev);
     }
 
     #[test]
@@ -10880,5 +10965,39 @@ mod tests {
         }));
         assert!(res_commit.is_some(), "kept commit ahead of opening_head must block Stop without receipt");
         assert!(mpath_commit.exists());
+
+        // Case C: First shell command modifies and commits in a single invocation -> opening_head MUST reflect pre-command HEAD (H0, not post-commit H1) so Stop blocks without receipt instead of retiring as `undo-clean`.
+        let sess_shell_commit = "sess-stage2-shell-first-commit";
+        let pre_cmd = "python -c edit_and_commit";
+        let pre_payload = json!({
+            "conversationId": sess_shell_commit,
+            "cwd": repo_str,
+            "workspacePaths": [repo_str],
+            "toolCall": {
+                "name": "run_command",
+                "args": {"CommandLine": pre_cmd}
+            }
+        });
+        cwg_mark::record_pre_tool_use(&pre_payload);
+        let h0 = rio::git_head_oid(&repo_str);
+        fs::write(&lib_rs, "pub fn n() -> i32 { 4 }\n").unwrap();
+        run_git(&["add", "src/lib.rs"]);
+        run_git(&["commit", "-m", "first command commit"]);
+        let h1 = rio::git_head_oid(&repo_str);
+        assert_ne!(h0, h1);
+        let mut post_payload = pre_payload.clone();
+        post_payload["toolResponse"] = json!({"output": "Command exited with code 0.\n"});
+        cwg_mark::record_post_tool_use(&post_payload).unwrap();
+        let m_shell = cwg_common::read_marker_with_pending(sess_shell_commit).unwrap();
+        assert_eq!(val_to_str(m_shell.get("opening_head")), h0);
+        let res_shell_stop = decide_stop(&json!({
+            "conversationId": sess_shell_commit,
+            "transcriptPath": tp.to_string_lossy(),
+            "lastAssistantMessage": "Applied and committed change without closing receipt.",
+        }));
+        assert!(
+            res_shell_stop.is_some(),
+            "first shell command commit must block Stop without receipt"
+        );
     }
 }

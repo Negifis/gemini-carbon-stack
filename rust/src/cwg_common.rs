@@ -7015,6 +7015,54 @@ pub fn verified_research_reset_state_with_path(
     (latest_ts, latest_seq, None)
 }
 
+fn is_simplify_worker_identity(name_low: &str, mdl_low: &str, brief_low: &str) -> bool {
+    is_simplify_worker_name(name_low)
+        || !simplify_lens_from_worker_name(name_low).is_empty()
+        || mdl_low == SONNET_HIGH_MODEL
+        || brief_low.contains("simplify_lens:")
+        || brief_low.contains("simplify_verdict:")
+}
+
+pub fn is_review_swarm_worker(name: &str, meta: Option<&Value>) -> bool {
+    let low = name.trim().to_ascii_lowercase();
+    let mdl = meta
+        .and_then(|m| {
+            m.get("model")
+                .or_else(|| m.get("applied_model"))
+                .or_else(|| m.get("desired_model"))
+        })
+        .map(|v| val_to_str(Some(v)).trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if is_simplify_worker_identity(&low, &mdl, "") {
+        return false;
+    }
+    mdl == OPUS_HIGH_MODEL || is_review_worker_name(&low)
+}
+
+pub fn is_review_swarm_worker_with_brief(
+    name: &str,
+    meta: Option<&Value>,
+    brief: &str,
+) -> bool {
+    let low = name.trim().to_ascii_lowercase();
+    let mdl = meta
+        .and_then(|m| {
+            m.get("model")
+                .or_else(|| m.get("applied_model"))
+                .or_else(|| m.get("desired_model"))
+        })
+        .map(|v| val_to_str(Some(v)).trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let low_brief = brief.to_lowercase();
+    if is_simplify_worker_identity(&low, &mdl, &low_brief) {
+        return false;
+    }
+    if mdl == OPUS_HIGH_MODEL || is_review_worker_name(&low) {
+        return true;
+    }
+    !brief.trim().is_empty() && is_review_worker_hint(name, brief)
+}
+
 pub fn is_simplify_or_review_swarm_worker(name: &str, meta: Option<&Value>) -> bool {
     let low = name.trim().to_ascii_lowercase();
     if is_simplify_worker_name(&low) || !simplify_lens_from_worker_name(&low).is_empty() {
@@ -7476,6 +7524,11 @@ pub fn active_simplify_or_review_workers(brain_root: &Path, session: &str) -> Ve
     active_simplify_or_review_workers_with_members(brain_root, session, &members)
 }
 
+pub fn active_review_workers(brain_root: &Path, session: &str) -> Vec<String> {
+    let members = rio::load_swarm_members(brain_root, session);
+    active_review_workers_with_members(brain_root, session, &members)
+}
+
 pub fn append_coordinator_board_briefs(
     btext: &str,
     known_workers: &[&str],
@@ -7803,7 +7856,15 @@ pub fn active_simplify_or_review_workers_with_members(
     session: &str,
     members: &Map<String, Value>,
 ) -> Vec<String> {
-    active_simplify_or_review_workers_with_members_inner(brain_root, session, members, None)
+    active_simplify_or_review_workers_with_members_inner(brain_root, session, members, None, true)
+}
+
+pub fn active_review_workers_with_members(
+    brain_root: &Path,
+    session: &str,
+    members: &Map<String, Value>,
+) -> Vec<String> {
+    active_simplify_or_review_workers_with_members_inner(brain_root, session, members, None, false)
 }
 
 #[cfg(test)]
@@ -7813,7 +7874,7 @@ fn active_simplify_or_review_workers_with_members_and_marker(
     members: &Map<String, Value>,
     marker: Option<&Value>,
 ) -> Vec<String> {
-    active_simplify_or_review_workers_with_members_inner(brain_root, session, members, Some(marker))
+    active_simplify_or_review_workers_with_members_inner(brain_root, session, members, Some(marker), true)
 }
 
 fn active_simplify_or_review_workers_with_members_inner(
@@ -7821,7 +7882,15 @@ fn active_simplify_or_review_workers_with_members_inner(
     session: &str,
     members: &Map<String, Value>,
     marker_override: Option<Option<&Value>>,
+    include_simplify: bool,
 ) -> Vec<String> {
+    let worker_matches = |name: &str, meta: Option<&Value>, brief: &str| -> bool {
+        if include_simplify {
+            is_simplify_or_review_swarm_worker_with_brief(name, meta, brief)
+        } else {
+            is_review_swarm_worker_with_brief(name, meta, brief)
+        }
+    };
     let known_workers = rio::swarm_worker_names(members);
     let mut alive: Vec<String> = Vec::new();
     let mut candidates: Vec<(&str, &Value)> = Vec::new();
@@ -7833,7 +7902,7 @@ fn active_simplify_or_review_workers_with_members_inner(
             continue;
         }
         let meta_brief = val_to_str(meta.get("brief"));
-        if is_simplify_or_review_swarm_worker_with_brief(name, Some(meta), &meta_brief) {
+        if worker_matches(name, Some(meta), &meta_brief) {
             alive.push(name.clone());
         } else {
             candidates.push((name.as_str(), meta));
@@ -7880,21 +7949,32 @@ fn active_simplify_or_review_workers_with_members_inner(
                     }
                     let scoped = extract_worker_scoped_brief(&btext, cname, &known_workers);
                     if !scoped.is_empty()
-                        && is_simplify_or_review_swarm_worker_with_brief(cname, Some(cmeta), &scoped)
+                        && worker_matches(cname, Some(cmeta), &scoped)
                     {
                         flagged[c_idx] = true;
                         *flagged_count += 1;
                     }
                 }
             } else {
-                for (c_idx, &(cname, _)) in candidates.iter().enumerate() {
+                for (c_idx, &(cname, cmeta)) in candidates.iter().enumerate() {
                     if flagged[c_idx] || (row_before_reset && !is_pre_reset[c_idx]) {
                         continue;
                     }
+                    let is_simp_name = is_simplify_worker_identity(
+                        &cname.trim().to_ascii_lowercase(),
+                        &cmeta
+                            .get("model")
+                            .or_else(|| cmeta.get("applied_model"))
+                            .or_else(|| cmeta.get("desired_model"))
+                            .map(|v| val_to_str(Some(v)).trim().to_ascii_lowercase())
+                            .unwrap_or_default(),
+                        "",
+                    );
                     if poster == cname
-                        && (extract_review_decision(&btext).0.is_some()
-                            || !val_to_str(parse_simplify_verdict(&btext, None).get("verdict"))
-                                .is_empty())
+                        && ((!is_simp_name && extract_review_decision(&btext).0.is_some())
+                            || (include_simplify
+                                && !val_to_str(parse_simplify_verdict(&btext, None).get("verdict"))
+                                    .is_empty()))
                     {
                         flagged[c_idx] = true;
                         *flagged_count += 1;

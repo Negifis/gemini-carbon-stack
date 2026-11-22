@@ -187,35 +187,142 @@ pub fn platform_hook_binary_rel(is_windows: bool) -> &'static str {
 
 pub fn normalize_hooks_json_for_os(txt: &str, is_windows: bool) -> String {
     if is_windows {
-        txt.replace("bin/carbon-stack hook", "bin\\carbon-stack.exe hook")
+        txt.replace("bin/carbon-stack.exe", "bin\\carbon-stack.exe")
+            .replace("bin/carbon-stack hook", "bin\\carbon-stack.exe hook")
     } else {
         txt.replace("bin\\\\carbon-stack.exe", "bin/carbon-stack")
+            .replace("bin\\carbon-stack.exe", "bin/carbon-stack")
             .replace("bin/carbon-stack.exe", "bin/carbon-stack")
     }
+}
+
+fn format_target_hook_binary(target_plugin_dir: &Path, is_windows: bool) -> String {
+    let abs_bin = rio::resolve_abs_path(&target_plugin_dir.join(platform_hook_binary_rel(is_windows)));
+    let raw_bin = abs_bin.to_string_lossy().into_owned();
+    let bin_full = if is_windows {
+        raw_bin.replace('/', "\\")
+    } else {
+        raw_bin.replace('\\', "/")
+    };
+    let needs_quote = bin_full
+        .chars()
+        .any(|c| c.is_whitespace() || matches!(c, '&' | '(' | ')' | '\'' | ';' | '^' | '%'));
+    if needs_quote {
+        format!("\"{}\"", bin_full)
+    } else {
+        bin_full
+    }
+}
+
+fn rewrite_relative_carbon_bin_cmd(cmd: &str, replacement_bin: &str) -> Option<String> {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (tok, rest) = if let Some(after_q) = trimmed.strip_prefix('"') {
+        let end = after_q.find('"')?;
+        (&after_q[..end], &after_q[end + 1..])
+    } else if let Some(after_q) = trimmed.strip_prefix('\'') {
+        let end = after_q.find('\'')?;
+        (&after_q[..end], &after_q[end + 1..])
+    } else {
+        let end = trimmed
+            .char_indices()
+            .find(|(_, c)| c.is_whitespace())
+            .map(|(idx, _)| idx)
+            .unwrap_or(trimmed.len());
+        (&trimmed[..end], &trimmed[end..])
+    };
+    let norm = tok.replace('\\', "/").to_ascii_lowercase();
+    if norm == "bin/carbon-stack.exe" || norm == "bin/carbon-stack" {
+        Some(format!("{}{}", replacement_bin, rest))
+    } else {
+        None
+    }
+}
+
+fn rewrite_hooks_json_commands_rec(val: &mut Value, replacement_bin: &str) {
+    match val {
+        Value::Object(map) => {
+            if let Some(Value::String(cmd)) = map.get_mut("command") {
+                if let Some(rewritten) = rewrite_relative_carbon_bin_cmd(cmd, replacement_bin) {
+                    *cmd = rewritten;
+                }
+            }
+            for (k, child) in map.iter_mut() {
+                if k != "command" {
+                    rewrite_hooks_json_commands_rec(child, replacement_bin);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                rewrite_hooks_json_commands_rec(item, replacement_bin);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn materialize_hooks_json_for_target(
+    txt: &str,
+    target_plugin_dir: Option<&Path>,
+    is_windows: bool,
+) -> String {
+    if !is_windows {
+        return normalize_hooks_json_for_os(txt, false);
+    }
+    let Some(dst_dir) = target_plugin_dir else {
+        return normalize_hooks_json_for_os(txt, true);
+    };
+    let Ok(mut parsed) = serde_json::from_str::<Value>(txt) else {
+        return normalize_hooks_json_for_os(txt, true);
+    };
+    let replacement_bin = format_target_hook_binary(dst_dir, true);
+    rewrite_hooks_json_commands_rec(&mut parsed, &replacement_bin);
+    match serde_json::to_string_pretty(&parsed) {
+        Ok(s) => format!("{}\n", s),
+        Err(_) => normalize_hooks_json_for_os(txt, true),
+    }
+}
+
+pub fn effective_source_manifest_strict_for_target(
+    src_plugin_dir: &Path,
+    target_plugin_dir: Option<&Path>,
+    is_windows: bool,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut map = tree_manifest_strict(src_plugin_dir)?;
+    if !is_windows && map.contains_key("bin/carbon-stack") {
+        map.remove("bin/carbon-stack.exe");
+    }
+    if (!is_windows || target_plugin_dir.is_some()) && map.contains_key("hooks.json") {
+        let hooks_file = src_plugin_dir.join("hooks.json");
+        let raw = fs::read_to_string(&hooks_file)
+            .map_err(|e| format!("{}: {}", hooks_file.display(), e))?;
+        let norm = materialize_hooks_json_for_target(&raw, target_plugin_dir, is_windows);
+        map.insert("hooks.json".to_string(), rio::sha256_hex(norm.as_bytes()));
+    }
+    Ok(map)
 }
 
 pub fn effective_source_manifest_strict(
     src_plugin_dir: &Path,
     is_windows: bool,
 ) -> Result<BTreeMap<String, String>, String> {
-    let mut map = tree_manifest_strict(src_plugin_dir)?;
-    if !is_windows {
-        if map.contains_key("bin/carbon-stack") {
-            map.remove("bin/carbon-stack.exe");
-        }
-        let hooks_file = src_plugin_dir.join("hooks.json");
-        if map.contains_key("hooks.json") {
-            let raw = fs::read_to_string(&hooks_file)
-                .map_err(|e| format!("{}: {}", hooks_file.display(), e))?;
-            let norm = normalize_hooks_json_for_os(&raw, false);
-            map.insert("hooks.json".to_string(), rio::sha256_hex(norm.as_bytes()));
-        }
-    }
-    Ok(map)
+    effective_source_manifest_strict_for_target(src_plugin_dir, None, is_windows)
+}
+
+pub fn effective_source_manifest_for_target(
+    src_plugin_dir: &Path,
+    target_plugin_dir: Option<&Path>,
+    is_windows: bool,
+) -> BTreeMap<String, String> {
+    effective_source_manifest_strict_for_target(src_plugin_dir, target_plugin_dir, is_windows)
+        .unwrap_or_default()
 }
 
 pub fn effective_source_manifest(src_plugin_dir: &Path, is_windows: bool) -> BTreeMap<String, String> {
-    effective_source_manifest_strict(src_plugin_dir, is_windows).unwrap_or_default()
+    effective_source_manifest_for_target(src_plugin_dir, None, is_windows)
 }
 
 fn collect_links_under_tree(root: &Path, out: &mut Vec<PathBuf>) {
@@ -869,6 +976,15 @@ pub fn copy_clean_tree_for_os(src: &Path, dst: &Path, is_windows: bool) -> Resul
 }
 
 fn copy_clean_tree_additive(src: &Path, dst: &Path, is_windows: bool) -> Result<(), String> {
+    copy_clean_tree_additive_for_target(src, dst, is_windows, false)
+}
+
+fn copy_clean_tree_additive_for_target(
+    src: &Path,
+    dst: &Path,
+    is_windows: bool,
+    materialize_hooks_abs: bool,
+) -> Result<(), String> {
     // INVARIANT: Copy/update incoming files without deleting pre-existing files yet so legacy hook handlers (`hooks/tokenade_hook.py`) remain runnable on disk until `<config_dir>/hooks.json` is atomically switched to `bin/carbon-stack`.
     let mut existing_links = Vec::new();
     collect_links_under_tree(src, &mut existing_links);
@@ -892,16 +1008,17 @@ fn copy_clean_tree_additive(src: &Path, dst: &Path, is_windows: bool) -> Result<
     }
     fs::create_dir_all(dst).map_err(|e| e.to_string())?;
 
-    let src_map = effective_source_manifest_strict(src, is_windows)?;
+    let target_opt = materialize_hooks_abs.then_some(dst);
+    let src_map = effective_source_manifest_strict_for_target(src, target_opt, is_windows)?;
     let dst_map = tree_manifest(dst);
     for (rel, src_hash) in &src_map {
         let dst_path = dst.join(rel);
         ensure_no_links_between(dst, &dst_path)?;
         if dst_map.get(rel) != Some(src_hash) {
-            if !is_windows && rel == "hooks.json" {
+            if rel == "hooks.json" && (materialize_hooks_abs || !is_windows) {
                 let src_file = src.join(rel);
                 let raw = fs::read_to_string(&src_file).map_err(|e| e.to_string())?;
-                let norm = normalize_hooks_json_for_os(&raw, false);
+                let norm = materialize_hooks_json_for_target(&raw, target_opt, is_windows);
                 let src_perms = fs::metadata(&src_file).ok().map(|m| m.permissions());
                 atomic_write_bytes_with_default_perms(&dst_path, norm.as_bytes(), src_perms)?;
             } else {
@@ -3472,7 +3589,8 @@ pub(crate) fn perform_install_with_drain_timeout(
         Err(e) => return json!({ "ok": false, "stage": "preflight", "error": e }),
     };
 
-    let src_manifest = effective_source_manifest(&source_plugin_dir, cfg!(windows));
+    let src_manifest =
+        effective_source_manifest_for_target(&source_plugin_dir, Some(&target_plugin_dir), cfg!(windows));
     let dst_manifest = tree_manifest(&target_plugin_dir);
     let src_rule_sha = sha256_file_full(&source_glob_rule).unwrap_or_default();
     let dst_rule_sha = if target_glob_rule.is_file() {
@@ -3646,9 +3764,12 @@ pub(crate) fn perform_install_with_drain_timeout(
     };
 
     if !plugin_identical {
-        if let Err(e) =
-            copy_clean_tree_additive(&source_plugin_dir, &target_plugin_dir, cfg!(windows))
-        {
+        if let Err(e) = copy_clean_tree_additive_for_target(
+            &source_plugin_dir,
+            &target_plugin_dir,
+            cfg!(windows),
+            true,
+        ) {
             let comp_ok = compensate_install_from_backup(
                 &pre_epoch_state,
                 &backup_id_str,
@@ -3808,6 +3929,7 @@ pub(crate) fn perform_install_with_drain_timeout(
 
 fn validate_legacy_plugin_snapshot(
     p_backup: &Path,
+    expected_target_dir: Option<&Path>,
     actual_hashes: &BTreeMap<String, String>,
 ) -> Result<(), String> {
     if actual_hashes.is_empty() {
@@ -3825,8 +3947,12 @@ fn validate_legacy_plugin_snapshot(
     let Some(hjson) = rio::read_json(&p_backup.join("hooks.json")) else {
         return Err("Incomplete legacy backup: missing or invalid hooks.json".to_string());
     };
-    let (hinfo, _, cmds_ok) =
-        stack_doctor::inspect_hooks_json_for_os(p_backup, Some(&hjson), cfg!(windows));
+    let (hinfo, _, cmds_ok) = stack_doctor::inspect_hooks_json_for_os_with_target(
+        p_backup,
+        Some(&hjson),
+        cfg!(windows),
+        expected_target_dir,
+    );
     let events_ok = hinfo
         .get("missing_events")
         .and_then(|v| v.as_array())
@@ -5895,7 +6021,9 @@ fn perform_rollback_internal(
                 });
             }
             None => {
-                if let Err(e) = validate_legacy_plugin_snapshot(&p_backup, &actual_hashes) {
+                if let Err(e) =
+                    validate_legacy_plugin_snapshot(&p_backup, Some(&p_target), &actual_hashes)
+                {
                     return json!({
                         "ok": false,
                         "stage": "rollback_validate",
@@ -6984,8 +7112,11 @@ pub fn perform_diagnose_for_os(
     let target_glob_rule = config_dir.join("rules").join("uiux-design.md");
 
     let plugin_trees_match = target_plugin_dir.is_dir()
-        && effective_source_manifest(&source_plugin_dir, is_windows)
-            == tree_manifest(&target_plugin_dir);
+        && effective_source_manifest_for_target(
+            &source_plugin_dir,
+            Some(&target_plugin_dir),
+            is_windows,
+        ) == tree_manifest(&target_plugin_dir);
     let hooks_migrated_ok = inspect_global_hooks_migration(config_dir, &target_plugin_dir, is_windows)
         .map(|m| m.is_none())
         .unwrap_or(false);
@@ -10876,6 +11007,43 @@ mod tests {
 
         #[cfg(windows)]
         {
+            // INVARIANT: Installing into a custom `--target-config-dir` with spaces materializes quoted `<target>\plugins\gemini-carbon-stack\bin\carbon-stack.exe` paths in installed `hooks.json` while leaving source `plugin/hooks.json` portable and reporting `in_sync_with_source: true`.
+            let cfg_spaced = tmp.0.join("My Profile Config");
+            let shome_spaced = tmp.0.join("shome-spaced");
+            let spaced_res = perform_install(&repo, &cfg_spaced, &shome_spaced, false, true);
+            assert_eq!(spaced_res["ok"], true, "spaced install failed: {}", spaced_res);
+            let installed_hooks_path = cfg_spaced.join("plugins").join(PLUGIN_NAME).join("hooks.json");
+            let installed_hooks_txt = fs::read_to_string(&installed_hooks_path).unwrap();
+            let expected_bin = rio::resolve_abs_path(
+                &cfg_spaced
+                    .join("plugins")
+                    .join(PLUGIN_NAME)
+                    .join("bin")
+                    .join("carbon-stack.exe"),
+            )
+            .to_string_lossy()
+            .replace('/', "\\");
+            let expected_prefix = format!("\"{}\" hook --event SessionStart", expected_bin);
+            let parsed_hk: Value = serde_json::from_str(&installed_hooks_txt).unwrap();
+            assert_eq!(
+                parsed_hk["carbon-stack"]["SessionStart"][0]["command"],
+                json!(expected_prefix),
+                "expected quoted target path `{}` in {}",
+                expected_prefix,
+                installed_hooks_txt
+            );
+            assert!(
+                expected_prefix.starts_with(&format!(
+                    "\"{}\\",
+                    rio::resolve_abs_path(&cfg_spaced)
+                        .to_string_lossy()
+                        .replace('/', "\\")
+                ))
+            );
+            let spaced_diag = perform_diagnose(&repo, &cfg_spaced, &shome_spaced);
+            assert_eq!(spaced_diag["in_sync_with_source"], true, "{}", spaced_diag);
+            assert_eq!(spaced_diag["doctor"]["hooks_json"]["commands_ok"], true, "{}", spaced_diag);
+
             // INVARIANT: If Step 2 of rollback fails after Step 1 restored `v1`, and an active `v1` lock/process is still running, `compensate_plugin_rollback` refuses to clear `.lock_epoch` and reports `compensated_plugin_restore: false` + `restore_error`.
             use std::os::windows::fs::OpenOptionsExt;
             let cfg_rc = tmp.0.join("cfg-rb-comp-v1");

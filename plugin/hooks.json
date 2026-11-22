@@ -4,14 +4,14 @@
     "SessionStart": [
       {
         "type": "command",
-        "command": "C:\\Users\\in\\.gemini\\config\\plugins\\gemini-carbon-stack\\bin\\carbon-stack.exe hook --event SessionStart",
+        "command": "bin\\carbon-stack.exe hook --event SessionStart",
         "timeout": 12
       }
     ],
     "PreInvocation": [
       {
         "type": "command",
-        "command": "C:\\Users\\in\\.gemini\\config\\plugins\\gemini-carbon-stack\\bin\\carbon-stack.exe hook --event PreInvocation",
+        "command": "bin\\carbon-stack.exe hook --event PreInvocation",
         "timeout": 10
       }
     ],
@@ -21,7 +21,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "C:\\Users\\in\\.gemini\\config\\plugins\\gemini-carbon-stack\\bin\\carbon-stack.exe hook --event PreToolUse",
+            "command": "bin\\carbon-stack.exe hook --event PreToolUse",
             "timeout": 12
           }
         ]
@@ -33,7 +33,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "C:\\Users\\in\\.gemini\\config\\plugins\\gemini-carbon-stack\\bin\\carbon-stack.exe hook --event PostToolUse",
+            "command": "bin\\carbon-stack.exe hook --event PostToolUse",
             "timeout": 12
           }
         ]
@@ -42,7 +42,7 @@
     "Stop": [
       {
         "type": "command",
-        "command": "C:\\Users\\in\\.gemini\\config\\plugins\\gemini-carbon-stack\\bin\\carbon-stack.exe hook --event Stop",
+        "command": "bin\\carbon-stack.exe hook --event Stop",
         "timeout": 15
       }
     ]

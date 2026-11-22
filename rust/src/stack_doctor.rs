@@ -25,7 +25,7 @@ const HOOK_EVENTS: &[&str] = &[
     "PostToolUse",
     "Stop",
 ];
-const REQUIRED_GUARD_TOOLS: &[&str] = &["edit_file", "write_file", "swarm_wait"];
+const REQUIRED_GUARD_TOOLS: &[&str] = &["run_command", "edit_file", "write_file", "swarm_wait"];
 
 fn hook_target_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -361,10 +361,44 @@ fn collect_hook_commands(val: &Value, out: &mut Vec<String>) {
     }
 }
 
+fn extract_leading_command_exe(cmd: &str) -> String {
+    let s = cmd.trim_start();
+    if s.is_empty() {
+        return String::new();
+    }
+    if let Some(rest) = s.strip_prefix('"') {
+        return rest.split('"').next().unwrap_or("").to_string();
+    }
+    if let Some(rest) = s.strip_prefix('\'') {
+        return rest.split('\'').next().unwrap_or("").to_string();
+    }
+    s.split_whitespace().next().unwrap_or("").to_string()
+}
+
+fn is_explicit_abs_path(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    raw.starts_with('/')
+        || raw.starts_with('\\')
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\'))
+        || Path::new(raw).is_absolute()
+}
+
 pub(crate) fn inspect_hooks_json_for_os(
     bundle_dir: &Path,
     hooks_val: Option<&Value>,
     is_windows: bool,
+) -> (Value, bool, bool) {
+    inspect_hooks_json_for_os_with_target(bundle_dir, hooks_val, is_windows, Some(bundle_dir))
+}
+
+pub(crate) fn inspect_hooks_json_for_os_with_target(
+    bundle_dir: &Path,
+    hooks_val: Option<&Value>,
+    is_windows: bool,
+    expected_target_bundle_dir: Option<&Path>,
 ) -> (Value, bool, bool) {
     let Some(Value::Object(root)) = hooks_val else {
         return (
@@ -447,7 +481,50 @@ pub(crate) fn inspect_hooks_json_for_os(
         .all(|t| safety_matcher.contains(t));
 
     let mut missing_targets: Vec<String> = Vec::new();
+    let exp_bundle = expected_target_bundle_dir.unwrap_or(bundle_dir);
+    let exp_rel = if is_windows {
+        "bin/carbon-stack.exe"
+    } else {
+        "bin/carbon-stack"
+    };
+    let exp_abs = rio::resolve_abs_path(&exp_bundle.join(exp_rel));
+    let same_bundle = expected_target_bundle_dir.is_none()
+        || rio::fold_path(&bundle_dir.to_string_lossy())
+            == rio::fold_path(&exp_bundle.to_string_lossy());
+    let norm_for_os = |p: &Path| -> String {
+        let s = p.to_string_lossy();
+        if is_windows {
+            rio::fold_path(&s)
+        } else {
+            rio::normalize_path(&s)
+        }
+    };
+    let check_carbon_bin = |eff_bin: &Path| -> bool {
+        let exec_mode_ok =
+            is_windows || crate::installer::is_posix_executable_file(eff_bin);
+        eff_bin.is_file()
+            && fs::metadata(eff_bin).map(|m| m.len() > 0).unwrap_or(false)
+            && (is_windows || !crate::installer::has_mz_header(eff_bin))
+            && exec_mode_ok
+    };
+
     for cmd in &commands {
+        let exe = extract_leading_command_exe(cmd);
+        if is_explicit_abs_path(&exe) {
+            let exe_abs = rio::resolve_abs_path(Path::new(&exe));
+            let target_matches_bundle = norm_for_os(&exe_abs) == norm_for_os(&exp_abs);
+            let eff_bin = if same_bundle {
+                exe_abs
+            } else {
+                bundle_dir.join(exp_rel)
+            };
+            if !(target_matches_bundle && check_carbon_bin(&eff_bin))
+                && !missing_targets.contains(&exe)
+            {
+                missing_targets.push(exe);
+            }
+            continue;
+        }
         for mat in hook_target_re().find_iter(cmd) {
             let rel = mat.as_str().replace('\\', "/");
             let candidate = bundle_dir.join(&rel);
@@ -464,13 +541,7 @@ pub(crate) fn inspect_hooks_json_for_os(
                 } else {
                     (!low_rel.ends_with(".exe"), candidate)
                 };
-                let exec_mode_ok =
-                    is_windows || crate::installer::is_posix_executable_file(&eff_bin);
-                rel_ok
-                    && eff_bin.is_file()
-                    && fs::metadata(&eff_bin).map(|m| m.len() > 0).unwrap_or(false)
-                    && (is_windows || !crate::installer::has_mz_header(&eff_bin))
-                    && exec_mode_ok
+                rel_ok && check_carbon_bin(&eff_bin)
             } else {
                 candidate.is_file()
             };
@@ -1447,7 +1518,7 @@ mod tests {
               "carbon-stack": {
                 "SessionStart": [{"type":"command","command":"bin\\carbon-stack.exe hook --event SessionStart"}],
                 "PreInvocation": [{"type":"command","command":"bin\\carbon-stack.exe hook --event PreInvocation"}],
-                "PreToolUse": [{"matcher":"read_board|edit_file|write_file|swarm_wait","hooks":[{"type":"command","command":"bin\\carbon-stack.exe hook --event PreToolUse"}]}],
+                "PreToolUse": [{"matcher":"run_command|edit_file|write_file|swarm_wait","hooks":[{"type":"command","command":"bin\\carbon-stack.exe hook --event PreToolUse"}]}],
                 "PostToolUse": [{"type":"command","command":"bin\\carbon-stack.exe hook --event PostToolUse"}],
                 "Stop": [{"type":"command","command":"bin\\carbon-stack.exe hook --event Stop"}]
               }
@@ -1592,5 +1663,46 @@ mod tests {
         assert_eq!(suite["disabled_mcp_count"], 1);
         assert_eq!(suite["all_lazy_eager_false"], false);
         assert_eq!(suite["non_lazy_mcp_servers"], json!(["noisy"]));
+    }
+
+    #[test]
+    fn test_inspect_hooks_json_validates_absolute_target_and_spaces() {
+        let tmp = TempDir::new("sd-abs-hooks");
+        let spaced = tmp.0.join("My Profile Config").join("bundle");
+        fs::create_dir_all(spaced.join("bin")).unwrap();
+        let real_exe = spaced.join("bin").join("carbon-stack.exe");
+        fs::write(&real_exe, b"MZ\x90\x00mock-bin").unwrap();
+
+        let mk_hooks = |cmd_prefix: &str| {
+            json!({
+                "carbon-stack": {
+                    "SessionStart": [{"type": "command", "command": format!("{} hook --event SessionStart", cmd_prefix)}],
+                    "PreInvocation": [{"type": "command", "command": format!("{} hook --event PreInvocation", cmd_prefix)}],
+                    "PreToolUse": [{"matcher": "run_command|edit_file|write_file|swarm_wait", "hooks": [{"type": "command", "command": format!("{} hook --event PreToolUse", cmd_prefix)}]}],
+                    "PostToolUse": [{"type": "command", "command": format!("{} hook --event PostToolUse", cmd_prefix)}],
+                    "Stop": [{"type": "command", "command": format!("{} hook --event Stop", cmd_prefix)}],
+                }
+            })
+        };
+
+        // 1. Quoted absolute path with spaces matching bundle_dir/bin/carbon-stack.exe -> PASS
+        let quoted_cmd = format!("\"{}\"", real_exe.to_string_lossy().replace('/', "\\"));
+        let (_, guards_ok, cmds_ok) =
+            inspect_hooks_json_for_os(&spaced, Some(&mk_hooks(&quoted_cmd)), true);
+        assert!(guards_ok);
+        assert!(cmds_ok);
+
+        // 2. Foreign profile absolute path (even pointing at an existing file!) -> FAIL
+        let foreign_dir = tmp.0.join("foreign").join("bin");
+        fs::create_dir_all(&foreign_dir).unwrap();
+        let foreign_exe = foreign_dir.join("carbon-stack.exe");
+        fs::write(&foreign_exe, b"MZ\x90\x00foreign").unwrap();
+        let (info_bad, _, cmds_bad) = inspect_hooks_json_for_os(
+            &spaced,
+            Some(&mk_hooks(&foreign_exe.to_string_lossy().replace('/', "\\"))),
+            true,
+        );
+        assert!(!cmds_bad);
+        assert!(!info_bad["missing_targets"].as_array().unwrap().is_empty());
     }
 }

@@ -2331,6 +2331,7 @@ struct CandidateMarkerUpdate<'a> {
     unknown_barrier: bool,
     cause_label: &'a str,
     known_git_root: Option<&'a str>,
+    opening_head_override: Option<&'a str>,
 }
 
 fn update_candidate_marker(upd: CandidateMarkerUpdate<'_>) -> (Option<Value>, Value, bool) {
@@ -2352,6 +2353,7 @@ fn update_candidate_marker_unlocked(
         unknown_barrier,
         cause_label,
         known_git_root,
+        opening_head_override,
     } = upd;
     let now = now_sec();
     let mp = cwg_common::marker_path(session);
@@ -2391,10 +2393,15 @@ fn update_candidate_marker_unlocked(
         }
         _ => {
             let git_top = resolve_known_or_git_root(known_git_root, &eff_cwd);
-            let opening_head = if !git_top.is_empty() {
-                rio::git_head_oid(&git_top)
-            } else {
-                String::new()
+            let opening_head = match opening_head_override {
+                Some(ov) => ov.to_string(),
+                None => {
+                    if !git_top.is_empty() {
+                        rio::git_head_oid(&git_top)
+                    } else {
+                        String::new()
+                    }
+                }
             };
             let mut m = json!({
                 "session": session,
@@ -3811,6 +3818,7 @@ pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
             unknown_barrier: false,
             cause_label: &cause_lbl,
             known_git_root: None,
+            opening_head_override: None,
         });
         let cctx = cwg_common::resolve_candidate_context(&after, false);
         if let Some(note) = build_transition_note(before.as_ref(), &after, Some(&cctx)) {
@@ -4076,6 +4084,23 @@ pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
         &cmd_cwd
     };
 
+    let before_opening_head: String = match before_snap.as_ref().and_then(|v| v.as_object()) {
+        Some(bmap) if json_truthy(bmap.get("in_git")) => {
+            let bh = bmap
+                .get("head")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if bh.is_empty() {
+                "<unborn>".to_string()
+            } else {
+                bh.to_string()
+            }
+        }
+        // SAFETY: If pre-command `before_snap` is missing or not in Git, inhibit post-command `HEAD` capture (`Some("")`) so a single shell command that runs `git init && git commit` fails closed instead of auto-retiring as `undo-clean`.
+        _ => String::new(),
+    };
+
     let cmd60: String = cmd.chars().take(60).collect();
     if !changed_paths.is_empty() {
         rio::bump_mutation_stamp(&session);
@@ -4089,6 +4114,7 @@ pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
             unknown_barrier: unmeasured,
             cause_label: &cause_lbl,
             known_git_root: snap_git_root.as_deref(),
+            opening_head_override: Some(before_opening_head.as_str()),
         });
         let cctx = cwg_common::resolve_candidate_context(&after, false);
         if let Some(note) = build_transition_note(before.as_ref(), &after, Some(&cctx)) {
@@ -4648,6 +4674,7 @@ mod tests {
                 unknown_barrier: false,
                 cause_label: "edit:mod.rs",
                 known_git_root: None,
+                opening_head_override: None,
             },
             false,
         );
@@ -4665,6 +4692,7 @@ mod tests {
                 unknown_barrier: false,
                 cause_label: "edit2:mod.rs",
                 known_git_root: None,
+                opening_head_override: None,
             },
             true,
         );

@@ -2500,6 +2500,14 @@ pub fn record_from_command(command_text: &str, output_text: &str, exit_code: i32
     let cleaned = strip_task_envelope_tail(output_text);
     let mut err_from_json = String::new();
     if let Some(jobj) = extract_cli_json_payload(&cleaned) {
+        let reason_s = val_to_str(jobj.get("reason"));
+        if reason_s.starts_with("circuit_breaker_open")
+            || (jobj.get("available").and_then(|v| v.as_bool()) == Some(false)
+                && jobj.get("lane").and_then(|v| v.as_str()) == Some("native-fallback"))
+        {
+            // SAFETY: Cached circuit-breaker / fallback status responses reflect existing outage state, never a fresh provider capacity failure.
+            return;
+        }
         let err_s = val_to_str(jobj.get("error"));
         // SAFETY: Local review timeouts, transient socket errors, and sandbox blocks must never trip the global circuit breaker via PostToolUse.
         if json_truthy(jobj.get("sandbox_blocked"))
@@ -4265,7 +4273,10 @@ fn build_codex_exec_args(
         format!("model_reasoning_effort=\"{}\"", effort),
         "-c".to_string(),
         "tools.web_search=true".to_string(),
-        "--dangerously-bypass-approvals-and-sandbox".to_string(),
+        "-c".to_string(),
+        "sandbox_mode=\"read-only\"".to_string(),
+        "-c".to_string(),
+        "approval_policy=\"never\"".to_string(),
         "--skip-git-repo-check".to_string(),
     ]);
     if !model.is_empty() {
@@ -4282,6 +4293,8 @@ fn build_codex_exec_args(
     } else {
         args.push("-C".to_string());
         args.push(cwd.to_string());
+        args.push("-s".to_string());
+        args.push("read-only".to_string());
         args.extend(common_opts);
         args.push("-".to_string());
     }
@@ -4757,6 +4770,15 @@ ROUND_MODE: timeout_continuation (same review thread — your previous turn hit 
     let use_interdiff = !spec.interdiff_text.trim().is_empty()
         || !spec.interdiff_stat.trim().is_empty();
 
+    let resume_intent_section = if !spec.business_intent.trim().is_empty() {
+        format!(
+            "\nBUSINESS_INTENT (authoritative current goal — supersedes any older goal in prior turns):\n{}\n",
+            spec.business_intent.trim()
+        )
+    } else {
+        String::new()
+    };
+
     if spec.is_resume {
         let (d_label, d_stat, d_body) = if use_interdiff {
             (
@@ -4775,11 +4797,12 @@ ROUND_MODE: delta_interdiff:\n\
 - Give each prior blocker disposition: RESOLVED, SETTLED_BY_DISPOSITION, NOT RESOLVED (with evidence), or REGRESSED. Judge whether the failure scenario is removed, even if implemented differently from your wording.\n\
 - Inspect the changes since the previous round plus their direct blast radius (callers, callees, contracts).\n\
 - SETTLED-SCOPE FREEZE: untouched code from earlier rounds is settled; do not re-read settled code or raise new findings on it unless new evidence or a brand-new CRITICAL requires it (explain why invisible in Round 1).\n\n\
-CANDIDATE SUMMARY:\n{}{}\n\n{}\n\n{}\n",
+CANDIDATE SUMMARY:\n{}{}{}\n\n{}\n\n{}\n",
             spec.review_id,
             spec.packet_nonce,
             round_header.trim_end(),
             spec.scope_summary,
+            resume_intent_section,
             dispositions_section,
             diff_block,
             verdict_rule
@@ -5948,6 +5971,11 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
     };
     let cwd = abs_path_from_str(&cwd_raw).to_string_lossy().into_owned();
     let git_root = rio::git_toplevel(&cwd, false).unwrap_or_else(|| cwd.clone());
+    let review_root = if !git_root.is_empty() && Path::new(&git_root).is_dir() {
+        git_root.as_str()
+    } else {
+        cwd.as_str()
+    };
     let effort = if args.xhigh { "ultra" } else { "high" };
     let eff_model = resolve_review_model(&args.model, args.xhigh);
     let phase = if args.closure || args.phase == "closure" {
@@ -6183,7 +6211,7 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
     }
     if phase == "closure" && !eff_session.is_empty() {
         let brain_root = rio::resolve_brain_root("");
-        let alive_workers = cwg_common::active_simplify_or_review_workers(&brain_root, &eff_session);
+        let alive_workers = cwg_common::active_review_workers(&brain_root, &eff_session);
         if !alive_workers.is_empty() {
             rio::print_cli_json(
                 &json!({
@@ -6191,7 +6219,7 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
                     "round_consumed": false,
                     "error": "active_swarm_workers_present",
                     "workers": alive_workers,
-                    "hint": "Kill all waiting/active simplify and review swarm workers via swarm(action='kill', ...) BEFORE launching `carbon-stack codex-lane review --closure`.",
+                    "hint": "Kill all waiting/active review swarm workers via swarm(action='kill', ...) BEFORE launching `carbon-stack codex-lane review --closure`.",
                 }),
                 args.pretty,
             );
@@ -6273,16 +6301,16 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
         );
         (st, body, hint)
     } else if cwg_common::is_git_oid(&curr_worktree_tree) {
-        let (st, body) = run_git_diff_with_stat(&cwd, "HEAD", Some(&curr_worktree_tree));
+        let (st, body) = run_git_diff_with_stat(review_root, "HEAD", Some(&curr_worktree_tree));
         let tree12 = &curr_worktree_tree[..curr_worktree_tree.len().min(12)];
         let hint = format!(
             "git diff --stat HEAD {}; git diff HEAD {} -- <file>",
             tree12, tree12
         );
         if st.is_empty() && body.is_empty() {
-            let (st2, body2) = run_git_diff_with_stat(&cwd, "HEAD", None);
+            let (st2, body2) = run_git_diff_with_stat(review_root, "HEAD", None);
             if st2.is_empty() && body2.is_empty() {
-                let (_, s_out, _) = rio::run_git(&cwd, &["status", "--short"], 5.0);
+                let (_, s_out, _) = rio::run_git(review_root, &["status", "--short"], 5.0);
                 (truncate_diff_stat(&s_out), String::new(), hint)
             } else {
                 (st2, body2, hint)
@@ -6291,10 +6319,10 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
             (st, body, hint)
         }
     } else {
-        let (st2, body2) = run_git_diff_with_stat(&cwd, "HEAD", None);
+        let (st2, body2) = run_git_diff_with_stat(review_root, "HEAD", None);
         let hint = "git diff --stat HEAD; git diff HEAD -- <file>".to_string();
         if st2.is_empty() && body2.is_empty() {
-            let (_, s_out, _) = rio::run_git(&cwd, &["status", "--short"], 5.0);
+            let (_, s_out, _) = rio::run_git(review_root, &["status", "--short"], 5.0);
             (truncate_diff_stat(&s_out), String::new(), hint)
         } else {
             (st2, body2, hint)
@@ -6402,7 +6430,7 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
             && cwg_common::is_git_oid(&prev_reviewed_tree)
         {
             let target_opt = cwg_common::is_git_oid(&curr_worktree_tree).then_some(curr_worktree_tree.as_str());
-            let (id_st, id_body) = run_git_diff_with_stat(&cwd, &prev_reviewed_tree, target_opt);
+            let (id_st, id_body) = run_git_diff_with_stat(review_root, &prev_reviewed_tree, target_opt);
             let prev12 = &prev_reviewed_tree[..prev_reviewed_tree.len().min(12)];
             let ih = match target_opt {
                 Some(t) => {
@@ -6480,6 +6508,40 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
     let is_timeout_continuation = saved_thread
         .as_ref()
         .map_or(false, |st| json_truthy(st.get("pending_timeout_resume")));
+    if !is_timeout_continuation {
+        if phase == "ordinary" && effective_ord_done >= crate::cwg_stop::MAX_REVIEW_ROUNDS {
+            rio::print_cli_json(
+                &json!({
+                    "ok": false,
+                    "round_consumed": false,
+                    "effective_ordinary_rounds": effective_ord_done,
+                    "error": "ordinary_round_cap_reached",
+                    "hint": format!(
+                        "Current review lane already consumed {0}/{0} ordinary rounds; transition to focused research + `--closure`, start `--new-session`, or close with `[gate] draft-blocked`.",
+                        crate::cwg_stop::MAX_REVIEW_ROUNDS,
+                    ),
+                }),
+                args.pretty,
+            );
+            return 2;
+        }
+        if phase == "closure" && effective_cls_done >= cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE {
+            rio::print_cli_json(
+                &json!({
+                    "ok": false,
+                    "round_consumed": false,
+                    "effective_closure_passes": effective_cls_done,
+                    "error": "max_closure_passes_reached",
+                    "hint": format!(
+                        "Current review lane already consumed {0}/{0} closure passes; finish finitely with `[gate] draft-blocked` (never run a 3rd closure pass).",
+                        cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE,
+                    ),
+                }),
+                args.pretty,
+            );
+            return 2;
+        }
+    }
     let saved_next_timeout: i64 = if is_timeout_continuation {
         saved_thread
             .as_ref()
@@ -6659,13 +6721,13 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
             committed: false,
         };
         launch_wall_ts = now_sec();
-        let cmd_args = build_codex_exec_args(&cwd, effort, &eff_model, cur_resume_sid);
+        let cmd_args = build_codex_exec_args(review_root, effort, &eff_model, cur_resume_sid);
         set_defer_timeout_print(&active_review_id, true);
         let exec_opt = exec_codex_once(CodexExecSpec {
             binary: &binary,
             args: &cmd_args,
             prompt: &prompt,
-            cwd: &cwd,
+            cwd: review_root,
             timeout: eff_timeout,
             review_id: &active_review_id,
             expected_phase: phase,
@@ -11872,10 +11934,17 @@ exit 0
         let fresh_args = build_codex_exec_args(r"C:\repo", "ultra", "gpt-6.2-astra", "");
         assert_eq!(fresh_args[0], "exec");
         assert!(fresh_args.contains(&"--ignore-user-config".to_string()));
-        assert!(fresh_args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+        assert!(!fresh_args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
         assert!(fresh_args.contains(&"--skip-git-repo-check".to_string()));
         assert!(fresh_args.contains(&"tools.web_search=true".to_string()));
         assert!(fresh_args.contains(&"model_reasoning_effort=\"ultra\"".to_string()));
+        assert!(fresh_args.windows(2).any(|w| w[0] == "-s" && w[1] == "read-only"));
+        assert!(fresh_args
+            .windows(2)
+            .any(|w| w[0] == "-c" && w[1] == "sandbox_mode=\"read-only\""));
+        assert!(fresh_args
+            .windows(2)
+            .any(|w| w[0] == "-c" && w[1] == "approval_policy=\"never\""));
         for feat in CODEX_DISABLED_FEATURES {
             assert!(
                 fresh_args.windows(2).any(|w| w[0] == "--disable" && w[1] == *feat),
@@ -11884,17 +11953,19 @@ exit 0
             );
         }
         assert!(!fresh_args.contains(&"codex_hooks".to_string()));
-        assert!(!fresh_args.contains(&"-s".to_string()));
-        assert!(!fresh_args.contains(&"read-only".to_string()));
-        assert!(!fresh_args.contains(&"sandbox_mode=\"read-only\"".to_string()));
 
         let res_args = build_codex_exec_args(r"C:\repo", "high", "gpt-6.2-sol", "sid-123");
         assert_eq!(&res_args[0..3], &["exec", "resume", "--all"]);
         assert!(res_args.contains(&"--ignore-user-config".to_string()));
-        assert!(res_args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+        assert!(!res_args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
         assert!(res_args.contains(&"model_reasoning_effort=\"high\"".to_string()));
+        assert!(res_args
+            .windows(2)
+            .any(|w| w[0] == "-c" && w[1] == "sandbox_mode=\"read-only\""));
+        assert!(res_args
+            .windows(2)
+            .any(|w| w[0] == "-c" && w[1] == "approval_policy=\"never\""));
         assert!(!res_args.contains(&"codex_hooks".to_string()));
-        assert!(!res_args.contains(&"sandbox_mode=\"read-only\"".to_string()));
         assert_eq!(&res_args[res_args.len() - 2..], &["sid-123", "-"]);
     }
 
@@ -11983,6 +12054,8 @@ exit 0
             is_timeout_resume: false,
         });
         assert!(p_r2_resumed.len() < 3_000, "R2 delta prompt too large: {}", p_r2_resumed.len());
+        assert!(p_r2_resumed.contains("BUSINESS_INTENT (authoritative current goal"));
+        assert!(p_r2_resumed.contains("Long intent not needed again on resume"));
         assert!(!p_r2_resumed.contains("Senior Read-Only Adversarial Reviewer"));
         assert!(!p_r2_resumed.contains("PRIOR ROUND FINDING LEDGER"));
         assert!(!p_r2_resumed.contains("Long old review output"));
@@ -12101,6 +12174,20 @@ print(verdict)
                 ]);
                 assert_eq!(rc, 0, "round {} failed", r);
             }
+            // 5th ordinary run without --new-session or --closure MUST fail closed (`ordinary_round_cap_reached`).
+            let rc_ord5 = run_cli(&[
+                "review".to_string(),
+                "--cwd".to_string(),
+                repo_s.clone(),
+                "--session".to_string(),
+                sess.to_string(),
+                "--diff-file".to_string(),
+                diff_s.clone(),
+                "--summary".to_string(),
+                "Markerless round 5 blocked".to_string(),
+            ]);
+            assert_eq!(rc_ord5, 2, "5th markerless ordinary run must fail cap check");
+
             // Thinking timeout before Pass 1/2 must NOT increment closure counter.
             let rc_to = run_cli(&[
                 "review".to_string(),
@@ -12132,6 +12219,20 @@ print(verdict)
                 ]);
                 assert_eq!(rc, 0, "closure {} failed", p);
             }
+            // 3rd closure pass MUST fail closed (`max_closure_passes_reached`).
+            let rc_cls3 = run_cli(&[
+                "review".to_string(),
+                "--cwd".to_string(),
+                repo_s.clone(),
+                "--session".to_string(),
+                sess.to_string(),
+                "--diff-file".to_string(),
+                diff_s.clone(),
+                "--closure".to_string(),
+                "--summary".to_string(),
+                "Markerless closure 3 blocked".to_string(),
+            ]);
+            assert_eq!(rc_cls3, 2, "3rd markerless closure run must fail cap check");
 
             let rows: Vec<Value> = fs::read_to_string(&prompt_log)
                 .unwrap()
@@ -12147,6 +12248,61 @@ print(verdict)
             assert!(val_to_str(rows[5].get("prompt")).contains("ROUND_MODE: timeout_continuation"));
             assert!(val_to_str(rows[5].get("prompt")).contains("MODE: CLOSURE_VALIDATION (Pass 1/2)"));
             assert!(val_to_str(rows[6].get("prompt")).contains("MODE: CLOSURE_VALIDATION (Pass 2/2"));
+        }
+    }
+
+    #[test]
+    fn test_cached_breaker_status_does_not_extend_ttl_and_subdir_review_uses_git_root() {
+        let _lock = crate::win32_sqlite::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = TempTestDir::new("stage4-r2-breaker-subdir");
+        let stack_home = tmp.0.join("stack");
+        let repo_dir = tmp.0.join("repo");
+        fs::create_dir_all(repo_dir.join("plugin")).unwrap();
+        fs::create_dir_all(repo_dir.join("rust").join("src")).unwrap();
+
+        let _env = EnvVarGuard::set(&[("CARBON_STACK_HOME", Some(&stack_home.to_string_lossy()))]);
+        wipe_breaker_for_test();
+
+        // 1. Finding #7: Cached `native-fallback` / `circuit_breaker_open` JSON output never re-trips or extends breaker TTL.
+        trip_breaker("CLI reported: Selected model is at capacity", 120);
+        let initial_until = val_to_f64(breaker_status().get("until_ts"));
+        let cached_health = check_health();
+        assert_eq!(cached_health.get("available"), Some(&json!(false)));
+        assert_eq!(cached_health.get("lane"), Some(&json!("native-fallback")));
+        let cached_str = serde_json::to_string(&cached_health).unwrap();
+        record_from_command("carbon-stack codex-lane review --cwd .", &cached_str, 2);
+        let after_until = val_to_f64(breaker_status().get("until_ts"));
+        assert_eq!(
+            after_until, initial_until,
+            "cached breaker response must not extend until_ts"
+        );
+        wipe_breaker_for_test();
+
+        // 2. Finding #9: Resolving `review_root` from a subdirectory `<repo>/rust` covers changes outside the subdir in BOTH stat and diff body.
+        let repo_s = repo_dir.to_string_lossy().into_owned();
+        if rio::run_git(&repo_s, &["init"], 5.0).0 == 0 {
+            let _ = rio::run_git(&repo_s, &["config", "user.email", "t@example.com"], 5.0);
+            let _ = rio::run_git(&repo_s, &["config", "user.name", "Test"], 5.0);
+            fs::write(repo_dir.join("plugin").join("hooks.json"), "{}\n").unwrap();
+            fs::write(repo_dir.join("rust").join("src").join("a.rs"), "pub fn a() {}\n").unwrap();
+            assert_eq!(rio::run_git(&repo_s, &["add", "."], 5.0).0, 0);
+            assert_eq!(rio::run_git(&repo_s, &["commit", "-m", "init"], 5.0).0, 0);
+
+            fs::write(repo_dir.join("plugin").join("hooks.json"), "{\"v\":2}\n").unwrap();
+            fs::write(
+                repo_dir.join("rust").join("src").join("a.rs"),
+                "pub fn a() -> i32 { 2 }\n",
+            )
+            .unwrap();
+            let subdir = repo_dir.join("rust").to_string_lossy().into_owned();
+            let resolved_root = rio::git_toplevel(&subdir, false).unwrap();
+            let (st, body) = run_git_diff_with_stat(&resolved_root, "HEAD", None);
+            assert!(st.contains("plugin/hooks.json"), "stat missing plugin/hooks.json: {}", st);
+            assert!(st.contains("rust/src/a.rs"), "stat missing rust/src/a.rs: {}", st);
+            assert!(body.contains("plugin/hooks.json"), "body missing plugin/hooks.json: {}", body);
+            assert!(body.contains("rust/src/a.rs"), "body missing rust/src/a.rs: {}", body);
         }
     }
 }
