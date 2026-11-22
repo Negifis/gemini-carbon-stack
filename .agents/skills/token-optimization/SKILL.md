@@ -1,32 +1,25 @@
 ---
 name: token-optimization
-description: Playbook for token and context efficiency using Serena MCP symbolic navigation, Tokenade CLI log compaction, Context7 lazy docs, and subagent delegation. Load ONLY when optimizing token usage or configuring MCP/Tokenade tooling.
+description: "Context efficiency via serena LSP, codebase-memory, explicit tokenade CLI, and eager:false MCP."
 ---
 
 # Token & Context Optimization Playbook
 
-## 1. Symbolic Code Navigation (`serena` MCP & `carbon-stack code-search`)
+## 1. Structural & Symbolic Code Navigation
 
-Prefer LSP symbol lookup over reading full source files:
+Locate definitions and blast radius before reading full blocks:
+1. L0–L1: `carbon-stack code-search` (`rg`), `tokenade map [path]`, `tokenade skeleton <files...>`, `tokenade query <sym>`, `tokenade impact <file>`.
+2. L2–L3: `codebase-memory` (`get_architecture`, `trace_path`, `detect_changes`) and `serena` (`get_symbols_overview`, `find_symbol`, `find_referencing_symbols`).
+3. Read coherent blocks via `read_file` (`StartLine`/`EndLine`), never blind `[1-800]` dumps, lockfiles, build dirs, or `steps/*/output.txt`. Edit with native `edit_file`/`write_file`.
 
-1. **File symbol outline:** call `serena` `get_symbols_overview` (or `tokenade skeleton <file>`) to inspect classes, functions, and line spans before calling `read_file`.
-2. **Definition & call-graph lookup:** call `serena` `find_symbol`, `find_referencing_symbols`, `find_implementations`, or `find_declaration` (fallback: `carbon-stack code-search symbols <query>`).
-3. **Targeted line-range reads:** once the symbol span is known, call `read_file` with `StartLine` and `EndLine` (`<= 120` lines).
-4. **All edits stay on native tools:** always perform file modifications via Antigravity's native `edit_file` / `write_file` so `code-work-gate` and `Loop Guard` track every change deterministically.
+## 2. Explicit `tokenade` CLI (No Auto-Wrap Hook)
 
-## 2. Terminal Log Compaction (`@tokenade/cli`)
+Automatic `CommandLine` wrapping for `tokenade` has been removed to prevent shell/quoting breakage; invoke `tokenade` explicitly when needed:
+- `tokenade read <office-doc> --prompt "q1, q2"` for PDF/Office passage extraction across multiple questions in one call.
+- `tokenade search "<q1>" "<q2>"` and `tokenade web <u1> <u2>` for concurrent compact web lookups.
+- `cmd | tokenade exec --lang python --script '<=20L>'` to filter/aggregate noisy command output before it enters context.
 
-- Global CLI hook (`~/.gemini/config/hooks.json`, template `templates/hooks.json`) wires `<PLUGIN_ROOT>/bin/carbon-stack tokenade-hook --event PreToolUse` (`carbon-stack.exe` on Windows; `carbon-stack install` automatically migrates legacy `hooks/tokenade_hook.py` entries while preserving other user hooks), and `cwg_mark.rs` / `safety_guards.rs` transparently unwrap `tokenade wrap` / `tokenade raw` commands.
-- Useful read-only Tokenade commands (recognized as `READ_ONLY` by Code Work Gate):
-  - `tokenade map` — compact repository structure map.
-  - `tokenade skeleton <path>` — function/class signatures without bodies.
-  - `tokenade query <symbol>` — locate symbol definitions across files.
-  - `tokenade expand-ref <hash>` — recover folded terminal output bytes on demand.
-  - `tokenade healthcheck` / `tokenade gain` — verify wiring and inspect local token savings.
+## 3. Lazy MCP Config Discipline
 
-## 3. Lazy MCP Loading & Tool Filtering (`mcp_config.json`)
-
-- Keep all MCP servers in `~/.gemini/config/mcp_config.json` and `~/.gemini/antigravity-cli/mcp_config.json` set to `"eager": false` so tool schemas load on demand via `call_mcp_tool`.
-- Restrict multi-tool servers via `"enabledTools"`:
-  - `serena`: `["activate_project", "get_symbols_overview", "find_symbol", "find_referencing_symbols", "find_implementations", "find_declaration", "search_for_pattern", "get_diagnostics_for_file"]` (8 read-only LSP tools instead of 24).
-  - `context7`: `["resolve-library-id", "query-docs"]`.
+- Keep **all** servers across `~/.gemini/config/mcp_config.json`, `~/.gemini/antigravity/mcp_config.json`, `~/.gemini/antigravity-cli/mcp_config.json`, and plugin `mcp_config.json` manifests at `"eager": false` (except essential minimal tools if required), with no duplicate server registrations and secrets isolated in `~/.gemini/secrets/mcp-gate.env`.
+- Restrict large MCP toolsets via `"enabledTools"` (e.g. `serena`: 8 read-only LSP tools; `context7`: `["resolve-library-id", "query-docs"]`).

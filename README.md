@@ -13,13 +13,13 @@
   - `templates/antigravity-cli-settings.json` — конфигурация `agy` CLI с маршрутизацией на `Orchestrator (Neon)` и `"useG1Credits": false`.
   - `templates/GEMINI.md` — тонкий глобальный контекст (`16` строк) для `Turn-0` токен-диеты.
 - `plugin/` — нативный плагин-бандл Antigravity (`gemini-carbon-stack`):
-  - `plugin.json`, `hooks.json` — манифест плагина и 4 группы runtime-хуков (`SessionStart`, `PreInvocation`, `PreToolUse`, `PostToolUse`, `Stop`).
+  - `plugin.json`, `hooks.json` — манифест плагина и 5 групп runtime-хуков (`SessionStart`, `PreInvocation`, `PreToolUse`, `PostToolUse`, `Stop`).
   - `bin/carbon-stack.exe` — релизный Rust-бинарник гейта (`cwg_*`), независимого ревью (`codex-lane`), `continuity`, защитных хуков (`safety_guards`, `comment_density_guard`), локальной FTS5-памяти (`carbon-memory`), импортера сессий Claude Code (`claude-chat-importer`), оркестратора worktree-задач (`chip-handoff`), поиска (`code-search`), кэша роя (`swarm-cache`), безопасного управления worktrees (`worktree-guard`), самодиагностики (`stack-doctor`) и установщика (`install`).
   - `tools/` — `file-holders.ps1` и `vectorize.mjs`.
   - `rules/` — компактная конституция `AGENTS.md` и селективные правила (`high-risk-verification.md` `glob`, `multi-agent-routing.md` `model_decision`, `engineering-tool-routing.md` `model_decision`, `deep-audit.md` `manual`).
   - `agents/` — `5` профильных субагентов (`adversarial-reviewer`, `adversarial-reviewer-xhigh`, `simplify-reviewer`, `code-explorer`, `translator`).
   - `skills/` — `25` прогрессивных навыков и slash-команд с компактными описаниями (`Turn-0 <= 6,500 tok`).
-- `rules/uiux-design.md` — контекстное правило фронтенда (`trigger: glob`).
+- `rules/uiux-design.md` — контекстное правило фронтенда (`trigger: model_decision`).
 
 ## Finite Verification & Swarm Architecture
 
