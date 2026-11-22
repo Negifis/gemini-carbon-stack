@@ -6622,10 +6622,28 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
             .as_ref()
             .map(|st| val_to_str(st.get("timeout_diff_file_sha256")))
             .unwrap_or_default();
+        let saved_timeout_diff_path = saved_thread
+            .as_ref()
+            .map(|st| val_to_str(st.get("timeout_diff_file_path")))
+            .unwrap_or_default();
         if !resolved_diff_file.is_empty() {
-            if !saved_timeout_diff_sha.is_empty() && saved_timeout_diff_sha == explicit_diff_sha {
+            let same_content =
+                !saved_timeout_diff_sha.is_empty() && saved_timeout_diff_sha == explicit_diff_sha;
+            let same_path = !saved_timeout_diff_path.is_empty()
+                && rio::normalize_path(&saved_timeout_diff_path)
+                    == rio::normalize_path(&resolved_diff_file);
+            if same_content && same_path {
                 interdiff_stat.clear();
                 interdiff_text.clear();
+            } else if same_content {
+                // INVARIANT: When an unchanged explicit `--diff-file` was renamed/moved after a timeout (critical for >25K truncated diffs where Codex only received the old path), emit the new absolute path in `INSPECT COMMANDS` without re-inlining unchanged body.
+                let sha12 = &explicit_diff_sha[..explicit_diff_sha.len().min(12)];
+                interdiff_stat = format!(
+                    "Explicit diff file moved/renamed (content unchanged, sha256={}): {}",
+                    sha12, resolved_diff_file
+                );
+                interdiff_text.clear();
+                inspect_hint = base_inspect_hint.clone();
             } else {
                 interdiff_stat = if diff_stat.trim().is_empty() && diff_text.trim().is_empty() {
                     format!(
@@ -12567,13 +12585,13 @@ print(verdict)
             ]);
             wipe_breaker_for_test();
 
-            let make_args = |diff_rel: &str, summary: &str, timeout: Option<i64>| ReviewArgs {
+            let make_args_sess = |sess: &str, diff_rel: &str, summary: &str, timeout: Option<i64>| ReviewArgs {
                 cwd: repo_s.clone(),
                 summary: summary.to_string(),
                 intent: String::new(),
                 diff_file: diff_rel.to_string(),
                 review_id: String::new(),
-                session: "sess-diff-file-01".to_string(),
+                session: sess.to_string(),
                 model: String::new(),
                 resume: String::new(),
                 new_session: false,
@@ -12582,6 +12600,9 @@ print(verdict)
                 phase: "ordinary".to_string(),
                 timeout,
                 pretty: false,
+            };
+            let make_args = |diff_rel: &str, summary: &str, timeout: Option<i64>| {
+                make_args_sess("sess-diff-file-01", diff_rel, summary, timeout)
             };
 
             // 1. Relative `--diff-file candidate.diff` resolves against `caller_dir`, NOT `--cwd repo_s`.
@@ -12610,13 +12631,58 @@ print(verdict)
             let rc_res3 = cmd_review_in_dir(&make_args("empty.diff", "Resume with empty.diff", None), &caller_dir);
             assert_eq!(rc_res3, 0);
 
+            // 5. Large (>25,000 char) diff renamed without content edits emits the new path in `INSPECT COMMANDS`.
+            let rc_large_init = cmd_review_in_dir(
+                &make_args_sess(
+                    "sess-diff-file-large-rename-01",
+                    "candidate.diff",
+                    "Init large rename session",
+                    None,
+                ),
+                &caller_dir,
+            );
+            assert_eq!(rc_large_init, 0);
+
+            let large_orig = caller_dir.join("large_orig.diff");
+            let large_moved = caller_dir.join("large_moved.diff");
+            let mut large_body = String::from("diff --git a/big.rs b/big.rs\n");
+            for i in 0..350usize {
+                large_body.push_str(&format!(
+                    "+pub fn big_line_{:04}() {{ /* padding_for_truncation_threshold_exceeded_25000_chars */ }}\n",
+                    i
+                ));
+            }
+            assert!(large_body.chars().count() > MAX_DIFF_SNAPSHOT_CHARS);
+            fs::write(&large_orig, &large_body).unwrap();
+            let rc_large_to = cmd_review_in_dir(
+                &make_args_sess(
+                    "sess-diff-file-large-rename-01",
+                    "large_orig.diff",
+                    "MOCK_SLEEP_TIMEOUT large truncated diff",
+                    Some(1),
+                ),
+                &caller_dir,
+            );
+            assert_eq!(rc_large_to, 3);
+            fs::rename(&large_orig, &large_moved).unwrap();
+            let rc_large_res = cmd_review_in_dir(
+                &make_args_sess(
+                    "sess-diff-file-large-rename-01",
+                    "large_moved.diff",
+                    "Resume after renaming large diff",
+                    None,
+                ),
+                &caller_dir,
+            );
+            assert_eq!(rc_large_res, 0);
+
             let rows: Vec<Value> = fs::read_to_string(&prompt_log)
                 .unwrap()
                 .lines()
                 .map(|l| serde_json::from_str::<Value>(l).unwrap())
                 .collect();
-            // 1 (ok) + 0 (missing failed closed!) + 1 (to1) + 1 (res1) + 1 (to2) + 1 (res2) + 1 (to3) + 1 (res3) = 7 invocations
-            assert_eq!(rows.len(), 7, "expected 7 Codex calls; missing file must not invoke Codex");
+            // 1 (ok) + 0 (missing failed closed!) + 1 (to1) + 1 (res1) + 1 (to2) + 1 (res2) + 1 (to3) + 1 (res3) + 1 (large_init) + 1 (large_to) + 1 (large_res) = 10 invocations
+            assert_eq!(rows.len(), 10, "expected 10 Codex calls; missing file must not invoke Codex");
 
             let p0 = val_to_str(rows[0].get("prompt"));
             assert!(p0.contains("explicit_caller_diff_fn"), "p0 missing explicit diff: {}", p0);
@@ -12638,6 +12704,17 @@ print(verdict)
             assert!(p_res3.contains("ROUND_MODE: timeout_continuation"));
             assert!(p_res3.contains(&empty_diff.to_string_lossy().into_owned()));
             assert!(p_res3.contains("is now empty (0 diff lines)"));
+
+            let p_large_to = val_to_str(rows[8].get("prompt"));
+            assert!(p_large_to.contains("[TRUNCATED:"));
+            assert!(p_large_to.contains(&large_orig.to_string_lossy().into_owned()));
+
+            let p_large_res = val_to_str(rows[9].get("prompt"));
+            assert!(p_large_res.contains("ROUND_MODE: timeout_continuation"));
+            assert!(p_large_res.contains("moved/renamed (content unchanged"));
+            assert!(p_large_res.contains("INSPECT COMMANDS: Read diff file directly:"));
+            assert!(p_large_res.contains(&large_moved.to_string_lossy().into_owned()));
+            assert!(!p_large_res.contains("large_orig.diff"));
         }
     }
 }
