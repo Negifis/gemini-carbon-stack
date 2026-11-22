@@ -323,28 +323,19 @@ pub fn evaluate_pre_tool_use(payload: &Value) -> (String, Option<String>) {
 pub fn decide_stop(payload: &Value) -> Option<String> {
     let reason = payload.get("terminationReason").and_then(Value::as_str).unwrap_or("");
     if rio::NON_ENFORCEABLE_STOP_REASONS.contains(&reason) || json_truthy(payload.get("error")) { return None; }
-    let (session, cwd, tp) = (rio::session_key(payload), rio::effective_cwd(payload), payload_tp(payload));
-    let mut state = load_session_state(&session);
+    let (session, tp) = (rio::session_key(payload), payload_tp(payload));
+    let (mut state, mut dirty) = (load_session_state(&session), false);
     // INVARIANT: Catch a newly flushed transcript USER_INPUT missed by an earlier PreInvocation lag before evaluating Stop output lint.
     if let Some((cs, content)) = rio::last_user_input_step(tp) {
-        let trimmed = content.trim();
-        let (ps, pb, ph) = (state.get("last_user_step").and_then(Value::as_i64), state.get("last_user_base_step").and_then(Value::as_i64), val_to_str(state.get("last_user_hash")));
+        let (trimmed, ps, pb, ph) = (content.trim(), state.get("last_user_step").and_then(Value::as_i64), state.get("last_user_base_step").and_then(Value::as_i64), val_to_str(state.get("last_user_hash")));
         if !trimmed.is_empty() && ps.map_or(true, |p| cs > p) && pb.map_or(true, |b| cs > b) {
             if ps.is_none() && !json_truthy(state.get("turn_closed")) && !ph.is_empty() && sha256_hex(trimmed.as_bytes())[..16] == ph {
                 state.insert("last_user_step".into(), json!(cs)); state.remove("last_user_base_step");
-            } else {
-                let _ = apply_new_user_turn(&mut state, trimmed, Some(cs), Some(cs));
-            }
+            } else { let _ = apply_new_user_turn(&mut state, trimmed, Some(cs), Some(cs)); }
+            dirty = true;
         }
     }
-    let locked_root = val_to_str(state.get("locked_git_root"));
-    if !json_truthy(state.get("correction_active")) {
-        let mut dirty = !json_truthy(state.get("turn_closed"));
-        state.insert("turn_closed".into(), Value::Bool(true));
-        if !locked_root.is_empty() { touch_tree_lock(&session, &cwd, &[], true, Some(&locked_root)); state.insert("locked_git_root".into(), Value::String(String::new())); dirty = true; }
-        if dirty { save_session_state(&session, &mut state); }
-        return None;
-    }
+    if !json_truthy(state.get("correction_active")) { if dirty { save_session_state(&session, &mut state); } return None; }
     let steps = rio::read_transcript_steps(tp, 40);
     if rio::is_subagent_session(tp, Some(&steps)) { return None; }
     let msg = match val_to_str(payload.get("lastAssistantMessage")) { s if !s.is_empty() => s, _ => rio::last_assistant_message(&steps) };
@@ -354,11 +345,21 @@ pub fn decide_stop(payload: &Value) -> Option<String> {
         rio::log_hook_event("continuity-events", "output_lint_block", json!({ "session": session, "count": lint_blocks + 1 }));
         return Some("[Continuity Output Lint] Финальный ответ после коррекции пользователя содержит описание отвергнутых попыток/черновиков. Перепишите ответ начисто по текущему состоянию результата (либо добавьте `[lint] intentional: <причина>` последней строкой, если сравнение версий запрошено пользователем).".into());
     }
-    state.insert("correction_active".into(), Value::Bool(false));
-    state.insert("turn_closed".into(), Value::Bool(true));
-    if !locked_root.is_empty() { touch_tree_lock(&session, &cwd, &[], true, Some(&locked_root)); state.insert("locked_git_root".into(), Value::String(String::new())); }
-    save_session_state(&session, &mut state);
+    if dirty { save_session_state(&session, &mut state); }
     None
+}
+
+pub(crate) fn mark_turn_closed(payload: &Value) {
+    // INVARIANT: Mark `turn_closed = true`, clear `correction_active`, and release tree lock strictly AFTER the full Stop dispatcher (continuity + chip + Code Work Gate) allows termination.
+    let reason = payload.get("terminationReason").and_then(Value::as_str).unwrap_or("");
+    if rio::NON_ENFORCEABLE_STOP_REASONS.contains(&reason) || json_truthy(payload.get("error")) { return; }
+    let (session, cwd) = (rio::session_key(payload), rio::effective_cwd(payload));
+    let mut state = load_session_state(&session);
+    let locked_root = val_to_str(state.get("locked_git_root"));
+    let mut dirty = !json_truthy(state.get("turn_closed")) || json_truthy(state.get("correction_active"));
+    state.insert("correction_active".into(), Value::Bool(false)); state.insert("turn_closed".into(), Value::Bool(true));
+    if !locked_root.is_empty() { touch_tree_lock(&session, &cwd, &[], true, Some(&locked_root)); state.insert("locked_git_root".into(), Value::String(String::new())); dirty = true; }
+    if dirty { save_session_state(&session, &mut state); }
 }
 
 fn cli_cwd_and_pkey(raw_cwd: &str, sess: &str) -> (String, String) {
@@ -489,7 +490,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             }
             rio::emit_json(&json!({}));
         }
-        "Stop" => match decide_stop(&payload) { Some(r) => rio::emit_stop_continue(&r), None => rio::emit_stop_allow() },
+        "Stop" => match decide_stop(&payload) { Some(r) => rio::emit_stop_continue(&r), None => { mark_turn_closed(&payload); rio::emit_stop_allow(); } },
         other => rio::emit_default_for_event(other),
     }
     0
@@ -751,24 +752,42 @@ mod tests {
         let st_after_cont = load_session_state(sid_rep);
         assert_eq!(val_to_i64(st_after_cont.get("lint_blocks")), 1);
         assert_eq!(val_to_i64(st_after_cont.get("strong_correction_streak")), 1);
-        assert!(decide_stop(&json!({
+        assert!(crate::hook_dispatch::evaluate_stop_chain(&json!({
             "conversationId": sid_rep, "transcriptPath": tp_rep.to_string_lossy(), "lastAssistantMessage": "В предыдущей версии я сделал иначе."
         })).is_some(), "Stop lint block #2 expected");
         assert!(evaluate_pre_invocation(&json!({
             "conversationId": sid_rep, "transcriptPath": tp_rep.to_string_lossy(), "lastUserInput": "Нет, переделай"
         })).is_none());
-        assert!(decide_stop(&json!({
+        // Codex C3 R4: Open PERSISTENT marker causes Code Work Gate to return `continue` AFTER continuity_hook allows the 3rd attempt; `turn_closed` MUST stay false so the next PreInvocation with same lastUserInput does NOT reset `lint_blocks` or re-trigger lint!
+        let mpath = cwg_common::marker_path(sid_rep);
+        rio::write_json(&mpath, &json!({
+            "session": sid_rep, "closed": false, "edits": 1, "operational": false,
+            "first_ts": now_sec() - 10.0, "paths": [sample.to_string_lossy()], "cwd": env.1.to_string_lossy()
+        })).unwrap();
+        let gate_blk = crate::hook_dispatch::evaluate_stop_chain(&json!({
             "conversationId": sid_rep, "transcriptPath": tp_rep.to_string_lossy(), "lastAssistantMessage": "В предыдущей версии я сделал иначе."
-        })).is_none(), "3rd Stop attempt must pass once 2-block lint cap is reached");
+        }));
+        assert!(gate_blk.as_deref().is_some_and(|s| s.contains("[gate]")), "expected Code Work Gate continue, got: {:?}", gate_blk);
+        assert!(!json_truthy(load_session_state(sid_rep).get("turn_closed")), "turn_closed must remain false when Code Work Gate continues Stop");
+        assert!(evaluate_pre_invocation(&json!({
+            "conversationId": sid_rep, "transcriptPath": tp_rep.to_string_lossy(), "lastUserInput": "Нет, переделай"
+        })).is_none(), "PreInvocation after Code Work Gate continue must NOT re-trigger correction or reset lint_blocks");
+        assert_eq!(val_to_i64(load_session_state(sid_rep).get("lint_blocks")), 2);
+        // Closing marker lets full Stop dispatcher allow and finally mark `turn_closed = true`.
+        let _ = fs::remove_file(&mpath);
+        assert!(crate::hook_dispatch::evaluate_stop_chain(&json!({
+            "conversationId": sid_rep, "transcriptPath": tp_rep.to_string_lossy(), "lastAssistantMessage": "В предыдущей версии я сделал иначе."
+        })).is_none(), "full Stop chain must allow once 2-block lint cap is reached and gate is clear");
+        assert!(json_truthy(load_session_state(sid_rep).get("turn_closed")));
         // New turn repeats identical text while transcript still shows step 0..2 -> MUST fire and re-arm Stop lint!
         let rep_inj = evaluate_pre_invocation(&json!({
             "conversationId": sid_rep, "transcriptPath": tp_rep.to_string_lossy(), "lastUserInput": "Нет, переделай"
         }));
         assert!(rep_inj.is_some(), "repeated identical correction after finished turn must fire despite transcript lag");
-        assert!(decide_stop(&json!({
+        assert!(crate::hook_dispatch::evaluate_stop_chain(&json!({
             "conversationId": sid_rep, "transcriptPath": tp_rep.to_string_lossy(), "lastAssistantMessage": "В предыдущей версии я сделал иначе."
         })).is_some(), "Stop lint must block after repeated correction");
-        assert!(decide_stop(&json!({
+        assert!(crate::hook_dispatch::evaluate_stop_chain(&json!({
             "conversationId": sid_rep, "transcriptPath": tp_rep.to_string_lossy(), "lastAssistantMessage": "Исправлено начисто."
         })).is_none());
         // Late transcript flush case: PreInvocation saw empty lastUserInput & lagged transcript, then new USER_INPUT flushes before Stop.

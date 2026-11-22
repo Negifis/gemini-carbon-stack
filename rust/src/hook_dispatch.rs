@@ -5,6 +5,20 @@ use crate::{
     rio, safety_guards,
 };
 
+pub(crate) fn evaluate_stop_chain(payload: &serde_json::Value) -> Option<String> {
+    if let Some(cont_reason) = continuity_hook::decide_stop(payload) {
+        return Some(cont_reason);
+    }
+    if let Some(chip_reason) = chip_hooks::decide_stop(payload) {
+        return Some(chip_reason);
+    }
+    if let Some(gate_reason) = cwg_stop::decide_stop(payload) {
+        return Some(gate_reason);
+    }
+    continuity_hook::mark_turn_closed(payload);
+    None
+}
+
 pub fn run_unified_hook(args: &[String]) -> i32 {
     let event = rio::parse_event_arg(args, "");
     let payload = match rio::read_hook_stdin() {
@@ -100,16 +114,8 @@ pub fn run_unified_hook(args: &[String]) -> i32 {
             return cwg_mark::evaluate_post_tool_use(&payload);
         }
         "Stop" => {
-            if let Some(cont_reason) = continuity_hook::decide_stop(&payload) {
-                rio::emit_stop_continue(&cont_reason);
-                return 0;
-            }
-            if let Some(chip_reason) = chip_hooks::decide_stop(&payload) {
-                rio::emit_stop_continue(&chip_reason);
-                return 0;
-            }
-            if let Some(gate_reason) = cwg_stop::decide_stop(&payload) {
-                rio::emit_stop_continue(&gate_reason);
+            if let Some(reason) = evaluate_stop_chain(&payload) {
+                rio::emit_stop_continue(&reason);
                 return 0;
             }
             rio::emit_stop_allow();
