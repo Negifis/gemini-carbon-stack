@@ -1324,25 +1324,41 @@ pub(crate) fn preserve_unix_access_or_refuse(src_target: &Path, stage_file: &fs:
     let orig_gid = orig_meta.gid();
     #[cfg(target_os = "linux")]
     {
-        extern "C" { fn lgetxattr(path: *const c_char, name: *const c_char, value: *mut c_void, size: usize) -> isize; }
+        extern "C" {
+            fn lgetxattr(path: *const c_char, name: *const c_char, value: *mut c_void, size: usize) -> isize;
+            fn fgetxattr(fd: c_int, name: *const c_char, value: *mut c_void, size: usize) -> isize;
+            fn fremovexattr(fd: c_int, name: *const c_char) -> c_int;
+        }
         let tc = path_cstr(src_target)?;
-        // SAFETY: Valid NUL-terminated paths; `size == 0` queries length without writing.
-        if unsafe { lgetxattr(tc.as_ptr(), b"system.posix_acl_access\0".as_ptr() as *const c_char, ptr::null_mut(), 0) } > 0 {
+        let acl_attr = b"system.posix_acl_access\0".as_ptr() as *const c_char;
+        // SAFETY: Valid NUL-terminated paths and open fd; query ACL length without writing, and strip any directory-inherited ACL on `stage_file` BEFORE applying `orig_mode`.
+        if unsafe { lgetxattr(tc.as_ptr(), acl_attr, ptr::null_mut(), 0) } > 0 {
             return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "global hooks.json has extended POSIX ACL; refusing to replace"));
+        }
+        if unsafe { fgetxattr(stage_file.as_raw_fd(), acl_attr, ptr::null_mut(), 0) } > 0
+            && unsafe { fremovexattr(stage_file.as_raw_fd(), acl_attr) } != 0
+        {
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "cannot strip directory-inherited POSIX ACL from staged hooks.json"));
         }
     }
     #[cfg(target_os = "macos")]
     {
         extern "C" {
             fn acl_get_link_np(path: *const c_char, acl_type: c_int) -> *mut c_void;
+            fn acl_get_fd_np(fd: c_int, acl_type: c_int) -> *mut c_void;
             fn acl_free(obj_p: *mut c_void) -> c_int;
         }
         let tc = path_cstr(src_target)?;
-        // SAFETY: Valid NUL-terminated path; `0x100` is `ACL_TYPE_EXTENDED` on Darwin; non-null handle is freed immediately.
+        // SAFETY: Valid NUL-terminated path and open fd; `0x100` is `ACL_TYPE_EXTENDED` on Darwin; refuse if either source or stage carries extended ACLs.
         let acl = unsafe { acl_get_link_np(tc.as_ptr(), 0x100) };
         if !acl.is_null() {
             unsafe { acl_free(acl); }
             return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "global hooks.json has extended ACL; refusing to replace"));
+        }
+        let stage_acl = unsafe { acl_get_fd_np(stage_file.as_raw_fd(), 0x100) };
+        if !stage_acl.is_null() {
+            unsafe { acl_free(stage_acl); }
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "staged hooks.json inherited extended ACL; refusing to widen access"));
         }
     }
     if (orig_mode & 0o070) != 0 && stage_file.metadata()?.gid() != orig_gid {
