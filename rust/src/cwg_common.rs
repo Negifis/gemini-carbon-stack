@@ -3855,87 +3855,6 @@ pub fn enforcement_state_path(session: &str) -> PathBuf {
     gate_subdir(&["states"]).join(format!("{}.json", session))
 }
 
-pub fn pending_visual_edits_path(session: &str) -> PathBuf {
-    gate_subdir(&["visual-pending"]).join(format!("{}.json", rio::safe_key(session, "default")))
-}
-
-fn pending_visual_edits_lock_path(session: &str) -> PathBuf {
-    gate_subdir(&["visual-pending"]).join(format!("{}.lock", rio::safe_key(session, "default")))
-}
-
-pub fn record_pending_visual_edit(session: &str, call_key: &str, raw_path: &str) {
-    // INVARIANT: Persist PreToolUse Oxc AST visual-edit facts in a dedicated per-session locked file (`gate/visual-pending/<session>.json`) isolated from `Stop`'s enforcement-state rewrites, aborting if the lock cannot be acquired (never writing unlocked).
-    if session.trim().is_empty() || call_key.trim().is_empty() || raw_path.trim().is_empty() {
-        return;
-    }
-    let norm = rio::normalize_path(raw_path);
-    if norm.is_empty() {
-        return;
-    }
-    let pfile = pending_visual_edits_path(session);
-    rio::with_file_lock(&pending_visual_edits_lock_path(session), 3.0, 15.0, |locked| {
-        if !locked {
-            return;
-        }
-        let mut map = match rio::read_json(&pfile) {
-            Some(Value::Object(m)) => m,
-            _ => Map::new(),
-        };
-        while map.len() >= 32 {
-            let Some(oldest_k) = map
-                .iter()
-                .min_by(|a, b| {
-                    val_to_f64(a.1.get("ts")).total_cmp(&val_to_f64(b.1.get("ts")))
-                })
-                .map(|(k, _)| k.clone())
-            else {
-                break;
-            };
-            map.remove(&oldest_k);
-        }
-        map.insert(
-            call_key.to_string(),
-            json!({ "path": norm, "ts": now_sec() }),
-        );
-        let _ = rio::write_json(&pfile, &Value::Object(map));
-    });
-}
-
-pub fn take_pending_visual_edit(session: &str, call_key: &str) -> Option<String> {
-    if session.trim().is_empty() || call_key.trim().is_empty() {
-        return None;
-    }
-    let pfile = pending_visual_edits_path(session);
-    if !pfile.is_file() {
-        return None;
-    }
-    rio::with_file_lock(&pending_visual_edits_lock_path(session), 3.0, 15.0, |locked| {
-        if !locked {
-            return None;
-        }
-        let Some(Value::Object(mut map)) = rio::read_json(&pfile) else {
-            return None;
-        };
-        let popped = map
-            .remove(call_key)
-            .and_then(|v| {
-                v.get("path")
-                    .and_then(Value::as_str)
-                    .or_else(|| v.as_str())
-                    .map(str::to_string)
-            })
-            .filter(|s| !s.is_empty());
-        if popped.is_some() {
-            if map.is_empty() {
-                let _ = fs::remove_file(&pfile);
-            } else {
-                let _ = rio::write_json(&pfile, &Value::Object(map));
-            }
-        }
-        popped
-    })
-}
-
 pub fn checks_ledger_path(session: &str) -> PathBuf {
     gate_subdir(&["checks"]).join(format!("{}.jsonl", session))
 }
@@ -4085,9 +4004,6 @@ pub fn default_gate_policy() -> Value {
         "require_simplify_on_standard": false,
         "require_review_on_standard": false,
         "require_tests_on_standard": null,
-        "design_gate": true,
-        "design_include_globs": [],
-        "design_exclude_globs": [],
     })
 }
 
@@ -4192,8 +4108,6 @@ fn parse_gate_policy(root: Option<&Path>, raw: &Map<String, Value>) -> Value {
         "low_risk_globs",
         "high_risk_globs",
         "xhigh_risk_globs",
-        "design_include_globs",
-        "design_exclude_globs",
     ] {
         if let Some(Value::Array(arr)) = raw.get(key) {
             let cleaned: Vec<Value> = arr
@@ -4208,7 +4122,6 @@ fn parse_gate_policy(root: Option<&Path>, raw: &Map<String, Value>) -> Value {
     for key in [
         "require_simplify_on_standard",
         "require_review_on_standard",
-        "design_gate",
     ] {
         if raw.contains_key(key) {
             policy.insert(key.to_string(), Value::Bool(json_truthy(raw.get(key))));
@@ -5030,17 +4943,8 @@ pub fn candidate_key(marker: &Value) -> String {
     hex_str[..20].to_string()
 }
 
-pub fn requires_simplify(risk: &str, policy: Option<&Value>) -> bool {
-    let default_pol = default_gate_policy();
-    let pol = policy.unwrap_or(&default_pol);
-    let up = if risk.trim().is_empty() {
-        "LOW".to_string()
-    } else {
-        risk.to_uppercase()
-    };
-    up == "HIGH"
-        || up == "XHIGH"
-        || (up == "STANDARD" && json_truthy(pol.get("require_simplify_on_standard")))
+pub fn requires_simplify(_risk: &str, _policy: Option<&Value>) -> bool {
+    false
 }
 
 pub fn requires_review(risk: &str, policy: Option<&Value>) -> bool {
@@ -5288,27 +5192,20 @@ pub fn resolve_candidate_context(marker: &Value, include_tests: bool) -> Value {
         .filter(|v| !v.is_null())
         .map(|v| val_to_str(Some(v)));
 
-    let (needs_simplify, needs_review) = if !items.is_empty() {
-        let ns = requires_simplify(&floor, Some(&policy))
-            || items
-                .iter()
-                .any(|(_, p_pol, p_risk)| requires_simplify(p_risk, Some(p_pol)));
+    let needs_simplify = false;
+    let needs_review = if !items.is_empty() {
         let nr = requires_review(&floor, Some(&policy))
             || items
                 .iter()
                 .any(|(_, p_pol, p_risk)| requires_review(p_risk, Some(p_pol)));
-        if json_truthy(policy.get("_multi_root")) && (ns || nr) {
+        if json_truthy(policy.get("_multi_root")) && nr {
             if let Value::Object(ref mut map) = policy {
-                map.insert("require_simplify_on_standard".to_string(), Value::Bool(ns));
                 map.insert("require_review_on_standard".to_string(), Value::Bool(nr));
             }
         }
-        (ns, nr)
+        nr
     } else {
-        (
-            requires_simplify(&floor, Some(&policy)),
-            requires_review(&floor, Some(&policy)),
-        )
+        requires_review(&floor, Some(&policy))
     };
 
     let req_tests = if include_tests {
@@ -5323,27 +5220,6 @@ pub fn resolve_candidate_context(marker: &Value, include_tests: bool) -> Value {
     } else {
         Value::Null
     };
-    let latched_design_fold: HashSet<String> =
-        durable_paths_from_val(marker.get("latched_design_paths"))
-            .into_iter()
-            .map(|p| rio::fold_path(&p))
-            .collect();
-    let design_paths: Vec<String> = items
-        .iter()
-        .filter(|(abs_p, p_pol, _)| {
-            let pol_root = val_to_str(p_pol.get("policy_root"));
-            let base_root = if !pol_root.is_empty() {
-                pol_root
-            } else {
-                git_root_opt.clone().unwrap_or_else(|| cwd.clone())
-            };
-            is_visual_design_path_with_base(abs_p, Some(p_pol), &base_root)
-                || (latched_design_fold.contains(&rio::fold_path(abs_p))
-                    && is_design_gate_enabled(Some(p_pol))
-                    && !is_path_excluded_by_design_globs(abs_p, Some(p_pol), &base_root))
-        })
-        .map(|(abs_p, _, _)| abs_p.clone())
-        .collect();
     let git_root_val = match git_root_opt {
         Some(gr) => Value::String(gr),
         None => Value::Null,
@@ -5353,7 +5229,6 @@ pub fn resolve_candidate_context(marker: &Value, include_tests: bool) -> Value {
         "cwd": cwd,
         "git_root": git_root_val,
         "dpaths": dpaths,
-        "design_paths": design_paths,
         "policy": policy,
         "floor": floor,
         "require_tests": req_tests,
@@ -5366,8 +5241,7 @@ pub fn receipt_requirements_summary(floor: &str, policy: Option<&Value>, has_tes
     let default_pol = default_gate_policy();
     let pol = policy.filter(|v| v.is_object()).unwrap_or(&default_pol);
     if floor == "LOW" {
-        return "honest content/render check (no simplify or adversarial review required)"
-            .to_string();
+        return "honest content/render check (no adversarial review required)".to_string();
     }
     if floor == "STANDARD" {
         let mut parts = vec![if has_tests {
@@ -5375,12 +5249,6 @@ pub fn receipt_requirements_summary(floor: &str, policy: Option<&Value>, has_tes
         } else {
             "self-check (run any applicable check)".to_string()
         }];
-        if json_truthy(pol.get("require_simplify_on_standard")) {
-            parts.push(format!(
-                "simplify on `{}` (fallback `{}`)",
-                SONNET_HIGH_MODEL, SIMPLIFY_FALLBACK_MODEL
-            ));
-        }
         if json_truthy(pol.get("require_review_on_standard")) {
             parts.push("independent APPROVED review".to_string());
         }
@@ -5392,12 +5260,7 @@ pub fn receipt_requirements_summary(floor: &str, policy: Option<&Value>, has_tes
         ("XHIGH", " --xhigh", "--xhigh --closure", CODEX_ASTRA_MODEL)
     };
     format!(
-        "decisive test/check execution -> simplify once (`SIMPLIFY_LENS: ALL` fast-path if <={} files & <={} lines, else {} separate lenses on `{}`, fallback `{}`) -> batch kill workers -> re-test after edits -> primary {} APPROVED review (1..{} rounds via `carbon-stack codex-lane review{}` on `{}` -> {}; APPROVED closes gate; after Round {} ESCALATE: mandatory research -> fix + re-test -> <={} `{}` passes or 1 `redesign-reset`)",
-        FAST_PATH_MAX_FILES,
-        FAST_PATH_MAX_LINES,
-        SIMPLIFY_LENSES.len(),
-        SONNET_HIGH_MODEL,
-        SIMPLIFY_FALLBACK_MODEL,
+        "decisive test/check execution -> primary {} APPROVED review (1..{} rounds via `carbon-stack codex-lane review{}` on `{}` -> {}; APPROVED closes gate; after Round {} ESCALATE: focused research -> fix + re-test -> <={} `{}` passes or 1 `redesign-reset`)",
         label,
         MAX_ORDINARY_REVIEW_ROUNDS,
         xhigh_flag,
@@ -5437,13 +5300,6 @@ fn is_research_mcp_server(server_name: &str) -> bool {
         .any(|prefix| matches_server_prefix(&s, prefix))
 }
 
-pub fn is_design_gate_enabled(policy: Option<&Value>) -> bool {
-    policy
-        .and_then(|p| p.get("design_gate"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true)
-}
-
 pub fn format_last_basenames(paths: &[String], limit: usize) -> String {
     let start = paths.len().saturating_sub(limit);
     paths[start..]
@@ -5451,526 +5307,6 @@ pub fn format_last_basenames(paths: &[String], limit: usize) -> String {
         .map(|p| p.rsplit('/').next().unwrap_or(p.as_str()))
         .collect::<Vec<&str>>()
         .join(", ")
-}
-
-
-pub(crate) fn flutter_widget_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"(?:extends\s+(?:Stateless|Stateful|Consumer(?:Stateful)?|Hook(?:Consumer)?|RenderObject)Widget\b|\bWidget\s+build\s*\(\s*BuildContext\b)",
-        )
-        .expect("flutter_widget_re")
-    })
-}
-
-fn file_content_matches_re(raw_path: &str, re: &Regex) -> Option<bool> {
-    let p = Path::new(raw_path);
-    let meta = fs::metadata(p).ok()?;
-    if !meta.is_file() || meta.len() > 262_144 {
-        return None;
-    }
-    let text = fs::read_to_string(p).ok()?;
-    Some(re.is_match(&text))
-}
-
-pub fn sync_design_edit_fields(marker: &mut Value, touched_paths: &[String], now: f64) -> bool {
-    sync_design_edit_fields_with_fp(marker, touched_paths, now, None)
-}
-
-fn git_head_file_has_visual_content(raw_path: &str, base_root: &str, ext: &str) -> Option<bool> {
-    let norm = rio::normalize_path(raw_path);
-    let p = Path::new(&norm);
-    let probe_dir = if p.is_absolute() {
-        p.parent()
-            .map(|d| d.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    } else if !base_root.trim().is_empty() {
-        base_root.trim().to_string()
-    } else {
-        String::new()
-    };
-    if probe_dir.is_empty() {
-        return None;
-    }
-    let git_top = rio::git_toplevel(&probe_dir, false)?;
-    let abs_p = if p.is_absolute() {
-        norm.clone()
-    } else {
-        rio::normalize_path(&Path::new(&git_top).join(&norm).to_string_lossy())
-    };
-    let fold_p = rio::fold_path(&abs_p);
-    let fold_top = rio::fold_path(&git_top);
-    let prefix = format!("{}/", fold_top.trim_end_matches('/'));
-    if !fold_p.starts_with(&prefix) {
-        return None;
-    }
-    let rel = if abs_p.len() == fold_p.len() && abs_p.is_char_boundary(prefix.len()) {
-        &abs_p[prefix.len()..]
-    } else {
-        &fold_p[prefix.len()..]
-    };
-    if rel.is_empty() {
-        return None;
-    }
-    let spec = format!("HEAD:{}", rel);
-    let (rc, out, _) = rio::run_git(&git_top, &["show", &spec], 3.0);
-    if rc != 0 || out.len() > 262_144 {
-        return None;
-    }
-    if ext == "tsx" || ext == "jsx" {
-        crate::tsx_ast::source_has_visual_ui_checked(&out, ext == "tsx")
-    } else if ext == "dart" {
-        Some(flutter_widget_re().is_match(&out))
-    } else {
-        None
-    }
-}
-
-pub fn latch_design_paths_in_marker(marker: &mut Value, paths: &[String]) {
-    if paths.is_empty() {
-        return;
-    }
-    let mut existing = durable_paths_from_val(marker.get("latched_design_paths"));
-    let mut seen: HashSet<String> = existing.iter().map(|p| rio::fold_path(p)).collect();
-    let mut changed = false;
-    for p in paths {
-        let norm = rio::normalize_path(p);
-        if norm.is_empty() || norm == SHELL_MUTATION_SENTINEL {
-            continue;
-        }
-        let fold = rio::fold_path(&norm);
-        if seen.insert(fold) {
-            existing.push(norm);
-            changed = true;
-        }
-    }
-    if changed {
-        if let Value::Object(ref mut m) = marker {
-            m.insert(
-                "latched_design_paths".to_string(),
-                Value::Array(existing.into_iter().map(Value::String).collect()),
-            );
-        }
-    }
-}
-
-fn is_path_excluded_by_design_globs(path: &str, policy: Option<&Value>, base_root: &str) -> bool {
-    let excl = policy
-        .map(|p| policy_globs(p, "design_exclude_globs"))
-        .unwrap_or_default();
-    if excl.is_empty() {
-        return false;
-    }
-    let pol_root = policy
-        .map(|p| val_to_str(p.get("policy_root")))
-        .unwrap_or_default();
-    let glob_root = if !pol_root.trim().is_empty() {
-        pol_root.as_str()
-    } else {
-        base_root
-    };
-    match_glob_patterns(&rio::normalize_path(path), &excl, glob_root)
-}
-
-pub fn sync_design_edit_fields_with_fp(
-    marker: &mut Value,
-    touched_paths: &[String],
-    now: f64,
-    precomputed_dfp: Option<&str>,
-) -> bool {
-    let cctx = resolve_candidate_context(marker, false);
-    let design_paths = durable_paths_from_val(cctx.get("design_paths"));
-    if design_paths.is_empty() {
-        return false;
-    }
-    latch_design_paths_in_marker(marker, &design_paths);
-    let cur_dfp = match precomputed_dfp {
-        Some(fp) => fp.to_string(),
-        None => content_fingerprint(&design_paths, MAX_FINGERPRINT_FILE_BYTES),
-    };
-    let prev_dfp = val_to_str(marker.get("design_fp"));
-    let prev_dts = val_to_f64(marker.get("last_design_edit_ts"));
-    let design_fold: HashSet<String> = design_paths.iter().map(|p| rio::fold_path(p)).collect();
-    let touched_design = touched_paths
-        .iter()
-        .any(|p| design_fold.contains(&rio::fold_path(p)));
-    // INVARIANT: Synchronize `design_fp` and `last_design_edit_ts` on hook edits AND external-editor Stop catch-up so stale UI approvals are invalidated without permanently deadlocking after fresh re-capture.
-    let should_bump = prev_dts <= 0.0
-        || (!cur_dfp.is_empty() && cur_dfp != prev_dfp)
-        || (cur_dfp.is_empty() && touched_design);
-    if !should_bump {
-        return false;
-    }
-    if let Value::Object(ref mut m) = marker {
-        m.insert("last_design_edit_ts".to_string(), json!(now.max(prev_dts)));
-        if !cur_dfp.is_empty() {
-            m.insert("design_fp".to_string(), Value::String(cur_dfp));
-        }
-    }
-    true
-}
-
-fn relative_path_for_design_check(norm: &str, base_root: &str) -> String {
-    let fold_p = rio::fold_path(norm);
-    let base_clean = base_root.trim();
-    if !base_clean.is_empty() {
-        let fold_b = rio::fold_path(base_clean);
-        let b_trim = fold_b.trim_end_matches('/');
-        if !b_trim.is_empty() {
-            let prefix = format!("{}/", b_trim);
-            if fold_p.starts_with(&prefix) {
-                return fold_p[prefix.len()..].to_string();
-            }
-        }
-    }
-    let p = Path::new(norm);
-    if p.is_absolute() {
-        if let Some(mut cur) = p.parent() {
-            while !cur.as_os_str().is_empty() {
-                if cur.join(".git").exists()
-                    || cur.join(".agents").exists()
-                    || cur.join("package.json").is_file()
-                    || cur.join("pubspec.yaml").is_file()
-                    || cur.join("Cargo.toml").is_file()
-                {
-                    let root_s = rio::normalize_path(&cur.to_string_lossy());
-                    let fold_r = rio::fold_path(&root_s);
-                    let r_trim = fold_r.trim_end_matches('/');
-                    if !r_trim.is_empty() {
-                        let prefix = format!("{}/", r_trim);
-                        if fold_p.starts_with(&prefix) {
-                            return fold_p[prefix.len()..].to_string();
-                        }
-                    }
-                    break;
-                }
-                match cur.parent() {
-                    Some(next) if next != cur => cur = next,
-                    _ => break,
-                }
-            }
-        }
-    }
-    norm.to_string()
-}
-
-const NON_VISUAL_DIRS: &[&str] = &[
-    "/__tests__/",
-    "/__mocks__/",
-    "/tests/",
-    "/test/",
-    "/e2e/",
-    "/fixtures/",
-    "/test_utils/",
-    "/dist/",
-    "/build/",
-    "/.next/",
-    "/node_modules/",
-    "/target/",
-    "/.generated/",
-    "/api/",
-    "/services/",
-    "/service/",
-    "/hooks/",
-    "/store/",
-    "/stores/",
-    "/state/",
-    "/types/",
-    "/models/",
-    "/schemas/",
-    "/utils/",
-    "/helpers/",
-    "/formatters/",
-    "/parsers/",
-    "/validators/",
-    "/mappers/",
-    "/selectors/",
-    "/clients/",
-    "/adapters/",
-    "/serializers/",
-    "/converters/",
-    "/transformers/",
-    "/domain/",
-    "/repositories/",
-    "/usecases/",
-    "/use_cases/",
-    "/queries/",
-    "/mutations/",
-    "/constants/",
-    "/config/",
-    "/middleware/",
-    "/server/",
-    "/backend/",
-    "/migrations/",
-    "/sql/",
-    "/infra/",
-    "/deploy/",
-    "/scripts/",
-    "/cli/",
-];
-
-pub fn is_visual_ast_eligible_path(path: &str, base_root: &str) -> bool {
-    let raw = path.trim();
-    if raw.is_empty() || raw == SHELL_MUTATION_SENTINEL {
-        return false;
-    }
-    let norm = rio::normalize_path(raw);
-    let rel_norm = relative_path_for_design_check(&norm, base_root);
-    let low = rel_norm.to_lowercase();
-    let fname = low.rsplit('/').next().unwrap_or("");
-    if fname.is_empty()
-        || fname.contains(".test.")
-        || fname.contains(".spec.")
-        || fname.contains(".stories.")
-        || fname.ends_with("_test.dart")
-        || fname.ends_with(".g.dart")
-        || fname.ends_with(".freezed.dart")
-    {
-        return false;
-    }
-    let padded = format!("/{}/", low.trim_matches('/'));
-    if NON_VISUAL_DIRS.iter().any(|seg| padded.contains(seg)) {
-        return false;
-    }
-    true
-}
-
-fn is_visual_design_path_with_globs(
-    path: &str,
-    pol_root: &str,
-    base_root: &str,
-    excl_globs: &[String],
-    incl_globs: &[String],
-) -> bool {
-    let raw = path.trim();
-    if raw.is_empty() || raw == SHELL_MUTATION_SENTINEL {
-        return false;
-    }
-    let norm = rio::normalize_path(raw);
-    let glob_root = if !pol_root.trim().is_empty() {
-        pol_root
-    } else {
-        base_root
-    };
-    if !excl_globs.is_empty() && match_glob_patterns(&norm, excl_globs, glob_root) {
-        return false;
-    }
-    if !incl_globs.is_empty() && match_glob_patterns(&norm, incl_globs, glob_root) {
-        return true;
-    }
-    // INVARIANT: Strip the project/repo root before checking directory-segment exclusions so parent directories above the workspace (e.g. `C:/src/cli/panel/Button.tsx`) never suppress Design Gate.
-    let rel_norm = relative_path_for_design_check(&norm, glob_root);
-    let low = rel_norm.to_lowercase();
-    let fname = low.rsplit('/').next().unwrap_or("");
-    if fname.is_empty()
-        || fname.contains(".test.")
-        || fname.contains(".spec.")
-        || fname.contains(".stories.")
-        || fname.ends_with("_test.dart")
-        || fname.ends_with(".g.dart")
-        || fname.ends_with(".freezed.dart")
-    {
-        return false;
-    }
-    let is_token_or_spec = matches!(
-        fname,
-        "design.md"
-            | "tokens.md"
-            | "mood.md"
-            | "voice.md"
-            | "tokens.json"
-            | "tokens.ts"
-            | "tokens.js"
-            | "theme.ts"
-            | "theme.js"
-            | "tailwind.config.js"
-            | "tailwind.config.ts"
-            | "tailwind.config.mjs"
-            | "tailwind.config.cjs"
-    ) || fname.starts_with("design-tokens");
-    let ext = if is_token_or_spec {
-        ""
-    } else {
-        let Some((_, e)) = fname.rsplit_once('.') else {
-            return false;
-        };
-        if !matches!(
-            e,
-            "tsx"
-                | "jsx"
-                | "vue"
-                | "svelte"
-                | "astro"
-                | "css"
-                | "scss"
-                | "sass"
-                | "less"
-                | "styl"
-                | "html"
-                | "htm"
-                | "dart"
-        ) {
-            return false;
-        }
-        e
-    };
-    // INVARIANT: Strictly exclude tests, stories, generated artifacts, and non-visual logic/backend/CLI/infra/API paths so Design Gate imposes zero overhead outside visual UI/design edits.
-    let padded = format!("/{}/", low.trim_matches('/'));
-    if NON_VISUAL_DIRS.iter().any(|seg| padded.contains(seg)) {
-        return false;
-    }
-    if is_token_or_spec {
-        return true;
-    }
-    if ext == "tsx" || ext == "jsx" {
-        // INVARIANT: Consider both post-edit disk content AND pre-edit git `HEAD` content via real Oxc AST (JSX + React/`jsx-runtime` element calls) so removing UI render still triggers Design Gate while pure-logic files stay zero-overhead.
-        let cur_has_visual = crate::tsx_ast::file_has_visual_ui(raw);
-        if cur_has_visual == Some(true) {
-            return true;
-        }
-        if git_head_file_has_visual_content(raw, glob_root, ext) == Some(true) {
-            return true;
-        }
-        return cur_has_visual.unwrap_or(true);
-    }
-    if ext != "dart" {
-        return true;
-    }
-    const FLUTTER_UI_DIRS: &[&str] = &[
-        "/widgets/",
-        "/screens/",
-        "/pages/",
-        "/views/",
-        "/ui/",
-        "/theme/",
-        "/presentation/",
-        "/components/",
-        "/dialogs/",
-        "/modals/",
-        "/sheets/",
-    ];
-    const FLUTTER_UI_SUFFIXES: &[&str] = &[
-        "_screen.dart",
-        "_page.dart",
-        "_view.dart",
-        "_widget.dart",
-        "_dialog.dart",
-        "_modal.dart",
-        "_sheet.dart",
-        "_card.dart",
-        "_tile.dart",
-        "_button.dart",
-        "_bar.dart",
-        "_nav.dart",
-        "_drawer.dart",
-        "_header.dart",
-        "_footer.dart",
-        "_layout.dart",
-        "_theme.dart",
-        "_styles.dart",
-        "_tokens.dart",
-    ];
-    const FLUTTER_LOGIC_SUFFIXES: &[&str] = &[
-        "_bloc.dart",
-        "_cubit.dart",
-        "_controller.dart",
-        "_provider.dart",
-        "_repository.dart",
-        "_service.dart",
-        "_model.dart",
-        "_state.dart",
-        "_event.dart",
-        "_dto.dart",
-        "_mapper.dart",
-        "_client.dart",
-        "_api.dart",
-        "_usecase.dart",
-        "_use_case.dart",
-        "_datasource.dart",
-        "_data_source.dart",
-        "_validator.dart",
-        "_formatter.dart",
-        "_parser.dart",
-        "_helper.dart",
-        "_util.dart",
-        "_utils.dart",
-    ];
-    if FLUTTER_LOGIC_SUFFIXES.iter().any(|sfx| fname.ends_with(sfx)) {
-        return false;
-    }
-    if FLUTTER_UI_DIRS.iter().any(|seg| padded.contains(seg))
-        || FLUTTER_UI_SUFFIXES.iter().any(|sfx| fname.ends_with(sfx))
-    {
-        return true;
-    }
-    if file_content_matches_re(raw, flutter_widget_re()).unwrap_or(false) {
-        return true;
-    }
-    git_head_file_has_visual_content(raw, glob_root, ext).unwrap_or(false)
-}
-
-
-pub fn is_visual_design_path_with_base(
-    path: &str,
-    policy: Option<&Value>,
-    base_root: &str,
-) -> bool {
-    if !is_design_gate_enabled(policy) {
-        return false;
-    }
-    let pol_root = policy
-        .map(|p| val_to_str(p.get("policy_root")))
-        .unwrap_or_default();
-    let excl = policy
-        .map(|p| policy_globs(p, "design_exclude_globs"))
-        .unwrap_or_default();
-    let incl = policy
-        .map(|p| policy_globs(p, "design_include_globs"))
-        .unwrap_or_default();
-    is_visual_design_path_with_globs(path, &pol_root, base_root, &excl, &incl)
-}
-
-pub fn is_visual_design_path(path: &str, policy: Option<&Value>) -> bool {
-    is_visual_design_path_with_base(path, policy, "")
-}
-
-pub fn design_gate_paths(paths: &[String], policy: Option<&Value>) -> Vec<String> {
-    if !is_design_gate_enabled(policy) || paths.is_empty() {
-        return Vec::new();
-    }
-    let pol_root = policy
-        .map(|p| val_to_str(p.get("policy_root")))
-        .unwrap_or_default();
-    let excl = policy
-        .map(|p| policy_globs(p, "design_exclude_globs"))
-        .unwrap_or_default();
-    let incl = policy
-        .map(|p| policy_globs(p, "design_include_globs"))
-        .unwrap_or_default();
-    paths
-        .iter()
-        .filter(|p| is_visual_design_path_with_globs(p, &pol_root, "", &excl, &incl))
-        .cloned()
-        .collect()
-}
-
-pub fn has_design_gate_paths(paths: &[String], policy: Option<&Value>) -> bool {
-    if !is_design_gate_enabled(policy) || paths.is_empty() {
-        return false;
-    }
-    let pol_root = policy
-        .map(|p| val_to_str(p.get("policy_root")))
-        .unwrap_or_default();
-    let excl = policy
-        .map(|p| policy_globs(p, "design_exclude_globs"))
-        .unwrap_or_default();
-    let incl = policy
-        .map(|p| policy_globs(p, "design_include_globs"))
-        .unwrap_or_default();
-    paths
-        .iter()
-        .any(|p| is_visual_design_path_with_globs(p, &pol_root, "", &excl, &incl))
 }
 
 fn is_research_shell_cmd(raw_cmd: &str) -> bool {
@@ -8796,113 +8132,6 @@ mod tests {
         assert!(clean_then_prose.0[0].2);
         assert!(!clean_then_prose.0[1].2);
 
-        // Design Gate classification: repo-relative path stripping, Flutter feature screens, TSX pure logic vs JSX, multi-root per-file policies.
-        assert!(is_visual_design_path_with_base(
-            "C:/src/cli/panel/Button.tsx",
-            None,
-            "C:/src/cli/panel"
-        ));
-        assert!(is_visual_design_path("lib/features/chat/chat_screen.dart", None));
-        assert!(!is_visual_design_path("lib/features/chat/chat_bloc.dart", None));
-        assert!(!is_visual_design_path("src/formatters/formatMoney.tsx", None));
-
-        // Syntactic TSX/JSX detection: generic JSX components and JSXText with apostrophes pass; HTML strings, templates, and TS generic arrows/call signatures stay non-visual.
-        assert!(crate::tsx_ast::tsx_source_has_jsx("export const L = ({ items }: any) => <List<User> items={items} />;"));
-        assert!(crate::tsx_ast::tsx_source_has_jsx("export const T = () => <Table<Record<string, User[]>> />;"));
-        assert!(crate::tsx_ast::tsx_source_has_jsx("export const U = () => <_Button />;"));
-        assert!(crate::tsx_ast::tsx_source_has_jsx("export const D = () => <$Icon size={16} />;"));
-        assert!(crate::tsx_ast::tsx_source_has_jsx("export const F = () => <><span>ok</span></>;"));
-        assert!(crate::tsx_ast::tsx_source_has_jsx("export const Label = () => <p>Don't stop</p>;"));
-        assert!(crate::tsx_ast::tsx_source_has_jsx("export const Note = () => <p>(note): Don't stop</p>;"));
-        assert!(crate::tsx_ast::tsx_source_has_jsx("export const Msg = ({ ok }: any) => <div>{ok ? \"can't\" : 'won\\'t'} Don't stop</div>;"));
-        assert!(crate::tsx_ast::tsx_source_has_jsx("export const Btn = () => <_Button>Don't click</_Button>;"));
-        assert!(crate::tsx_ast::tsx_source_has_jsx("export const Frag = () => <>Don't stop</>;"));
-        assert!(crate::tsx_ast::tsx_source_has_jsx("export const Nested = ({ items }: any) => <Card>Don't forget {items.map((x: any) => <span>Can't</span>)}</Card>;"));
-        assert!(crate::tsx_ast::tsx_source_has_jsx("export type Props = { x: string }\nexport const AfterType = () => <p>Don't stop</p>;"));
-        assert!(crate::tsx_ast::tsx_source_has_jsx("type Props = { label: string }\nroot.render(<App />)"));
-        assert!(crate::tsx_ast::tsx_source_has_jsx("type Props = { label: string }\n// mount app\nroot.render(<App />)"));
-        assert!(crate::tsx_ast::tsx_source_has_jsx("export type Lit = <T>(x: \"</T> \") => T\nroot.render(<App />)"));
-        assert!(crate::tsx_ast::tsx_source_has_jsx("type A = string\n(<p>Don't stop</p>)"));
-        assert!(crate::tsx_ast::tsx_source_has_jsx("type A = Record<string, string>\nrender(<p>Don't stop</p>)"));
-        assert!(crate::tsx_ast::tsx_source_has_jsx("type Tpl = `a${`b`}c`\nroot.render(<App />)"));
-        assert!(crate::tsx_ast::tsx_source_has_jsx("type Props = { label: string }\n[1, 2].map((n) => <li key={n}>{n}</li>)"));
-        assert!(crate::tsx_ast::tsx_source_has_jsx("class W { type\n  el = <App />\n}"));
-        assert!(crate::tsx_ast::tsx_source_has_jsx("class W { interface\n  el = <App />\n}"));
-        assert!(crate::tsx_ast::tsx_source_has_jsx("type Props = object /*\n*/export const View = () => <div />"));
-        assert!(crate::tsx_ast::tsx_source_has_jsx("class W { type /*\n*/ el = <App />\n}"));
-        assert!(crate::tsx_ast::tsx_source_has_jsx("type Props = object /*\r*/export const View = () => <div />"));
-        assert!(!crate::tsx_ast::tsx_source_has_jsx("type /* ok */ Lit = <T>(x: \"</T> \") => T"));
-        assert!(!crate::tsx_ast::tsx_source_has_jsx("type Multi = { a: string } /*\n*/ | <T>(x: \"</T> \") => T"));
-        assert!(!crate::tsx_ast::tsx_source_has_jsx(r#"export const html = "<div>hello</div>";"#));
-        assert!(!crate::tsx_ast::tsx_source_has_jsx("export const tpl = (x: string) => `<span>${x}</span>`;"));
-        assert!(!crate::tsx_ast::tsx_source_has_jsx("export type Mapper = <T>(value: T) => T;"));
-        assert!(!crate::tsx_ast::tsx_source_has_jsx(r#"export type Mapper = <T>(value: T) => T; const s = "</T>";"#));
-        assert!(!crate::tsx_ast::tsx_source_has_jsx(r#"export type Lit = <T>(x: "</T>") => T;"#));
-        assert!(!crate::tsx_ast::tsx_source_has_jsx(r#"export type LitSpaced = <T>(x: "</T> ") => T;"#));
-        assert!(!crate::tsx_ast::tsx_source_has_jsx("export type MultilineFn = <T>(\n  x: \"</T> \"\n) =>\n  T"));
-        assert!(!crate::tsx_ast::tsx_source_has_jsx("export type MultilineUnion =\n  | <T>(x: \"</T> \") => T\n  | <U>(y: \"</U> \") => U"));
-        assert!(!crate::tsx_ast::tsx_source_has_jsx("export type MultilineCond<T> = T\n  extends string\n  ? <U>(x: \"</U> \") => U\n  : never"));
-        assert!(!crate::tsx_ast::tsx_source_has_jsx(r#"export const fnAnn: <T>(x: "</T> ") => T = (x) => x;"#));
-        assert!(!crate::tsx_ast::tsx_source_has_jsx("export const fnTpl: <T>(x: `</T>\n`) => T = (x) => x;"));
-        assert!(!crate::tsx_ast::tsx_source_has_jsx("export interface Fn { map: <T>(value: T) => T; }"));
-        assert!(!crate::tsx_ast::tsx_source_has_jsx(r#"export interface Fn { <T>(value: "</T> "): T; }"#));
-        assert!(!crate::tsx_ast::tsx_source_has_jsx(r#"export interface Fn { <T>(value: T): T; } const s = "</T>";"#));
-        assert!(!crate::tsx_ast::tsx_source_has_jsx("export const id = <T,>(x: T): T => x;"));
-        assert!(!crate::tsx_ast::tsx_source_has_jsx("export const pick = <T extends object>(x: T): Array<T> => [x];"));
-        assert!(!crate::tsx_ast::tsx_source_has_jsx("export const rx = (x: number) => x < /abc/.source.length;"));
-        assert!(!crate::tsx_ast::tsx_source_has_jsx("// <div /> commented out\nexport const cmp = (a: number, b: number) => a < b && b > 0;"));
-
-        let td_path = std::env::temp_dir().join(format!(
-            "cwg-common-dg-test-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&td_path);
-        let mod_a = td_path.join("mod_a");
-        let mod_b = td_path.join("mod_b");
-        fs::create_dir_all(mod_a.join(".agents")).unwrap();
-        fs::create_dir_all(mod_a.join("src")).unwrap();
-        fs::create_dir_all(mod_b.join(".agents")).unwrap();
-        fs::create_dir_all(mod_b.join("src")).unwrap();
-        fs::write(
-            mod_a.join(".agents").join("carbon-gate.json"),
-            r#"{"design_gate": false}"#,
-        )
-        .unwrap();
-        fs::write(
-            mod_b.join(".agents").join("carbon-gate.json"),
-            r#"{"design_gate": true}"#,
-        )
-        .unwrap();
-        let btn_a = mod_a.join("src").join("Button.tsx");
-        let srv_b = mod_b.join("src").join("server.ts");
-        let pure_tsx = mod_b.join("src").join("calc.tsx");
-        let ui_tsx = mod_b.join("src").join("Card.tsx");
-        fs::write(&btn_a, "export const Button = () => <button>Go</button>;").unwrap();
-        fs::write(&srv_b, "export const ok = true;").unwrap();
-        fs::write(&pure_tsx, "export function calc<T>(x: T): T { return x; }").unwrap();
-        fs::write(&ui_tsx, "export const Card = () => <div>Hi</div>;").unwrap();
-        assert!(!is_visual_design_path_with_base(
-            &pure_tsx.to_string_lossy(),
-            None,
-            &mod_b.to_string_lossy()
-        ));
-        assert!(is_visual_design_path_with_base(
-            &ui_tsx.to_string_lossy(),
-            None,
-            &mod_b.to_string_lossy()
-        ));
-        let multi_marker = json!({
-            "cwd": td_path.to_string_lossy(),
-            "paths": [btn_a.to_string_lossy(), srv_b.to_string_lossy()],
-        });
-        let multi_ctx = resolve_candidate_context(&multi_marker, false);
-        assert!(
-            multi_ctx["design_paths"].as_array().unwrap().is_empty(),
-            "multi-root must preserve mod_a design_gate=false: {:?}",
-            multi_ctx["design_paths"]
-        );
-        let _ = fs::remove_dir_all(&td_path);
-
         let brief_prose_only = "Please post @coordinator [done] Quality review findings:\n- Do not skip checks.";
         assert_eq!(parse_simplify_verdict(brief_prose_only, Some("quality"))["verdict"], "");
 
@@ -9011,7 +8240,7 @@ mod tests {
         assert!(high_sum.contains(CARBON_HIGH_MODEL));
 
         let xhigh_sum = receipt_requirements_summary("XHIGH", None, true);
-        assert!(xhigh_sum.contains(NEON_XHIGH_MODEL));
+        assert!(!xhigh_sum.contains(NEON_XHIGH_MODEL));
         assert!(xhigh_sum.contains(&format!(
             "`{}` -> {}",
             CODEX_ASTRA_MODEL,
@@ -10014,24 +9243,14 @@ mod tests {
     #[test]
     fn test_finite_gate_summary_and_expanded_research_mcps() {
         let high_summary = receipt_requirements_summary("HIGH", None, false);
-        let simplify_pos = high_summary.find("simplify once").expect("simplify in HIGH summary");
-        let review_pos = high_summary
-            .find("primary independent APPROVED review")
-            .expect("review in HIGH summary");
-        assert!(
-            simplify_pos < review_pos,
-            "Finite Gate summary must place simplify before review: {}",
-            high_summary
-        );
+        assert!(high_summary.contains("primary independent APPROVED review"));
         assert!(high_summary.contains("APPROVED closes gate"));
-        assert!(high_summary.contains("mandatory research -> fix + re-test -> <=2 `--closure` passes"));
+        assert!(high_summary.contains("focused research -> fix + re-test -> <=2 `--closure` passes"));
+        assert!(!high_summary.contains("simplify once"));
 
         let xhigh_summary = receipt_requirements_summary("XHIGH", None, false);
-        let x_simp = xhigh_summary.find("simplify once").expect("simplify in XHIGH summary");
-        let x_rev = xhigh_summary
-            .find("primary XHIGH APPROVED review")
-            .expect("review in XHIGH summary");
-        assert!(x_simp < x_rev);
+        assert!(xhigh_summary.contains("primary XHIGH APPROVED review"));
+        assert!(!xhigh_summary.contains("simplify once"));
 
         for srv in [
             "exa",

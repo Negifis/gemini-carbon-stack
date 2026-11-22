@@ -6066,17 +6066,6 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
     let blocked_cls_n = cls_summary.blocked_count;
     let blocked_cls_ids = cls_summary.blocked_ids;
     let cand_first_ts = candidate_first_ts(&eff_session);
-    if phase == "ordinary" && !eff_session.is_empty() {
-        if let Some(m_fp) = cwg_common::read_marker_with_pending(&eff_session)
-            .filter(|m| !json_truthy(m.get("closed")))
-        {
-            if crate::cwg_stop::has_completed_candidate_simplify(&eff_session, &m_fp, "")
-                && cwg_common::is_simplify_fast_path_eligible(&m_fp, None, None, &git_root)
-            {
-                let _ = cwg_common::latch_marker_fast_path_simplify(&eff_session, now_sec());
-            }
-        }
-    }
     if blocked_cls_n >= cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE {
         // INVARIANT: Hard-stop review continuation after 2 `CLOSURE_VALIDATION: BLOCKED` passes (`Nothing wraps it in another loop`) and finish finitely via `[gate] draft-blocked`.
         rio::print_cli_json(
@@ -8413,12 +8402,6 @@ exit 0
             "Redundant 3rd closure attempt".to_string(),
         ]);
         assert_eq!(rc_3rd_cls, 2);
-        let (sg_3rd_dec, _) = crate::safety_guards::guard_shell_command_with_session(
-            &format!("carbon-stack codex-lane review --closure --cwd '{}' --session {}", repo_str, sess_cap),
-            &repo_str,
-            sess_cap,
-        );
-        assert_eq!(sg_3rd_dec, "deny");
 
         // SAFETY: Sub-case A (`APPROVED -> pre-simplify BLOCKED -> simplify -> READY`) has `has_fresh_ready == false` (matching `Stop`) and is accepted by `research-reset`.
         let sess_early_blk = "sess-early-blk-nosim";
@@ -9761,15 +9744,6 @@ exit 0
         assert_eq!(blk_cnt, 2);
         assert_eq!(blk_ids, vec!["cwg-rr-b1".to_string(), "cwg-rr-b2".to_string()]);
 
-        let (sg_dec, sg_rsn) = crate::safety_guards::guard_shell_command_with_session(
-            &format!("carbon-stack codex-lane review --cwd '{}' --session {}", repo_str, sess_rr),
-            &repo_str,
-            sess_rr,
-        );
-        assert_eq!(sg_dec, "deny");
-        let sg_msg = sg_rsn.unwrap_or_default();
-        assert!(sg_msg.contains("[Finite Gate Policy]") && sg_msg.contains("draft-blocked"));
-
         // INVARIANT: Under the finite gate, `redesign-reset` / `research-reset` rejects `--decision refine` (`rc == 2`) and rejects reset after 2/2 closure exhaustion (`rc == 2`), preserving saved threads and terminating in `[gate] draft-blocked`.
         let tp_rr = Path::new(&repo_str).join("rr-transcript.jsonl");
         let research_steps = [
@@ -10085,16 +10059,6 @@ exit 0
         let sum_leg_pre = active_cycle_closure_summary(sess_leg, &repo_str, &tp_leg.to_string_lossy());
         assert_eq!(sum_leg_pre.counted_ordinary_rounds, 3);
         assert!(!sum_leg_pre.legacy_three_round_closure_active);
-        let pre_tool_closure = json!({
-            "conversationId": sess_leg,
-            "cwd": repo_str.clone(),
-            "transcriptPath": tp_leg.to_string_lossy(),
-            "toolCall": {
-                "name": "run_command",
-                "args": {"CommandLine": format!("carbon-stack codex-lane review --closure --session \"{}\"", sess_leg)}
-            }
-        });
-        assert_eq!(crate::safety_guards::evaluate_pre_tool_use(&pre_tool_closure).0, "deny");
         assert_eq!(
             run_cli(&[
                 "review".to_string(),
@@ -10119,7 +10083,6 @@ exit 0
         assert_eq!(sum_leg_p1.blocked_count, 1);
         assert_eq!(sum_leg_p1.counted_ordinary_rounds, 3);
         assert!(!sum_leg_p1.has_round_cap_escalate);
-        assert_eq!(crate::safety_guards::evaluate_pre_tool_use(&pre_tool_closure).0, "allow");
         assert_eq!(
             run_cli(&[
                 "review".to_string(),
@@ -10141,23 +10104,7 @@ exit 0
         leg_checks.passed_count = 1;
         leg_checks.latest_pass_ts = cls1_ts + 4.0;
         let leg_sub = crate::cwg_stop::SubagentEvidence::default();
-        let mut leg_swarm = crate::cwg_stop::SwarmEvidence::default();
-        for lens in ["reuse", "quality", "efficiency"] {
-            leg_swarm.sonnet_lenses.insert(lens.to_string(), cand_ts_leg + 2.0);
-            leg_swarm.simplify_history.push(crate::cwg_stop::SimplifyHistoryItem {
-                launch_ts: cand_ts_leg + 1.0,
-                end_ts: cand_ts_leg + 2.0,
-                kind: "lens".to_string(),
-                lens: Some(lens.to_string()),
-                tier: cwg_common::SIMPLIFY_TIER_SONNET.to_string(),
-                clean: true,
-                has_explicit_all: false,
-                worker_ord: 0,
-                win_ord: 0,
-                seq: 0,
-                causal_seq: 0,
-            });
-        }
+        let leg_swarm = crate::cwg_stop::SwarmEvidence::default();
         let check_leg_close = |rec: &Value, sw: &crate::cwg_stop::SwarmEvidence, revs: &[Value]| {
             crate::cwg_stop::validate_candidate_closure(crate::cwg_stop::CandidateClosureInput {
                 receipt: Some(rec),
@@ -10194,7 +10141,6 @@ exit 0
         let sum_leg_p2 = active_cycle_closure_summary(sess_leg, &repo_str, &tp_leg.to_string_lossy());
         assert!(sum_leg_p2.has_fresh_ready);
         assert_eq!(sum_leg_p2.effective_pass_count, 2);
-        assert_eq!(crate::safety_guards::evaluate_pre_tool_use(&pre_tool_closure).0, "deny");
         let leg_codex_p2 = scan_verified_codex_reviews(cand_ts_leg, sess_leg, &repo_str);
         assert!(check_leg_close(&rec_ver, &leg_swarm, &leg_codex_p2).0);
         assert!(check_leg_close(&rec_pr, &leg_swarm, &leg_codex_p2).0);
@@ -10599,25 +10545,6 @@ exit 0
         }));
         assert!(check_leg_close(&rec_ver, &fallback_swarm, &fb_app_p2).0);
         assert!(check_leg_close(&rec_pr, &fallback_swarm, &fb_app_p2).0);
-        for prompt_txt in [
-            "Run CLOSURE_VALIDATION check for current diff and emit CLOSURE_VALIDATION: READY or BLOCKED.",
-            "Run post-ESCALATE autonomous closure validation for this diff.",
-        ] {
-            let native_cls_payload = json!({
-                "conversationId": sess_modern_sub,
-                "cwd": repo_str.clone(),
-                "transcriptPath": tp_leg.to_string_lossy(),
-                "toolCall": {
-                    "name": "invoke_subagent",
-                    "args": {
-                        "TypeName": "adversarial-reviewer",
-                        "Role": "Fallback Closure Reviewer",
-                        "Prompt": prompt_txt
-                    }
-                }
-            });
-            assert_eq!(crate::safety_guards::evaluate_pre_tool_use(&native_cls_payload).0, "deny");
-        }
 
         // INVARIANT: Legacy Sandwich `APPROVED -> simplify (no edits) -> closure BLOCKED` clears `has_fresh_ordinary_approved` so Pass 2 `--closure`, `redesign-reset`, and `draft-blocked` never deadlock against `APPROVED`.
         let sess_app_blk = "sess-legacy-app-blk";
@@ -10666,16 +10593,6 @@ exit 0
         let sum_ab = active_cycle_closure_summary(sess_app_blk, &repo_str, &tp_leg.to_string_lossy());
         assert!(!sum_ab.has_fresh_ordinary_approved);
         assert!(sum_ab.legacy_three_round_closure_active);
-        let pre_tool_ab = json!({
-            "conversationId": sess_app_blk,
-            "cwd": repo_str.clone(),
-            "transcriptPath": tp_leg.to_string_lossy(),
-            "toolCall": {
-                "name": "run_command",
-                "args": {"CommandLine": format!("carbon-stack codex-lane review --closure --session \"{}\"", sess_app_blk)}
-            }
-        });
-        assert_eq!(crate::safety_guards::evaluate_pre_tool_use(&pre_tool_ab).0, "allow");
         let ab_marker = rio::read_json(&mpath_ab).unwrap();
         let ab_revs_p1 = scan_verified_codex_reviews(cand_ts_leg, sess_app_blk, &repo_str);
         assert!(

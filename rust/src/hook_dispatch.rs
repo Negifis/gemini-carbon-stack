@@ -1,7 +1,8 @@
 use serde_json::json;
 
 use crate::{
-    chip_hooks, continuity_hook, cwg_mark, cwg_pre_invocation, cwg_stop, rio, safety_guards,
+    chip_hooks, comment_density_guard, continuity_hook, cwg_mark, cwg_pre_invocation, cwg_stop,
+    rio, safety_guards, worktree_guard,
 };
 
 pub fn run_unified_hook(args: &[String]) -> i32 {
@@ -82,6 +83,11 @@ pub fn run_unified_hook(args: &[String]) -> i32 {
             } else {
                 payload.clone()
             };
+            let (cdg_dec, cdg_reason) = comment_density_guard::evaluate_pre_tool_use(&effective_payload);
+            if cdg_dec != "allow" {
+                rio::emit_pre_tool(&cdg_dec, cdg_reason.as_deref(), None);
+                return 0;
+            }
             let (lg_dec, lg_reason) = continuity_hook::evaluate_pre_tool_use(&effective_payload);
             if lg_dec != "allow" {
                 rio::emit_pre_tool(&lg_dec, lg_reason.as_deref(), None);
@@ -92,6 +98,10 @@ pub fn run_unified_hook(args: &[String]) -> i32 {
         }
         "PostToolUse" => {
             return cwg_mark::evaluate_post_tool_use(&payload);
+        }
+        "WorktreeRemove" => {
+            worktree_guard::evaluate_worktree_remove(&payload);
+            rio::emit_json(&json!({}));
         }
         "Stop" => {
             if let Some(cont_reason) = continuity_hook::decide_stop(&payload) {

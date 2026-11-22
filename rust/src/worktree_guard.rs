@@ -3,9 +3,13 @@ use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::rio;
 use crate::win32_sqlite;
+
+const SNAPSHOT_PROBE_TIMEOUT: f64 = 60.0;
+static SNAPSHOT_SEQ: AtomicU64 = AtomicU64::new(1);
 
 fn eprintln_line(msg: &str) {
     let mut err = std::io::stderr().lock();
@@ -89,6 +93,74 @@ pub fn unlink_directory_links(root_dir: &str) -> (Vec<String>, Vec<String>) {
     (unlinked, errors)
 }
 
+fn git_out(p: &str, a: &[&str]) -> Result<String, String> {
+    let (rc, o, e) = rio::run_git(p, a, SNAPSHOT_PROBE_TIMEOUT);
+    if rc == 0 { Ok(o) } else { Err(if e.trim().is_empty() { format!("exit_{}", rc) } else { e.trim().into() }) }
+}
+fn pending_files(p: &str) -> Result<Vec<String>, String> { Ok(git_out(p, &["status", "--porcelain"])?.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect()) }
+pub fn snapshot_for_removal(p: &str, name: Option<&str>, br: Option<&str>) -> Option<Value> {
+    if p.trim().is_empty() || !Path::new(p).is_dir() || git_out(p, &["rev-parse", "--git-dir"]).is_err() { return None; }
+    let err = |m: String| Some(json!({"error": m}));
+    let Ok(pend) = pending_files(p) else { return err("git status did not answer, so a clean tree cannot be told from a busy one".into()); };
+    let ne = |r: Result<String, String>| r.ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let cur = ne(git_out(p, &["rev-parse", "--abbrev-ref", "HEAD"])).filter(|s| s != "HEAD").or_else(|| br.map(str::trim).filter(|b| !b.is_empty()).map(str::to_string));
+    let pcnt = |s: &str| { let t = s.trim(); (!t.is_empty() && t.bytes().all(|b| b.is_ascii_digit())).then(|| t.parse::<usize>().ok()).flatten() };
+    let ahead_res = git_out(p, &["rev-list", "--count", "@{upstream}..HEAD"]).and_then(|u| pcnt(&u).ok_or(u)).or_else(|_| {
+        git_out(p, &["for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes"]).and_then(|refs| {
+            let own = cur.as_deref().map(str::trim).filter(|b| !b.is_empty()).map(|b| format!("refs/heads/{}", b));
+            let mut a = vec!["rev-list", "--count", "HEAD", "--not"];
+            a.extend(refs.lines().map(str::trim).filter(|r| !r.is_empty() && own.as_deref() != Some(*r)));
+            git_out(p, &a).and_then(|o| pcnt(&o).ok_or(o))
+        })
+    });
+    let ahead = match ahead_res { Ok(n) => n, Err(_) if pend.is_empty() => return err("git could not say whether this branch holds commits nothing else reaches".into()), Err(_) => 0 };
+    if pend.is_empty() && ahead == 0 { return None; }
+    let stamp = win32_sqlite::format_iso_utc(win32_sqlite::now_sec()).get(..10).map_or_else(|| "19700101".into(), |s| s.replace('-', ""));
+    let bn = name.map(str::trim).filter(|s| !s.is_empty()).or_else(|| Path::new(p.trim_end_matches(['/', '\\'])).file_name().and_then(|s| s.to_str())).unwrap_or("worktree");
+    let lr: String = bn.chars().map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '-' }).collect();
+    let lbl = truncate_chars(&lr, 60);
+    let base = format!("wip/{}-{}", lbl, stamp);
+    let Some(target) = (0..50).filter(|&i| i != 1).map(|i| if i == 0 { base.clone() } else { format!("{}-{}", base, i) }).find(|c| rio::run_git(p, &["rev-parse", "--verify", "--quiet", c], 5.0).0 != 0) else { return err(format!("no free wip/ branch name for {}", lbl)); };
+    let head = ne(git_out(p, &["rev-parse", "HEAD"]));
+    if head.is_none() && pend.is_empty() { return None; }
+    let (mode, files, commit) = if pend.is_empty() { ("ref", 0, head.unwrap_or_default()) } else {
+        // SAFETY: Stage into an isolated scratch index so worktree HEAD, real index staged/unstaged split, and merge state stay untouched.
+        let idx = env::temp_dir().join(format!("cwg-snapshot-{}-{}.index", std::process::id(), SNAPSHOT_SEQ.fetch_add(1, Ordering::Relaxed)));
+        let idx_s = idx.to_string_lossy().into_owned();
+        let ge = [("GIT_INDEX_FILE", idx_s.as_str())];
+        let ge_run = |a: &[&str], to| rio::run_git_env(p, a, to, &ge);
+        let tr: Result<String, &'static str> = (|| {
+            if let Some(ref h) = head { if ge_run(&["read-tree", h], 30.0).0 != 0 { return Err("git read-tree failed, so the snapshot would drop tracked-but-ignored files"); } }
+            if ge_run(&["add", "-A"], 60.0).0 != 0 { return Err("git add failed (locked index, or a path git refuses)"); }
+            let (rc, o, _) = ge_run(&["write-tree"], 30.0);
+            let t = o.trim().to_string();
+            if rc != 0 || t.is_empty() { Err("git write-tree failed") } else { Ok(t) }
+        })();
+        let _ = fs::remove_file(&idx);
+        let tree = match tr { Ok(t) => t, Err(m) => return err(m.into()) };
+        let msg = format!("snapshot: unfinished work from worktree {}", lbl);
+        let mut ca = vec!["commit-tree", tree.as_str()];
+        if let Some(ref h) = head { ca.extend(["-p", h.as_str()]); }
+        ca.extend(["-m", msg.as_str()]);
+        let Some(c) = ne(git_out(p, &ca)) else { return err("git commit-tree failed".into()); };
+        ("commit", pend.len(), c)
+    };
+    if rio::run_git(p, &["branch", &target, &commit], 10.0).0 != 0 { return err(format!("could not create branch {}", target)); }
+    Some(json!({"branch": target, "mode": mode, "files": files, "ahead": ahead, "head": commit}))
+}
+pub fn evaluate_worktree_remove(payload: &Value) {
+    let p = payload.get("worktree_path").or_else(|| payload.get("worktreePath")).or_else(|| payload.get("path")).and_then(|v| v.as_str()).unwrap_or("").trim();
+    if p.is_empty() { return; }
+    let (sid, name, br) = (rio::session_key(payload), payload.get("name").and_then(|v| v.as_str()), payload.get("branch").and_then(|v| v.as_str()));
+    let Some(res) = snapshot_for_removal(p, name, br) else { return; };
+    if let Some(err) = res.get("error").and_then(|v| v.as_str()) {
+        rio::log_hook_event("worktree-snapshots", "snapshot_failed", json!({"session_id": sid, "worktree": p, "removed_branch": br, "failed": err}));
+        eprintln_line(&format!("Could NOT save unfinished work from {}: {}. The worktree is being removed anyway.", p, err));
+    } else {
+        rio::log_hook_event("worktree-snapshots", "snapshot_saved", json!({"session_id": sid, "worktree": p, "removed_branch": br, "saved_to": res["branch"], "mode": res["mode"], "files": res["files"], "ahead": res["ahead"], "head": res["head"]}));
+    }
+}
+
 pub fn snapshot_dirty_worktree(worktree_dir: &str, label: &str) -> Value {
     let wt = abs_clean_path(worktree_dir);
     let wt_str = wt.to_string_lossy().into_owned();
@@ -161,8 +233,17 @@ pub fn safe_remove_worktree(worktree_dir: &str, repo_dir: &str, snapshot_dirty: 
         return json!({"ok": true, "already_absent": true, "worktree": wt_norm});
     }
 
-    let (rc_st, status_out, _) = rio::run_git(&wt, &["status", "--porcelain=v1"], 5.0);
-    let is_dirty = rc_st == 0 && !status_out.trim().is_empty();
+    let pending = match pending_files(&wt) {
+        Ok(v) => v,
+        Err(err_s) => {
+            return json!({
+                "ok": false,
+                "error": format!("git_status_failed:{}", truncate_chars(&err_s, 160)),
+                "worktree": wt_norm,
+            });
+        }
+    };
+    let is_dirty = !pending.is_empty();
 
     let mut snap_info: Option<Value> = None;
     if is_dirty {
@@ -339,6 +420,7 @@ pub fn audit_worktrees(cwd: &str) -> Value {
             "for-each-ref",
             "--format=%(refname:short) %(objectname:short)",
             "refs/wip/",
+            "refs/heads/wip/",
         ],
         4.0,
     );
@@ -376,12 +458,30 @@ fn take_flag_value(args: &[String], idx: &mut usize, flag_name: &str) -> Result<
 
 pub fn run_cli(args: &[String]) -> i32 {
     if args.is_empty() {
-        eprintln_line("usage: worktree_guard <audit|snapshot|remove|unlink-links> [options]");
+        eprintln_line(
+            "usage: worktree_guard <audit|snapshot|remove|unlink-links|hook-remove> [options]",
+        );
         return 2;
     }
     match args[0].as_str() {
         "-h" | "--help" => {
-            eprintln_line("usage: worktree_guard <audit|snapshot|remove|unlink-links> [options]");
+            eprintln_line(
+                "usage: worktree_guard <audit|snapshot|remove|unlink-links|hook-remove> [options]",
+            );
+            0
+        }
+        "hook-remove" => {
+            match rio::read_hook_stdin() {
+                Ok(payload) => evaluate_worktree_remove(&payload),
+                Err(err) => {
+                    rio::log_hook_event(
+                        "hook-errors",
+                        "stdin_error",
+                        json!({"hook": "worktree_guard_hook_remove", "error": err}),
+                    );
+                }
+            }
+            rio::emit_json(&json!({}));
             0
         }
         "audit" => {
@@ -542,7 +642,7 @@ pub fn run_cli(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::win32_sqlite::TEST_ENV_LOCK;
 
     static TEST_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -636,6 +736,106 @@ mod tests {
             assert!(!audit["wip_snapshots"].as_array().unwrap().is_empty());
         }
 
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_evaluate_worktree_remove_snapshots_dirty_and_clean_ref_and_fails_closed() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = make_temp_dir("wguard-hook");
+        let stack_home = base.join("stack");
+        fs::create_dir_all(&stack_home).unwrap();
+        let prev_home = env::var_os("CARBON_STACK_HOME");
+        unsafe { env::set_var("CARBON_STACK_HOME", &stack_home) };
+
+        let repo = base.join("repo");
+        let wt_dirty = base.join("wt-dirty");
+        let wt_clean = base.join("wt-clean-ahead");
+        fs::create_dir_all(&repo).unwrap();
+        let repo_s = repo.to_string_lossy().into_owned();
+        if rio::run_git(&repo_s, &["init"], 5.0).0 == 0 {
+            let _ = rio::run_git(&repo_s, &["config", "user.email", "t@example.com"], 5.0);
+            let _ = rio::run_git(&repo_s, &["config", "user.name", "Test"], 5.0);
+            fs::write(repo.join("base.txt"), "base\n").unwrap();
+            let _ = rio::run_git(&repo_s, &["add", "base.txt"], 5.0);
+            let _ = rio::run_git(&repo_s, &["commit", "-m", "init"], 5.0);
+
+            // 1. Dirty worktree -> mode: "commit" on wip/<label>-<YYYYMMDD>, log written, index untouched.
+            let wt_dirty_s = wt_dirty.to_string_lossy().into_owned();
+            assert_eq!(
+                rio::run_git(
+                    &repo_s,
+                    &["worktree", "add", "-b", "feat/dirty", &wt_dirty_s],
+                    5.0
+                )
+                .0,
+                0
+            );
+            fs::write(wt_dirty.join("untracked.txt"), "rescue me\n").unwrap();
+            evaluate_worktree_remove(&json!({
+                "session_id": "sess-wg-1",
+                "worktree_path": wt_dirty_s,
+                "name": "feat-dirty",
+                "branch": "feat/dirty",
+            }));
+            let (rc_b1, branches1, _) =
+                rio::run_git(&repo_s, &["branch", "--list", "wip/feat-dirty-*"], 5.0);
+            assert_eq!(rc_b1, 0);
+            assert!(!branches1.trim().is_empty());
+            // Real worktree index must remain untouched (untracked.txt not staged into real index).
+            let (_, diff_cached, _) = rio::run_git(&wt_dirty_s, &["diff", "--cached", "--name-only"], 5.0);
+            assert!(diff_cached.trim().is_empty());
+
+            // 2. Clean worktree with unreachable local commit -> mode: "ref"
+            let wt_clean_s = wt_clean.to_string_lossy().into_owned();
+            assert_eq!(
+                rio::run_git(
+                    &repo_s,
+                    &["worktree", "add", "-b", "feat/ahead", &wt_clean_s],
+                    5.0
+                )
+                .0,
+                0
+            );
+            let _ = rio::run_git(&wt_clean_s, &["config", "user.email", "t@example.com"], 5.0);
+            let _ = rio::run_git(&wt_clean_s, &["config", "user.name", "Test"], 5.0);
+            fs::write(wt_clean.join("committed.txt"), "ahead\n").unwrap();
+            let _ = rio::run_git(&wt_clean_s, &["add", "committed.txt"], 5.0);
+            let _ = rio::run_git(&wt_clean_s, &["commit", "-m", "ahead commit"], 5.0);
+            evaluate_worktree_remove(&json!({
+                "session_id": "sess-wg-2",
+                "worktree_path": wt_clean_s,
+                "name": "feat-ahead",
+                "branch": "feat/ahead",
+            }));
+            let (_, branches2, _) =
+                rio::run_git(&repo_s, &["branch", "--list", "wip/feat-ahead-*"], 5.0);
+            assert!(!branches2.trim().is_empty());
+
+            let snap_log = fs::read_to_string(
+                stack_home
+                    .join("state")
+                    .join("logs")
+                    .join("worktree-snapshots.jsonl"),
+            )
+            .unwrap_or_default();
+            assert!(snap_log.contains("\"mode\":\"commit\""));
+            assert!(snap_log.contains("\"mode\":\"ref\""));
+        }
+
+        // 3. Non-repo path in safe_remove_worktree fails closed with git_status_failed instead of clean.
+        let not_repo = base.join("not-a-repo");
+        fs::create_dir_all(&not_repo).unwrap();
+        let failed = safe_remove_worktree(&not_repo.to_string_lossy(), "", false);
+        assert_eq!(failed["ok"], json!(false));
+        assert!(failed["error"].as_str().unwrap().starts_with("git_status_failed:"));
+
+        unsafe {
+            match prev_home {
+                Some(v) => env::set_var("CARBON_STACK_HOME", v),
+                None => env::remove_var("CARBON_STACK_HOME"),
+            }
+        }
         let _ = fs::remove_dir_all(&base);
     }
 }

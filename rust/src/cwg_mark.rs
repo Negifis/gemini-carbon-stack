@@ -88,35 +88,6 @@ const PS_NON_PATH_VALUE_FLAGS: &[&str] = &[
 const PS_PATH_FLAGS: &[&str] = &["-path", "-p", "-literalpath", "-lp", "-filepath"];
 const PS_DEST_FLAGS: &[&str] = &["-destination", "-dest", "-destinationpath"];
 
-const SCRIPT_EXTS: &[&str] = &[".ps1", ".bat", ".cmd", ".vbs", ".wsf", ".exe", ".com", ".msi"];
-
-const INTERPRETER_BASENAMES: &[&str] = &[
-    "python",
-    "python.exe",
-    "python3",
-    "python3.exe",
-    "py",
-    "py.exe",
-    "node",
-    "node.exe",
-    "deno",
-    "deno.exe",
-    "bun",
-    "bun.exe",
-    "pwsh",
-    "pwsh.exe",
-    "powershell",
-    "powershell.exe",
-    "cmd",
-    "cmd.exe",
-    "bash",
-    "bash.exe",
-    "sh",
-    "sh.exe",
-    "wsl",
-    "wsl.exe",
-];
-
 fn exe_pat_followed_by_space(names_pat: &str, ext_pat: &str, allow_dq_vars: bool) -> String {
     // INVARIANT: Allow quoted/path-qualified Windows executables while keeping `dq_char` branches disjoint (O(N)) and blocking `$`/backticks on allowlists.
     let dq_char = if allow_dq_vars {
@@ -197,7 +168,7 @@ fn bookkeeping_cmd_re() -> &'static Regex {
         let chat_bus_bin = exe_pat_followed_by_space("chat-bus", r"(?:\.exe)?", false);
         let bk_tail = format!(r#"(?:\s+(?:[^|;&\r\n"']|{}|{})*)?"#, PS_DQ_PAT, PS_SQ_PAT);
         let pat = format!(
-            r"(?i)\A\s*(?:\$null\s*\|\s*)?(?:&\s*)?(?:{py}\s+(?:-(?:X\s+utf8|[uBEsSO])\s+)*(?:{bk}|(?:{cont}\s+{cont_sub}|{cl}\s+{cl_sub}|{cb_py}\s+{cb_sub}))|{cs}\s+(?:(?:carbon[-_]memory|gate[-_]inbox|chip[-_]handoff|swarm[-_]cache|swarm[-_]ctl|design[-_]gate)\b|continuity\s+{cont_sub}|codex[-_]lane\s+{cl_sub})|{cb}\s+{cb_sub}){tail}\z",
+            r"(?i)\A\s*(?:\$null\s*\|\s*)?(?:&\s*)?(?:{py}\s+(?:-(?:X\s+utf8|[uBEsSO])\s+)*(?:{bk}|(?:{cont}\s+{cont_sub}|{cl}\s+{cl_sub}|{cb_py}\s+{cb_sub}))|{cs}\s+(?:(?:carbon[-_]memory|gate[-_]inbox|chip[-_]handoff|swarm[-_]cache|swarm[-_]ctl)\b|continuity\s+{cont_sub}|codex[-_]lane\s+{cl_sub})|{cb}\s+{cb_sub}){tail}\z",
             py = py,
             bk = bk_scripts,
             cont = continuity,
@@ -1043,17 +1014,6 @@ fn has_inline_py(core: &str) -> bool {
     false
 }
 
-fn starts_with_inline_py(clause: &str) -> bool {
-    let Some(m) = inline_py_search_re().find(clause) else {
-        return false;
-    };
-    if m.start() != 0 {
-        return false;
-    }
-    let rest = skip_py_any_flags(&clause[m.end()..]);
-    inline_py_c_re().is_match(rest)
-}
-
 fn inline_py_write_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -1178,21 +1138,6 @@ fn amp_digit_re() -> &'static Regex {
 fn win_drive_prefix_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"\A[A-Za-z]:[\\/]").expect("win_drive_prefix_re"))
-}
-
-fn ps_control_kw_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"(?i)\A\s*(?:(?:if|elseif|else|try|catch|finally|do|while|switch|ForEach-Object|foreach|for)\b\s*|%(?:\z|\s+))",
-        )
-        .expect("ps_control_kw_re")
-    })
-}
-
-fn dot_slash_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\A\.[\\/]").expect("dot_slash_re"))
 }
 
 fn out_null_re() -> &'static Regex {
@@ -2150,7 +2095,53 @@ fn git_entry_unchanged_on_disk(path: &str, b_tok: &str, a_tok: Option<&str>) -> 
     file_entry_token(p, "", Some(&st)) == b_ctok
 }
 
+fn clean_integration_rel_paths(root: &str, bh: &str, ah: &str, cmd: &str, no_dirty: bool) -> Option<HashSet<String>> {
+    if let (0, po, _) = rio::run_git(root, &["rev-list", "--parents", "-n", "1", ah], 3.0) {
+        let oids: Vec<&str> = po.split_whitespace().collect();
+        if oids.len() >= 3 && oids[1] == bh {
+            let (rc_m, mo) = run_git_bytes(root, &["merge-tree", "--write-tree", "--no-messages", bh, oids[2]], 5.0);
+            let ms = String::from_utf8_lossy(&mo);
+            let mt = ms.lines().next().unwrap_or("").trim();
+            if matches!(rc_m, 0 | 1) && mt.len() >= 40 && mt.bytes().all(|b| b.is_ascii_hexdigit()) {
+                if rc_m == 0 && rio::run_git(root, &["rev-parse", &format!("{}^{{tree}}", ah)], 3.0).1.trim() == mt { return Some(HashSet::new()); }
+                let (rc_d, db) = run_git_bytes(root, &["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--no-renames", mt, ah], 4.0);
+                if rc_d == 0 { return Some(db.split(|&b| b == 0).filter(|b| !b.is_empty()).map(|b| String::from_utf8_lossy(b).into_owned()).collect()); }
+            }
+            return None;
+        }
+    }
+    if !no_dirty || cmd.trim().is_empty() { return None; }
+    let mut saw = false;
+    for (_, seg) in split_shell_segments(cmd, false) {
+        let s = seg.trim();
+        if s.is_empty() || s.eq_ignore_ascii_case("$null") || nav_segment_re().is_match(s) || is_benign_ps_env_assign(s) { continue; }
+        let toks = ps_tokens(s);
+        let mut i = usize::from(toks.first().is_some_and(|t| t.eq_ignore_ascii_case("$null")));
+        if toks.get(i).is_some_and(|t| t == "&") { i += 1; }
+        if !matches!(toks.get(i).and_then(|x| x.rsplit(['/', '\\']).next()).unwrap_or("").to_ascii_lowercase().as_str(), "git" | "git.exe") { return None; }
+        i += 1;
+        let sub = loop {
+            let t = toks.get(i)?.as_str();
+            if matches!(t, "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--super-prefix" | "--exec-path") { i += 2; continue; }
+            if t.starts_with('-') { i += 1; continue; }
+            break t.to_ascii_lowercase();
+        };
+        if sub == "commit" || toks[i + 1..].iter().any(|x| x.eq_ignore_ascii_case("--amend")) { return None; }
+        if matches!(sub.as_str(), "pull" | "merge" | "checkout" | "switch" | "rebase") { saw = true; }
+        else if !matches!(sub.as_str(), "status" | "fetch" | "rev-parse" | "branch" | "log" | "show" | "diff") { return None; }
+    }
+    saw.then(HashSet::new)
+}
+
 pub fn diff_git_snapshots(before: Option<&Value>, after: Option<&Value>) -> (Vec<String>, bool) {
+    diff_git_snapshots_for_cmd(before, after, "")
+}
+
+pub fn diff_git_snapshots_for_cmd(
+    before: Option<&Value>,
+    after: Option<&Value>,
+    core_cmd: &str,
+) -> (Vec<String>, bool) {
     let (Some(Value::Object(b_obj)), Some(Value::Object(a_obj))) = (before, after) else {
         return (Vec::new(), true);
     };
@@ -2205,7 +2196,7 @@ pub fn diff_git_snapshots(before: Option<&Value>, after: Option<&Value>) -> (Vec
         return (out, false);
     }
 
-    // INVARIANT: Pure `git add` / `git commit` of already-dirty working-tree files keeps on-disk SHA-256 identical and must be treated as OPERATIONAL rather than reopening a PERSISTENT code-edit candidate.
+    // INVARIANT: Pure `git add` / `git commit` of already-dirty working-tree files keeps on-disk SHA-256 identical rather than reopening a PERSISTENT candidate.
     let mut unchanged_clean: HashSet<String> = HashSet::new();
     for (path, tok_v) in a_entries {
         let tok = tok_v.as_str().unwrap_or("");
@@ -2225,7 +2216,7 @@ pub fn diff_git_snapshots(before: Option<&Value>, after: Option<&Value>) -> (Vec
         }
     }
 
-    // INVARIANT: Files modified & committed during a shell command leave status clean, so diff HEAD transitions explicitly.
+    // INVARIANT: Diff HEAD transitions explicitly, filtering out upstream files brought in cleanly via `git merge-tree` or pure integration/switch commands.
     let b_head = b_obj.get("head").and_then(|v| v.as_str()).unwrap_or("");
     let a_head = a_obj.get("head").and_then(|v| v.as_str()).unwrap_or("");
     let root = a_obj.get("root").and_then(|v| v.as_str()).unwrap_or("");
@@ -2244,14 +2235,14 @@ pub fn diff_git_snapshots(before: Option<&Value>, after: Option<&Value>) -> (Vec
             out.sort();
             return (out, true);
         }
+        let merge_filter = (!b_head.is_empty()).then(|| clean_integration_rel_paths(root, b_head, a_head, core_cmd, unchanged_clean.is_empty())).flatten();
         for rel_b in out_bytes.split(|&b| b == 0) {
-            if rel_b.is_empty() {
-                continue;
-            }
+            if rel_b.is_empty() { continue; }
             let rel = String::from_utf8_lossy(rel_b).into_owned();
             if !cache_path_re().is_match(&rel.replace('\\', "/")) {
                 let norm_p = rio::normalize_path(&Path::new(root).join(&rel).to_string_lossy());
-                if !unchanged_clean.contains(&norm_p) {
+                let is_clean_merged = merge_filter.as_ref().is_some_and(|cm| !cm.contains(&rel) && !a_entries.contains_key(&norm_p));
+                if !is_clean_merged && !unchanged_clean.contains(&norm_p) {
                     changed.insert(norm_p);
                 }
             }
@@ -2330,142 +2321,37 @@ fn resolve_known_or_git_root(known_git_root: Option<&str>, eff_cwd: &str) -> Str
     }
 }
 
-fn extract_replaced_targets<'a>(args: &'a Map<String, Value>) -> Vec<&'a str> {
-    let mut targets: Vec<&'a str> = Vec::new();
-    for key in ["Target", "TargetContent", "old_string", "old_str"] {
-        if let Some(s) = args.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()) {
-            targets.push(s);
-        }
-    }
-    if let Some(chunks) = args.get("ReplacementChunks").and_then(Value::as_array) {
-        for ch in chunks {
-            if let Some(s) = ch
-                .get("TargetContent")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-            {
-                targets.push(s);
-            }
-        }
-    }
-    targets
-}
-
-fn pre_edit_touches_visual_content(
-    target_path: &str,
-    cwd: &str,
-    tool_name: &str,
-    args: &Map<String, Value>,
-) -> bool {
-    // INVARIANT: Evaluate full-file pre-edit AST BEFORE mutation (`write_file` overwrite or targeted `edit_file`/`replace_file_content`/`multi_replace_file_content` overlapping a real JSX/React/Flutter UI node) on eligible visual paths only (never `.test.tsx`, `hooks/`, `api/`, or non-existent files).
-    if !cwg_common::is_visual_ast_eligible_path(target_path, cwd) {
-        return false;
-    }
-    let p = Path::new(target_path);
-    if !p.is_file() {
-        return false;
-    }
-    let ext = p
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if !matches!(ext.as_str(), "tsx" | "jsx" | "dart") {
-        return false;
-    }
-    if tool_name == "write_file" && json_truthy(args.get("Append")) {
-        return false;
-    }
-    let targets = if tool_name == "write_file" || tool_name == "write_to_file" {
-        Vec::new()
-    } else {
-        extract_replaced_targets(args)
-    };
-    if ext == "dart" {
-        let Ok(raw) = fs::read_to_string(p) else {
-            return false;
-        };
-        let norm_src = raw.replace("\r\n", "\n");
-        let re = cwg_common::flutter_widget_re();
-        let spans: Vec<(usize, usize)> = re
-            .find_iter(&norm_src)
-            .map(|m| (m.start(), m.end()))
-            .collect();
-        if spans.is_empty() {
-            return false;
-        }
-        if targets.is_empty() {
-            return true;
-        }
-        return targets.iter().any(|t| {
-            let nt = t.replace("\r\n", "\n");
-            !nt.is_empty()
-                && norm_src.match_indices(&nt).any(|(s, m)| {
-                    let e = s + m.len();
-                    spans.iter().any(|&(ns, ne)| ns < e && s < ne)
-                })
-        });
-    }
-    crate::tsx_ast::pre_edit_file_touches_visual_ui(target_path, &targets)
-}
-
 #[derive(Copy, Clone)]
 struct CandidateMarkerUpdate<'a> {
     session: &'a str,
     cwd: &'a str,
     durable_new_paths: &'a [String],
-    latch_visual_paths: &'a [String],
-    operational_mutation: bool,
     changed_lines_delta: i64,
     shell_durable_edit: bool,
     unknown_barrier: bool,
     cause_label: &'a str,
     known_git_root: Option<&'a str>,
-    pre_marker_call_key: Option<&'a str>,
-}
-
-fn prior_closed_candidate_ts(session: &str, raw_before: Option<&Value>) -> f64 {
-    let from_marker = raw_before
-        .filter(|m| json_truthy(m.get("closed")))
-        .map(|m| rio::val_to_f64(m.get("last_ts")).max(rio::val_to_f64(m.get("first_ts"))))
-        .unwrap_or(0.0);
-    from_marker.max(cwg_common::enforcement_state_closed_ts(session))
 }
 
 fn update_candidate_marker(upd: CandidateMarkerUpdate<'_>) -> (Option<Value>, Value, bool) {
-    // SAFETY: Serialize candidate marker read-modify-write via `marker_lock_path`, and finalize any pre-marker `swarm_rounds` adoption ONLY after releasing `marker_lock_path` to avoid AB-BA lock inversion with `swarm_cache`.
-    let (before_open, marker, ok, adopted) =
-        rio::with_file_lock(&cwg_common::marker_lock_path(upd.session), 5.0, 30.0, |locked| {
-            update_candidate_marker_unlocked(upd, locked)
-        });
-    if ok {
-        if let Some((git_top, prep_ts)) = adopted {
-            let _ = cwg_common::finalize_pre_marker_simplify_adoption(
-                upd.session,
-                &git_top,
-                prep_ts,
-            );
-        }
-    }
-    (before_open, marker, ok)
+    rio::with_file_lock(&cwg_common::marker_lock_path(upd.session), 5.0, 30.0, |locked| {
+        update_candidate_marker_unlocked(upd, locked)
+    })
 }
 
 fn update_candidate_marker_unlocked(
     upd: CandidateMarkerUpdate<'_>,
     persist: bool,
-) -> (Option<Value>, Value, bool, Option<(String, f64)>) {
+) -> (Option<Value>, Value, bool) {
     let CandidateMarkerUpdate {
         session,
         cwd,
         durable_new_paths,
-        latch_visual_paths,
-        operational_mutation,
         changed_lines_delta,
         shell_durable_edit,
         unknown_barrier,
         cause_label,
         known_git_root,
-        pre_marker_call_key,
     } = upd;
     let now = now_sec();
     let mp = cwg_common::marker_path(session);
@@ -2483,7 +2369,7 @@ fn update_candidate_marker_unlocked(
         String::new()
     };
 
-    let (before_open, mut marker, adopted_prep): (Option<Value>, Value, Option<(String, f64)>) = match before {
+    let (before_open, mut marker): (Option<Value>, Value) = match before {
         Some(Value::Object(ref bmap)) if !json_truthy(bmap.get("closed")) => {
             let mut m = bmap.clone();
             let cur_cwd = m.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
@@ -2501,28 +2387,18 @@ fn update_candidate_marker_unlocked(
                     );
                 }
             }
-            (Some(Value::Object(bmap.clone())), Value::Object(m), None)
+            (Some(Value::Object(bmap.clone())), Value::Object(m))
         }
         _ => {
             let git_top = resolve_known_or_git_root(known_git_root, &eff_cwd);
-            let adopted = if !git_top.is_empty()
-                && cwg_common::has_unbound_pre_marker_simplify_rounds(session)
-            {
-                let prior_closed = prior_closed_candidate_ts(session, raw_before.as_ref());
-                cwg_common::read_pre_marker_simplify_prepare(
-                    session,
-                    &git_top,
-                    now,
-                    prior_closed,
-                    pre_marker_call_key,
-                )
+            let opening_head = if !git_top.is_empty() {
+                rio::git_head_oid(&git_top)
             } else {
-                None
+                String::new()
             };
-            let eff_first_ts = adopted.as_ref().map_or(now, |(pts, _, _)| *pts);
             let mut m = json!({
                 "session": session,
-                "first_ts": eff_first_ts,
+                "first_ts": now,
                 "last_ts": now,
                 "last_durable_ts": if durable_new_paths.is_empty() { 0.0 } else { now },
                 "cwd": rio::normalize_path(&eff_cwd),
@@ -2536,27 +2412,12 @@ fn update_candidate_marker_unlocked(
                 "gate_max_review_rounds": cwg_common::MAX_ORDINARY_REVIEW_ROUNDS,
                 "closed": false,
             });
-            let adopted_ret = if let Some((prep_ts, _, pre_hashes)) = adopted {
+            if !opening_head.is_empty() {
                 if let Value::Object(ref mut mobj) = m {
-                    // INVARIANT: Anchor a newly opened marker to an active post-close pre-marker `swarm-cache prepare` on the same repo so in-flight or just-completed simplify passes remain candidate-bound.
-                    mobj.insert("swarm_prepare_cycle_ts".to_string(), json!(prep_ts));
-                    if !pre_hashes.is_empty() {
-                        mobj.insert(
-                            "simplify_verified_latched".to_string(),
-                            json!({
-                                "candidate_first_ts": prep_ts,
-                                "reset_epoch": 0,
-                                "verified_ts": now,
-                                "verified_hashes": pre_hashes,
-                            }),
-                        );
-                    }
+                    mobj.insert("opening_head".to_string(), Value::String(opening_head));
                 }
-                Some((git_top, prep_ts))
-            } else {
-                None
-            };
-            (None, m, adopted_ret)
+            }
+            (None, m)
         }
     };
 
@@ -2627,12 +2488,6 @@ fn update_candidate_marker_unlocked(
                 }
             }
         }
-        if !latch_visual_paths.is_empty() {
-            cwg_common::latch_design_paths_in_marker(&mut marker, latch_visual_paths);
-        }
-        if changed_fp || added_new_path || !shell_durable_edit {
-            refresh_design_edit_fields(&mut marker, &durable_new_paths, now);
-        }
         cwg_common::trim_content_marks(&mut marker, marks);
         let has_round_id = marker
             .get("round_id")
@@ -2641,69 +2496,6 @@ fn update_candidate_marker_unlocked(
         if changed_fp || !has_round_id {
             let repo_root = marker_repo_root(&marker, &eff_cwd);
             refresh_swarm_round_fields(&mut marker, session, &repo_root, &fp);
-        }
-    } else if operational_mutation {
-        if let Value::Object(ref mut m) = marker {
-            m.insert("operational".to_string(), Value::Bool(true));
-        }
-        let dpaths = cwg_common::durable_paths_from_val(marker.get("paths"));
-        if !dpaths.is_empty() {
-            let mut marks = marker
-                .get("content_marks")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let fp = cwg_common::content_fingerprint(&dpaths, cwg_common::MAX_FINGERPRINT_FILE_BYTES);
-            let last_fp = marks
-                .last()
-                .and_then(|v| v.as_str().map(|_| ""))
-                .or_else(|| {
-                    marks
-                        .last()
-                        .and_then(|v| v.as_object())
-                        .and_then(|o| o.get("fp"))
-                        .and_then(|v| v.as_str())
-                })
-                .unwrap_or("");
-            let last_has_fp_str = marks
-                .last()
-                .and_then(|v| v.as_object())
-                .and_then(|o| o.get("fp"))
-                .and_then(|v| v.as_str())
-                .is_some();
-            let repo_root = marker_repo_root(&marker, &eff_cwd);
-
-            if fp.is_empty() {
-                marks.push(json!({
-                    "ts": now,
-                    "fp": null,
-                    "unknown": true,
-                    "cause": cause_trunc,
-                }));
-                cwg_common::trim_content_marks(&mut marker, marks);
-                refresh_swarm_round_fields(&mut marker, session, &repo_root, "");
-            } else if !last_has_fp_str || fp != last_fp {
-                marks.push(json!({
-                    "ts": now,
-                    "fp": fp,
-                    "cause": cause_trunc,
-                }));
-                if let Value::Object(ref mut m) = marker {
-                    m.insert("last_durable_ts".to_string(), json!(now));
-                }
-                refresh_design_edit_fields(&mut marker, &dpaths, now);
-                cwg_common::trim_content_marks(&mut marker, marks);
-                refresh_swarm_round_fields(&mut marker, session, &repo_root, &fp);
-            } else if marks
-                .last()
-                .map_or(false, |v| json_truthy(v.get("unknown")))
-            {
-                // INVARIANT: Clear legacy unknown flag when SHA-256 fingerprint is confirmed identical.
-                if let Some(Value::Object(last_obj)) = marks.last_mut() {
-                    last_obj.remove("unknown");
-                }
-                cwg_common::trim_content_marks(&mut marker, marks);
-            }
         }
     }
 
@@ -2729,7 +2521,7 @@ fn update_candidate_marker_unlocked(
             cwd: m_cwd,
             git_root: m_gr,
             durable_new_paths,
-            operational_mutation,
+            operational_mutation: false,
             changed_lines_delta,
             shell_durable_edit,
             unknown_barrier,
@@ -2739,7 +2531,7 @@ fn update_candidate_marker_unlocked(
         })
         .is_some();
     }
-    (before_open, marker, persisted_ok, adopted_prep)
+    (before_open, marker, persisted_ok)
 }
 
 fn marker_repo_root(marker: &Value, eff_cwd: &str) -> String {
@@ -2755,10 +2547,6 @@ fn marker_repo_root(marker: &Value, eff_cwd: &str) -> String {
         return cwd.to_string();
     }
     eff_cwd.to_string()
-}
-
-fn refresh_design_edit_fields(marker: &mut Value, touched_paths: &[String], now: f64) {
-    let _ = cwg_common::sync_design_edit_fields(marker, touched_paths, now);
 }
 
 fn build_transition_note(
@@ -2778,18 +2566,12 @@ fn build_transition_note(
             &owned_ctx
         }
     };
-    let needs_simplify = json_truthy(cctx.get("needs_simplify"));
     let needs_review = json_truthy(cctx.get("needs_review"));
-    let policy = cctx.get("policy");
-    let dpaths = cwg_common::durable_paths_from_val(cctx.get("dpaths"));
-    let design_paths = cctx
-        .get("design_paths")
-        .map(|v| cwg_common::durable_paths_from_val(Some(v)))
-        .unwrap_or_else(|| cwg_common::design_gate_paths(&dpaths, policy));
-    let needs_design = !design_paths.is_empty();
-    if !needs_simplify && !needs_review && !needs_design {
+    if !needs_review {
         return None;
     }
+    let policy = cctx.get("policy");
+    let dpaths = cwg_common::durable_paths_from_val(cctx.get("dpaths"));
     let new_floor = cctx
         .get("floor")
         .and_then(|v| v.as_str())
@@ -2799,37 +2581,12 @@ fn build_transition_note(
         if cwg_common::candidate_class(b) == new_class {
             let old_cctx = cwg_common::resolve_candidate_context(b, false);
             let old_floor = old_cctx.get("floor").and_then(|v| v.as_str()).unwrap_or("");
-            let old_needs_design = old_cctx
-                .get("design_paths")
-                .map(|v| !cwg_common::durable_paths_from_val(Some(v)).is_empty())
-                .unwrap_or_else(|| {
-                    cwg_common::has_design_gate_paths(
-                        &cwg_common::durable_paths_from_val(old_cctx.get("dpaths")),
-                        old_cctx.get("policy"),
-                    )
-                });
             if old_floor == new_floor
-                && json_truthy(old_cctx.get("needs_simplify")) == needs_simplify
                 && json_truthy(old_cctx.get("needs_review")) == needs_review
-                && old_needs_design == needs_design
             {
                 return None;
             }
         }
-    }
-
-    let design_note = if needs_design {
-        format!(
-            "[Design Gate] UI/дизайн ({}ф: {}): до/во время вёрстки — `modern-web-guidance` + `mobbin` (`mobbin_mobbin`) + `frontend-design`/`critique-*`; после — реальные скриншоты в браузере (desktop+mobile, light/dark) + независимое read-only визуальное ревью (`visual-qa-reviewer` или `visual-design-critic` + `ux-adversarial-auditor` с веб-поиском и `mobbin_mobbin`) до `VISUAL_REVIEW_VERDICT: APPROVED`.",
-            design_paths.len(),
-            cwg_common::format_last_basenames(&design_paths, 3),
-        )
-    } else {
-        String::new()
-    };
-
-    if !needs_simplify && !needs_review {
-        return Some(design_note);
     }
 
     let req_tests = match cctx.get("require_tests") {
@@ -2845,19 +2602,14 @@ fn build_transition_note(
     };
 
     let reqs = cwg_common::receipt_requirements_summary(new_floor, policy, req_tests);
-    let base = format!(
+    Some(format!(
         "[Code Work Gate] `{}` ({}ф: {}): {}. Финал: `[gate] verified: {}; <кандидат и проверки>`.",
         new_floor,
         dpaths.len(),
         cwg_common::format_last_basenames(&dpaths, 3),
         reqs,
         new_floor,
-    );
-    if design_note.is_empty() {
-        Some(base)
-    } else {
-        Some(format!("{}\n{}", base, design_note))
-    }
+    ))
 }
 
 fn capture_direct_codex_packet(cmd: &str, cwd: &str, session: &str) {
@@ -3262,71 +3014,6 @@ fn parse_cmdlet_args(
         }
     }
     Some((path_vals, dest_vals, positionals, extra_val, saw_value_flag))
-}
-
-fn has_opaque_script_or_exec(cmd: &str) -> bool {
-    let core = rio::unwrap_tokenade_command(cmd);
-    if core.is_empty() {
-        return false;
-    }
-    let subexprs = extract_ps_subexprs(&core);
-    for raw_clause in all_ps_clauses(&core, &subexprs) {
-        let mut s = raw_clause.trim();
-        while !s.is_empty() {
-            let Some(m_kw) = ps_control_kw_re().find(s) else {
-                break;
-            };
-            s = s[m_kw.end()..].trim();
-        }
-        if s.is_empty() {
-            continue;
-        }
-        if let Some(caps) = ps_assign_re().captures(s) {
-            s = caps.name("rhs").map_or("", |m| m.as_str()).trim();
-        }
-        if s.starts_with('&') || s.starts_with(". ") || dot_slash_re().is_match(s) {
-            return true;
-        }
-        if starts_with_inline_py(s)
-            || bookkeeping_cmd_re().is_match(s)
-            || is_validation_segment(s)
-            || read_only_cmd_re().is_match(s)
-            || nav_segment_re().is_match(s)
-            || ps_safe_filter_re().is_match(s)
-        {
-            continue;
-        }
-        let toks = ps_tokens(s);
-        if toks.is_empty() {
-            continue;
-        }
-        let head_raw = &toks[0];
-        if head_raw == "&" || head_raw == "." || (head_raw.starts_with('&') && head_raw.len() > 1)
-        {
-            return true;
-        }
-        let head_norm = head_raw.replace('\\', "/").to_lowercase();
-        let base = head_norm.rsplit('/').next().unwrap_or("");
-        if INTERPRETER_BASENAMES.iter().any(|&b| b == base)
-            || SCRIPT_EXTS.iter().any(|&ext| head_norm.ends_with(ext))
-        {
-            return true;
-        }
-    }
-    false
-}
-
-fn references_scratch_space(cmd: &str, artifact_dir: &str) -> bool {
-    let norm_cmd = cmd.replace('\\', "/").to_lowercase();
-    if !artifact_dir.is_empty() {
-        let art = rio::normalize_path(artifact_dir).to_lowercase();
-        if !art.is_empty() && norm_cmd.contains(&art) {
-            return true;
-        }
-    }
-    cwg_common::user_scratch_patterns()
-        .iter()
-        .any(|p| p.is_match(&norm_cmd))
 }
 
 pub fn extract_ps_redirections(seg: &str) -> (String, Vec<String>) {
@@ -3978,123 +3665,19 @@ fn pop_anon_snapshot(
     .unwrap_or((None, 0.0))
 }
 
-fn edit_tool_call_key(
-    payload: &Value,
-    tc: Option<&Map<String, Value>>,
-    tool_name: &str,
-    cwd: &str,
-    edit_path: Option<&str>,
-) -> String {
-    let sig = format!(
-        "{}\0{}",
-        tool_name,
-        rio::fold_path(edit_path.unwrap_or(""))
-    );
-    tool_call_snap_key(payload, tc, cwd, &sig).0
-}
-
-fn latch_live_simplify_if_ready(
-    session: &str,
-    transcript_path: &str,
-    hint_path: Option<&str>,
-    hint_cwd: &str,
-    call_key: &str,
-) {
-    if session.trim().is_empty() || session == "unknown" {
-        return;
-    }
-    let m_raw = cwg_common::read_marker_with_pending(session);
-    if let Some(m_pre) = m_raw.as_ref().filter(|m| {
-        !json_truthy(m.get("closed"))
-            && cwg_common::marker_has_prepare_cycle(Some(m))
-            && cwg_common::active_marker_verified_simplify_hashes(m).is_empty()
-    }) {
-        // INVARIANT: Forward-latch live-verified simplify hashes right before the first mutating edit so applying `ACTIONABLE_FIXES` or `REVISE` fixes never breaks a verified snapshot while pre-edit drift outside `marker.paths` remains unlatched.
-        let _ = crate::cwg_stop::latch_live_simplify_for_pre_edit(
-            session,
-            m_pre,
-            transcript_path,
-            hint_path,
-        );
-        return;
-    }
-    let no_open_marker = m_raw
-        .as_ref()
-        .map_or(true, |m| json_truthy(m.get("closed")));
-    if !no_open_marker || !cwg_common::has_unbound_pre_marker_simplify_rounds(session) {
-        return;
-    }
-    let probe_dir = hint_path
-        .filter(|p| !p.trim().is_empty())
-        .and_then(|p| Path::new(p).parent().map(|d| d.to_string_lossy().into_owned()))
-        .filter(|d| !d.is_empty())
-        .unwrap_or_else(|| hint_cwd.to_string());
-    if probe_dir.is_empty() {
-        let _ = cwg_common::clear_pre_marker_verified_simplify(session);
-        return;
-    }
-    let git_top = rio::git_toplevel(&probe_dir, false).unwrap_or_default();
-    if git_top.is_empty() {
-        let _ = cwg_common::clear_pre_marker_verified_simplify(session);
-        return;
-    }
-    let now = now_sec();
-    let prior_closed = prior_closed_candidate_ts(session, m_raw.as_ref());
-    // SAFETY: Re-probe live worktree state on every pre-marker tool invocation (never trusting cached `pre_marker_verified`), binding the fresh record strictly to `call_key` or clearing any stale record on drift/failure.
-    if let Some((prep_ts, tree_oid, _)) =
-        cwg_common::read_pre_marker_simplify_prepare(session, &git_top, now, prior_closed, None)
-    {
-        let _ = crate::cwg_stop::probe_and_record_pre_marker_simplify(
-            session,
-            &git_top,
-            prep_ts,
-            &tree_oid,
-            call_key,
-            transcript_path,
-        );
-    } else {
-        let _ = cwg_common::clear_pre_marker_verified_simplify(session);
-    }
-}
-
 pub fn record_pre_tool_use(payload: &Value) {
     let tc = payload.get("toolCall").and_then(|v| v.as_object());
     let tool_name = tc
         .and_then(|m| m.get("name"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let is_edit_tool = EDIT_TOOLS.iter().any(|&t| t == tool_name);
-    let is_shell_tool = SHELL_TOOLS.iter().any(|&t| t == tool_name);
-    if !is_edit_tool && !is_shell_tool {
+    if !SHELL_TOOLS.iter().any(|&t| t == tool_name) {
         return;
     }
     let tp = payload
         .get("transcriptPath")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if is_edit_tool {
-        if !rio::is_subagent_session(tp, None) {
-            let session = rio::session_key(payload);
-            let cwd = rio::effective_cwd(payload);
-            let args_map = tc.and_then(|m| m.get("args")).and_then(|v| v.as_object());
-            let edit_path = args_map
-                .and_then(|a| {
-                    a.get("Path")
-                        .or_else(|| a.get("path"))
-                        .or_else(|| a.get("TargetFile"))
-                })
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.trim().is_empty());
-            let edit_key = edit_tool_call_key(payload, tc, tool_name, &cwd, edit_path);
-            latch_live_simplify_if_ready(&session, tp, edit_path, &cwd, &edit_key);
-            if let (Some(ep), Some(amap)) = (edit_path, args_map) {
-                if pre_edit_touches_visual_content(ep, &cwd, tool_name, amap) {
-                    cwg_common::record_pending_visual_edit(&session, &edit_key, ep);
-                }
-            }
-        }
-        return;
-    }
 
     let args = tc.and_then(|m| m.get("args")).and_then(|v| v.as_object());
     let cmd = args
@@ -4128,7 +3711,6 @@ pub fn record_pre_tool_use(payload: &Value) {
     }
     if policy != "READ_ONLY" && policy != "BOOKKEEPING" {
         let cmd_cwd = resolve_command_cwd(cmd, &cwd, &session);
-        latch_live_simplify_if_ready(&session, tp, None, &cmd_cwd, &call_key);
         // INVARIANT: Stamp `pre_ts` before snapshot subprocesses run so `PostToolUse` records the true pre-spawn `start_ts` on the same wall clock as `last_durable_ts`.
         let pre_ts = now_sec();
         let snap_file = cwg_common::snapshot_path(&session, &call_key);
@@ -4202,47 +3784,18 @@ pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let cwd = rio::effective_cwd(payload);
-        let edit_call_key = if !is_sub && !target_path.is_empty() {
-            edit_tool_call_key(payload, tc, tool_name, &cwd, Some(target_path))
-        } else {
-            String::new()
-        };
-        let pre_visual_latch = if !edit_call_key.is_empty() {
-            cwg_common::take_pending_visual_edit(&session, &edit_call_key)
-        } else {
-            None
-        };
-        if failed {
-            if !is_sub {
-                let _ = cwg_common::clear_pre_marker_verified_simplify(&session);
-            }
-            return Ok(());
-        }
-        if target_path.is_empty() {
-            if !is_sub {
-                let _ = cwg_common::clear_pre_marker_verified_simplify(&session);
-            }
+        if failed || target_path.is_empty() {
             return Ok(());
         }
         // INVARIANT: Advance Loop Guard mutation stamp for subagent and scratch edits too without spawning continuity PostToolUse.
         rio::bump_mutation_stamp(&session);
-        if json_truthy(args.get("ArtifactMetadata")) {
-            if !is_sub {
-                let _ = cwg_common::clear_pre_marker_verified_simplify(&session);
-            }
-            return Ok(());
-        }
-        if cwg_common::is_scratch_or_ephemeral(target_path, art_dir, &wps, &cwd) {
-            if !is_sub {
-                let _ = cwg_common::clear_pre_marker_verified_simplify(&session);
-            }
-            return Ok(());
-        }
-        if is_sub {
+        if json_truthy(args.get("ArtifactMetadata"))
+            || cwg_common::is_scratch_or_ephemeral(target_path, art_dir, &wps, &cwd)
+            || is_sub
+        {
             return Ok(());
         }
         let target_vec = vec![target_path.to_string()];
-        let latch_vec: Vec<String> = pre_visual_latch.into_iter().collect();
         cwg_common::publish_claim(&session, &target_vec, false, &cwd);
         let base_name = Path::new(target_path)
             .file_name()
@@ -4253,14 +3806,11 @@ pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
             session: &session,
             cwd: &cwd,
             durable_new_paths: &target_vec,
-            latch_visual_paths: &latch_vec,
-            operational_mutation: false,
             changed_lines_delta: estimate_changed_lines(tool_name, args),
             shell_durable_edit: false,
             unknown_barrier: false,
             cause_label: &cause_lbl,
             known_git_root: None,
-            pre_marker_call_key: Some(&edit_call_key),
         });
         let cctx = cwg_common::resolve_candidate_context(&after, false);
         if let Some(note) = build_transition_note(before.as_ref(), &after, Some(&cctx)) {
@@ -4487,7 +4037,8 @@ pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
         None
     };
 
-    let (mut changed_paths, unmeasured) = diff_git_snapshots(before_snap.as_ref(), Some(&after_snap));
+    let (mut changed_paths, unmeasured) =
+        diff_git_snapshots_for_cmd(before_snap.as_ref(), Some(&after_snap), &core_cmd);
     if !changed_paths.is_empty() {
         let others: HashSet<String> = cwg_common::claimed_by_other_sessions(
             &session,
@@ -4533,14 +4084,11 @@ pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
             session: &session,
             cwd: marker_cwd,
             durable_new_paths: &changed_paths,
-            latch_visual_paths: &[],
-            operational_mutation: false,
             changed_lines_delta: 10,
             shell_durable_edit: true,
             unknown_barrier: unmeasured,
             cause_label: &cause_lbl,
             known_git_root: snap_git_root.as_deref(),
-            pre_marker_call_key: Some(&call_key),
         });
         let cctx = cwg_common::resolve_candidate_context(&after, false);
         if let Some(note) = build_transition_note(before.as_ref(), &after, Some(&cctx)) {
@@ -4562,64 +4110,18 @@ pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
         if !persisted {
             return Err(format!("Failed to persist shell candidate marker delta for session {}", session));
         }
-    } else if !failed {
-        let has_opaque = policy == "UNCERTAIN" && has_opaque_script_or_exec(cmd);
-        let opaque_unmeasured = has_opaque
-            && (json_truthy(after_snap.get("ephemeral_cwd"))
-                || json_truthy(after_snap.get("no_project"))
-                || references_scratch_space(cmd, art_dir));
-        let is_mutating_non_ephemeral = policy == "MUTATING"
-            && !is_ephemeral_only_shell_mutation(cmd, art_dir, &wps, &cwd);
-        if is_mutating_non_ephemeral || (policy == "UNCERTAIN" && (unmeasured || opaque_unmeasured))
-        {
-            let cause_lbl = format!("run_command:{}", cmd60);
-            let (before, after, persisted) = update_candidate_marker(CandidateMarkerUpdate {
-                session: &session,
-                cwd: marker_cwd,
-                durable_new_paths: &[],
-                latch_visual_paths: &[],
-                operational_mutation: true,
-                changed_lines_delta: 0,
-                shell_durable_edit: false,
-                unknown_barrier: unmeasured || opaque_unmeasured,
-                cause_label: &cause_lbl,
-                known_git_root: snap_git_root.as_deref(),
-                pre_marker_call_key: Some(&call_key),
-            });
-            if let Some(note) = build_transition_note(before.as_ref(), &after, None) {
-                cwg_common::queue_pending_note(&session, &note);
-            }
-            let cmd80: String = cmd.chars().take(80).collect();
-            rio::log_hook_event(
-                "gate-events",
-                "mark_operational",
-                json!({
-                    "session": session,
-                    "policy": policy,
-                    "cmd": cmd80,
-                }),
-            );
-            if !persisted {
-                return Err(format!("Failed to persist operational marker delta for session {}", session));
-            }
-        } else {
-            let _ = cwg_common::clear_pre_marker_verified_simplify(&session);
-        }
-    } else {
-        let _ = cwg_common::clear_pre_marker_verified_simplify(&session);
     }
     Ok(())
 }
 
 pub fn evaluate_post_tool_use(payload: &Value) -> i32 {
+    // INVARIANT: PostToolUse marking is strictly fail-open so a state-persistence error never blocks editing or shell work.
     if let Err(err) = record_post_tool_use(payload) {
         rio::log_hook_event(
             "hook-errors",
             "post_tool_persist_failed",
             json!({ "error": err }),
         );
-        eprintln!("[Code Work Gate] {}", err);
-        return 2;
     }
     rio::emit_json(&json!({}));
     0
@@ -4713,8 +4215,6 @@ mod tests {
         let _ = ps_redirect_inner_re();
         let _ = amp_digit_re();
         let _ = win_drive_prefix_re();
-        let _ = ps_control_kw_re();
-        let _ = dot_slash_re();
         let _ = out_null_re();
         let _ = extended_gate_validation_re();
         let _ = extended_pkg_script_re();
@@ -4815,10 +4315,6 @@ mod tests {
             ),
             (
                 r#"$null | & "C:\Users\in\.gemini\config\plugins\gemini-carbon-stack\bin\carbon-stack.exe" codex-lane redesign-reset --session "s1" --decision redesign"#,
-                "BOOKKEEPING",
-            ),
-            (
-                r#"$null | & "C:\Users\in\.gemini\config\plugins\gemini-carbon-stack\bin\carbon-stack.exe" design-gate record-screenshot --session "s1" --path "shots/desktop.png" --viewport desktop"#,
                 "BOOKKEEPING",
             ),
             (
@@ -5142,19 +4638,16 @@ mod tests {
         fs::write(&f_edit, "pub fn a() {}\n").unwrap();
         let f_vec = vec![f_edit.to_string_lossy().into_owned()];
         let tmp_home_str = tmp_home.to_string_lossy().into_owned();
-        let (_, _, ok1, _) = update_candidate_marker_unlocked(
+        let (_, _, ok1) = update_candidate_marker_unlocked(
             CandidateMarkerUpdate {
                 session: sess_p,
                 cwd: &tmp_home_str,
                 durable_new_paths: &f_vec,
-                latch_visual_paths: &[],
-                operational_mutation: false,
                 changed_lines_delta: 1,
                 shell_durable_edit: false,
                 unknown_barrier: false,
                 cause_label: "edit:mod.rs",
                 known_git_root: None,
-                pre_marker_call_key: None,
             },
             false,
         );
@@ -5162,19 +4655,16 @@ mod tests {
         assert!(!cwg_common::marker_path(sess_p).exists());
         assert!(cwg_common::has_pending_marker_deltas(sess_p));
         assert!(cwg_common::pending_marker_mtime_ns(sess_p) > 0);
-        let (_, flushed, ok2, _) = update_candidate_marker_unlocked(
+        let (_, flushed, ok2) = update_candidate_marker_unlocked(
             CandidateMarkerUpdate {
                 session: sess_p,
                 cwd: &tmp_home_str,
                 durable_new_paths: &f_vec,
-                latch_visual_paths: &[],
-                operational_mutation: false,
                 changed_lines_delta: 1,
                 shell_durable_edit: false,
                 unknown_barrier: false,
                 cause_label: "edit2:mod.rs",
                 known_git_root: None,
-                pre_marker_call_key: None,
             },
             true,
         );
@@ -5286,6 +4776,90 @@ mod tests {
         let last_pop = pop_anon_snapshot(sess_burst, &shared_snap, cmd_sha, true);
         assert!(last_pop.0.is_none());
         assert!(!shared_snap.exists());
+
+        match prev_sh {
+            Some(v) => std::env::set_var("CARBON_STACK_HOME", v),
+            None => std::env::remove_var("CARBON_STACK_HOME"),
+        }
+        let _ = fs::remove_dir_all(&tmp_home);
+    }
+
+    #[test]
+    fn test_stage2_no_operational_marker_fail_open_and_merge_tree_filter() {
+        let _lock = crate::win32_sqlite::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp_home = std::env::temp_dir().join(format!("cwg-mark-s2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp_home);
+        fs::create_dir_all(&tmp_home).unwrap();
+        let prev_sh = std::env::var_os("CARBON_STACK_HOME");
+        std::env::set_var("CARBON_STACK_HOME", &tmp_home);
+
+        let repo = tmp_home.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let repo_s = repo.to_string_lossy().into_owned();
+        let run_g = |args: &[&str]| {
+            let (rc, out, err) = rio::run_git(&repo_s, args, 10.0);
+            assert_eq!(rc, 0, "git {:?} failed: {} {}", args, out, err);
+            out
+        };
+        run_g(&["init"]);
+        run_g(&["config", "user.email", "t@example.com"]);
+        run_g(&["config", "user.name", "Test"]);
+        fs::write(repo.join("base.txt"), "base\n").unwrap();
+        run_g(&["add", "-A"]);
+        run_g(&["commit", "-m", "base"]);
+        let base_branch = run_g(&["rev-parse", "--abbrev-ref", "HEAD"]).trim().to_string();
+
+        run_g(&["checkout", "-b", "partner"]);
+        fs::write(repo.join("partner_a.txt"), "upstream a\n").unwrap();
+        fs::write(repo.join("partner_b.txt"), "upstream b\n").unwrap();
+        run_g(&["add", "-A"]);
+        run_g(&["commit", "-m", "partner changes"]);
+
+        run_g(&["checkout", &base_branch]);
+        fs::write(repo.join("local.txt"), "local\n").unwrap();
+        run_g(&["add", "-A"]);
+        run_g(&["commit", "-m", "local branch commit"]);
+
+        let sess = "sess-s2-noop";
+        for cmd in [
+            "rg --files",
+            r#"python -c "print(1)""#,
+            "git commit --allow-empty -m noop",
+        ] {
+            let payload = json!({
+                "conversationId": sess,
+                "cwd": repo_s,
+                "toolCall": { "name": "run_command", "args": { "CommandLine": cmd }, "id": format!("c-{}", cmd.len()) },
+                "response": "Exit code: 0\n"
+            });
+            evaluate_pre_tool_use(&payload);
+            assert_eq!(evaluate_post_tool_use(&payload), 0);
+        }
+        assert!(
+            !cwg_common::marker_path(sess).exists(),
+            "no-file commands must not create operational marker"
+        );
+
+        let before_merge = take_git_snapshot(&repo_s, "", &[], None);
+        run_g(&["merge", "--no-edit", "partner"]);
+        let after_clean_merge = take_git_snapshot(&repo_s, "", &[], None);
+        let (clean_chg, clean_unm) =
+            diff_git_snapshots_for_cmd(Some(&before_merge), Some(&after_clean_merge), "git merge partner");
+        assert!(!clean_unm);
+        assert!(
+            clean_chg.is_empty(),
+            "clean git merge must not attribute partner files: {:?}",
+            clean_chg
+        );
+
+        fs::write(repo.join("manual_after_merge.txt"), "edited\n").unwrap();
+        let after_edit = take_git_snapshot(&repo_s, "", &[], None);
+        let (edit_chg, _) =
+            diff_git_snapshots_for_cmd(Some(&before_merge), Some(&after_edit), "git merge partner");
+        assert_eq!(edit_chg.len(), 1, "manual edit after merge must still be tracked: {:?}", edit_chg);
+        assert!(edit_chg[0].ends_with("/manual_after_merge.txt"));
 
         match prev_sh {
             Some(v) => std::env::set_var("CARBON_STACK_HOME", v),

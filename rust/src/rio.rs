@@ -2280,7 +2280,7 @@ fn run_git_raw(
     }
 }
 
-fn run_git_env(
+pub fn run_git_env(
     cwd: &str,
     args: &[&str],
     timeout_sec: f64,

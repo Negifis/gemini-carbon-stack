@@ -70,7 +70,9 @@ fn edit_residue_re() -> &'static Regex {
 
 fn lint_waiver_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)\[lint\]\s*intentional\s*:").expect("lint_waiver_re"))
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)^\[lint\]\s*intentional\s*[:-]\s*\S.*$").expect("lint_waiver_re")
+    })
 }
 
 fn section_hdr_re() -> &'static Regex {
@@ -982,6 +984,23 @@ pub fn detect_compaction(
     false
 }
 
+fn fence_edge(l: &str, f: Option<(u8, usize)>) -> (bool, Option<(u8, usize)>) {
+    let t = l.trim_start();
+    let Some(fc) = t.as_bytes().first().copied().filter(|&b| b == b'`' || b == b'~') else { return (false, f); };
+    let flen = t.bytes().take_while(|&b| b == fc).count();
+    if flen < 3 { (false, f) } else { match f { None => (true, Some((fc, flen))), Some((p, pl)) if fc == p && flen >= pl => (true, None), Some(prev) => (true, Some(prev)) } }
+}
+fn prose_lines(msg: &str) -> Vec<&str> {
+    let (mut v, mut f) = (Vec::new(), None);
+    for l in msg.lines() { let (d, n) = fence_edge(l, f); f = n; if !d && f.is_none() && !l.trim_start().starts_with('>') { v.push(l); } }
+    v
+}
+fn waived_final_line(msg: &str) -> bool {
+    let (mut last, mut f) = ("", None);
+    for l in msg.lines() { let (d, n) = fence_edge(l, f); f = n; if d { last = ""; } else if !l.trim().is_empty() { last = if f.is_some() { "" } else { l.trim() }; } }
+    !last.is_empty() && lint_waiver_re().is_match(last)
+}
+
 pub fn evaluate_pre_invocation(payload: &Value) -> Option<String> {
     let tp = payload
         .get("transcriptPath")
@@ -1021,6 +1040,9 @@ pub fn evaluate_pre_invocation(payload: &Value) -> Option<String> {
         state.insert("generation".to_string(), json!(gen));
         state.insert("tool_counts".to_string(), Value::Object(Map::new()));
         state.insert("lint_blocks".to_string(), json!(0));
+        static HR: OnceLock<Regex> = OnceLock::new();
+        let hr = HR.get_or_init(|| Regex::new(r"(?i)(?:changelog|чейнджлог|история\s+(?:изменений|правок)|что\s+изменилось|сравни(?:ть|)\s+верси|\bdiff\b|разбор\s+(?:исправлени|правок|ошиб)|миграци|before\s*/?\s*after|до\s+и\s+после|почему\s+(?:ты\s+|это\s+|оно\s+)?.{0,20}(?:ошиб|неправ|не\s+так|не\s+сработ)|что\s+пошло\s+не\s+так|\bwhat\s+went\s+wrong\b|\bwhy\s+(?:was|were|did).{0,30}wrong\b)").expect("hr"));
+        state.insert("history_requested".into(), Value::Bool(hr.is_match(user_input)));
 
         if strong_correction_re().is_match(user_input) {
             state.insert("correction_active".to_string(), Value::Bool(true));
@@ -1151,54 +1173,17 @@ pub fn evaluate_pre_tool_use(payload: &Value) -> (String, Option<String>) {
     }
     state.insert("tool_counts".to_string(), Value::Object(counts));
 
-    if tool_name == "read_file" && new_count >= READ_REPEAT_DENY_LIMIT {
-        save_session_state(&session, &mut state);
-        rio::log_hook_event(
-            "continuity-events",
-            "loop_guard_deny_read",
-            json!({ "session": session, "sig": sig, "count": new_count }),
-        );
-        return (
-            "deny".to_string(),
-            Some(format!(
-                "[Continuity Loop Guard] Повторное чтение неизменившегося диапазона файла ({}-й раз подряд в одном поколении без правок). Используйте уже прочитанное содержимое или прочитайте другой диапазон строк.",
-                new_count
-            )),
-        );
-    }
-
-    if tool_name == "run_command" {
-        let cmd_str = val_to_str(args.get("CommandLine"));
-        let is_test_runner = test_runner_re().is_match(&cmd_str);
-        if !is_test_runner {
-            if new_count == CMD_REPEAT_WARN_LIMIT {
-                let mut warns: Vec<Value> = state
-                    .get("pending_warnings")
-                    .and_then(|v| v.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-                warns.push(Value::String(format!(
-                    "[Continuity Loop Guard] Одинаковая команда `run_command` вызвана {} раза подряд без изменений кода. Проверьте первопричину вместо повторения идентичного вызова; следующий повтор будет заблокирован.",
-                    new_count
-                )));
-                let start = warns.len().saturating_sub(4);
-                state.insert("pending_warnings".to_string(), Value::Array(warns[start..].to_vec()));
-            } else if new_count >= CMD_REPEAT_DENY_LIMIT {
-                save_session_state(&session, &mut state);
-                rio::log_hook_event(
-                    "continuity-events",
-                    "loop_guard_deny_cmd",
-                    json!({ "session": session, "sig": sig, "count": new_count }),
-                );
-                return (
-                    "deny".to_string(),
-                    Some(format!(
-                        "[Continuity Loop Guard] Заблокирован непродуктивный цикл: идентичная команда `run_command` запущена {}-й раз подряд без изменений состояния. Измените диагностику или устраните первопричину.",
-                        new_count
-                    )),
-                );
-            }
-        }
+    let loop_warn = if tool_name == "read_file" && new_count >= READ_REPEAT_DENY_LIMIT && new_count % READ_REPEAT_DENY_LIMIT == 0 {
+        Some(("loop_guard_warn_read", format!("[Continuity Loop Guard] Предупреждение: повторное чтение неизменившегося диапазона файла ({}-й раз подряд без правок). Используйте уже прочитанное содержимое или другой диапазон строк.", new_count)))
+    } else if tool_name == "run_command" && !test_runner_re().is_match(&val_to_str(args.get("CommandLine"))) && new_count >= CMD_REPEAT_WARN_LIMIT && new_count % CMD_REPEAT_WARN_LIMIT == 0 {
+        Some(("loop_guard_warn_cmd", format!("[Continuity Loop Guard] Одинаковая команда `run_command` вызвана {} раза подряд без изменений кода. Проверьте первопричину вместо повторения идентичного вызова.", new_count)))
+    } else { None };
+    if let Some((ev, msg)) = loop_warn {
+        let mut w: Vec<Value> = state.get("pending_warnings").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        w.push(Value::String(msg));
+        let s = w.len().saturating_sub(4);
+        state.insert("pending_warnings".into(), Value::Array(w[s..].to_vec()));
+        rio::log_hook_event("continuity-events", ev, json!({"session": session, "sig": sig, "count": new_count}));
     }
 
     save_session_state(&session, &mut state);
@@ -1265,9 +1250,13 @@ pub fn decide_stop(payload: &Value) -> Option<String> {
         rio::last_assistant_message(&steps)
     };
     let lint_blocks = val_to_i64(state.get("lint_blocks"));
+    let history_requested = json_truthy(state.get("history_requested"));
     if !msg.is_empty()
-        && !lint_waiver_re().is_match(&msg)
-        && edit_residue_re().is_match(&msg)
+        && !history_requested
+        && !waived_final_line(&msg)
+        && prose_lines(&msg)
+            .iter()
+            .any(|line| edit_residue_re().is_match(line))
         && lint_blocks < MAX_LINT_BLOCKS_PER_EPISODE
     {
         let next_blocks = lint_blocks + 1;
@@ -1279,7 +1268,7 @@ pub fn decide_stop(payload: &Value) -> Option<String> {
             json!({ "session": session, "count": next_blocks }),
         );
         return Some(
-            "[Continuity Output Lint] Финальный ответ после коррекции пользователя содержит описание отвергнутых попыток/черновиков. Перепишите ответ начисто по текущему состоянию результата (либо добавьте `[lint] intentional: <причина>`, если сравнение версий запрошено пользователем).".to_string(),
+            "[Continuity Output Lint] Финальный ответ после коррекции пользователя содержит описание отвергнутых попыток/черновиков. Перепишите ответ начисто по текущему состоянию результата (либо добавьте `[lint] intentional: <причина>` последней строкой, если сравнение версий запрошено пользователем).".to_string(),
         );
     }
 
@@ -1816,7 +1805,7 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp_dir);
         fs::create_dir_all(&tmp_dir).unwrap();
         let prev = std::env::var_os("CARBON_STACK_HOME");
-        std::env::set_var("CARBON_STACK_HOME", &tmp_dir);
+        unsafe { std::env::set_var("CARBON_STACK_HOME", &tmp_dir) };
 
         let target = tmp_dir.join("sample.rs");
         fs::write(&target, "fn main() {}\n").unwrap();
@@ -1838,8 +1827,26 @@ mod tests {
         assert_eq!(evaluate_pre_tool_use(&payload).0, "allow");
         assert_eq!(evaluate_pre_tool_use(&payload).0, "allow");
         let (dec3, reason3) = evaluate_pre_tool_use(&payload);
-        assert_eq!(dec3, "deny");
-        assert!(reason3.unwrap().contains("Loop Guard"));
+        assert_eq!(dec3, "allow");
+        assert!(reason3.is_none());
+        let st = load_session_state(sid);
+        let warns = st.get("pending_warnings").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(warns.len(), 1);
+        assert!(warns[0].as_str().unwrap().contains("Continuity Loop Guard"));
+
+        let cmd_payload = json!({
+            "conversationId": sid,
+            "toolCall": {
+                "id": "call-2",
+                "name": "run_command",
+                "args": {"CommandLine": "git status --short"}
+            }
+        });
+        assert_eq!(evaluate_pre_tool_use(&cmd_payload).0, "allow");
+        assert_eq!(evaluate_pre_tool_use(&cmd_payload).0, "allow");
+        assert_eq!(evaluate_pre_tool_use(&cmd_payload).0, "allow");
+        let st_cmd = load_session_state(sid);
+        assert_eq!(st_cmd.get("pending_warnings").and_then(|v| v.as_array()).unwrap().len(), 2);
 
         let new_stamp = rio::bump_mutation_stamp(sid);
         assert_eq!(new_stamp, 1);
@@ -1848,9 +1855,76 @@ mod tests {
         assert_eq!(dec4, "allow");
         assert!(reason4.is_none());
 
-        match prev {
-            Some(v) => std::env::set_var("CARBON_STACK_HOME", v),
-            None => std::env::remove_var("CARBON_STACK_HOME"),
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("CARBON_STACK_HOME", v),
+                None => std::env::remove_var("CARBON_STACK_HOME"),
+            }
+        }
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_prose_lines_waiver_and_history_exemption() {
+        let _guard = crate::win32_sqlite::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp_dir = std::env::temp_dir().join(format!("continuity-lint-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let prev = std::env::var_os("CARBON_STACK_HOME");
+        unsafe { std::env::set_var("CARBON_STACK_HOME", &tmp_dir) };
+
+        let fenced_and_quoted = [
+            "Clean result:",
+            "```markdown",
+            "In my earlier attempt I wrote X.",
+            "```",
+            "> В предыдущей версии я сделал иначе.",
+            "Current code works cleanly.",
+        ]
+        .join("\n");
+        let prose = prose_lines(&fenced_and_quoted);
+        assert_eq!(prose, vec!["Clean result:", "Current code works cleanly."]);
+
+        assert!(waived_final_line("Diff explanation.\n[lint] intentional: user asked"));
+        assert!(!waived_final_line("[lint] intentional: mid\nTrailing summary"));
+        assert!(!waived_final_line("Text\n```\n[lint] intentional: fenced\n```"));
+
+        let sid = "sess-hist-lint-01";
+        assert!(evaluate_pre_invocation(&json!({
+            "conversationId": sid,
+            "lastUserInput": "Нет, переделай без кеша"
+        }))
+        .is_some());
+
+        let block_msg = "В предыдущей версии я сделал с кешем, но исправил.";
+        let stop_blk = decide_stop(&json!({
+            "conversationId": sid,
+            "lastAssistantMessage": block_msg
+        }));
+        assert!(stop_blk.is_some());
+
+        assert!(decide_stop(&json!({
+            "conversationId": sid,
+            "lastAssistantMessage": format!("{}\n[lint] intentional: comparing approaches", block_msg)
+        }))
+        .is_none());
+
+        assert!(evaluate_pre_invocation(&json!({
+            "conversationId": sid,
+            "lastUserInput": "Нет, не так — покажи что пошло не так и история изменений"
+        }))
+        .is_some());
+        assert!(decide_stop(&json!({
+            "conversationId": sid,
+            "lastAssistantMessage": block_msg
+        }))
+        .is_none());
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("CARBON_STACK_HOME", v),
+                None => std::env::remove_var("CARBON_STACK_HOME"),
+            }
         }
         let _ = fs::remove_dir_all(&tmp_dir);
     }
