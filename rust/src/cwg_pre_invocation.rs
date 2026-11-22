@@ -39,6 +39,7 @@ pub fn evaluate_pre_invocation(payload: &Value) -> Option<String> {
             let ui = payload.get("lastUserInput").and_then(|v| v.as_str()).unwrap_or("").trim();
             let ui_hash = (!ui.is_empty()).then(|| rio::sha256_hex(ui.as_bytes())[..16].to_string());
             let tx_step = rio::last_user_input_step(tp);
+            let tx_idx = tx_step.as_ref().map(|(idx, _)| *idx);
             let (cur_step, cur_hash): (Option<i64>, Option<String>) = if ui.is_empty() {
                 match tx_step {
                     Some((idx, content)) => {
@@ -55,15 +56,20 @@ pub fn evaluate_pre_invocation(payload: &Value) -> Option<String> {
             };
             let prev_cand = rio::val_to_str(st.get("last_open_reminder_cand"));
             let prev_step = st.get("last_open_reminder_step").and_then(|v| v.as_i64());
+            let prev_base_step = st.get("last_open_reminder_base_step").and_then(|v| v.as_i64());
             let prev_hash = rio::val_to_str(st.get("last_open_reminder_ui_hash"));
+            // INVARIANT: A monotonic transcript step `<= prev_base_step` cannot supersede or clobber a pending `lastUserInput` reminder that arrived before the transcript flushed.
             let same_turn = if prev_cand != cand_key {
                 false
             } else {
                 match (prev_step, cur_step) {
-                    (Some(ps), Some(cs)) => ps == cs,
+                    (Some(ps), Some(cs)) => cs <= ps,
                     (None, Some(cs)) => {
-                        if !prev_hash.is_empty() && cur_hash.as_deref() == Some(prev_hash.as_str()) {
+                        if prev_base_step.is_some_and(|bs| cs <= bs) {
+                            true
+                        } else if !prev_hash.is_empty() && cur_hash.as_deref() == Some(prev_hash.as_str()) {
                             st.insert("last_open_reminder_step".into(), json!(cs));
+                            st.remove("last_open_reminder_base_step");
                             chg = true;
                             true
                         } else {
@@ -78,8 +84,17 @@ pub fn evaluate_pre_invocation(payload: &Value) -> Option<String> {
                 notes.push(format!("[gate] Open candidate: PERSISTENT, path floor {} ({} lasting file{}{}). Requires {}. End the final message with `[gate] verified: {}; <candidate and decisive checks>` (or pr-ready/draft-blocked after autonomous closure); a closing message without a receipt is blocked.", fl, n, if n == 1 { "" } else { "s" }, since, reqs, fl));
                 st.insert("last_open_reminder_cand".into(), json!(cand_key));
                 match cur_step {
-                    Some(cs) => { st.insert("last_open_reminder_step".into(), json!(cs)); }
-                    None => { st.remove("last_open_reminder_step"); }
+                    Some(cs) => {
+                        st.insert("last_open_reminder_step".into(), json!(cs));
+                        st.remove("last_open_reminder_base_step");
+                    }
+                    None => {
+                        st.remove("last_open_reminder_step");
+                        match tx_idx {
+                            Some(bs) => { st.insert("last_open_reminder_base_step".into(), json!(bs)); }
+                            None => { st.remove("last_open_reminder_base_step"); }
+                        }
+                    }
                 }
                 match cur_hash {
                     Some(ch) => { st.insert("last_open_reminder_ui_hash".into(), json!(ch)); }
@@ -473,6 +488,9 @@ mod tests {
         });
         assert!(evaluate_pre_invocation(&p_lag_b).is_some());
         assert_eq!(evaluate_pre_invocation(&p_lag_b), None);
+        // Even if `lastUserInput` disappears BEFORE step 20 flushes (transcript still at step 12),
+        // the stale step 12 MUST NOT re-fire or clobber the pending "message B" state.
+        assert_eq!(evaluate_pre_invocation(&payload_omitted), None);
 
         // Transcript flushes step 20 with "message B": must NOT re-fire whether lastUserInput is present or omitted.
         let turn_b_transcript = format!(
@@ -482,8 +500,8 @@ mod tests {
             "{\"step_index\":20,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"message B\"}\n"
         );
         fs::write(&tp, &turn_b_transcript).unwrap();
-        assert_eq!(evaluate_pre_invocation(&p_lag_b), None);
         assert_eq!(evaluate_pre_invocation(&payload_omitted), None);
+        assert_eq!(evaluate_pre_invocation(&p_lag_b), None);
 
         // Another turn with identical text "message B" at step 25 MUST fire once (new step_index).
         let turn_b2_transcript = format!(

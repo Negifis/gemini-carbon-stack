@@ -6047,6 +6047,23 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
             return 2;
         }
     }
+    if let Some(custom_to) = args.timeout {
+        // INVARIANT: Enforce `1..=MAX_REVIEW_TIMEOUT_SECONDS` unconditionally at CLI entry regardless of `CARBON_CODEX_BIN` so invalid/above-cap timeouts fail fast before probing Codex.
+        if custom_to <= 0 || custom_to > MAX_REVIEW_TIMEOUT_SECONDS {
+            rio::print_cli_json(
+                &json!({
+                    "ok": false,
+                    "invalid_timeout": true,
+                    "error": format!(
+                        "Custom --timeout {}s is out of allowed range (1..={}s); omit --timeout or pass <= {}s.",
+                        custom_to, MAX_REVIEW_TIMEOUT_SECONDS, MAX_REVIEW_TIMEOUT_SECONDS
+                    ),
+                }),
+                args.pretty,
+            );
+            return 2;
+        }
+    }
 
     let cwd = if args.cwd.trim().is_empty() {
         rio::resolve_abs_path(invocation_dir)
@@ -6749,6 +6766,21 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
     if let Some(custom_to) = args.timeout {
+        // INVARIANT: Enforce `<= MAX_REVIEW_TIMEOUT_SECONDS` unconditionally regardless of `CARBON_CODEX_BIN` override so custom binary paths never bypass the 7000s hard cap.
+        if custom_to > MAX_REVIEW_TIMEOUT_SECONDS {
+            rio::print_cli_json(
+                &json!({
+                    "ok": false,
+                    "invalid_timeout": true,
+                    "error": format!(
+                        "Custom --timeout {}s exceeds maximum allowed timeout ({}s); omit --timeout or pass <= {}s.",
+                        custom_to, MAX_REVIEW_TIMEOUT_SECONDS, MAX_REVIEW_TIMEOUT_SECONDS
+                    ),
+                }),
+                args.pretty,
+            );
+            return 2;
+        }
         if !has_codex_override {
             if let Err(err_msg) =
                 validate_live_custom_timeout(custom_to, is_timeout_continuation, min_required_timeout)
@@ -12778,6 +12810,51 @@ print(verdict)
         let over_err = validate_live_custom_timeout(7001, true, 4500).unwrap_err();
         assert!(over_err.contains("7001") && over_err.contains("7000"));
         assert!(validate_live_custom_timeout(7200, true, 7000).is_err());
+
+        // Wave A1 R2 #3: `--timeout 7001` MUST fail fast with exit 2 even when `CARBON_CODEX_BIN` points to a valid executable (must never even invoke the binary).
+        {
+            let _lock = crate::win32_sqlite::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let tmp_to = TempTestDir::new("wavea-timeout-cap-override");
+            let repo_to = tmp_to.0.join("repo");
+            fs::create_dir_all(&repo_to).unwrap();
+            let called_marker = tmp_to.0.join("codex_was_called.txt");
+            let fake_codex = tmp_to.0.join("codex.cmd");
+            fs::write(
+                &fake_codex,
+                format!(
+                    "@echo off\r\necho called > \"{}\"\r\necho Logged in using ChatGPT\r\n",
+                    called_marker.to_string_lossy()
+                ),
+            )
+            .unwrap();
+            let _env = EnvVarGuard::set(&[
+                ("CARBON_STACK_HOME", Some(tmp_to.0.join("stack").to_string_lossy().as_ref())),
+                ("CARBON_CODEX_BIN", Some(fake_codex.to_string_lossy().as_ref())),
+            ]);
+            let over_args = ReviewArgs {
+                cwd: repo_to.to_string_lossy().into_owned(),
+                summary: "check upper cap".to_string(),
+                intent: String::new(),
+                diff_file: String::new(),
+                review_id: String::new(),
+                session: "sess-timeout-cap-override".to_string(),
+                model: String::new(),
+                resume: String::new(),
+                new_session: true,
+                xhigh: false,
+                closure: false,
+                phase: String::new(),
+                timeout: Some(7001),
+                pretty: false,
+            };
+            assert_eq!(cmd_review_in_dir(&over_args, &tmp_to.0), 2);
+            assert!(
+                !called_marker.exists(),
+                "above-cap --timeout 7001 must be rejected before invoking CARBON_CODEX_BIN"
+            );
+        }
 
         let ledger = format_dispositions_ledger(&[json!({
             "category": "accepted-risk",
