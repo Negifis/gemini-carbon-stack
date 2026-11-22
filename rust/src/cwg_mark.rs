@@ -247,8 +247,9 @@ fn validation_non_runner_re() -> &'static Regex {
         let node = exe_pat_followed_by_space("node", r"(?:\.exe)?", false);
         let pkg_script =
             r"(?:[A-Za-z0-9_.-]+:)*(?:test|tests|lint|build|typecheck|check)(?:[:_-][A-Za-z0-9_:.-]+)*";
+        let npx_flags = r#"(?:(?:--no-install|--no|(?:-w|--workspace)(?:=|\s+)(?:'[^'\r\n]+'|"[^"`$\r\n]+"|[A-Za-z0-9_@./\\:][A-Za-z0-9_@./\\:-]*))\s+)*(?:--\s+)?"#;
         let pat = format!(
-            r#"(?i)\A\s*(?:\$null\s*\|\s*)?(?:&\s*)?(?:{ruff}\s+check\b|{py}\s+(?:-(?:X\s+utf8|[uBEsSO])\s+)*(?:-m\s+(?:pytest|unittest|py_compile|compileall|mypy|ruff|flake8)\b|{inst}\s+(?:[^\r\n|;&]*\s)?(?:--diagnose|--dry-run)(?:\z|[\s|;&])|{mcp}\s+--semgrep-scan\b)|{cs}\s+install\s+(?:[^\r\n|;&]*\s)?(?:--diagnose|--dry-run)(?:\z|[\s|;&])|(?:uvx(?:\.exe)?\s+(?:--offline\s+)?--from\s+semgrep\s+)?semgrep(?:\.exe)?\s+(?:--legacy\s+)?scan\b|{node}\s+(?:(?:--no-warnings|--experimental-[A-Za-z0-9_-]+)\s+)*(?:(?:--test|--check)(?:\z|[\s|;&])|["']?(?:\.[/\\])?(?:[A-Za-z0-9_][A-Za-z0-9_.-]*[/\\])*(?:test[-_][A-Za-z0-9_.-]*|[A-Za-z0-9_][A-Za-z0-9_.-]*[-_.]tests?|[A-Za-z0-9_][A-Za-z0-9_.-]*\.spec)\.(?:c?js|mjs)["']?(?:\z|[\s|;&]))|bun(?:\.exe)?\s+(?:test(?:\z|[\s|;&])|run\s+{pkg_s}\b)|deno(?:\.exe)?\s+(?:test|check|lint)(?:\z|[\s|;&])|npm(?:\.cmd)?\s+(?:test\b|run\s+{pkg_s}\b)|(?:pnpm|yarn)(?:\.cmd)?\s+(?:run\s+)?(?:test\b|{pkg_s}\b)|npx(?:\.cmd)?\s+(?:tsc|vitest|jest|eslint|playwright\s+test)\b|(?:flutter|dart)(?:\.bat|\.exe)?\s+(?:test|analyze)\b|cargo(?:\.exe)?\s+(?:\+[A-Za-z0-9._-]+\s+)?(?:test|check|clippy)\b|go(?:\.exe)?\s+(?:test|vet)\b|dotnet(?:\.exe)?\s+(?:test|build)\b|{agy}\s+plugin\s+validate\b)"#,
+            r#"(?i)\A\s*(?:\$null\s*\|\s*)?(?:&\s*)?(?:{ruff}\s+check\b|{py}\s+(?:-(?:X\s+utf8|[uBEsSO])\s+)*(?:-m\s+(?:pytest|unittest|py_compile|compileall|mypy|ruff|flake8)\b|{inst}\s+(?:[^\r\n|;&]*\s)?(?:--diagnose|--dry-run)(?:\z|[\s|;&])|{mcp}\s+--semgrep-scan\b)|{cs}\s+install\s+(?:[^\r\n|;&]*\s)?(?:--diagnose|--dry-run)(?:\z|[\s|;&])|(?:uvx(?:\.exe)?\s+(?:--offline\s+)?--from\s+semgrep\s+)?semgrep(?:\.exe)?\s+(?:--legacy\s+)?scan\b|{node}\s+(?:(?:--no-warnings|--experimental-[A-Za-z0-9_-]+)\s+)*(?:(?:--test|--check)(?:\z|[\s|;&])|["']?(?:\.[/\\])?(?:[A-Za-z0-9_][A-Za-z0-9_.-]*[/\\])*(?:test[-_][A-Za-z0-9_.-]*|[A-Za-z0-9_][A-Za-z0-9_.-]*[-_.]tests?|[A-Za-z0-9_][A-Za-z0-9_.-]*\.spec)\.(?:c?js|mjs)["']?(?:\z|[\s|;&]))|bun(?:\.exe)?\s+(?:test(?:\z|[\s|;&])|run\s+{pkg_s}\b)|deno(?:\.exe)?\s+(?:test|check|lint)(?:\z|[\s|;&])|npm(?:\.cmd)?\s+(?:test\b|run\s+{pkg_s}\b)|(?:pnpm|yarn)(?:\.cmd)?\s+(?:run\s+)?(?:test\b|{pkg_s}\b)|npx(?:\.cmd)?\s+{npx_f}(?:tsc|vitest|jest|eslint|playwright\s+test)\b|(?:flutter|dart)(?:\.bat|\.exe)?\s+(?:test|analyze)\b|cargo(?:\.exe)?\s+(?:\+[A-Za-z0-9._-]+\s+)?(?:test|check|clippy)\b|go(?:\.exe)?\s+(?:test|vet)\b|dotnet(?:\.exe)?\s+(?:test|build)\b|{agy}\s+plugin\s+validate\b)"#,
             ruff = ruff,
             py = py,
             inst = install,
@@ -257,6 +258,7 @@ fn validation_non_runner_re() -> &'static Regex {
             agy = agy,
             node = node,
             pkg_s = pkg_script,
+            npx_f = npx_flags,
         );
         Regex::new(&pat).expect("validation_non_runner_re")
     })
@@ -4495,6 +4497,25 @@ mod tests {
             ("node scripts/migrate.js", "UNCERTAIN"),
             (
                 "$null | npm.cmd test -w backend -- --runInBand; $null | git status --short",
+                "UNCERTAIN",
+            ),
+            (
+                "$null | npx --workspace backend jest src/__tests__/foo.test.ts --runInBand",
+                "VALIDATION",
+            ),
+            ("npx -w backend vitest run", "VALIDATION"),
+            ("npx --workspace=backend tsc --noEmit", "VALIDATION"),
+            (r#"npx --no-install --workspace "@scope/backend" eslint src/"#, "VALIDATION"),
+            ("npx --workspace backend -- playwright test", "VALIDATION"),
+            ("npx.cmd --no jest", "VALIDATION"),
+            ("npx --workspaces jest", "UNCERTAIN"),
+            ("npx -p fake-jest jest", "UNCERTAIN"),
+            (r#"npx --workspace backend -c "echo ok" jest"#, "UNCERTAIN"),
+            ("npx --workspace backend --if-present jest", "UNCERTAIN"),
+            ("npx -w -c jest", "UNCERTAIN"),
+            (r#"npx --workspace backend node -e "process.exit(0)""#, "UNCERTAIN"),
+            (
+                "$null | npm run typecheck -w backend; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $null | npx --workspace backend jest src/__tests__/foo.test.ts --runInBand",
                 "UNCERTAIN",
             ),
             (

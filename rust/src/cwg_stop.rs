@@ -515,6 +515,7 @@ pub struct ChecksEvidence {
     pub latest_pass_ts: f64,
     pub latest_fail_ts: f64,
     pub saw_uncertain_pass: bool,
+    pub latest_uncertain_pass_ts: f64,
 }
 
 impl ChecksEvidence {
@@ -530,6 +531,13 @@ impl ChecksEvidence {
             if ts > self.latest_fail_ts {
                 self.latest_fail_ts = ts;
             }
+        }
+    }
+
+    fn record_uncertain_pass(&mut self, ts: f64) {
+        self.saw_uncertain_pass = true;
+        if ts > self.latest_uncertain_pass_ts {
+            self.latest_uncertain_pass_ts = ts;
         }
     }
 }
@@ -598,6 +606,7 @@ fn handle_bg_check_sys_step(
     pending_bg_checks: &mut HashMap<String, (String, f64, bool)>,
     completed_bg_checks: &mut Vec<(bool, f64)>,
     saw_bg_uncertain_pass: &mut bool,
+    latest_bg_uncertain_pass_ts: &mut f64,
     max_prior_ts: &mut f64,
 ) {
     let sys_pt = parse_iso_ts_meta(st.get("created_at").and_then(Value::as_str).unwrap_or(""));
@@ -617,10 +626,13 @@ fn handle_bg_check_sys_step(
                     if let Some(credit_ts) = pass_credit_ts(start_ts, done_ts, first_ts) {
                         completed_bg_checks.push((true, credit_ts));
                     }
-                } else if pol == "UNCERTAIN"
-                    && pass_credit_ts(start_ts, done_ts, first_ts).is_some()
-                {
-                    *saw_bg_uncertain_pass = true;
+                } else if pol == "UNCERTAIN" {
+                    if let Some(credit_ts) = pass_credit_ts(start_ts, done_ts, first_ts) {
+                        *saw_bg_uncertain_pass = true;
+                        if credit_ts > *latest_bg_uncertain_pass_ts {
+                            *latest_bg_uncertain_pass_ts = credit_ts;
+                        }
+                    }
                 }
             }
         }
@@ -658,9 +670,11 @@ pub fn read_checks_evidence_with_steps_in_cwd(
     let mut step_start_ts: HashMap<i64, f64> = HashMap::new();
     let mut sync_checks: Vec<(Option<i64>, bool, f64)> = Vec::new();
     let mut saw_sync_uncertain_pass = false;
+    let mut latest_sync_uncertain_pass_ts: f64 = 0.0;
     let mut pending_bg_checks: HashMap<String, (String, f64, bool)> = HashMap::new();
     let mut completed_bg_checks: Vec<(bool, f64)> = Vec::new();
     let mut saw_bg_uncertain_pass = false;
+    let mut latest_bg_uncertain_pass_ts: f64 = 0.0;
 
     for rec in &ledger_recs {
         let rcwd = val_to_str(rec.get("cwd"));
@@ -741,6 +755,7 @@ pub fn read_checks_evidence_with_steps_in_cwd(
                 &mut pending_bg_checks,
                 &mut completed_bg_checks,
                 &mut saw_bg_uncertain_pass,
+                &mut latest_bg_uncertain_pass_ts,
                 &mut max_prior_ts,
             );
             continue;
@@ -958,11 +973,13 @@ pub fn read_checks_evidence_with_steps_in_cwd(
                 if let Some(credit_ts) = pass_credit_ts(start_ts, g_pt.ts, first_ts) {
                     sync_checks.push((g_step_idx, true, credit_ts));
                 }
-            } else if pol == "UNCERTAIN"
-                && exit_opt == Some(0)
-                && pass_credit_ts(start_ts, g_pt.ts, first_ts).is_some()
-            {
-                saw_sync_uncertain_pass = true;
+            } else if pol == "UNCERTAIN" && exit_opt == Some(0) {
+                if let Some(credit_ts) = pass_credit_ts(start_ts, g_pt.ts, first_ts) {
+                    saw_sync_uncertain_pass = true;
+                    if credit_ts > latest_sync_uncertain_pass_ts {
+                        latest_sync_uncertain_pass_ts = credit_ts;
+                    }
+                }
             }
         }
     }
@@ -1000,8 +1017,8 @@ pub fn read_checks_evidence_with_steps_in_cwd(
             }
         } else if passed {
             let resolved_start = resolve_ledger_start_ts(&rec, s_idx, &step_start_ts);
-            if pass_credit_ts(resolved_start, ts, first_ts).is_some() {
-                ev.saw_uncertain_pass = true;
+            if let Some(credit_ts) = pass_credit_ts(resolved_start, ts, first_ts) {
+                ev.record_uncertain_pass(credit_ts);
             }
         }
     }
@@ -1014,7 +1031,12 @@ pub fn read_checks_evidence_with_steps_in_cwd(
     for (passed, credit_ts) in completed_bg_checks {
         ev.record_outcome(passed, credit_ts);
     }
-    ev.saw_uncertain_pass |= saw_sync_uncertain_pass || saw_bg_uncertain_pass;
+    if saw_sync_uncertain_pass {
+        ev.record_uncertain_pass(latest_sync_uncertain_pass_ts);
+    }
+    if saw_bg_uncertain_pass {
+        ev.record_uncertain_pass(latest_bg_uncertain_pass_ts);
+    }
     ev
 }
 
@@ -4790,6 +4812,13 @@ fn validate_candidate_closure_inner(
     if (rkind == "verified" || rkind == "pr-ready")
         && checks_ev.latest_fail_ts > checks_ev.latest_pass_ts
     {
+        if checks_ev.latest_uncertain_pass_ts > checks_ev.latest_fail_ts {
+            return (
+                false,
+                "latest validation/test command failed with no subsequent standalone passing verification run (subsequent chained/non-standalone check run(s) were ignored because ';', '||', PowerShell 'if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }', trailing segments, or pipes can mask exit codes); re-run verification as a standalone command (single runner, no '; cmd' or trailing pipes)"
+                    .to_string(),
+            );
+        }
         return (
             false,
             "latest validation/test command failed with no subsequent passing verification run"
@@ -4839,6 +4868,13 @@ fn validate_candidate_closure_inner(
                         "{} candidate has zero executed verification/test commands recorded in runtime",
                         effective_risk
                     ),
+                );
+            }
+            if checks_ev.latest_uncertain_pass_ts + TS_EPS >= last_durable {
+                return (
+                    false,
+                    "last standalone passing test/verification command ran BEFORE the latest file edit (subsequent chained/non-standalone check run(s) were ignored because ';', '||', PowerShell 'if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }', trailing segments, or pipes can mask exit codes); re-verify current bytes with a standalone test command (single runner, no '; cmd' or trailing pipes)"
+                        .to_string(),
                 );
             }
             return (
@@ -8698,6 +8734,208 @@ mod tests {
                 && why_chained.contains("standalone command"),
             "expected actionable chained-command block reason, got: {}",
             why_chained
+        );
+
+        match prev_home {
+            Some(v) => std::env::set_var("CARBON_STACK_HOME", v),
+            None => std::env::remove_var("CARBON_STACK_HOME"),
+        }
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_anom_fc051e39_chained_pass_after_fail_and_npx_workspace_standalone() {
+        let _guard = crate::win32_sqlite::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!(
+            "cwg-stop-anom-fc051e39-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let prev_home = std::env::var("CARBON_STACK_HOME").ok();
+        std::env::set_var("CARBON_STACK_HOME", &tmp);
+
+        let sess = "sess-anom-fc051e39";
+        let chained_fail_cmd = "npm test -w backend -- --runInBand src/__tests__/foo.test.ts\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\nnpm run typecheck -w backend";
+        let chained_pass_cmd = "$null | npm run typecheck -w backend; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $null | node scripts/ci/backend-jest-selector.js --check; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $null | npx --workspace backend jest src/__tests__/foo.test.ts --runInBand";
+        let standalone_npx_cmd = "$null | npx --workspace backend jest src/__tests__/foo.test.ts --runInBand";
+
+        let base_steps = vec![
+            json!({
+                "step_index": 11002,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-22T13:42:14Z",
+                "tool_calls": [{"name": "run_command", "args": {"CommandLine": chained_fail_cmd}}]
+            }),
+            json!({
+                "step_index": 11003,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "created_at": "2026-11-22T13:42:18Z",
+                "content": "Tool is running as a background task with task id: sess-anom-fc051e39/task-11003\n"
+            }),
+            json!({
+                "step_index": 11020,
+                "source": "SYSTEM",
+                "type": "SYSTEM_MESSAGE",
+                "created_at": "2026-11-22T13:43:20Z",
+                "content": "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-22T13:43:13Z sender=sess-anom-fc051e39/task-11003 priority=MESSAGE_PRIORITY_HIGH content=Task id \"sess-anom-fc051e39/task-11003\" finished with result:\nCommand exited with code 2.\n\nCommand output:\nFAIL\n</SYSTEM_MESSAGE>"
+            }),
+            json!({
+                "step_index": 11487,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-22T16:02:34Z",
+                "tool_calls": [{"name": "run_command", "args": {"CommandLine": chained_pass_cmd}}]
+            }),
+            json!({
+                "step_index": 11488,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "created_at": "2026-11-22T16:02:56Z",
+                "content": "Created At: 2026-11-22T21:02:56+05:00\nTool is running as a background task with task id: sess-anom-fc051e39/task-11488\n"
+            }),
+            json!({
+                "step_index": 11490,
+                "source": "SYSTEM",
+                "type": "SYSTEM_MESSAGE",
+                "created_at": "2026-11-22T16:03:48Z",
+                "content": "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-22T16:03:47Z sender=sess-anom-fc051e39/task-11488 priority=MESSAGE_PRIORITY_HIGH content=Task id \"sess-anom-fc051e39/task-11488\" finished with result:\nCommand exited with code 0.\n\nCommand output:\nPASS 136/136\n"
+            }),
+        ];
+
+        let first_ts = rio::parse_iso_ts("2026-11-22T13:00:00Z");
+        let ev_after_chained = read_checks_evidence_with_steps_in_cwd(sess, first_ts, &base_steps, "");
+        assert!(
+            ev_after_chained.latest_fail_ts > ev_after_chained.latest_pass_ts
+                && ev_after_chained.saw_uncertain_pass
+                && ev_after_chained.latest_uncertain_pass_ts > ev_after_chained.latest_fail_ts,
+            "chained PS5.1 pass after failure must stay uncredited while recording latest_uncertain_pass_ts > latest_fail_ts: {:?}",
+            ev_after_chained
+        );
+
+        let ws = tmp.join("ws_fc051e39");
+        fs::create_dir_all(ws.join("src")).unwrap();
+        fs::write(
+            ws.join("package.json"),
+            r#"{"name":"ws-fc051e39","scripts":{"test":"jest"}}"#,
+        )
+        .unwrap();
+        let src_file = ws.join("src").join("app.ts");
+        fs::write(&src_file, "export const x = 1;\n").unwrap();
+        let src_path = src_file.to_string_lossy().into_owned();
+        let src_fp = cwg_common::content_fingerprint(std::slice::from_ref(&src_path), 4_000_000);
+        let edit_ts = rio::parse_iso_ts("2026-11-22T13:44:00Z");
+        let marker = json!({
+            "session": sess,
+            "cwd": ws.to_string_lossy(),
+            "git_root": "",
+            "paths": [src_path],
+            "first_ts": first_ts,
+            "last_durable_ts": edit_ts,
+            "content_marks": [{"ts": edit_ts, "fp": src_fp}],
+            "edits": 1,
+            "closed": false,
+        });
+        let rcp_std = cwg_common::parse_terminal_receipt("[gate] verified: STANDARD; ok").unwrap();
+        let (ok_fail, why_fail) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_std),
+            marker_in: &marker,
+            checks_ev: &ev_after_chained,
+            sub_ev: &SubagentEvidence::default(),
+            swarm_ev: &SwarmEvidence::default(),
+            codex_reviews: &[],
+            ctx: None,
+            steps: None,
+            transcript_path: None,
+        });
+        assert!(!ok_fail);
+        assert!(
+            why_fail.contains("chained/non-standalone check run(s) were ignored")
+                && why_fail.contains("standalone command"),
+            "fail branch must surface actionable chained-check hint when a later chained run passed, got: {}",
+            why_fail
+        );
+
+        let ev_stale_with_chained = ChecksEvidence {
+            checks_count: 1,
+            passed_count: 1,
+            failed_count: 0,
+            latest_pass_ts: edit_ts - 60.0,
+            latest_fail_ts: 0.0,
+            saw_uncertain_pass: true,
+            latest_uncertain_pass_ts: edit_ts + 30.0,
+        };
+        let (ok_stale, why_stale) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_std),
+            marker_in: &marker,
+            checks_ev: &ev_stale_with_chained,
+            sub_ev: &SubagentEvidence::default(),
+            swarm_ev: &SwarmEvidence::default(),
+            codex_reviews: &[],
+            ctx: None,
+            steps: None,
+            transcript_path: None,
+        });
+        assert!(!ok_stale);
+        assert!(
+            why_stale.contains("chained/non-standalone check run(s) were ignored")
+                && why_stale.contains("standalone test command"),
+            "stale branch must surface actionable chained-check hint when a post-edit chained run passed, got: {}",
+            why_stale
+        );
+
+        let mut steps_with_standalone = base_steps;
+        steps_with_standalone.extend([
+            json!({
+                "step_index": 11495,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-22T16:04:10Z",
+                "tool_calls": [{"name": "run_command", "args": {"CommandLine": standalone_npx_cmd}}]
+            }),
+            json!({
+                "step_index": 11496,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "created_at": "2026-11-22T16:04:12Z",
+                "content": "Tool is running as a background task with task id: sess-anom-fc051e39/task-11496\n"
+            }),
+            json!({
+                "step_index": 11498,
+                "source": "SYSTEM",
+                "type": "SYSTEM_MESSAGE",
+                "created_at": "2026-11-22T16:04:40Z",
+                "content": "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-22T16:04:39Z sender=sess-anom-fc051e39/task-11496 priority=MESSAGE_PRIORITY_HIGH content=Task id \"sess-anom-fc051e39/task-11496\" finished with result:\nCommand exited with code 0.\n\nCommand output:\nPASS src/__tests__/foo.test.ts\n</SYSTEM_MESSAGE>"
+            }),
+        ]);
+        let ev_standalone = read_checks_evidence_with_steps_in_cwd(sess, first_ts, &steps_with_standalone, "");
+        assert!(
+            ev_standalone.passed_count == 1 && ev_standalone.latest_pass_ts > ev_standalone.latest_fail_ts,
+            "standalone background `npx --workspace backend jest` must be credited as passing verification: {:?}",
+            ev_standalone
+        );
+        let (ok_pass, why_pass) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_std),
+            marker_in: &marker,
+            checks_ev: &ev_standalone,
+            sub_ev: &SubagentEvidence::default(),
+            swarm_ev: &SwarmEvidence::default(),
+            codex_reviews: &[],
+            ctx: None,
+            steps: None,
+            transcript_path: None,
+        });
+        assert!(
+            ok_pass,
+            "subsequent standalone `npx --workspace backend jest` must clear prior failure and satisfy STANDARD gate: {}",
+            why_pass
         );
 
         match prev_home {
