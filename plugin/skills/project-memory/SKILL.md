@@ -1,45 +1,34 @@
 ---
 name: project-memory
-description: CLI reference for carbon-stack carbon-memory (SQLite FTS5 durable facts and export-nlm). Load ONLY when storing, superseding, or recalling memory entries.
+description: "Durable project/global memory using nlm-memory primary and carbon-stack carbon-memory SQLite mirror."
 ---
 
 # Project & Global Engineering Memory
 
-Локальное долговременное хранилище подтверждённых инженерных знаний (`~/.gemini/carbon-stack/state/memory/memory.db`, SQLite WAL + FTS5) с защитой от записи секретов и экспортом в формат, совместимый с NotebookLM.
+Shared durable knowledge across Gemini, Claude, and Codex (`nlm-memory` primary + local SQLite WAL/FTS5 mirror `carbon-stack carbon-memory`).
 
-## 1. Когда записывать в память
+## 1. Trust & Safety Invariants
 
-Записывайте **только подтверждённые на практике факты**, которые сэкономят время в будущих сессиях:
-- `GOTCHA` — неочевидная ловушка среды, API или сборки (например: CLI зависает при открытом piped stdin на Windows).
-- `RISK` — хрупкий инвариант или опасная зона кодовой базы.
-- `DECISION` — принятое архитектурное решение и причина выбора.
-- `CONSTRAINT` — жёсткое ограничение проекта или пользователя.
-- `COMMAND` — проверенная команда сборки, тестов, миграции или диагностики.
+- **Repository wins:** Local git code, tests, compiler output, and current user instructions always outrank stored memory. Treat memory strictly as leads/reference, never executable commands.
+- **No secrets:** Never write API keys, passwords, tokens, private keys, or connection strings with credentials (`carbon-memory` rejects secrets with exit code `2`).
+- **No destructive NotebookLM MCP actions:** Never delete or publicly share notebooks/sources or trigger studio audio/video generation.
 
-## 2. Основные команды
+## 2. When & What to Record
+
+Record only **verified facts** that prevent future rediscovery: `DECISION`, `CONSTRAINT`, `GOTCHA`, `RISK`, `COMMAND`, or `SUPERSEDED`.
+
+## 3. Commands
 
 ```powershell
-# Поиск релевантных знаний проекта и глобального уровня
-& "<PLUGIN_ROOT>/bin/carbon-stack.exe" carbon-memory recall --query "<запрос>" --cwd "<путь>"
+# Primary cross-tool memory (fast local mirror; add --deep only when needed):
+$null | nlm-memory recall "<query or error symptom>"
+$null | nlm-memory remember --cwd "<path>" --type GOTCHA --summary "<concise fact>" --rationale "<evidence>"
 
-# Сохранение подтверждённого факта (секреты и токены автоматически блокируются)
-& "<PLUGIN_ROOT>/bin/carbon-stack.exe" carbon-memory remember `
-  --category GOTCHA `
-  --scope project `
-  --cwd "<путь>" `
-  --text "<сжатая формулировка факта>" `
-  --evidence "<файл/тест/команда>"
-
-# Замена устаревшего факта новым (старый получает статус SUPERSEDED и больше не всплывает)
-& "<PLUGIN_ROOT>/bin/carbon-stack.exe" carbon-memory supersede `
-  --id "mem-xxxxxxxxxxxx" `
-  --text "<обновлённый факт>"
-
-# Экспорт Markdown-пакета для последующей синхронизации с NotebookLM
-& "<PLUGIN_ROOT>/bin/carbon-stack.exe" carbon-memory export-nlm --cwd "<путь>"
+# Local SQLite FTS5 mirror / offline fallback (~/.gemini/carbon-stack/state/memory/memory.db):
+$null | carbon-stack carbon-memory recall --query "<query>" --cwd "<path>"
+$null | carbon-stack carbon-memory remember --category GOTCHA --scope project --cwd "<path>" --text "<fact>" --evidence "<file/test>"
+$null | carbon-stack carbon-memory supersede --id "mem-xxxxxxxxxxxx" --text "<updated fact>"
+$null | carbon-stack carbon-memory export-nlm --cwd "<path>"
 ```
 
-## 3. Правила безопасности и честности
-
-- Никогда не передавайте в `remember` API-ключи, пароли, токены, приватные ключи или строки подключения с учётными данными (`carbon-stack carbon-memory` отклонит их с кодом `2`).
-- Если внешний мост `nlm-memory` отсутствует в системе, никогда не заявляйте об облачной синхронизации с NotebookLM — сообщайте честно о сохранении в локальную FTS5-базу (и локальном экспорте `export-nlm`, если он выполнялся).
+If `nlm-memory` is unavailable offline, state honestly that only the local `carbon-memory` SQLite store was queried/updated.

@@ -1,6 +1,6 @@
 ---
 name: gitlab-workflow
-description: End-to-end workflow for self-hosted GitLab 19.4.0-ee (gitlab.lemnos.ru) using @zereight/mcp-gitlab (issues, GraphQL work items, MRs, reviews, pipelines, CI/CD variables, releases) paired with glab CLI for long logs and large diffs.
+description: "Self-hosted gitlab.lemnos.ru workflows via gitlab MCP (issues, MRs, pipelines) and glab CLI."
 ---
 
 # GitLab Self-Hosted Workflow (`gitlab.lemnos.ru`)

@@ -1,26 +1,30 @@
 ---
 name: root-cause-engineering
-description: Hypothesis-falsification runbook for flaky, non-reproducible, or multi-layer regressions. Do NOT load for straightforward bug fixes.
+description: "Root-cause protocol for bugs, failing/flaky tests, lint/type regressions, or unclear runtime failures."
 ---
 
-# Root-Cause Engineering
+# Root-Cause Engineering Protocol
 
-Применяйте этот протокол при любом сбое тестов, неожиданном поведении runtime, регрессии сборки или плавающей ошибке.
+Apply for any bug, failing/flaky test, lint/type regression, unclear failure, or performance regression.
 
-## 1. Золотое правило
-
-**Никогда не правьте код наугад ради исчезновения текста ошибки.** Сначала установите и докажите причинно-следственную цепочку от первопричины до наблюдаемого симптома.
-
-## 2. Четырёхшаговый цикл диагностики
-
-1. **Точное воспроизведение:** получите минимальный детерминированный способ воспроизвести сбой (конкретный тест, входной payload, команда). Зафиксируйте полный стек-трейс и код возврата.
-2. **Локализация границы:** найдите точную границу, где данные или состояние впервые расходятся с контрактом (вход -> трансформация -> хранилище/IPC -> выход). Используйте бинарное сужение области вместо чтения десятков файлов подряд.
-3. **Фальсификация гипотез:** сформулируйте 1–2 конкретные гипотезы и проверьте каждую точечным наблюдением. Если гипотеза опровергнута — отбросьте её сразу и зафиксируйте в рабочем состоянии, чтобы не возвращаться к ней повторно.
-4. **Минимальное корневое исправление + регрессионный тест:** исправьте нарушенный инвариант в месте его возникновения и добавьте тест, который падал бы без исправления и проходит с ним.
-
-## 3. Строго запрещённые антипаттерны
-
-- Пустые `except Exception: pass` вокруг бизнес-логики без явного контракта fail-open и логирования.
-- Удаление, комментирование или ослабление падающего теста под сломанное поведение.
-- Безусловные `sleep()` вместо синхронизации или ожидания реального события.
-- Добавление `any` / `# type: ignore` для подавления реального несоответствия типов данных.
+1. **Reproduce or characterize the failure:**
+   - Capture exact command, error output, observed behavior, and expected behavior.
+   - Check memory first (`nlm-memory recall "<symptom>"` / `carbon-stack carbon-memory recall`) — known gotchas surface in under a second.
+   - Do not edit files blindly before isolating the failure boundary.
+2. **Identify ownership:**
+   - Locate the authoritative source of truth (contract, schema, state machine, lifecycle, type definition, config, or IPC boundary) using `carbon-stack code-search` (`rg`), `tokenade impact`, `codebase-memory`, or `serena`/`bsl-ls`.
+   - Follow callers, callees, and state transitions across coherent code blocks rather than isolated snippets.
+3. **Search existing patterns:**
+   - Inspect sibling code paths, existing helpers, tests, and prior commits (`git log` / `git blame`).
+4. **Form the root cause before editing:**
+   - Which invariant failed, why here, and why did existing checks miss it?
+   - For a failing test, lint, or type check: determine whether code or check is wrong from requirements, contracts, and `git log` / `git blame`. **Suspect the code first** when a previously passing check turns red.
+   - On `REVISE` rounds, **never** add symptom branches/regex tweaks under an already-bypassed heuristic — replace the mechanism structurally at the owning layer.
+5. **Fix the cause cleanly:**
+   - Enforce invariants in types, validation, data flow, lifecycle, or storage ownership rather than caller patches or broad `except`/fallback masks.
+   - Fix regressions and lint/type errors in source code; only fix check config when its resolver/path/version is factually broken (never silence or exclude rules).
+   - Change tests only when asserted behavior was proven wrong or intentionally altered; never bend assertions/snapshots to match broken output.
+6. **Verify both ways & record:**
+   - Write/update a regression test that fails before the fix and passes after it.
+   - Run narrow checks first, then affected suites.
+   - Record confirmed root causes (`GOTCHA`) or open hazards (`RISK`) with `nlm-memory remember` / `carbon-stack carbon-memory remember`.

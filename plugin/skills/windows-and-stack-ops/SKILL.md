@@ -1,45 +1,41 @@
 ---
 name: windows-and-stack-ops
-description: Windows file-lock inspection (file-holders.ps1), NTFS junction recovery (carbon-stack worktree-guard), and carbon-stack swarm-cache CLI. Do NOT load for ordinary PowerShell commands.
+description: "Windows PowerShell 5.1 rules, file-holders.ps1, carbon-stack worktree-guard, and swarm-cache CLI."
 ---
 
 # Windows Runtime & Stack Operations
 
-Практические правила работы в окружении **Windows NT + PowerShell 5.1 + Python 3.13 + Git for Windows**.
+Rules for **Windows NT + PowerShell 5.1 + Python 3.12 + Git for Windows**.
 
-## 1. Особенности Windows PowerShell 5.1 и предотвращение сбоев команд
+## 1. Windows PowerShell 5.1 & Local Environment
 
-| Частая ошибка из bash/Linux | Правильно в Windows PowerShell 5.1 |
+| Avoid (Linux/bash habits) | Use in Windows PowerShell 5.1 |
 |---|---|
-| `cmd1 && cmd2` или `cmd1 \|\| cmd2` | `cmd1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cmd2` |
-| `python - <<'EOF' ... EOF` или `< file` | `@' ... '@ \| python -X utf8 -` |
-| `(Get-Content f)[10:20]` (срез Python) | `(Get-Content f)[10..20]` или `read_file(Path=..., StartLine=11, EndLine=21)` |
-| `sed`, `awk`, `head`, `tail`, `rg` | `read_file`, `carbon-stack code-search`, `git grep -n`, `Select-String`, `Select-Object -First/-Last` |
-| `python -m pyflakes ...` | `python -X utf8 -m py_compile ...` или `ast.parse` (пакет `pyflakes` не установлен) |
-| `2>/dev/null` или `python ...` без кодировки | `2>$null` / `$null \| ...` и всегда `python -X utf8` |
-| `python -m unittest ... 2>&1 \| Select-Object` | Запускайте `python -X utf8 -m unittest ...` напрямую (вывод `OK` в `stderr` порождает `NativeCommandError`) |
+| `cmd1 && cmd2` or `cmd1 \|\| cmd2` | `cmd1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cmd2` |
+| `python - <<'EOF' ... EOF` or `< file` | `@' ... '@ \| C:\Users\in\AppData\Local\Programs\Python\Python312\python.exe -` |
+| Colon range syntax inside `[...]` | PowerShell range `(Get-Content f)[10..20]` or `read_file(Path=..., StartLine=11, EndLine=21)` |
+| GNU `sed`, `awk`, `head`, `tail` | `read_file`, `rg`, `carbon-stack code-search`, `git grep -n`, `Select-String`, `Select-Object -First/-Last` |
+| `python -m pyflakes ...` | `python -X utf8 -m py_compile ...` or `ast.parse` |
+| `2>/dev/null` or piped `unittest \| Select-Object` | `$null \| ...` / `2>$null`, run `unittest` directly |
 
-- В `run_command` пайп `stdin` открыт для интерактивного ввода. Для утилит, ожидающих EOF на stdin (`codex exec`, фильтры), закрывайте вход явно: `$null | <команда>` в PowerShell или `stdin=subprocess.DEVNULL` в Python.
+- **Machine paths & PATH shadowing:** Verify which executable runs when native and npm/venv installs coexist. Use Python 3.12 (`C:\Users\in\AppData\Local\Programs\Python\Python312\python.exe`), Ripgrep (`C:\tools\ripgrep-15.1.0-x86_64-pc-windows-msvc\ripgrep-15.1.0-x86_64-pc-windows-msvc\rg.exe`, also in `PATH`), and Rust GNU toolchain (`+stable-x86_64-pc-windows-gnu`). Close `stdin` on CLIs (`$null | <cmd>`).
 
-## 2. Встроенные утилиты стека (`<PLUGIN_ROOT>/tools/`)
+## 2. Carbon Stack Utilities
 
-- **Контроль 5-минутного TTL кэша `swarm` и генерация инкрементального диффа:**
-  ```powershell
-  & "<PLUGIN_ROOT>/bin/carbon-stack.exe" swarm-cache status --session "<id>" --label simplify
-  & "<PLUGIN_ROOT>/bin/carbon-stack.exe" swarm-cache prepare --session "<id>" --cwd "<путь>" --label simplify
-  ```
-- **Поиск символов и кода (замена отсутствующим `rg`/`jev`):**
-  ```powershell
-  & "<PLUGIN_ROOT>/bin/carbon-stack.exe" code-search symbols "<имя>" --cwd "<путь>"
-  & "<PLUGIN_ROOT>/bin/carbon-stack.exe" code-search grep "<шаблон>" --cwd "<путь>"
-  ```
-- **Кто держит заблокированный файл на Windows (`ERROR_SHARING_VIOLATION`):**
-  ```powershell
-  powershell -NoProfile -ExecutionPolicy Bypass -File "<PLUGIN_ROOT>/tools/file-holders.ps1" -Path "<путь к файлу>"
-  ```
-- **Безопасная работа с git worktrees и снимками грязного дерева:**
-  ```powershell
-  & "<PLUGIN_ROOT>/bin/carbon-stack.exe" worktree-guard audit --cwd "<путь>"
-  & "<PLUGIN_ROOT>/bin/carbon-stack.exe" worktree-guard snapshot --worktree "<путь>" --label "pre-op"
-  & "<PLUGIN_ROOT>/bin/carbon-stack.exe" worktree-guard remove --worktree "<путь>"
-  ```
+```powershell
+# Code & symbol search (wraps rg cleanly):
+$null | carbon-stack code-search symbols "<name>" --cwd "<path>"
+$null | carbon-stack code-search grep "<pattern>" --cwd "<path>"
+
+# Swarm diff cache & incremental interdiffs:
+$null | carbon-stack swarm-cache status --session "<id>" --label simplify
+$null | carbon-stack swarm-cache prepare --session "<id>" --cwd "<path>" --label simplify
+
+# File-lock holders (ERROR_SHARING_VIOLATION):
+powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\in\.gemini\config\plugins\gemini-carbon-stack\tools\file-holders.ps1" -Path "<file>"
+
+# Safe worktree snapshots, NTFS junction detachment, and removal:
+$null | carbon-stack worktree-guard audit --cwd "<path>"
+$null | carbon-stack worktree-guard snapshot --worktree "<path>" --label "pre-op"
+$null | carbon-stack worktree-guard remove --worktree "<path>"
+```

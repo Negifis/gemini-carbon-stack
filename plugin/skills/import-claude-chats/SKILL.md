@@ -1,6 +1,6 @@
 ---
 name: import-claude-chats
-description: Triggered by /import-claude-chats to import interactive Claude Code sessions (~/.claude/projects) into Google Antigravity across all 5 storage layers with continuation merging, checkpointing, and FTS5 indexing.
+description: "Import Claude Code sessions into Antigravity across all 5 storage layers with FTS5 indexing."
 ---
 
 # `/import-claude-chats` — Импорт истории чатов Claude Code в Google Antigravity

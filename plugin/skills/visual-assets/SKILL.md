@@ -1,6 +1,6 @@
 ---
 name: visual-assets
-description: Raster asset generation and CSS-tokenized SVG vectorization (image-generator + vectorize.mjs). Load ONLY when creating icons or illustrations.
+description: "Raster asset generation and CSS-tokenized SVG vectorization via image-generator and vectorize.mjs."
 ---
 
 # Visual Assets & Theme-Aware SVG Pipeline

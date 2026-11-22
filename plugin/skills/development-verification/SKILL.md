@@ -1,41 +1,58 @@
 ---
 name: development-verification
-description: Edge-case reference for Code Work Gate (XHIGH review tiers, pr-ready, draft-blocked, carbon-stack gate-inbox anomalies, .agents/carbon-gate.json). Do NOT load for standard tasks.
+description: "Code Work Gate verification: Operational Track, risk floors, test/disabled-check rules, and finite closure."
 ---
 
 # Development Verification & Code Work Gate
 
-Контракт верификации, контролируемый runtime-хуками `cwg_mark.rs` и `cwg_stop.rs`.
+Single code-work completion contract aligned with `cwg_mark.rs` and `cwg_stop.rs`. Never wrap this gate in extra outer loops.
 
-## 1. Классы работы и политика риска
+## 1. Work Classification
 
-| Класс | Когда открывается | Требование к закрытию |
-|---|---|---|
-| `NO_CHANGE` | Чтение, диагностика, подтверждённое non-mutating выполнение | Квитанция не требуется; `Stop` пропускает сразу |
-| `OPERATIONAL` | Подтверждённая мутация через `run_command` без изменения файлов (или не измеренное `UNCERTAIN` действие) | `[gate] operational: <предпроверка>; <подтверждённый эффект>` или `[gate] no-change: <причина>` |
-| `PERSISTENT` | Изменение файлов через `edit_file`, `write_file` или файловую дельту `run_command` | `[gate] verified: <RISK>; <кандидат и решающие проверки>` (или граничный исход) |
+- **`NO_CHANGE`:** read-only inspection, diagnosis, planning — closes without a `[gate]` receipt.
+- **`OPERATIONAL`:** live system action via shell or throwaway script outside repositories (`C:/tmp`, session scratchpad) — follows **Operational Track** (§2); auto-retires at Stop cleanly without blocking. Unintended lasting edits restored cleanly back to `opening_head` (`git merge-tree` / `kept_commit_blocker` clean) also auto-retire (`undo-clean`).
+- **`PERSISTENT`:** any lasting change to repository source, config, migrations, docs, or executable instructions — follows risk floors (§3) and closes with `[gate] verified: <RISK>; <candidate and checks>` (or closure receipt).
 
-Риск определяется **не числом изменённых строк**, а затронутыми компонентами, характером операции и политикой проекта (`.agents/carbon-gate.json`):
+## 2. Operational Track
 
-- **`LOW`** (документация, текстовые заметки, статические метаданные/ассеты, `low_risk_globs`): проверка содержимого/ссылок.
-- **`STANDARD`** (обычный код, скрипты, UI, тесты, аддоны вне критических путей):
-  - Автоматический `swarm`/независимое ревью **не требуются** по умолчанию.
-  - Релевантные локальные тесты/проверки обязательны, если проект содержит тестовую инфраструктуру или правки затронули исполняемый код (либо задано `"require_tests_on_standard": true`); любой упавший прогон после правки блокирует закрытие до устранения.
-  - Строгие проекты могут включить `"require_simplify_on_standard": true` / `"require_review_on_standard": true` в `.agents/carbon-gate.json`.
-- **`HIGH`** (security/auth/jwt/crypto/secrets/rbac/permissions, БД-миграции, CI/CD/Docker, runtime-хуки/манифесты плагина/`carbon-stack install`, `high_risk_globs`):
-  - Линейный конечный пайплайн (`Finite Gate`, логика `claude-code-stack` + эмпирические лимиты 80% Pareto по чатам стека, максимум `1 + 4 + 2 = 7` раундов — *ничто не оборачивает его во внешний цикл*): 1) решающие тесты -> 2) консультативный проход `simplify` строго 1 раз ДО ревью (`MAX_SIMPLIFY_PASSES = 1`: `SIMPLIFY_LENS: ALL` при `<= 2` файлах и `<= 30` строках либо 3 линзы `reuse`, `quality`, `efficiency` на `claude-sonnet-5-5-high`, primary fallback `gemini-4-neon-xhigh`, вторично `gemini-4-hydrogen-xhigh`; при `ACTIONABLE_FIXES` — внесите осмысленные правки и перезапустите тесты без повторного прогона `simplify`) -> 3) пакетный `kill` всех `waiting` simplify-воркеров -> 4) независимое ревью `carbon-stack codex-lane review` (`1..4` раунда в одной сессии, `MAX_REVIEW_ROUNDS = 4`, `BLOCKING_THRESHOLD = HIGH`, Раунды `2–4` проверяют только инкрементальный interdiff и открытые блокеры без расширения скоупа; при подтверждённой недоступности Codex — внутренний `claude-opus-5-5-high` -> `gemini-4-neon-xhigh` [`HIGH`] или `gemini-4-carbon-high` [`XHIGH`] при сбое/0% квоты Opus). **`VERDICT: APPROVED` на любом раунде `1..4` немедленно закрывает гейт** (`[gate] verified: HIGH; ...`) без повторного `simplify` и без `--closure`. Только при `Round 4: ESCALATE` выполняется однократный проход исследования (`REMEDIATE`/`REDESIGN`: документация/плагины/интернет), целевая правка + тесты и до **2 попыток** (`MAX_CLOSURE_PASSES = 2`) `carbon-stack codex-lane review --closure` в той же сессии только по исходным блокерам и дельте (`CLOSURE_VALIDATION: READY` -> `[gate] verified` / `pr-ready`; 2-й `BLOCKED` -> финальный терминальный `[gate] draft-blocked`).
-- **`XHIGH`** (`xhigh_risk_globs`, критические протоколы/конкурентные границы безопасности): то же, что `HIGH`, но с `carbon-stack codex-lane review --xhigh` на модели `gpt-6.2-astra` (включая пост-эскалационный `--xhigh --closure`; `gpt-6.2-sol` остаётся на `HIGH`) или внутренним `REVIEW_TIER: XHIGH` при подтверждённом сбое Codex.
-- **Условный Design Gate *(строго только при правке визуальных UI/дизайн-файлов — 0 накладных расходов вне UI)*:** при правке `*.tsx`/`*.jsx`/`*.vue`/`*.svelte`/`*.css`/`*.scss`/`*.html`, `DESIGN.md`, дизайн-токенов или Flutter UI-виджетов (исключая тесты, pure-logic, API, backend, CLI, SQL, infra, docs) `cwg_stop.rs` проверяет наличие живых скриншотов (`browser`/`BROWSER_HOST_FACTS`, `playwright`, `chrome-devtools`, `odiff`) и независимого read-only визуального ревью (`VISUAL_REVIEW_VERDICT: APPROVED`, плюс `UX_REVIEW_VERDICT: APPROVED` при запуске UX-аудитора; самоосмотр основного агента не принимается). Настраивается в `.agents/carbon-gate.json` полями `"design_gate": false`, `"design_include_globs"`, `"design_exclude_globs"`.
+Before mutating a live system (server, DB, remote account, service):
+1. Confirm exact target from the live system itself (disk, host, DB, account) — never from memory.
+2. Establish reversibility (backup, snapshot, export, rollback path, or explicit blast-radius statement).
+3. Run read-only precheck / dry-run first when available.
+4. For irreversible wide-blast-radius changes, validate the plan before execution (never post-hoc).
 
-## 2. Прагматичность ревью, свежесть доказательств, конечность и граничные исходы
+After running: verify actual system state matches expected outcome and separate verified facts from assumptions. Never run `simplify` or code review on executed throwaway scripts. Close with `[gate] operational: <precheck>; <verified effect>` (or `no-change` if nothing changed).
 
-- **Приоритет бизнес-намерения и анти-бумеранг (`--intent` + `codex-lane dispose`):** *ревью защищает реализацию бизнес-требований, а не защищает систему от самих бизнес-требований.* Передавайте `--intent` в `codex-lane review` (при пропуске подтягивается из треда / `.agents/handoff.json` / `USER_INPUT`). Блокируют только дефекты Класса A (`CRITICAL`/`HIGH` с `PRESERVES_INTENT: YES` и `file:line`); запрошенные возможности (внешние AI API, сетевые агенты, сторонние интеграции, prod-инфра) защищаются соразмерными мерами Класса B без их удаления. Отклонённые по существу замечания Класса C/D фиксируйте через `carbon-stack codex-lane dispose --finding "..." --category <intent-conflict|accepted-risk|no-practical-gain|deferred-improvement> --reason "..."` (классифицируется как `BOOKKEEPING`, попадает в `ANTI-BOOMERANG LEDGER` следующих раундов и очищается при смене кандидата или `redesign-reset`).
+## 3. Risk Floors (`PERSISTENT`)
 
-- SHA-256 отпечаток (`content_marks`) аннулирует прежний `APPROVED`/`READY` при любой последующей правке; выполненный на кандидате консультативный проход `simplify` (`MAX_SIMPLIFY_PASSES = 1`) остаётся зачтённым и не запускается заново после правок по замечаниям ревью.
-- `[gate] no-change: <причина>` на `PERSISTENT`-кандидате допустимо только при полном возврате файлов к чистому `HEAD`.
-- Максимум **4 обычных раунда** ревью до эскалации (`MAX_REVIEW_ROUNDS = 4`; дисквалифицированные запуски внутреннего ревью при доступном Codex и локальные таймауты размышления Codex не расходуют лимит раундов) и — исключительно после `Round 4: ESCALATE` — строго **не более 2 попыток closure validation (`CLOSURE_VALIDATION: READY|BLOCKED`, `MAX_CLOSURE_PASSES = 2`)** в той же сессии без повторного `simplify` (`MAX_TOTAL_GATE_ROUNDS = 7`), плюс **3 блокировки `Stop`** на неизменный кандидат (`MAX_BLOCKS_PER_CANDIDATE = 3`).
-- **Строгая конечность гейта (`MAX_REDESIGN_RESETS = 1` и терминальный `[gate] draft-blocked`):** после `Round 4: ESCALATE` агент проводит ровно один сфокусированный проход исследования (документация, плагины, интернет: `search_web`, `tokenade search/web`, `Context7`, `Developer Knowledge` / `Gemini Docs`, субагент `research`) и выбирает один из двух путей:
-  - **`REMEDIATE` (точечная доработка):** остаётся в текущей сессии Codex, применяет правку + тесты и запускает `carbon-stack codex-lane review --closure` (`1..2` попытки).
-  - **`REDESIGN` (архитектурная переделка, максимум 1 раз на кандидата — `MAX_REDESIGN_RESETS = 1`):** завершает воркеров и запускает `carbon-stack codex-lane redesign-reset --cwd <repo> --session <id> --findings "..."` — сбрасывает счётчик раундов и открывает свежую сессию упрощения и ревью без старого контекста Codex. Повторный `redesign-reset` для того же кандидата запрещён (`redesign_reset_limit_reached`).
-  - Если `2`-й проход `--closure` вернул `CLOSURE_VALIDATION: BLOCKED`, дальнейшие раунды ревью, `simplify` и сбросы запрещены (`carbon-stack codex-lane`, `safety_guards.rs`, `cwg_stop.rs`) — закройте ход терминальной квитанцией `[gate] draft-blocked: <причина и оставшиеся блокеры>` и эскалируйте решение пользователю.
-- **Маршрутизация аномалий (`carbon-stack gate-inbox`)**: при объективной аномалии зафиксируйте nonce-репорт `carbon-stack gate-inbox report`, отправьте живое уведомление дежурному чату аномалий (`carbon-stack gate-inbox handler` / `set-handler --session <conv-id> --repo <path>`) через `send_message(Recipient="<handler_session>", Message="[GATE_ANOMALY <id>] ...")` и закройте ответ `[gate] anomaly-reported: <id>; <факт>`. В самом дежурном чате аномалий (`PreInvocation` инжектирует дайджест открытых репортов) разбирайте `carbon-stack gate-inbox show --id <id>`, устраняйте первопричину в репозитории стека + синхронизируйте `carbon-stack install --force` + тесты и закрывайте репорт `carbon-stack gate-inbox resolve --id <id> --note "..."`.
+Determine risk by blast radius, data sensitivity, reversibility, and security boundary — not raw line count:
+- **`LOW`:** docs, comments, tests-only, static assets — run relevant deterministic checks; no independent review.
+- **`STANDARD`:** bounded logic or UI edits outside critical paths — run affected tests/linters (`require_tests_on_standard` if configured); optional advisory `simplify-reviewer` when helpful. Keep diffs compact (`<= 30–40 KB` per step).
+- **`HIGH`:** auth/permissions/secrets/crypto, DB migrations/schemas, CI/CD/deploy/release, plugin runtime hooks/manifests (`rust/src/**`, `hooks.json`, `mcp_config.json`), or wide cross-component diffs — affected checks + optional advisory `simplify` before review + independent review (`carbon-stack codex-lane review`, fallback `adversarial-reviewer` only on verified Codex outage; `1..4` rounds, `BLOCKING_THRESHOLD = HIGH`, `VERDICT: APPROVED` closes immediately).
+- **`XHIGH`:** fragile concurrency/state machines, security/hook enforcement invariants, complex cryptography, or critical multi-component boundaries — same track with `--xhigh` (`gpt-6.2-astra` `ultra` in Codex, or `adversarial-reviewer-xhigh` fallback).
+
+## 4. Candidate Verification & Disabled Checks
+
+- Bind evidence to final file bytes (`cwg_stop.rs` tracks content SHA-256 `content_marks`; any edit after `APPROVED`/`READY` invalidates the verdict and requires re-testing + delta review; clean upstream merges via `git merge-tree` and pure git integration commands stay clean).
+- Never ignore failing checks (unit, integration, e2e, lint, types, build — including pre-existing or flaky):
+  - Failures caused by or inside task scope: fix root cause in source (`root-cause-engineering`).
+  - Pre-existing out-of-scope failures: hand off to a worktree subagent or `carbon-stack chip-handoff open` (verify reproduction on base revision without mixing fixes into current candidate). Parent verifies every handoff result.
+- **Disabled checks are hidden failures:** never add skip/xfail markers, `eslint-disable`, `# noqa`, `# type: ignore`, `@ts-ignore`, linter exclusions, or `--no-verify`; re-enable any encountered in touched scope and fix underlying causes.
+- Unavailable checks (missing service/credentials): state honestly what could not run and why; never report unrun checks as passing.
+
+## 5. Finite Review & Autonomous Closure
+
+- **Advisory `simplify` (`simplify` skill):** recommended once before Round 1 review on `HIGH`/`XHIGH` (`simplify-reviewer` or 3 lenses via `swarm`; never blocks `Stop` and never repeats after review).
+- **Review loop (`1..4` rounds, `BLOCKING_THRESHOLD = HIGH`):** only `CRITICAL`/`HIGH` defects with concrete reachable triggers (and broken acceptance criteria) block. Dismiss `Class C/D` / intent-conflicting noise via `carbon-stack codex-lane dispose`.
+- **After `Round 4: ESCALATE`:** freeze open blockers, run **one** focused evidence pass (code, tests, Context7, web), then choose:
+  - **`REMEDIATE`:** stay in same session, fix + re-test, run `<= 2` `--closure` passes (`CLOSURE_VALIDATION: READY` -> `[gate] verified` / `[gate] pr-ready`; 2nd `BLOCKED` -> terminal `[gate] draft-blocked: <blocker and handoff>`).
+  - **`REDESIGN`:** call `carbon-stack codex-lane research-reset` or `redesign-reset` (1 reset allowed per candidate) for a clean architectural cycle.
+- **Active production incident:** apply smallest reversible mitigation + smoke check to stop user harm first, then complete proportionate verification and report both states distinctly.
+
+## 6. Terminal Receipts & Anomalies
+
+End `PERSISTENT` completions with one factual final line:
+- `[gate] verified: <LOW|STANDARD|HIGH|XHIGH>; <candidate and checks>`
+- `[gate] pr-ready: <branch/PR and closure summary>` | `[gate] draft-blocked: <blocker and handoff>`
+
+If a Stop block contradicts facts verifiable in the transcript: run `carbon-stack gate-inbox report` (using the nonce from the block), notify handler chat `a508fe71-2b38-458a-b726-7529ddc212ac` (`send_message` or `chat-bus`), and close with `[gate] anomaly-reported: <id>; <fact>`.

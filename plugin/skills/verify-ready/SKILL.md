@@ -1,14 +1,15 @@
 ---
 name: verify-ready
-description: Triggered by /verify-ready to audit pre-closure readiness (risk level, checks, Sonnet lenses, and review SHA-256 freshness).
+description: "Pre-closure readiness audit: intent match, checks, review freshness, and compact scope check."
 ---
 
-# `/verify-ready` — Проверка готовности результата перед закрытием
+# `/verify-ready` — Pre-Closure Readiness Audit
 
-1. **Целостность задачи и чистота дерева:** сверьте результат с исходным бизнес-намерением пользователя (`BUSINESS_INTENT`) и критериями успеха (ни одна запрошенная возможность не вырезана из-за избыточной перестраховки); проверьте `git status --short` и `git diff --stat` (нет временных файлов, секретов и лишних правок).
-2. **Решающие проверки и условный Design Gate:** тесты/проверки сборки и типов прошли успешно **после самой последней правки файлов**. Если изменялись визуальные UI/дизайн-файлы (`*.tsx`/`*.css`/`DESIGN.md`/Flutter UI-виджеты), сняты реальные скриншоты в браузере и получен независимый `VISUAL_REVIEW_VERDICT: APPROVED` (плюс `UX_REVIEW_VERDICT: APPROVED` при UX-аудите).
-3. **Соответствие уровню риска Code Work Gate:**
-   - `LOW`: проверены разметка и ссылки.
-   - `STANDARD`: пройдены применимые локальные тесты/проверки (без авто-`swarm`, если политика `.agents/carbon-gate.json` не требует `simplify`).
-   - `HIGH` / `XHIGH` (линейный конечный пайплайн `Finite Gate` из `development-verification`, `MAX_TOTAL_GATE_ROUNDS = 7`, `MAX_REDESIGN_RESETS = 1`): 1) тесты -> 2) консультативный проход `simplify` 1 раз ДО ревью (`MAX_SIMPLIFY_PASSES = 1`: `SIMPLIFY_LENS: ALL` при `<= 2` ф. и `<= 30` ст. либо 3 линзы `reuse`, `quality`, `efficiency`; при `ACTIONABLE_FIXES` — правка и перезапуск тестов без повторного `simplify`) -> 3) пакетный `kill` `waiting` simplify-воркеров -> 4) независимое прагматичное ревью `carbon-stack codex-lane review --intent "..."` (`1..4` раунда в одной сессии, `MAX_REVIEW_ROUNDS = 4`, `BLOCKING_THRESHOLD = HIGH`, только дефекты Класса A с `PRESERVES_INTENT: YES`; отклонённые замечания Класса C/D зафиксированы в `codex-lane dispose`; **`VERDICT: APPROVED` на любом раунде `1..4` сразу закрывает гейт** без повторного `simplify` и без `--closure`; только при `Round 4: ESCALATE` — однократный проход исследования: `REMEDIATE` в той же сессии до 2 попыток `--closure` -> `CLOSURE_VALIDATION: READY` / терминальный `[gate] draft-blocked`, либо при архитектурном `REDESIGN` — 1 конечный `carbon-stack codex-lane redesign-reset` с обнулением раундов и чистой сессией ревьюера).
-4. **Чипы и квитанция:** убедитесь через `carbon-stack chip-handoff status`, что дочерние чипы закрыты, и завершите ответ строкой `[gate] ...`.
+1. **Intent & Diff Hygiene (`<= 30–40 KB`):** verify output matches `BUSINESS_INTENT` (no requested capability stripped out); inspect `git status --short` and `git diff --stat` (no stray binaries/temp files/disabled checks, coherent compact candidate).
+2. **Fresh Checks:** affected tests, type checks, and linters ran and passed **after the final file edit** (any pre-existing out-of-scope failure handed off explicitly, never ignored or suppressed).
+3. **Gate Risk Alignment (`development-verification`):**
+   - `LOW`: content/links/deterministic check verified.
+   - `STANDARD`: affected local tests/linters green (optional advisory `simplify-reviewer`).
+   - `HIGH` / `XHIGH`: tests green → optional advisory `simplify` once before review → independent review via `carbon-stack codex-lane review --intent "..."` (`1..4` rounds, `DISPOSE` recorded for Class C/D/intent conflicts; `VERDICT: APPROVED` closes gate; after `Round 4: ESCALATE` → 1 research pass → `<= 2` `--closure` passes -> `verified`/`pr-ready` or terminal `[gate] draft-blocked`, or 1 `research-reset`/`redesign-reset`).
+   - If visual UI files changed meaningfully: live browser screenshots checked + `VISUAL_REVIEW_VERDICT: APPROVED` from read-only `visual-qa-reviewer`.
+4. **Handoffs, Memory & Receipt:** confirm child chips closed via `carbon-stack chip-handoff status`, record any confirmed `DECISION`/`GOTCHA` via `nlm-memory remember`, and finish with exact final `[gate]` receipt.

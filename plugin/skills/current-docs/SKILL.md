@@ -1,15 +1,15 @@
 ---
 name: current-docs
-description: External library/SDK version verification via manifests and Context7 MCP. Load ONLY when checking unfamiliar or version-sensitive APIs.
+description: "Version-pinned external SDK/API verification via manifests, Context7 MCP, and web search cascade."
 ---
 
 # Current Documentation Verification
 
-Никогда не полагайтесь на устаревшую память обучения для быстро меняющихся API, SDK, CLI-флагов и конфигурационных схем.
+Never write external library, framework, CLI, or SDK integration code from stale training memory. Verify installed versions and current official APIs first.
 
-## Порядок проверки
-
-1. **Установите точную локальную версию:** сначала проверьте `package.json` / lock-файл, `pyproject.toml`, `Cargo.toml`, `go.mod`, `--help` бинарника или `pip show` / `npm ls`, чтобы знать фактическую мажорную и минорную версию в окружении.
-2. **Проверьте локальные встроенные схемы и исходники:** для системных расширений Antigravity читайте встроенную документацию (`agy-customizations`, `antigravity_guide`), а для установленных пакетов — их реальные `.d.ts` / Python-сигнатуры в `node_modules` или `site-packages`.
-3. **Запросите актуальную документацию через Context7 MCP:** прочитайте схему ленивых инструментов `context7_context7` (`resolve-library-id` -> `query-docs`) и запросите документацию под установленную версию библиотеки.
-4. **Веб-поиск (`search_web`) как резерв:** используйте с приоритетом официального домена разработчика, когда библиотека не представлена в Context7 или речь о свежем релизе/issue.
+1. **Pin Exact Local Version:** Read the project manifest/lockfile (`package.json`, `Cargo.toml`, `pyproject.toml`, `pubspec.yaml`, `go.mod`) or `<cli> --help` / `pip show` / `npm ls` to establish exact major/minor versions.
+2. **Check Local Types & Builtins:** Inspect installed `.d.ts` / Python/Rust source signatures or Antigravity builtin docs (`agy-customizations`, `antigravity_guide`) directly on disk.
+3. **Version-Pinned Context7 Lookup (`ServerName="context7"`):**
+   - Inspect `~/.gemini/antigravity/mcp/context7/*.json` if needed, then call `resolve-library-id` -> `query-docs` (passing `/org/project/<version>` when manifest-pinned). Limit to focused queries with zero secrets.
+4. **Web & GitHub Cascade:** For OSS internals or docs missing in Context7, check `deepwiki` (`read_wiki_structure` -> `ask_wiki_question`), `exa` (`web_search_exa` / `web_fetch_exa`), or `$null | tokenade search "<query>"` + `fetch`.
+5. **Reuse Before Wrapping:** Search existing project client wrappers, error types, and retry helpers before adding new glue.

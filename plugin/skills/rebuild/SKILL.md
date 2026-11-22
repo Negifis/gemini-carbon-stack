@@ -1,6 +1,6 @@
 ---
 name: rebuild
-description: Triggered by /rebuild to reconcile stale handoff state with live git status/diff after interrupted sessions.
+description: "Reconcile stale handoff state with live git status/diff after interrupted sessions."
 ---
 
 # `/rebuild` — Чистое восстановление состояния

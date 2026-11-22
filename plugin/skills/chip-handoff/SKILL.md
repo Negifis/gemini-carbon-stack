@@ -1,6 +1,6 @@
 ---
 name: chip-handoff
-description: Parallel git-worktree child-task workflow (carbon-stack chip-handoff). Load ONLY when splitting concurrent coding tasks across worktrees.
+description: "Parallel git-worktree child-task handoff workflow via carbon-stack chip-handoff."
 ---
 
 # Chip Handoff & Multi-Session Orchestration

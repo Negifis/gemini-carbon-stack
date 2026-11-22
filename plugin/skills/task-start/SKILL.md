@@ -1,19 +1,14 @@
 ---
 name: task-start
-description: Triggered by /task-start to audit tree locks, recall project memory, and initialize handoff before a multi-session feature.
+description: "Start non-trivial tasks: audit worktrees, recall memory, locate targets, and initialize handoff."
 ---
 
-# `/task-start` — Запуск работы над инженерной задачей
+# `/task-start` — Engineering Task Initialization
 
-При вызове `/task-start` (или начале крупной задачи/issue) выполните компактный старт:
+Run a compact orientation sequence before editing non-trivial features or multi-file tasks:
 
-1. **Проверка рабочего дерева и веток:**
-   - Запустите `git status --short --branch` и `carbon-stack worktree-guard audit`.
-   - Если в дереве есть чужие/пользовательские незакоммиченные изменения, решите: работать аккуратно в непересекающихся файлах или выделить изолированный worktree через `carbon-stack chip-handoff open`.
-2. **Извлечение знаний проекта:**
-   - Выполните `carbon-stack carbon-memory recall --query "<ключевые слова задачи>" --cwd "<путь>"`.
-3. **Быстрая разведка точек входа:**
-   - Найдите целевые модули и существующие тесты через `carbon-stack code-search symbols` / `carbon-stack code-search grep`.
-4. **Фиксация стартового канонического состояния (для многошаговых задач):**
-   - Запишите `GOAL`, `AUTHORITATIVE STATE`, `ACCEPTANCE` и `NEXT ACTION` через `carbon-stack continuity checkpoint`.
-5. Немедленно переходите к выполнению первого шага (не останавливаясь на пустом отчёте о старте, если требования ясны).
+1. **Inspect tree & worktrees:** Run `git status --short --branch` and `carbon-stack worktree-guard audit`; if unrelated dirty changes exist, isolate work cleanly in disjoint files or `carbon-stack chip-handoff open`.
+2. **Recall prior decisions & constraints:** Query `nlm-memory recall "<keywords>"` (and `carbon-stack carbon-memory recall --query "<keywords>" --cwd "<path>"` offline).
+3. **Locate entrypoints & contracts:** Map target symbols, callers, and tests via `carbon-stack code-search`, `tokenade map`/`impact`, and `codebase-memory`.
+4. **State invariants, slices & handoff:** Formulate `3–5` core invariants, keep work sliced into `<= 30–40 KB` (~500–1,000 LOC) stages, and for multi-session work save `GOAL`, `AUTHORITATIVE STATE`, `ACCEPTANCE`, and `NEXT ACTION` via `carbon-stack continuity handoff`.
+5. Proceed immediately into execution rather than stopping after orientation.

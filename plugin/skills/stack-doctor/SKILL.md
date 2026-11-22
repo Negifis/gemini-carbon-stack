@@ -1,19 +1,19 @@
 ---
 name: stack-doctor
-description: Triggered by /stack-doctor to run health diagnostics on gemini-carbon-stack installation, hooks, Codex lane, and Language Server.
+description: "Health diagnostics for gemini-carbon-stack installation, hooks, Codex lane, and Language Server."
 ---
 
-# `/stack-doctor` — Диагностика инженерного стека
+# `/stack-doctor` — Engineering Stack Health Check
 
-Запустите комплексную самодиагностику стека:
+Run end-to-end diagnostics via the installed `carbon-stack` binary:
 
 ```powershell
-& "<PLUGIN_ROOT>/bin/carbon-stack.exe" stack-doctor --cwd "<рабочая директория>"
+$null | carbon-stack stack-doctor --cwd "<workspace>"
 ```
 
-При необходимости дополнительно проверьте:
-- Статус установщика и резервных копий: `& "<REPO_ROOT>/plugin/bin/carbon-stack.exe" install --diagnose`
-- Очередь аномалий гейта: `& "<PLUGIN_ROOT>/bin/carbon-stack.exe" gate-inbox list`
-- Здоровье внешнего ревью-движка Codex: `& "<PLUGIN_ROOT>/bin/carbon-stack.exe" codex-lane check`
+Additional targeted checks:
+- Installer & backups: `$null | carbon-stack install --diagnose`
+- Gate anomaly inbox: `$null | carbon-stack gate-inbox list`
+- External Codex reviewer health: `$null | carbon-stack codex-lane check`
 
-Сообщите пользователю статус каждого контура (Plugin & LS Ingestion, Hooks, Codex Lane, Local FTS5 Memory, Active Chips, Gate Inbox) и конкретную команду исправления, если какой-либо контур деградировал.
+Report status across Plugin & LS Ingestion, Hooks, Codex Lane, Memory (`nlm-memory` / FTS5), Active Chips, and Gate Inbox, plus exact remediation commands if anything degraded.

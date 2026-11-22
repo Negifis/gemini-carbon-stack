@@ -1,6 +1,6 @@
 ---
 name: canonical-state
-description: Schema reference for multi-session handoff files and requirement-replacement recovery. Do NOT load on single-session tasks.
+description: "Schema reference for multi-session handoff state and requirement-replacement recovery."
 ---
 
 # Canonical State & Minimal Handoff

@@ -1,6 +1,6 @@
 ---
 name: checkpoint
-description: Triggered by /checkpoint to save repo-backed handoff state (goal, decisions, remaining steps) via carbon-stack continuity.
+description: "Save compact repo-backed handoff state (goal, decisions, next steps) via carbon-stack continuity."
 ---
 
 # `/checkpoint` — Сохранение минимального handoff-состояния

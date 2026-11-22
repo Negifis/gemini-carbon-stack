@@ -1,6 +1,6 @@
 ---
 name: infra-sre-ops
-description: Read-only-first incident diagnostics, resource analysis, and infrastructure/database/security inspection across Proxmox VE, Kubernetes/k3s, Nomad, Docker, Zabbix, Grafana/Prometheus/Loki, PostgreSQL, MSSQL, Linux/Windows SSH, and Trivy.
+description: "Read-only-first diagnostics for Proxmox, K8s, Nomad, Docker, Zabbix, Grafana, DBs, SSH, and Trivy."
 ---
 
 # Infrastructure, DevOps & SRE Diagnostics Playbook

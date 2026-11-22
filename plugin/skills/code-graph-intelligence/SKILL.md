@@ -1,6 +1,6 @@
 ---
 name: code-graph-intelligence
-description: 4-layer code intelligence protocol combining ripgrep, tokenade, codebase-memory-mcp (CBM + CBM Lens), serena LSP, and ast-grep for architecture discovery, blast-radius analysis, and cross-service tracing in large polyglot monorepos like Charon.
+description: "4-layer code discovery (rg, tokenade, codebase-memory, serena/bsl-ls) for architecture and blast radius."
 ---
 
 # Code Graph Intelligence (CBM + Lens + Serena + Tokenade)

@@ -1,6 +1,6 @@
 ---
 name: enterprise-1c-bitrix-jira
-description: Practical workflows for Bitrix24 (REST API, CRM, Open Lines, webhooks), 1C Enterprise / BSL (bsl-language-server MCP, v8std, 1c-syntax-helper, XML/EDT metadata), Jira Data Center / JSM (jira.lemnos.ru), and local OpenAPI/API testing (Hurl, Schemathesis, Newman, Postman).
+description: "Bitrix24 REST/CRM, 1C/BSL (bsl-ls/v8std), Jira DC/JSM, and local Hurl/Schemathesis/Newman testing."
 ---
 
 # Enterprise Integrations: Bitrix24, 1С/BSL, Jira DC & API Testing
