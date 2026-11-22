@@ -25,7 +25,7 @@ const HOOK_EVENTS: &[&str] = &[
     "PostToolUse",
     "Stop",
 ];
-const REQUIRED_GUARD_TOOLS: &[&str] = &["read_board", "edit_file", "write_file", "swarm_wait"];
+const REQUIRED_GUARD_TOOLS: &[&str] = &["edit_file", "write_file", "swarm_wait"];
 
 fn hook_target_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
