@@ -59,22 +59,23 @@ pub fn handoff_items(ho: &Map<String, Value>, key: &str) -> Vec<String> {
     }
 }
 pub fn handoff_constraints(ho: &Map<String, Value>) -> (Vec<String>, Vec<String>) { (handoff_items(ho, "decisions"), handoff_items(ho, "superseded")) }
-fn load_superseding_cp(cwd: &str, wps: &[String], pk: &str, sess: &str, no_ho: bool, ho_closed: bool, ho_path: Option<&Path>) -> Option<String> {
+fn find_superseding_cp_path(cwd: &str, wps: &[String], pk: &str, sess: &str, no_ho: bool, ho_closed: bool, ho_path: Option<&Path>) -> Option<PathBuf> {
     if !no_ho && !ho_closed { return None; }
     let cp = resolve_checkpoint_file(cwd, wps, Some(pk), sess)?;
-    if !no_ho && !ho_path.map_or(true, |hp| matches!((file_mtime_ns(&cp), file_mtime_ns(hp)), (Some(c), Some(h)) if c > h)) { return None; }
-    fs::read_to_string(&cp).ok()
+    (no_ho || ho_path.map_or(true, |hp| matches!((file_mtime_ns(&cp), file_mtime_ns(hp)), (Some(c), Some(h)) if c > h))).then_some(cp)
 }
 pub fn active_constraints(cwd: &str, workspace_paths: &[String], pkey: Option<&str>, session: &str) -> (String, String) {
     let pk = eff_pkey(cwd, workspace_paths, pkey, session);
     let (ho_path, raw_ho) = resolve_handoff(cwd, workspace_paths, Some(&pk), session);
     let ho_closed = raw_ho.as_ref().is_some_and(|h| is_closed_status(&val_to_str(h.get("status"))));
     if let Some(ref ho) = raw_ho { if !ho_closed { let (d, s) = handoff_constraints(ho); return (truncate_chars(&d.join("; "), 400).to_string(), truncate_chars(&s.join("; "), 300).to_string()); } }
-    if let Some(text) = load_superseding_cp(cwd, workspace_paths, &pk, session, raw_ho.is_none(), ho_closed, ho_path.as_deref()) {
-        let secs = parse_checkpoint_sections(&text);
-        if !is_closed_status(secs.get("STATUS").map(String::as_str).unwrap_or("")) {
-            let cl = |k: &str, n: usize| { let v = secs.get(k).map(|s| s.trim()).unwrap_or(""); if v == "—" { String::new() } else { truncate_chars(v, n).to_string() } };
-            return (cl("AUTHORITATIVE STATE", 400), cl("SUPERSEDED / CANCELLED", 300));
+    if let Some(cp) = find_superseding_cp_path(cwd, workspace_paths, &pk, session, raw_ho.is_none(), ho_closed, ho_path.as_deref()) {
+        if let Ok(text) = fs::read_to_string(&cp) {
+            let secs = parse_checkpoint_sections(&text);
+            if !is_closed_status(secs.get("STATUS").map(String::as_str).unwrap_or("")) {
+                let cl = |k: &str, n: usize| { let v = secs.get(k).map(|s| s.trim()).unwrap_or(""); if v == "—" { String::new() } else { truncate_chars(v, n).to_string() } };
+                return (cl("AUTHORITATIVE STATE", 400), cl("SUPERSEDED / CANCELLED", 300));
+            }
         }
     }
     (String::new(), String::new())
@@ -148,9 +149,12 @@ fn build_repo_handoff(cwd: &str, session: &str, wps: &[String], mode: &str, max_
     let (no_ho, ho_closed, cand) = (raw_ho.is_none(), raw_ho.as_ref().is_some_and(|h| is_closed_status(&val_to_str(h.get("status")))), open_candidate_brief(session));
     let mut ho = if mode == "lead" && cand.is_empty() && ho_closed { None } else { raw_ho };
     let mut cp_text = String::new();
-    if let Some(t) = load_superseding_cp(cwd, wps, &pk, session, no_ho, ho_closed, ho_path.as_deref()) {
+    if let Some(cp) = find_superseding_cp_path(cwd, wps, &pk, session, no_ho, ho_closed, ho_path.as_deref()) {
+        // INVARIANT: Clear superseded closed handoff before reading CHECKPOINT.md so an unreadable newer checkpoint never revives closed handoff state.
         ho = None;
-        if !(mode == "lead" && cand.is_empty() && is_closed_status(parse_checkpoint_sections(&t).get("STATUS").map(String::as_str).unwrap_or(""))) { cp_text = t; }
+        if let Ok(t) = fs::read_to_string(&cp) {
+            if !(mode == "lead" && cand.is_empty() && is_closed_status(parse_checkpoint_sections(&t).get("STATUS").map(String::as_str).unwrap_or(""))) { cp_text = t; }
+        }
     }
     let gb = (mode == "authoritative" || ho.is_some() || !cp_text.is_empty()).then(|| collect_git_brief(cwd)).flatten();
     let mut lines = Vec::new();
@@ -220,6 +224,24 @@ fn waived_final_line(msg: &str) -> bool {
     !last.is_empty() && lint_waiver_re().is_match(last)
 }
 
+fn apply_new_user_turn(state: &mut Map<String, Value>, user_text: &str, cur_step: Option<i64>, tx_idx: Option<i64>) -> Option<String> {
+    state.insert("last_user_hash".into(), Value::String(sha256_hex(user_text.as_bytes())[..16].to_string()));
+    state.insert("turn_closed".into(), Value::Bool(false));
+    match cur_step {
+        Some(cs) => { state.insert("last_user_step".into(), json!(cs)); state.remove("last_user_base_step"); }
+        None => { state.remove("last_user_step"); if let Some(bs) = tx_idx { state.insert("last_user_base_step".into(), json!(bs)); } else { state.remove("last_user_base_step"); } }
+    }
+    bump_gen(state); state.insert("lint_blocks".into(), json!(0));
+    let norm_ui = norm_yo(user_text);
+    state.insert("history_requested".into(), Value::Bool(history_re().is_match(&norm_ui)));
+    if strong_correction_re().is_match(&norm_ui) {
+        let streak = val_to_i64(state.get("strong_correction_streak")) + 1;
+        state.insert("correction_active".into(), Value::Bool(true)); state.insert("strong_correction_streak".into(), json!(streak));
+        Some(if streak >= 2 { "[Continuity — Clean-Room Rebuild Escalation] Два сильных корректирующих указания подряд. Остановите инкрементальные заплатки: зафиксируйте обновлённый `AUTHORITATIVE STATE` и отменённые требования в `SUPERSEDED / CANCELLED` (через `/rebuild` или `carbon-stack continuity checkpoint`), перепроверьте состояние файлов с диска и стройте финальный ответ без упоминания отвергнутых черновиков.".into() }
+             else { "[Continuity — Замена требования] Пользователь отменил или изменил прежний подход. Обновите активные требования, поместите отменённое в `SUPERSEDED / CANCELLED`, не возвращайте старую гипотезу и не описывайте отвергнутый черновик в финальном ответе.".into() })
+    } else { state.insert("correction_active".into(), Value::Bool(false)); state.insert("strong_correction_streak".into(), json!(0)); None }
+}
+
 pub fn evaluate_pre_invocation(payload: &Value) -> Option<String> {
     let tp = payload_tp(payload);
     if rio::is_subagent_session(tp, None) { return None; }
@@ -227,15 +249,15 @@ pub fn evaluate_pre_invocation(payload: &Value) -> Option<String> {
     let mut state = load_session_state(&session);
     let mut injected: Vec<String> = state.get("pending_warnings").and_then(Value::as_array).map(|a| a.iter().map(|w| val_to_str(Some(w))).collect()).unwrap_or_default();
     state.insert("pending_warnings".into(), Value::Array(Vec::new()));
-    // INVARIANT: Live Antigravity `PreInvocation` leaves `lastUserInput` empty; fall back to `rio::last_user_input_step(tp)` with monotonic `(last_user_step, last_user_base_step, last_user_hash)` turn dedup so each user turn fires once even across transcript-flush lag.
+    // INVARIANT: Live Antigravity `PreInvocation` leaves `lastUserInput` empty; fall back to `rio::last_user_input_step(tp)` with monotonic turn dedup, while never binding a new post-answer `lastUserInput` to an already answered/closed transcript step.
     let (ui, tx_step) = (payload.get("lastUserInput").and_then(Value::as_str).unwrap_or("").trim(), rio::last_user_input_step(tp));
     let tx_idx = tx_step.as_ref().map(|(i, _)| *i);
-    let (user_text, cur_step) = if !ui.is_empty() { (ui.to_string(), tx_step.as_ref().filter(|(_, c)| c.trim() == ui).map(|(i, _)| *i)) }
+    let ui_fresh_turn = !ui.is_empty() && (json_truthy(state.get("turn_closed")) || tx_idx.is_some_and(|ti| steps.iter().any(|st| st.get("source").and_then(Value::as_str) == Some("MODEL") && st.get("type").and_then(Value::as_str) == Some("PLANNER_RESPONSE") && val_to_i64(st.get("step_index")) > ti)));
+    let (user_text, cur_step) = if !ui.is_empty() { (ui.to_string(), (!ui_fresh_turn).then(|| tx_step.as_ref().filter(|(_, c)| c.trim() == ui).map(|(i, _)| *i)).flatten()) }
         else if let Some((idx, content)) = tx_step { (content.trim().to_string(), Some(idx)) } else { (String::new(), None) };
     if !user_text.is_empty() {
-        let cur_hash = sha256_hex(user_text.as_bytes())[..16].to_string();
-        let (prev_step, prev_base, prev_hash) = (state.get("last_user_step").and_then(Value::as_i64), state.get("last_user_base_step").and_then(Value::as_i64), val_to_str(state.get("last_user_hash")));
-        let same_turn = match (prev_step, cur_step) {
+        let (cur_hash, prev_step, prev_base, prev_hash) = (sha256_hex(user_text.as_bytes())[..16].to_string(), state.get("last_user_step").and_then(Value::as_i64), state.get("last_user_base_step").and_then(Value::as_i64), val_to_str(state.get("last_user_hash")));
+        let same_turn = !ui_fresh_turn && match (prev_step, cur_step) {
             (Some(ps), Some(cs)) => cs <= ps,
             (None, Some(cs)) if prev_base.is_some_and(|bs| cs <= bs) => true,
             (None, Some(cs)) if !prev_hash.is_empty() && cur_hash == prev_hash => { state.insert("last_user_step".into(), json!(cs)); state.remove("last_user_base_step"); true }
@@ -243,26 +265,7 @@ pub fn evaluate_pre_invocation(payload: &Value) -> Option<String> {
             (Some(_), None) => !prev_hash.is_empty() && cur_hash == prev_hash,
             (None, None) => cur_hash == prev_hash,
         };
-        if !same_turn {
-            state.insert("last_user_hash".into(), Value::String(cur_hash));
-            match cur_step {
-                Some(cs) => { state.insert("last_user_step".into(), json!(cs)); state.remove("last_user_base_step"); }
-                None => { state.remove("last_user_step"); if let Some(bs) = tx_idx { state.insert("last_user_base_step".into(), json!(bs)); } else { state.remove("last_user_base_step"); } }
-            }
-            bump_gen(&mut state);
-            state.insert("lint_blocks".into(), json!(0));
-            let norm_ui = norm_yo(&user_text);
-            state.insert("history_requested".into(), Value::Bool(history_re().is_match(&norm_ui)));
-            if strong_correction_re().is_match(&norm_ui) {
-                let streak = val_to_i64(state.get("strong_correction_streak")) + 1;
-                state.insert("correction_active".into(), Value::Bool(true)); state.insert("strong_correction_streak".into(), json!(streak));
-                injected.push(if streak >= 2 {
-                    "[Continuity — Clean-Room Rebuild Escalation] Два сильных корректирующих указания подряд. Остановите инкрементальные заплатки: зафиксируйте обновлённый `AUTHORITATIVE STATE` и отменённые требования в `SUPERSEDED / CANCELLED` (через `/rebuild` или `carbon-stack continuity checkpoint`), перепроверьте состояние файлов с диска и стройте финальный ответ без упоминания отвергнутых черновиков.".into()
-                } else {
-                    "[Continuity — Замена требования] Пользователь отменил или изменил прежний подход. Обновите активные требования, поместите отменённое в `SUPERSEDED / CANCELLED`, не возвращайте старую гипотезу и не описывайте отвергнутый черновик в финальном ответе.".into()
-                });
-            } else { state.insert("correction_active".into(), Value::Bool(false)); state.insert("strong_correction_streak".into(), json!(0)); }
-        }
+        if !same_turn { if let Some(msg) = apply_new_user_turn(&mut state, &user_text, cur_step, tx_idx) { injected.push(msg); } }
     }
     let (init_s, prev_s) = (val_to_i64(payload.get("initialNumSteps")), val_to_i64(state.get("last_step_count")));
     let compacted = (prev_s > 12 && init_s > 0 && init_s < prev_s / 2) || steps[steps.len().saturating_sub(4)..].iter().any(|st| {
@@ -319,14 +322,29 @@ pub fn evaluate_pre_tool_use(payload: &Value) -> (String, Option<String>) {
 pub fn decide_stop(payload: &Value) -> Option<String> {
     let reason = payload.get("terminationReason").and_then(Value::as_str).unwrap_or("");
     if rio::NON_ENFORCEABLE_STOP_REASONS.contains(&reason) || json_truthy(payload.get("error")) { return None; }
-    let (session, cwd) = (rio::session_key(payload), rio::effective_cwd(payload));
+    let (session, cwd, tp) = (rio::session_key(payload), rio::effective_cwd(payload), payload_tp(payload));
     let mut state = load_session_state(&session);
+    // INVARIANT: Catch a newly flushed transcript USER_INPUT missed by an earlier PreInvocation lag before evaluating Stop output lint.
+    if let Some((cs, content)) = rio::last_user_input_step(tp) {
+        let trimmed = content.trim();
+        let (ps, pb, ph) = (state.get("last_user_step").and_then(Value::as_i64), state.get("last_user_base_step").and_then(Value::as_i64), val_to_str(state.get("last_user_hash")));
+        if !trimmed.is_empty() && ps.map_or(true, |p| cs > p) && pb.map_or(true, |b| cs > b) {
+            if ps.is_none() && !json_truthy(state.get("turn_closed")) && !ph.is_empty() && sha256_hex(trimmed.as_bytes())[..16] == ph {
+                state.insert("last_user_step".into(), json!(cs)); state.remove("last_user_base_step");
+            } else {
+                let _ = apply_new_user_turn(&mut state, trimmed, Some(cs), Some(cs));
+            }
+        }
+    }
     let locked_root = val_to_str(state.get("locked_git_root"));
     if !json_truthy(state.get("correction_active")) {
-        if !locked_root.is_empty() { touch_tree_lock(&session, &cwd, &[], true, Some(&locked_root)); state.insert("locked_git_root".into(), Value::String(String::new())); save_session_state(&session, &mut state); }
+        let mut dirty = !json_truthy(state.get("turn_closed"));
+        state.insert("turn_closed".into(), Value::Bool(true));
+        if !locked_root.is_empty() { touch_tree_lock(&session, &cwd, &[], true, Some(&locked_root)); state.insert("locked_git_root".into(), Value::String(String::new())); dirty = true; }
+        if dirty { save_session_state(&session, &mut state); }
         return None;
     }
-    let tp = payload_tp(payload); let steps = rio::read_transcript_steps(tp, 40);
+    let steps = rio::read_transcript_steps(tp, 40);
     if rio::is_subagent_session(tp, Some(&steps)) { return None; }
     let msg = match val_to_str(payload.get("lastAssistantMessage")) { s if !s.is_empty() => s, _ => rio::last_assistant_message(&steps) };
     let lint_blocks = val_to_i64(state.get("lint_blocks"));
@@ -336,6 +354,7 @@ pub fn decide_stop(payload: &Value) -> Option<String> {
         return Some("[Continuity Output Lint] Финальный ответ после коррекции пользователя содержит описание отвергнутых попыток/черновиков. Перепишите ответ начисто по текущему состоянию результата (либо добавьте `[lint] intentional: <причина>` последней строкой, если сравнение версий запрошено пользователем).".into());
     }
     state.insert("correction_active".into(), Value::Bool(false));
+    state.insert("turn_closed".into(), Value::Bool(true));
     if !locked_root.is_empty() { touch_tree_lock(&session, &cwd, &[], true, Some(&locked_root)); state.insert("locked_git_root".into(), Value::String(String::new())); }
     save_session_state(&session, &mut state);
     None
@@ -696,5 +715,60 @@ mod tests {
             "lastAssistantMessage": "КАК Я УЖЁ ПИСАЛ ДО ИСПРАВЛЕНИЯ, решение готово."
         }));
         assert!(yo_upper_blk.unwrap().contains("Continuity Output Lint"));
+
+        // (d) Codex C3 #4: repeating the exact same correction phrase in a new turn while transcript still lags on the answered step must still fire PreInvocation and enforce Stop lint, and a late-flushed transcript USER_INPUT must be caught in Stop.
+        let sid_rep = "sess-repeat-corr-01";
+        let tp_rep = env.1.join("transcript_repeat.jsonl");
+        let rep_t1 = concat!(
+            "{\"step_index\":0,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"Нет, переделай\"}\n",
+            "{\"step_index\":1,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"content\":\"Готово.\"}\n"
+        );
+        fs::write(&tp_rep, rep_t1).unwrap();
+        assert!(evaluate_pre_invocation(&json!({
+            "conversationId": sid_rep, "transcriptPath": tp_rep.to_string_lossy(), "lastUserInput": "Нет, переделай"
+        })).is_some());
+        assert!(decide_stop(&json!({
+            "conversationId": sid_rep, "transcriptPath": tp_rep.to_string_lossy(), "lastAssistantMessage": "Готово начисто."
+        })).is_none());
+        // New turn repeats identical text while transcript still shows step 0/1 -> MUST fire and re-arm Stop lint!
+        let rep_inj = evaluate_pre_invocation(&json!({
+            "conversationId": sid_rep, "transcriptPath": tp_rep.to_string_lossy(), "lastUserInput": "Нет, переделай"
+        }));
+        assert!(rep_inj.is_some(), "repeated identical correction after finished turn must fire despite transcript lag");
+        assert!(decide_stop(&json!({
+            "conversationId": sid_rep, "transcriptPath": tp_rep.to_string_lossy(), "lastAssistantMessage": "В предыдущей версии я сделал иначе."
+        })).is_some(), "Stop lint must block after repeated correction");
+        assert!(decide_stop(&json!({
+            "conversationId": sid_rep, "transcriptPath": tp_rep.to_string_lossy(), "lastAssistantMessage": "Исправлено начисто."
+        })).is_none());
+        // Late transcript flush case: PreInvocation saw empty lastUserInput & lagged transcript, then new USER_INPUT flushes before Stop.
+        assert!(evaluate_pre_invocation(&json!({
+            "conversationId": sid_rep, "transcriptPath": tp_rep.to_string_lossy(), "lastUserInput": ""
+        })).is_none());
+        fs::write(&tp_rep, format!("{}{}", rep_t1, "{\"step_index\":5,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"Нет, переделай\"}\n")).unwrap();
+        assert!(decide_stop(&json!({
+            "conversationId": sid_rep, "transcriptPath": tp_rep.to_string_lossy(), "lastAssistantMessage": "В предыдущей версии я сделал иначе."
+        })).is_some(), "Stop must catch newly flushed USER_INPUT correction");
+
+        // (e) Codex C3 #5: an unreadable newer CHECKPOINT.md (e.g. invalid UTF-8 / UTF-16 bytes) must NOT revive a closed handoff on SessionStart(resume).
+        let ws_dir = env.1.join("repo_utf16");
+        let agents_dir = ws_dir.join(".agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        fs::write(
+            agents_dir.join("handoff.json"),
+            r#"{"goal":"OLD CLOSED GOAL","status":"done","remaining":["OLD NEXT"],"updated_ts":1000.0}"#,
+        ).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        // Write UTF-16LE bytes (invalid UTF-8) with newer mtime than closed handoff.json.
+        fs::write(agents_dir.join("CHECKPOINT.md"), &[0xFF, 0xFE, b'#', 0x00, b' ', 0x00, b'C', 0x00]).unwrap();
+        let (ss_msg, _) = evaluate_session_start(&json!({
+            "conversationId": "sess-utf16-cp",
+            "cwd": ws_dir.to_string_lossy(),
+            "source": "resume"
+        }));
+        assert!(
+            !ss_msg.unwrap_or_default().contains("OLD CLOSED GOAL"),
+            "unreadable newer CHECKPOINT.md must not revive closed handoff.json"
+        );
     }
 }

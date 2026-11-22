@@ -1994,6 +1994,12 @@ pub fn take_git_snapshot(
     } else {
         String::new()
     };
+    let reflog_len: usize = if !head.is_empty() {
+        let (rc_rl, rl_out, _) = rio::run_git(&root, &["rev-list", "--walk-reflogs", "--count", "HEAD"], 3.0);
+        if rc_rl == 0 { rl_out.trim().parse().unwrap_or(0) } else { 0 }
+    } else {
+        0
+    };
     let (rc_s, status_bytes) =
         run_git_bytes(&root, &["status", "--porcelain=v1", "-z", "-uall"], 5.0);
     if rc_s != 0 {
@@ -2035,6 +2041,7 @@ pub fn take_git_snapshot(
         "in_git": true,
         "root": rio::normalize_path(&root),
         "head": head,
+        "reflog_len": reflog_len,
         "entries": Value::Object(entries),
         "unmeasured": false,
     })
@@ -2095,9 +2102,19 @@ fn git_entry_unchanged_on_disk(path: &str, b_tok: &str, a_tok: Option<&str>) -> 
     file_entry_token(p, "", Some(&st)) == b_ctok
 }
 
-fn is_clean_upstream_ff_reflog_transition(root: &str, bh: &str, ah: &str) -> bool {
-    // INVARIANT: Prove a clean fast-forward onto an existing remote-tracking commit directly from git ancestry, `refs/remotes/`, and reflog (independent of read-only sibling shell commands like `git symbolic-ref`).
-    if bh.is_empty() || ah.is_empty() || bh == ah {
+fn is_clean_upstream_ff_reflog_transition(
+    root: &str,
+    bh: &str,
+    ah: &str,
+    b_reflog_len: usize,
+    a_reflog_len: usize,
+) -> bool {
+    // INVARIANT: Prove a clean fast-forward onto an existing remote-tracking commit by inspecting EVERY reflog entry added during `[b_reflog_len..a_reflog_len]` (never stopping early at a return to `bh`) plus git ancestry and `refs/remotes/`, BEFORE `merge-tree` reconstruction.
+    if bh.is_empty() || ah.is_empty() || bh == ah || b_reflog_len == 0 || a_reflog_len <= b_reflog_len {
+        return false;
+    }
+    let delta = a_reflog_len - b_reflog_len;
+    if delta == 0 || delta > 20 {
         return false;
     }
     if rio::run_git(root, &["merge-base", "--is-ancestor", bh, ah], 3.0).0 != 0 {
@@ -2111,25 +2128,21 @@ fn is_clean_upstream_ff_reflog_transition(root: &str, bh: &str, ah: &str) -> boo
     if rc_ref != 0 || ref_out.trim().is_empty() {
         return false;
     }
+    let count_arg = (delta + 1).to_string();
     let (rc_rl, rl_out, _) = rio::run_git(
         root,
-        &["reflog", "show", "-n", "10", "--format=%H %gs", "HEAD"],
+        &["reflog", "show", "-n", &count_arg, "--format=%H %gs", "HEAD"],
         3.0,
     );
     if rc_rl != 0 {
         return false;
     }
+    let entries: Vec<(&str, &str)> = rl_out.lines().filter_map(|l| l.split_once(' ')).collect();
+    if entries.len() != delta + 1 || entries[0].0 != ah || entries[delta].0 != bh {
+        return false;
+    }
     let mut saw_ff = false;
-    for (idx, line) in rl_out.lines().enumerate() {
-        let Some((oid, subj)) = line.split_once(' ') else {
-            return false;
-        };
-        if idx == 0 && oid != ah {
-            return false;
-        }
-        if oid == bh {
-            return saw_ff;
-        }
+    for &(_, subj) in &entries[..delta] {
         let is_ff = (subj.starts_with("merge ") || subj.starts_with("pull "))
             && subj.contains(": Fast-forward");
         let is_move = subj.starts_with("checkout: moving from ");
@@ -2139,10 +2152,21 @@ fn is_clean_upstream_ff_reflog_transition(root: &str, bh: &str, ah: &str) -> boo
             return false;
         }
     }
-    false
+    saw_ff
 }
 
-fn clean_integration_rel_paths(root: &str, bh: &str, ah: &str, cmd: &str, no_dirty: bool) -> Option<HashSet<String>> {
+fn clean_integration_rel_paths(
+    root: &str,
+    bh: &str,
+    ah: &str,
+    b_reflog_len: usize,
+    a_reflog_len: usize,
+    cmd: &str,
+    no_dirty: bool,
+) -> Option<HashSet<String>> {
+    if no_dirty && is_clean_upstream_ff_reflog_transition(root, bh, ah, b_reflog_len, a_reflog_len) {
+        return Some(HashSet::new());
+    }
     if let (0, po, _) = rio::run_git(root, &["rev-list", "--parents", "-n", "1", ah], 3.0) {
         let oids: Vec<&str> = po.split_whitespace().collect();
         if oids.len() >= 3 && oids[1] == bh {
@@ -2157,11 +2181,7 @@ fn clean_integration_rel_paths(root: &str, bh: &str, ah: &str, cmd: &str, no_dir
             return None;
         }
     }
-    if !no_dirty { return None; }
-    if is_clean_upstream_ff_reflog_transition(root, bh, ah) {
-        return Some(HashSet::new());
-    }
-    if cmd.trim().is_empty() { return None; }
+    if !no_dirty || cmd.trim().is_empty() { return None; }
     let mut saw = false;
     for (_, seg) in split_shell_segments(cmd, false) {
         let s = seg.trim();
@@ -2287,7 +2307,21 @@ pub fn diff_git_snapshots_for_cmd(
             out.sort();
             return (out, true);
         }
-        let merge_filter = (!b_head.is_empty()).then(|| clean_integration_rel_paths(root, b_head, a_head, core_cmd, unchanged_clean.is_empty())).flatten();
+        let b_reflog_len = b_obj.get("reflog_len").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let a_reflog_len = a_obj.get("reflog_len").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let merge_filter = (!b_head.is_empty())
+            .then(|| {
+                clean_integration_rel_paths(
+                    root,
+                    b_head,
+                    a_head,
+                    b_reflog_len,
+                    a_reflog_len,
+                    core_cmd,
+                    unchanged_clean.is_empty(),
+                )
+            })
+            .flatten();
         for rel_b in out_bytes.split(|&b| b == 0) {
             if rel_b.is_empty() { continue; }
             let rel = String::from_utf8_lossy(rel_b).into_owned();
@@ -5057,6 +5091,64 @@ mod tests {
             cp_chg.iter().any(|p| p.ends_with("/committed_pushed.txt")),
             "local commit+push must never look like an upstream fast-forward: {:?}",
             cp_chg
+        );
+
+        // Negative 3 (Codex C3 #1): single command creates local commit on topic, pushes origin/topic, checks out main, and fast-forwards to origin/topic -> MUST detect changed file via full reflog delta!
+        let before_topic_bypass = take_git_snapshot(&repo_s, "", &[], None);
+        run_g(&repo, &["checkout", "-b", "topic-bypass"]);
+        fs::write(repo.join("sneaky_topic.txt"), "bypass\n").unwrap();
+        run_g(&repo, &["add", "sneaky_topic.txt"]);
+        run_g(&repo, &["commit", "-m", "sneaky local commit"]);
+        run_g(&repo, &["push", "origin", "topic-bypass"]);
+        run_g(&repo, &["checkout", &branch]);
+        run_g(&repo, &["merge", "--ff-only", "origin/topic-bypass"]);
+        let after_topic_bypass = take_git_snapshot(&repo_s, "", &[], None);
+        let (bypass_chg, _) = diff_git_snapshots_for_cmd(
+            Some(&before_topic_bypass),
+            Some(&after_topic_bypass),
+            "git checkout -b topic-bypass; git commit -m x; git push origin topic-bypass; git checkout main; git merge --ff-only origin/topic-bypass",
+        );
+        assert!(
+            bypass_chg.iter().any(|p| p.ends_with("/sneaky_topic.txt")),
+            "topic commit+push+checkout+ff-only in one span must NOT bypass gate: {:?}",
+            bypass_chg
+        );
+
+        // Positive 2 (Codex C3 #2): clean upstream fast-forward onto an upstream merge commit whose first parent is local HEAD and which resolved a conflict upstream -> MUST NOT attribute upstream resolution to local session!
+        run_g(&repo, &["reset", "--hard", &format!("origin/{}", branch)]);
+        run_g(&upstream, &["fetch", "origin"]);
+        run_g(&upstream, &["reset", "--hard", &format!("origin/{}", branch)]);
+        run_g(&upstream, &["checkout", "-b", "side-conflict"]);
+        fs::write(upstream.join("base.txt"), "side version\n").unwrap();
+        run_g(&upstream, &["commit", "-am", "side conflict"]);
+        run_g(&upstream, &["checkout", &branch]);
+        fs::write(upstream.join("base.txt"), "main version\n").unwrap();
+        run_g(&upstream, &["commit", "-am", "main version"]);
+        run_g(&upstream, &["push", "origin", &branch]);
+        // Sync local repo to the exact first parent of the upcoming upstream conflict-resolved merge commit.
+        run_g(&repo, &["fetch", "origin"]);
+        run_g(&repo, &["merge", "--ff-only", &format!("origin/{}", branch)]);
+        // Resolve the conflict upstream and push the merge commit (first parent == repo HEAD).
+        let (m_rc, _, _) = rio::run_git(&upstream.to_string_lossy(), &["merge", "--no-commit", "side-conflict"], 5.0);
+        assert_ne!(m_rc, 0, "expected real conflict in upstream");
+        fs::write(upstream.join("base.txt"), "resolved upstream both\n").unwrap();
+        run_g(&upstream, &["add", "base.txt"]);
+        run_g(&upstream, &["commit", "-m", "upstream resolved merge"]);
+        run_g(&upstream, &["push", "origin", &branch]);
+        run_g(&repo, &["fetch", "origin"]);
+        let before_up_merge_ff = take_git_snapshot(&repo_s, "", &[], None);
+        run_g(&repo, &["merge", "--ff-only", &format!("origin/{}", branch)]);
+        let after_up_merge_ff = take_git_snapshot(&repo_s, "", &[], None);
+        let (up_merge_chg, up_merge_unm) = diff_git_snapshots_for_cmd(
+            Some(&before_up_merge_ff),
+            Some(&after_up_merge_ff),
+            &format!("git merge --ff-only origin/{}", branch),
+        );
+        assert!(!up_merge_unm);
+        assert!(
+            up_merge_chg.is_empty(),
+            "clean upstream ff onto conflict-resolved merge commit must not open local candidate: {:?}",
+            up_merge_chg
         );
 
         let _ = fs::remove_dir_all(&root);

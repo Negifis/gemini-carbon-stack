@@ -264,6 +264,36 @@ fn resolve_brain_root_for_payload(payload: &Value) -> PathBuf {
     rio::resolve_brain_root("")
 }
 
+fn worker_turn_after_wake(brain_root: &Path, minfo: &Value, last_assign_seq: i64) -> Option<Value> {
+    let w_cid = minfo
+        .get("conversation_id")
+        .or_else(|| minfo.get("conversationId"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if w_cid.is_empty() {
+        return None;
+    }
+    let tp = rio::member_transcript_path(brain_root, w_cid);
+    let w_steps = rio::read_transcript_steps(&tp.to_string_lossy(), 60);
+    if w_steps.is_empty() {
+        return None;
+    }
+    Some(rio::inspect_worker_turn_after_wake(&w_steps, last_assign_seq))
+}
+
+fn turn_is_terminally_finished(turn: &Value) -> bool {
+    let pending_nonempty = turn
+        .get("pending_bg")
+        .and_then(|v| v.as_array())
+        .map_or(false, |a| !a.is_empty());
+    if !json_truthy(turn.get("woke_for_assign")) || !json_truthy(turn.get("has_tail")) || pending_nonempty {
+        return false;
+    }
+    json_truthy(turn.get("has_error"))
+        || (json_truthy(turn.get("saw_model")) && json_truthy(turn.get("terminal_parked")))
+}
+
 fn is_worker_silently_parked(brain_root: &Path, minfo: &Value, last_assign_seq: i64) -> bool {
     let wake_mode = val_to_str(minfo.get("wake_mode")).trim().to_lowercase();
     let mstate = val_to_str(minfo.get("state")).trim().to_lowercase();
@@ -273,37 +303,15 @@ fn is_worker_silently_parked(brain_root: &Path, minfo: &Value, last_assign_seq: 
     {
         return true;
     }
+    let Some(turn) = worker_turn_after_wake(brain_root, minfo, last_assign_seq) else {
+        return false;
+    };
+    !json_truthy(turn.get("called_post")) && turn_is_terminally_finished(&turn)
+}
 
-    let w_cid = minfo
-        .get("conversation_id")
-        .or_else(|| minfo.get("conversationId"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim();
-    if w_cid.is_empty() {
-        return false;
-    }
-    let tp = rio::member_transcript_path(brain_root, w_cid);
-    let w_steps = rio::read_transcript_steps(&tp.to_string_lossy(), 60);
-    if w_steps.is_empty() {
-        return false;
-    }
-    let turn = rio::inspect_worker_turn_after_wake(&w_steps, last_assign_seq);
-    let pending_nonempty = turn
-        .get("pending_bg")
-        .and_then(|v| v.as_array())
-        .map_or(false, |a| !a.is_empty());
-    if !json_truthy(turn.get("woke_for_assign"))
-        || !json_truthy(turn.get("has_tail"))
-        || json_truthy(turn.get("called_post"))
-        || pending_nonempty
-    {
-        return false;
-    }
-    if json_truthy(turn.get("has_error")) {
-        return true;
-    }
-    json_truthy(turn.get("saw_model")) && json_truthy(turn.get("terminal_parked"))
+fn is_worker_turn_terminally_parked(brain_root: &Path, minfo: &Value, last_assign_seq: i64) -> bool {
+    worker_turn_after_wake(brain_root, minfo, last_assign_seq)
+        .is_some_and(|turn| turn_is_terminally_finished(&turn))
 }
 
 pub fn guard_swarm_wait(payload: &Value, args: Option<&Value>) -> (String, Option<String>) {
@@ -345,12 +353,6 @@ pub fn guard_swarm_wait(payload: &Value, args: Option<&Value>) -> (String, Optio
             continue;
         }
         active_workers.push(mname.clone());
-        let mstate = val_to_str(minfo.get("state")).trim().to_ascii_lowercase();
-        if mstate == "working" {
-            // INVARIANT: A worker still in `state == "working"` after a peer-to-peer board post remains in-flight (subject to `detect_stalled_workers` below), not finished.
-            in_flight.push(mname.clone());
-            continue;
-        }
         let added_by = minfo
             .get("added_by")
             .and_then(|v| v.as_str())
@@ -358,10 +360,19 @@ pub fn guard_swarm_wait(payload: &Value, args: Option<&Value>) -> (String, Optio
         let (last_assign_seq, last_reply_seq) =
             rio::latest_board_assign_and_reply_seq(&raw_board, mname, added_by);
         if last_assign_seq == 0 || last_reply_seq < last_assign_seq {
+            // INVARIANT: Always run transcript-backed silent-park detection before trusting `state == "working"` so a finished worker with stale `members.json` cannot deadlock `swarm_wait`.
             if last_assign_seq > 0 && is_worker_silently_parked(&brain_root, minfo, last_assign_seq)
             {
                 unposted_parked.push(mname.clone());
             } else {
+                in_flight.push(mname.clone());
+            }
+        } else {
+            let mstate = val_to_str(minfo.get("state")).trim().to_ascii_lowercase();
+            // INVARIANT: After a peer-to-peer post (`last_reply_seq >= last_assign_seq`), keep `state == "working"` in-flight ONLY while its transcript has not terminally parked.
+            if mstate == "working"
+                && !is_worker_turn_terminally_parked(&brain_root, minfo, last_assign_seq)
+            {
                 in_flight.push(mname.clone());
             }
         }
@@ -764,6 +775,54 @@ mod tests {
         let (dec_stall, reason_stall) = guard_swarm_wait(&payload, Some(&args));
         assert_eq!(dec_stall, "deny");
         assert!(reason_stall.unwrap().contains("Swarm Stall Watchdog"));
+
+        // Stale `state == "working"` whose transcript already terminally parked WITHOUT `post_message` -> deny (`Swarm Wait Guard`), NOT allow!
+        let w_cid = format!("worker-silent-{}", std::process::id());
+        let w_tp = brain_root
+            .join(&w_cid)
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl");
+        fs::create_dir_all(w_tp.parent().unwrap()).unwrap();
+        let assign_board = format!(
+            "{{\"seq\":1,\"agent\":\"coordinator\",\"time\":\"{0}\",\"text\":\"@worker-a finish module\"}}\n",
+            now_iso
+        );
+        fs::write(swarm_path.join("board.jsonl"), &assign_board).unwrap();
+        fs::write(
+            swarm_path.join("members.json"),
+            format!(
+                r#"{{"members":{{"worker-a":{{"role":"worker","state":"working","conversation_id":"{}"}}}}}}"#,
+                w_cid
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &w_tp,
+            concat!(
+                "{\"step_index\":0,\"source\":\"SYSTEM\",\"type\":\"SYSTEM_MESSAGE\",\"status\":\"DONE\",\"content\":\"[swarm] new board message #1\"}\n",
+                "{\"step_index\":1,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"content\":\"Done locally.\",\"tool_calls\":[]}\n"
+            ),
+        )
+        .unwrap();
+        let (dec_silent, reason_silent) = guard_swarm_wait(&payload, Some(&json!({"since": 1})));
+        assert_eq!(dec_silent, "deny");
+        assert!(reason_silent.unwrap().contains("Swarm Wait Guard"));
+
+        // Stale `state == "working"` after a peer post whose transcript ALSO terminally parked -> deny!
+        fs::write(swarm_path.join("board.jsonl"), &fresh_board).unwrap();
+        fs::write(
+            &w_tp,
+            concat!(
+                "{\"step_index\":0,\"source\":\"SYSTEM\",\"type\":\"SYSTEM_MESSAGE\",\"status\":\"DONE\",\"content\":\"[swarm] new board message #1\"}\n",
+                "{\"step_index\":1,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"content\":\"Posting peer sync.\",\"tool_calls\":[{\"name\":\"post_message\"}]}\n",
+                "{\"step_index\":2,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"content\":\"Finished turn.\",\"tool_calls\":[]}\n"
+            ),
+        )
+        .unwrap();
+        let (dec_parked_post, reason_parked_post) = guard_swarm_wait(&payload, Some(&args));
+        assert_eq!(dec_parked_post, "deny");
+        assert!(reason_parked_post.unwrap().contains("Swarm Wait Guard"));
 
         let _ = fs::remove_dir_all(&root);
     }
