@@ -769,12 +769,11 @@ fn has_non_executing_validation_arg(seg: &str) -> bool {
     let is_dotnet = matches!(cmd_base.as_str(), "dotnet" | "dotnet.exe");
     let is_go = matches!(cmd_base.as_str(), "go" | "go.exe");
     let is_npx = matches!(cmd_base.as_str(), "npx" | "npx.cmd");
+    let mut is_jest = matches!(cmd_base.as_str(), "jest" | "jest.cmd");
     let mut is_vitest = matches!(cmd_base.as_str(), "vitest" | "vitest.cmd");
     let mut is_tsc = matches!(cmd_base.as_str(), "tsc" | "tsc.cmd");
-    let mut is_js_v_version = matches!(
-        cmd_base.as_str(),
-        "jest" | "jest.cmd" | "vitest" | "vitest.cmd" | "eslint" | "eslint.cmd" | "tsc" | "tsc.cmd"
-    );
+    let mut is_eslint = matches!(cmd_base.as_str(), "eslint" | "eslint.cmd");
+    let mut is_js_v_version = is_jest || is_vitest || is_eslint || is_tsc;
     let mut arg_start = 1usize;
     if is_npx {
         let mut i = 1usize;
@@ -796,13 +795,16 @@ fn has_non_executing_validation_arg(seg: &str) -> bool {
         }
         if let Some(runner) = tokens.get(i) {
             let r = runner.to_ascii_lowercase();
+            is_jest = r == "jest";
             is_vitest = r == "vitest";
             is_tsc = r == "tsc";
-            is_js_v_version = matches!(r.as_str(), "jest" | "vitest" | "eslint" | "tsc");
+            is_eslint = r == "eslint";
+            is_js_v_version = is_jest || is_vitest || is_eslint || is_tsc;
             arg_start = i + 1;
         }
     }
     let mut vitest_saw_run = false;
+    let mut saw_build_flag = false;
     for tok in tokens.iter().skip(arg_start) {
         let key_raw = tok.split_once('=').map_or(tok.as_str(), |(k, _)| k);
         if matches!(key_raw, "-h" | "-?" | "-V") {
@@ -811,24 +813,68 @@ fn has_non_executing_validation_arg(seg: &str) -> bool {
         if is_js_v_version && key_raw == "-v" {
             return true;
         }
+        if is_jest && key_raw == "-o" {
+            return true;
+        }
         if is_dotnet && key_raw == "-t" {
             return true;
         }
+        if is_go && matches!(key_raw, "-c" | "-n") {
+            return true;
+        }
         let key = key_raw.to_ascii_lowercase();
+        if matches!(key.as_str(), "-b" | "--build") {
+            saw_build_flag = true;
+        }
         if is_go && key == "-list" {
             return true;
         }
         if is_vitest {
             if key == "run" {
                 vitest_saw_run = true;
-            } else if !vitest_saw_run && key == "list" {
+            } else if !vitest_saw_run && matches!(key.as_str(), "list" | "init" | "inspect") {
                 return true;
             }
+        }
+        if is_tsc && key.starts_with('-') && key.len() >= 2 {
+            // SAFETY: TypeScript's CLI parser strips either `-` or `--` on long flags (e.g. `tsc -b -dry` == `tsc --build --dry`, `tsc -noCheck` == `tsc --noCheck`).
+            let opt = key.trim_start_matches('-');
+            if matches!(
+                opt,
+                "dry"
+                    | "clean"
+                    | "nocheck"
+                    | "no-check"
+                    | "listfilesonly"
+                    | "showconfig"
+                    | "all"
+                    | "init"
+                    | "version"
+                    | "help"
+            ) {
+                return true;
+            }
+        }
+        if is_eslint && matches!(key.as_str(), "--env-info" | "--inspect-config") {
+            return true;
+        }
+        if saw_build_flag
+            && matches!(
+                key.as_str(),
+                "--clean" | "-clean" | "-dry" | "-nocheck" | "-listfilesonly" | "-showconfig"
+            )
+        {
+            return true;
         }
         if matches!(
             key.as_str(),
             "--help"
                 | "--version"
+                | "--dry"
+                | "--exit-zero"
+                | "--exitzero"
+                | "--nocheck"
+                | "--no-check"
                 | "--list"
                 | "--list-tests"
                 | "--listtests"
@@ -845,17 +891,24 @@ fn has_non_executing_validation_arg(seg: &str) -> bool {
                 | "--printconfig"
                 | "--clear-cache"
                 | "--clearcache"
+                | "--cache-show"
+                | "--env-info"
                 | "--init"
                 | "--fixtures"
+                | "--fixtures-per-test"
                 | "--markers"
                 | "--setup-only"
                 | "--setup-plan"
                 | "--pass-with-no-tests"
                 | "--passwithnotests"
+                | "--only-changed"
+                | "--onlychanged"
+                | "--last-commit"
+                | "--lastcommit"
+                | "--show-settings"
+                | "--show-files"
+                | "--fix-only"
         ) {
-            return true;
-        }
-        if is_tsc && key == "--all" {
             return true;
         }
         if !is_install_cmd && matches!(key.as_str(), "--dry-run" | "--dryrun") {
@@ -4694,6 +4747,19 @@ mod tests {
             ("npx --workspace backend playwright test --list", "UNCERTAIN"),
             ("npx --workspace backend tsc --showConfig", "UNCERTAIN"),
             ("npx --workspace backend tsc -v", "UNCERTAIN"),
+            ("npx --workspace backend tsc --build --dry", "UNCERTAIN"),
+            ("npx --workspace backend tsc -b -dry", "UNCERTAIN"),
+            ("npx --workspace backend tsc --build --clean", "UNCERTAIN"),
+            ("npx --workspace backend tsc --noCheck", "UNCERTAIN"),
+            ("npx --workspace backend tsc -noCheck", "UNCERTAIN"),
+            ("npx --workspace backend tsc --build", "VALIDATION"),
+            ("npm run typecheck -w backend -- --build --dry", "UNCERTAIN"),
+            ("npx --workspace backend jest --onlyChanged", "UNCERTAIN"),
+            ("npx --workspace backend jest -o", "MUTATING"),
+            ("npx --workspace backend eslint --env-info", "UNCERTAIN"),
+            ("go test -c ./...", "UNCERTAIN"),
+            ("go test -n ./...", "UNCERTAIN"),
+            ("ruff check --exit-zero src", "UNCERTAIN"),
             ("cargo test --no-run", "UNCERTAIN"),
             ("cargo test -- --list", "UNCERTAIN"),
             ("pytest --collect-only", "UNCERTAIN"),

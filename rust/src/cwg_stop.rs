@@ -8930,6 +8930,46 @@ mod tests {
             "`npx --workspace backend jest --listTests` exiting 0 must keep the gate blocked after a prior test failure"
         );
 
+        let mut steps_with_tsc_dry = base_steps.clone();
+        steps_with_tsc_dry.extend([
+            json!({
+                "step_index": 11493,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-22T16:04:04Z",
+                "tool_calls": [{"name": "run_command", "args": {"CommandLine": "$null | npx --workspace backend tsc --build --dry"}}]
+            }),
+            json!({
+                "step_index": 11494,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": "2026-11-22T16:04:06Z",
+                "content": "Command exited with code 0.\n\nCommand output:\nA non-dry build would build project 'tsconfig.json'\n"
+            }),
+        ]);
+        let ev_tsc_dry = read_checks_evidence_with_steps_in_cwd(sess, first_ts, &steps_with_tsc_dry, "");
+        assert!(
+            ev_tsc_dry.passed_count == 0 && ev_tsc_dry.latest_fail_ts > ev_tsc_dry.latest_pass_ts,
+            "`npx --workspace backend tsc --build --dry` must NEVER be credited as a passing verification run or clear a prior failure: {:?}",
+            ev_tsc_dry
+        );
+        let (ok_tsc_dry, _) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_std),
+            marker_in: &marker,
+            checks_ev: &ev_tsc_dry,
+            sub_ev: &SubagentEvidence::default(),
+            swarm_ev: &SwarmEvidence::default(),
+            codex_reviews: &[],
+            ctx: None,
+            steps: None,
+            transcript_path: None,
+        });
+        assert!(
+            !ok_tsc_dry,
+            "`npx --workspace backend tsc --build --dry` exiting 0 must keep the gate blocked after a prior test failure"
+        );
+
         let mut steps_with_standalone = base_steps;
         steps_with_standalone.extend([
             json!({
