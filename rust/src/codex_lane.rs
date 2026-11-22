@@ -731,11 +731,11 @@ fn is_direct_codex_invocation(cmd_str: &str) -> bool {
         || exe.strip_prefix("python3.").is_some_and(|r| !r.is_empty() && r.chars().all(|c| c.is_ascii_digit()));
     if is_py {
         let mut idx = 1usize;
-        while idx < tokens.len() {
+        while idx < tokens.len() && tokens[idx].starts_with('-') {
             let f = tokens[idx].as_str();
-            if matches!(f, "-3" | "-u" | "-B" | "-E" | "-s" | "-S") || (f.starts_with("-X") && f.len() > 2) { idx += 1; }
-            else if f == "-X" && idx + 1 < tokens.len() { idx += 2; }
-            else { break; }
+            if f.starts_with("-c") || f.starts_with("-m") { return false; }
+            if f == "--" { idx += 1; break; }
+            idx += if matches!(f, "-X" | "-W" | "--check-hash-based-pycs") { 2 } else { 1 };
         }
         if idx + 1 < tokens.len() && tokens[idx].replace('\\', "/").to_ascii_lowercase().rsplit('/').next() == Some("codex_lane.py") {
             return validate_codex_lane_subcmd_tokens(&tokens[idx + 1].to_ascii_lowercase(), &tokens[idx + 2..]);
@@ -2770,16 +2770,26 @@ mod tests {
         })
         .to_string();
         assert!(is_verified_codex_cmd_outage(cmd_lane, "ERROR", &fallback_out));
-        let cmd_legacy_py = r#"$null | python -X utf8 C:\Users\in\.gemini\hooks\codex_lane.py review --cwd C:\repo"#;
+        let cmd_legacy_py = r#"$null | python -X utf8 -Wignore C:\Users\in\.gemini\hooks\codex_lane.py review --cwd C:\repo"#;
         let net_out = json!({
             "ok": false,
             "review_id": "cwg-net01",
             "network_outage": true,
             "fallback": "adversarial-reviewer",
-            "error": "network timeout"
+            "error": "timeout_after_600s"
         })
         .to_string();
         assert!(is_verified_codex_cmd_outage(cmd_legacy_py, "ERROR", &net_out));
+        assert!(is_verified_codex_cmd_outage(
+            r#"python -W ignore -u /opt/hooks/codex_lane.py review --cwd /repo"#,
+            "ERROR",
+            &net_out
+        ));
+        assert!(!is_verified_codex_cmd_outage(
+            r#"python -c "print('codex_lane.py')" review"#,
+            "ERROR",
+            &net_out
+        ));
 
         let cmd_direct = r#"codex exec -s read-only -C C:\repo -"#;
         assert!(is_verified_codex_cmd_outage(
