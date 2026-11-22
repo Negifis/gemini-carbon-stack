@@ -593,6 +593,33 @@ pub fn required_review_timeout(xhigh: bool, saved_next_sec: i64) -> i64 {
     MAX_REVIEW_TIMEOUT_SECONDS.min(base.max(saved_next_sec.max(0)))
 }
 
+fn validate_live_custom_timeout(
+    custom_to: i64,
+    is_timeout_continuation: bool,
+    min_required_timeout: i64,
+) -> Result<(), String> {
+    // INVARIANT: Reject upfront, shrunk, or above-cap (`> MAX_REVIEW_TIMEOUT_SECONDS`) custom `--timeout` in live runs; standard defaults are 3600s (HIGH) and 7000s (XHIGH).
+    if !is_timeout_continuation {
+        return Err(format!(
+            "Upfront custom --timeout is forbidden; omit --timeout so `carbon-stack codex-lane review` uses the standard {}s (HIGH) / {}s (--xhigh) timeout.",
+            DEFAULT_REVIEW_TIMEOUT_SECONDS, DEFAULT_XHIGH_REVIEW_TIMEOUT_SECONDS
+        ));
+    }
+    if custom_to < min_required_timeout {
+        return Err(format!(
+            "Custom --timeout {}s is below required continuation timeout ({}s); omit --timeout to continue automatically with increased timeout.",
+            custom_to, min_required_timeout
+        ));
+    }
+    if custom_to > MAX_REVIEW_TIMEOUT_SECONDS {
+        return Err(format!(
+            "Custom --timeout {}s exceeds maximum allowed timeout ({}s); omit --timeout or pass <= {}s.",
+            custom_to, MAX_REVIEW_TIMEOUT_SECONDS, MAX_REVIEW_TIMEOUT_SECONDS
+        ));
+    }
+    Ok(())
+}
+
 fn breaker_path() -> PathBuf {
     cwg_common::gate_dir().join("codex_lane.json")
 }
@@ -4177,14 +4204,29 @@ const INLINE_DIFF_EXCLUDES: &[&str] = &[
     ":(exclude)*.db",
     ":(exclude)*.sqlite",
     ":(exclude)Cargo.lock",
+    ":(exclude,glob)**/Cargo.lock",
     ":(exclude)package-lock.json",
+    ":(exclude,glob)**/package-lock.json",
     ":(exclude)yarn.lock",
+    ":(exclude,glob)**/yarn.lock",
     ":(exclude)pnpm-lock.yaml",
+    ":(exclude,glob)**/pnpm-lock.yaml",
     ":(exclude)*.min.js",
     ":(exclude)*.map",
     ":(exclude)*.wasm",
     ":(exclude)*.svg",
 ];
+
+fn run_git_filtered_status_short(cwd: &str) -> String {
+    let mut args = vec!["status", "--short", "--", "."];
+    args.extend_from_slice(INLINE_DIFF_EXCLUDES);
+    let (rc, out, _) = rio::run_git(cwd, &args, 5.0);
+    if rc == 0 {
+        truncate_diff_stat(&out)
+    } else {
+        String::new()
+    }
+}
 
 fn truncate_diff_stat(raw: &str) -> String {
     let trimmed = raw.trim();
@@ -6376,8 +6418,7 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
         if st.is_empty() && body.is_empty() {
             let (st2, body2) = run_git_diff_with_stat(review_root, "HEAD", None);
             if st2.is_empty() && body2.is_empty() {
-                let (_, s_out, _) = rio::run_git(review_root, &["status", "--short"], 5.0);
-                (truncate_diff_stat(&s_out), String::new(), hint)
+                (run_git_filtered_status_short(review_root), String::new(), hint)
             } else {
                 (st2, body2, hint)
             }
@@ -6388,8 +6429,7 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
         let (st2, body2) = run_git_diff_with_stat(review_root, "HEAD", None);
         let hint = "git diff --stat HEAD; git diff HEAD -- <file>".to_string();
         if st2.is_empty() && body2.is_empty() {
-            let (_, s_out, _) = rio::run_git(review_root, &["status", "--short"], 5.0);
-            (truncate_diff_stat(&s_out), String::new(), hint)
+            (run_git_filtered_status_short(review_root), String::new(), hint)
         } else {
             (st2, body2, hint)
         }
@@ -6710,30 +6750,14 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
         .unwrap_or(false);
     if let Some(custom_to) = args.timeout {
         if !has_codex_override {
-            // INVARIANT: Reject upfront or shrunk custom `--timeout` in live runs; standard defaults are 3600s (HIGH) and 7000s (XHIGH).
-            if !is_timeout_continuation {
+            if let Err(err_msg) =
+                validate_live_custom_timeout(custom_to, is_timeout_continuation, min_required_timeout)
+            {
                 rio::print_cli_json(
                     &json!({
                         "ok": false,
                         "invalid_timeout": true,
-                        "error": format!(
-                            "Upfront custom --timeout is forbidden; omit --timeout so `carbon-stack codex-lane review` uses the standard {}s (HIGH) / {}s (--xhigh) timeout.",
-                            DEFAULT_REVIEW_TIMEOUT_SECONDS, DEFAULT_XHIGH_REVIEW_TIMEOUT_SECONDS
-                        ),
-                    }),
-                    args.pretty,
-                );
-                return 2;
-            }
-            if custom_to < min_required_timeout {
-                rio::print_cli_json(
-                    &json!({
-                        "ok": false,
-                        "invalid_timeout": true,
-                        "error": format!(
-                            "Custom --timeout {}s is below required continuation timeout ({}s); omit --timeout to continue automatically with increased timeout.",
-                            custom_to, min_required_timeout
-                        ),
+                        "error": err_msg,
                     }),
                     args.pretty,
                 );
@@ -12745,6 +12769,16 @@ print(verdict)
         assert_eq!(required_review_timeout(true, 0), 7000);
         assert_eq!(required_review_timeout(true, 4500), 7000);
 
+        // Wave A1 R1 #3: upper cap boundary 7000 vs 7001 on continuation timeout validation.
+        assert!(validate_live_custom_timeout(3600, false, 3600).is_err());
+        assert!(validate_live_custom_timeout(4499, true, 4500).is_err());
+        assert!(validate_live_custom_timeout(4500, true, 4500).is_ok());
+        assert!(validate_live_custom_timeout(7000, true, 4500).is_ok());
+        assert!(validate_live_custom_timeout(7000, true, 7000).is_ok());
+        let over_err = validate_live_custom_timeout(7001, true, 4500).unwrap_err();
+        assert!(over_err.contains("7001") && over_err.contains("7000"));
+        assert!(validate_live_custom_timeout(7200, true, 7000).is_err());
+
         let ledger = format_dispositions_ledger(&[json!({
             "category": "accepted-risk",
             "finding": "keep retry loop",
@@ -12756,6 +12790,9 @@ print(verdict)
         let tmp = TempTestDir::new("wavea-inline-diff-excludes");
         let repo_dir = tmp.0.join("repo");
         fs::create_dir_all(repo_dir.join("src")).unwrap();
+        fs::create_dir_all(repo_dir.join("rust")).unwrap();
+        fs::create_dir_all(repo_dir.join("apps").join("web")).unwrap();
+        fs::create_dir_all(repo_dir.join("apps").join("api")).unwrap();
         fs::create_dir_all(repo_dir.join("dist")).unwrap();
         fs::create_dir_all(repo_dir.join("pkg")).unwrap();
         fs::create_dir_all(repo_dir.join("assets")).unwrap();
@@ -12764,6 +12801,10 @@ print(verdict)
             let _ = rio::run_git(&repo_s, &["config", "user.email", "t@example.com"], 5.0);
             let _ = rio::run_git(&repo_s, &["config", "user.name", "Test"], 5.0);
             fs::write(repo_dir.join("src").join("lib.rs"), "pub fn v() -> i32 { 1 }\n").unwrap();
+            fs::write(repo_dir.join("rust").join("Cargo.lock"), "version = 3\n").unwrap();
+            fs::write(repo_dir.join("apps").join("web").join("yarn.lock"), "a@1:\n  version \"1.0.0\"\n").unwrap();
+            fs::write(repo_dir.join("apps").join("api").join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+            fs::write(repo_dir.join("apps").join("web").join("package-lock.json"), "{\"lockfileVersion\":3}\n").unwrap();
             fs::write(repo_dir.join("yarn.lock"), "a@1:\n  version \"1.0.0\"\n").unwrap();
             fs::write(repo_dir.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
             fs::write(repo_dir.join("dist").join("bundle.min.js"), "var a=1;\n").unwrap();
@@ -12773,13 +12814,28 @@ print(verdict)
             assert_eq!(rio::run_git(&repo_s, &["add", "."], 5.0).0, 0);
             assert_eq!(rio::run_git(&repo_s, &["commit", "-m", "init"], 5.0).0, 0);
 
+            // Wave A1 R1 #2: excluded-only change must NOT leak into filtered `git status --short` fallback.
+            fs::write(repo_dir.join("assets").join("icon.svg"), "<svg>v2</svg>\n").unwrap();
+            fs::write(repo_dir.join("rust").join("Cargo.lock"), "version = 4\n").unwrap();
+            let (st_only, body_only) = run_git_diff_with_stat(&repo_s, "HEAD", None);
+            assert!(st_only.is_empty(), "excluded-only stat must be empty: {}", st_only);
+            assert!(body_only.is_empty(), "excluded-only body must be empty: {}", body_only);
+            let fallback_stat = run_git_filtered_status_short(&repo_s);
+            assert!(
+                fallback_stat.is_empty(),
+                "filtered status fallback must not leak excluded files: {}",
+                fallback_stat
+            );
+
             fs::write(repo_dir.join("src").join("lib.rs"), "pub fn v() -> i32 { 2 }\n").unwrap();
+            fs::write(repo_dir.join("apps").join("web").join("yarn.lock"), "a@1:\n  version \"2.0.0\"\n").unwrap();
+            fs::write(repo_dir.join("apps").join("api").join("pnpm-lock.yaml"), "lockfileVersion: '9.1'\n").unwrap();
+            fs::write(repo_dir.join("apps").join("web").join("package-lock.json"), "{\"lockfileVersion\":4}\n").unwrap();
             fs::write(repo_dir.join("yarn.lock"), "a@1:\n  version \"2.0.0\"\n").unwrap();
             fs::write(repo_dir.join("pnpm-lock.yaml"), "lockfileVersion: '9.1'\n").unwrap();
             fs::write(repo_dir.join("dist").join("bundle.min.js"), "var a=2;\n").unwrap();
             fs::write(repo_dir.join("dist").join("app.js.map"), "{\"version\":4}\n").unwrap();
             fs::write(repo_dir.join("pkg").join("mod.wasm"), b"\x00asm\x02\x00\x00\x00").unwrap();
-            fs::write(repo_dir.join("assets").join("icon.svg"), "<svg>v2</svg>\n").unwrap();
 
             let tree_oid = rio::capture_worktree_tree_oid(&repo_s, 5.0);
             let mut cases: Vec<(&str, (String, String))> =
@@ -12800,6 +12856,8 @@ print(verdict)
                     body
                 );
                 for excluded in [
+                    "Cargo.lock",
+                    "package-lock.json",
                     "yarn.lock",
                     "pnpm-lock.yaml",
                     "bundle.min.js",

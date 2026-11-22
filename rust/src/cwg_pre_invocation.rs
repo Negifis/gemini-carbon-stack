@@ -35,18 +35,58 @@ pub fn evaluate_pre_invocation(payload: &Value) -> Option<String> {
             let ts = rio::val_to_f64(m.get("first_ts"));
             let since = (ts > 0.0).then(|| format_iso_utc(ts)).filter(|x| x.len() >= 16).map_or_else(String::new, |x| format!(", open since {}", &x[11..16]));
             let first_ts_ms: i64 = if ts.is_finite() && ts > 0.0 { (ts * 1000.0).round() as i64 } else { 0 };
+            let cand_key = format!("{}|{}", first_ts_ms, fl);
             let ui = payload.get("lastUserInput").and_then(|v| v.as_str()).unwrap_or("").trim();
-            let uh = if ui.is_empty() { String::new() } else { rio::sha256_hex(ui.as_bytes())[..16].to_string() };
-            let user_turn_key = match (rio::last_user_input_step(tp).map(|(idx, _)| idx), !uh.is_empty()) {
-                (Some(idx), true) => format!("t:{}|u:{}", idx, uh),
-                (Some(idx), false) => format!("t:{}", idx),
-                (None, true) => format!("u:{}", uh),
-                (None, false) => String::new(),
+            let ui_hash = (!ui.is_empty()).then(|| rio::sha256_hex(ui.as_bytes())[..16].to_string());
+            let tx_step = rio::last_user_input_step(tp);
+            let (cur_step, cur_hash): (Option<i64>, Option<String>) = if ui.is_empty() {
+                match tx_step {
+                    Some((idx, content)) => {
+                        let t = content.trim();
+                        (Some(idx), (!t.is_empty()).then(|| rio::sha256_hex(t.as_bytes())[..16].to_string()))
+                    }
+                    None => (None, None),
+                }
+            } else {
+                match tx_step {
+                    Some((idx, content)) if content.trim() == ui => (Some(idx), ui_hash),
+                    _ => (None, ui_hash),
+                }
             };
-            let key = format!("{}|{}|{}", first_ts_ms, fl, user_turn_key);
-            if key != rio::val_to_str(st.get("last_open_reminder_key")) {
+            let prev_cand = rio::val_to_str(st.get("last_open_reminder_cand"));
+            let prev_step = st.get("last_open_reminder_step").and_then(|v| v.as_i64());
+            let prev_hash = rio::val_to_str(st.get("last_open_reminder_ui_hash"));
+            let same_turn = if prev_cand != cand_key {
+                false
+            } else {
+                match (prev_step, cur_step) {
+                    (Some(ps), Some(cs)) => ps == cs,
+                    (None, Some(cs)) => {
+                        if !prev_hash.is_empty() && cur_hash.as_deref() == Some(prev_hash.as_str()) {
+                            st.insert("last_open_reminder_step".into(), json!(cs));
+                            chg = true;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    (Some(_), None) => !prev_hash.is_empty() && cur_hash.as_deref() == Some(prev_hash.as_str()),
+                    (None, None) => cur_hash.as_deref().unwrap_or("") == prev_hash.as_str(),
+                }
+            };
+            if !same_turn {
                 notes.push(format!("[gate] Open candidate: PERSISTENT, path floor {} ({} lasting file{}{}). Requires {}. End the final message with `[gate] verified: {}; <candidate and decisive checks>` (or pr-ready/draft-blocked after autonomous closure); a closing message without a receipt is blocked.", fl, n, if n == 1 { "" } else { "s" }, since, reqs, fl));
-                st.insert("last_open_reminder_key".into(), json!(key)); chg = true;
+                st.insert("last_open_reminder_cand".into(), json!(cand_key));
+                match cur_step {
+                    Some(cs) => { st.insert("last_open_reminder_step".into(), json!(cs)); }
+                    None => { st.remove("last_open_reminder_step"); }
+                }
+                match cur_hash {
+                    Some(ch) => { st.insert("last_open_reminder_ui_hash".into(), json!(ch)); }
+                    None => { st.remove("last_open_reminder_ui_hash"); }
+                }
+                st.remove("last_open_reminder_key");
+                chg = true;
             }
         }
     }
@@ -421,6 +461,39 @@ mod tests {
         rio::write_json(&cwg_common::marker_path(sid), &m_new_cand).unwrap();
         let rem_new = evaluate_pre_invocation(&payload_omitted).unwrap();
         assert!(rem_new.contains("[gate] Open candidate: PERSISTENT, path floor STANDARD"));
+        assert_eq!(evaluate_pre_invocation(&payload_omitted), None);
+
+        // Regression for Wave A1 R1 #1: `lastUserInput` arrives ahead of transcript flush,
+        // then transcript records that exact turn, then `lastUserInput` disappears — must emit
+        // strictly once for the turn, while a subsequent new turn emits once again.
+        let p_lag_b = json!({
+            "conversationId": sid,
+            "transcriptPath": tp.to_string_lossy(),
+            "lastUserInput": "message B"
+        });
+        assert!(evaluate_pre_invocation(&p_lag_b).is_some());
+        assert_eq!(evaluate_pre_invocation(&p_lag_b), None);
+
+        // Transcript flushes step 20 with "message B": must NOT re-fire whether lastUserInput is present or omitted.
+        let turn_b_transcript = format!(
+            "{}{}{}",
+            turn1_transcript,
+            "{\"step_index\":12,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"continue checks\"}\n",
+            "{\"step_index\":20,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"message B\"}\n"
+        );
+        fs::write(&tp, &turn_b_transcript).unwrap();
+        assert_eq!(evaluate_pre_invocation(&p_lag_b), None);
+        assert_eq!(evaluate_pre_invocation(&payload_omitted), None);
+
+        // Another turn with identical text "message B" at step 25 MUST fire once (new step_index).
+        let turn_b2_transcript = format!(
+            "{}{}",
+            turn_b_transcript,
+            "{\"step_index\":25,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"message B\"}\n"
+        );
+        fs::write(&tp, &turn_b2_transcript).unwrap();
+        assert!(evaluate_pre_invocation(&payload_omitted).is_some());
+        assert_eq!(evaluate_pre_invocation(&p_lag_b), None);
         assert_eq!(evaluate_pre_invocation(&payload_omitted), None);
 
         unsafe {
