@@ -105,9 +105,24 @@ pub fn is_review_worker_hint(name: &str, brief: &str) -> bool {
         "не публик",
         "не отправ",
     ];
+    fn find_standalone_marker(clause: &str, needle: &str) -> Option<usize> {
+        let mut offset = 0usize;
+        while let Some(rel) = clause[offset..].find(needle) {
+            let pos = offset + rel;
+            let prev = clause[..pos].chars().next_back();
+            if !prev.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                return Some(pos);
+            }
+            offset = pos + needle.len();
+        }
+        None
+    }
     let low_brief = brief.to_lowercase();
     for clause in low_brief.split(['\n', '.', ';', ',']) {
-        let pos = match (clause.find("verdict:"), clause.find("closure_validation:")) {
+        let pos = match (
+            find_standalone_marker(clause, "verdict:"),
+            find_standalone_marker(clause, "closure_validation:"),
+        ) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) => Some(a),
             (None, Some(b)) => Some(b),

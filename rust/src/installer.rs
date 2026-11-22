@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -524,38 +524,24 @@ fn split_simple_hook_tokens(cmd: &str) -> Option<Vec<String>> {
 }
 
 fn unwrap_single_shell_wrapper(tokens: &[String]) -> Option<&str> {
-    let first_norm = norm_instance_path(&tokens[0], true);
-    let base = first_norm.rsplit('/').next().unwrap_or(&first_norm);
+    let base = norm_instance_path(&tokens[0], true);
+    let base = base.rsplit('/').next().unwrap_or(&base);
     let mut i = 1usize;
     if matches!(base, "sh" | "bash" | "dash" | "zsh" | "ash" | "ksh" | "sh.exe" | "bash.exe") {
-        while let Some(f) = tokens.get(i).map(String::as_str) {
-            if matches!(f, "-l" | "-e" | "-u" | "-f" | "--login") { i += 1; } else { break; }
+        while tokens.get(i).is_some_and(|f| matches!(f.as_str(), "-l" | "-e" | "-u" | "-f" | "--login")) { i += 1; }
+        return (tokens.get(i).is_some_and(|f| matches!(f.as_str(), "-c" | "-lc" | "-ec" | "-ce")) && i + 2 == tokens.len()).then(|| tokens[i + 1].as_str());
+    }
+    if matches!(base, "cmd" | "cmd.exe") {
+        while tokens.get(i).is_some_and(|f| matches!(f.to_ascii_lowercase().as_str(), "/d" | "/q" | "/s" | "/a" | "/u")) { i += 1; }
+        return (tokens.get(i).is_some_and(|f| f.eq_ignore_ascii_case("/c")) && i + 2 == tokens.len()).then(|| tokens[i + 1].as_str());
+    }
+    if matches!(base, "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe") {
+        while let Some(f) = tokens.get(i).map(|s| s.to_ascii_lowercase()) {
+            if matches!(f.as_str(), "-noprofile" | "-noninteractive" | "-nologo" | "-nop") { i += 1; }
+            else if matches!(f.as_str(), "-executionpolicy" | "-ep") && i + 1 < tokens.len() { i += 2; }
+            else { break; }
         }
-        let flag = tokens.get(i)?.as_str();
-        if matches!(flag, "-c" | "-lc" | "-ec" | "-ce") && i + 2 == tokens.len() {
-            return Some(tokens[i + 1].as_str());
-        }
-    } else if matches!(base, "cmd" | "cmd.exe") {
-        while let Some(f) = tokens.get(i).map(String::as_str) {
-            if matches!(f.to_ascii_lowercase().as_str(), "/d" | "/q" | "/s" | "/a" | "/u") { i += 1; } else { break; }
-        }
-        if tokens.get(i).is_some_and(|f| f.eq_ignore_ascii_case("/c")) && i + 2 == tokens.len() {
-            return Some(tokens[i + 1].as_str());
-        }
-    } else if matches!(base, "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe") {
-        while let Some(f) = tokens.get(i).map(String::as_str) {
-            let fl = f.to_ascii_lowercase();
-            if matches!(fl.as_str(), "-noprofile" | "-noninteractive" | "-nologo" | "-nop") {
-                i += 1;
-            } else if matches!(fl.as_str(), "-executionpolicy" | "-ep") && i + 1 < tokens.len() {
-                i += 2;
-            } else {
-                break;
-            }
-        }
-        if tokens.get(i).is_some_and(|f| matches!(f.to_ascii_lowercase().as_str(), "-command" | "-c")) && i + 2 == tokens.len() {
-            return Some(tokens[i + 1].as_str());
-        }
+        return (tokens.get(i).is_some_and(|f| matches!(f.to_ascii_lowercase().as_str(), "-command" | "-c")) && i + 2 == tokens.len()).then(|| tokens[i + 1].as_str());
     }
     None
 }
@@ -564,10 +550,19 @@ fn is_legacy_managed_tokenade_command(cmd: &str, config_dir: &Path, target_plugi
     is_legacy_managed_tokenade_command_depth(cmd, config_dir, target_plugin_dir, is_windows, 0)
 }
 
+fn strip_ps_single_call_prefix(cmd: &str) -> &str {
+    let mut s = cmd.trim();
+    if let Some(rest) = s.get(..5).filter(|p| p.eq_ignore_ascii_case("$null")).map(|_| s[5..].trim_start()) {
+        if let Some(after_pipe) = rest.strip_prefix('|') { s = after_pipe.trim_start(); }
+    }
+    if let Some(after_amp) = s.strip_prefix('&') {
+        if after_amp.chars().next().is_some_and(char::is_whitespace) { return after_amp.trim_start(); }
+    }
+    s
+}
+
 fn is_legacy_managed_tokenade_command_depth(cmd: &str, config_dir: &Path, target_plugin_dir: &Path, is_windows: bool, depth: u8) -> bool {
-    let Some(tokens) = split_simple_hook_tokens(cmd) else {
-        return false;
-    };
+    let Some(tokens) = split_simple_hook_tokens(strip_ps_single_call_prefix(cmd)) else { return false };
     if depth < 2 {
         if let Some(inner) = unwrap_single_shell_wrapper(&tokens) {
             return is_legacy_managed_tokenade_command_depth(inner, config_dir, target_plugin_dir, is_windows, depth + 1);
@@ -682,12 +677,14 @@ fn collect_hook_commands<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
     }
 }
 
-fn find_dangling_plugin_hook_ref(
-    root: &Value,
-    target_plugin_dir: &Path,
-    next_manifest: Option<&BTreeMap<String, String>>,
-    is_windows: bool,
-) -> Option<String> {
+fn has_token_boundary_before(hay: &str, start: usize, allow_dot_slash: bool) -> bool {
+    if start == 0 { return true; }
+    let prev = hay[..start].chars().next_back().unwrap_or('\0');
+    if prev.is_whitespace() || matches!(prev, '"' | '\'' | ';' | '&' | '|' | '(' | '=' | ',') { return true; }
+    allow_dot_slash && start >= 2 && &hay[start - 2..start] == "./" && has_token_boundary_before(hay, start - 2, false)
+}
+
+fn find_dangling_plugin_hook_ref(root: &Value, target_plugin_dir: &Path, next_manifest: Option<&BTreeMap<String, String>>, is_windows: bool) -> Option<String> {
     let Some(manifest) = next_manifest.filter(|m| !m.is_empty()) else { return None };
     let mut cmds = Vec::new();
     collect_hook_commands(root, &mut cmds);
@@ -699,33 +696,42 @@ fn find_dangling_plugin_hook_ref(
     for cmd in cmds {
         let mut norm = cmd.replace('\\', "/");
         if !home_norm.is_empty() {
-            for pat in ["~/", "$HOME/", "${HOME}/"] {
-                norm = norm.replace(pat, &format!("{}/", home_norm.trim_end_matches('/')));
-            }
-            if is_windows {
-                let low = norm.to_ascii_lowercase();
-                if low.contains("%userprofile%/") {
-                    norm = low.replace("%userprofile%/", &format!("{}/", home_norm.trim_end_matches('/').to_ascii_lowercase()));
-                }
+            let ht = home_norm.trim_end_matches('/');
+            for pat in ["~/", "$HOME/", "${HOME}/"] { norm = norm.replace(pat, &format!("{}/", ht)); }
+            if is_windows && norm.to_ascii_lowercase().contains("%userprofile%/") {
+                norm = norm.to_ascii_lowercase().replace("%userprofile%/", &format!("{}/", ht.to_ascii_lowercase()));
             }
         }
         let hay = if is_windows { norm.to_ascii_lowercase() } else { norm };
-        for pref in [&abs_pref, &rel_pref] {
+        for (pref, is_rel) in [(&abs_pref, false), (&rel_pref, true)] {
             let mut offset = 0usize;
             while let Some(pos) = hay[offset..].find(pref.as_str()) {
                 let start = offset + pos;
-                let quote_before = start.checked_sub(1).and_then(|idx| hay.as_bytes().get(idx)).copied().filter(|&b| b == b'"' || b == b'\'');
-                let rest = &hay[start + pref.len()..];
-                let end = rest.find(|c: char| match quote_before {
+                offset = start + pref.len();
+                // INVARIANT: Require token boundary so `/other-profile/plugins/gemini-carbon-stack/...` never matches relative `plugins/gemini-carbon-stack/`.
+                if !has_token_boundary_before(&hay, start, is_rel) { continue; }
+                let q_before = start.checked_sub(1).and_then(|i| hay.as_bytes().get(i)).copied().filter(|&b| b == b'"' || b == b'\'');
+                let rest = &hay[offset..];
+                let end = rest.find(|c: char| match q_before {
                     Some(q) => c as u32 == q as u32 || matches!(c, '\n' | '\r'),
                     None => c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '&' | '|' | '>' | '<' | ')' | ',' | '\n' | '\r'),
                 }).unwrap_or(rest.len());
                 let rel = rest[..end].trim_start_matches("./").trim_end_matches('/');
-                if !rel.is_empty() && !manifest_keys.iter().any(|k| k == rel) {
-                    return Some(rel.to_string());
+                if rel.is_empty() { continue; }
+                if !manifest_keys.iter().any(|k| k == rel) { return Some(rel.to_string()); }
+                // INVARIANT: Even though `bin/carbon-stack[.exe]` stays in manifest, any unpruned invocation of removed `tokenade-hook` fails closed.
+                let after = rest[end..].trim_start_matches(['"', '\'', ' ', '\t']);
+                let next_tok = after.split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '&' | '|')).next().unwrap_or("");
+                if matches!(rel, "bin/carbon-stack" | "bin/carbon-stack.exe") && next_tok.eq_ignore_ascii_case("tokenade-hook") {
+                    return Some(format!("{} tokenade-hook", rel));
                 }
-                offset = start + pref.len();
             }
+        }
+        let low_hay = hay.to_ascii_lowercase();
+        if let Some(tp) = low_hay.find("tokenade-hook") {
+            let before = low_hay[..tp].trim_end();
+            let prev_tok = before.rsplit(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '&' | '|')).next().unwrap_or("");
+            if matches!(prev_tok, "carbon-stack" | "carbon-stack.exe") { return Some("carbon-stack tokenade-hook".to_string()); }
         }
     }
     None
@@ -1623,6 +1629,42 @@ fn compensate_rollback(st: &RollbackStage<'_>, mut_plugin: bool, mut_rule: bool,
     err_resp
 }
 
+fn compare_and_replace_file(target: &Path, expected_sha: &str, new_bytes: &[u8]) -> Result<(), (String, bool)> {
+    // INVARIANT: Serialize conditional `hooks.json` update against concurrent editors via kernel exclusive open (`share_mode(0)` on Windows; `flock` + `(dev, ino)` verification on Unix) and return `touched_live` so compensation never overwrites untouched user edits.
+    if win32_sqlite::is_link_or_junction(target) { return Err((format!("Refusing symlink/junction {}", target.display()), false)); }
+    #[cfg(windows)]
+    let mut fh = { use std::os::windows::fs::OpenOptionsExt; fs::OpenOptions::new().read(true).write(true).share_mode(0).open(target).map_err(|e| (format!("Cannot lock {} exclusively: {}", target.display(), e), false))? };
+    #[cfg(not(windows))]
+    let mut fh = {
+        let f = fs::OpenOptions::new().read(true).write(true).open(target).map_err(|e| (format!("Cannot open {}: {}", target.display(), e), false))?;
+        let dl = Instant::now() + Duration::from_secs(2);
+        loop {
+            match f.try_lock() { Ok(()) => break, Err(fs::TryLockError::WouldBlock) if Instant::now() < dl => thread::sleep(Duration::from_millis(10)), Err(e) => return Err((format!("Cannot lock {}: {:?}", target.display(), e), false)) }
+        }
+        f
+    };
+    #[cfg(unix)]
+    let same_inode = |f: &fs::File| -> bool { use std::os::unix::fs::MetadataExt; matches!((f.metadata(), fs::symlink_metadata(target)), (Ok(fm), Ok(pm)) if pm.file_type().is_file() && fm.dev() == pm.dev() && fm.ino() == pm.ino()) };
+    #[cfg(unix)]
+    if !same_inode(&fh) { return Err((format!("Global {} was replaced concurrently; refusing to overwrite user edits", target.display()), false)); }
+    let mut cur = Vec::new();
+    fh.read_to_end(&mut cur).map_err(|e| (format!("Cannot read {}: {}", target.display(), e), false))?;
+    if rio::sha256_hex(&cur) != expected_sha { return Err((format!("Global {} changed concurrently; refusing to overwrite user edits", target.display()), false)); }
+    #[cfg(unix)]
+    if !same_inode(&fh) { return Err((format!("Global {} was replaced concurrently; refusing to overwrite user edits", target.display()), false)); }
+    fh.seek(SeekFrom::Start(0)).map_err(|e| (format!("Seek {} failed: {}", target.display(), e), false))?;
+    if let Err(e) = fh.write_all(new_bytes).and_then(|()| fh.set_len(new_bytes.len() as u64)).and_then(|()| fh.sync_all()) {
+        #[cfg(unix)]
+        let touched = same_inode(&fh);
+        #[cfg(not(unix))]
+        let touched = true;
+        return Err((format!("Write {} failed: {}", target.display(), e), touched));
+    }
+    #[cfg(unix)]
+    if !same_inode(&fh) { return Err((format!("Global {} was replaced concurrently during write; preserving user edits", target.display()), false)); }
+    Ok(())
+}
+
 fn perform_install(repo_root: &Path, config_dir: &Path, stack_home: &Path, dry_run: bool, force_foreign: bool) -> Value {
     let source_plugin_dir = repo_root.join("plugin");
     let source_glob_rule = repo_root.join("rules").join("uiux-design.md");
@@ -1754,16 +1796,8 @@ fn perform_install(repo_root: &Path, config_dir: &Path, stack_home: &Path, dry_r
         }
     }
     if let Some((rendered_hooks, _, planned_sha)) = hooks_prune {
-        if sha256_file_full(&target_global_hooks).ok().as_deref() != Some(planned_sha.as_str()) {
-            return fail_comp(
-                "prune_global_hooks",
-                format!("Global {} changed concurrently during install; refusing to overwrite user edits", target_global_hooks.display()),
-                false,
-            );
-        }
-        if let Err(e) = atomic_write_bytes_with_default_perms(&target_global_hooks, rendered_hooks.as_bytes(), None) {
-            let live_changed = sha256_file_full(&target_global_hooks).ok().as_deref() != Some(planned_sha.as_str());
-            return fail_comp("prune_global_hooks", e, live_changed);
+        if let Err((e, touched_live)) = compare_and_replace_file(&target_global_hooks, &planned_sha, rendered_hooks.as_bytes()) {
+            return fail_comp("prune_global_hooks", e, touched_live);
         }
     }
 
@@ -2499,6 +2533,8 @@ mod tests {
         // Codex C1b #4: unambiguous shell wrappers around managed legacy tokenade commands MUST be recognized & pruned.
         assert!(is_legacy_managed_tokenade_command(&format!("sh -c \"python '{}'\"", py_hook_path), &cfg, &target_plug, false));
         assert!(is_legacy_managed_tokenade_command("cmd /c \"carbon-stack tokenade-hook --event PreToolUse\"", &cfg, &target_plug, true));
+        assert!(is_legacy_managed_tokenade_command(&format!("pwsh -NoProfile -Command \"& '{}' tokenade-hook --event PreToolUse\"", bin_hook_path.replace('\\', "/")), &cfg, &target_plug, true));
+        assert!(is_legacy_managed_tokenade_command(&format!("$null | & '{}' tokenade-hook --event PreToolUse", bin_hook_path.replace('\\', "/")), &cfg, &target_plug, true));
         assert!(!is_legacy_managed_tokenade_command(&format!("sh -c \"echo keep && python '{}'\"", py_hook_path), &cfg, &target_plug, false));
 
         let orig_hooks_str = format!(
@@ -2581,12 +2617,29 @@ mod tests {
         assert!(custom_plugin_script.is_file(), "install must fail before pruning referenced plugin script");
         let _ = fs::remove_file(&custom_plugin_script);
 
-        // Codex C1b #1: compensation rollback with `restore_global_hooks = false` MUST NOT overwrite newer user edits in `hooks.json`.
+        // Codex C1b #1: compare_and_replace_file fails closed with `touched_live = false` if hooks.json changed concurrently, AND compensation rollback with `restore_global_hooks = false` preserves newer user edits.
         let newer_user_hooks = "{\"user-new\":{\"enabled\":true,\"Stop\":[{\"type\":\"command\",\"command\":\"echo keep-new\"}]}}\n";
         fs::write(&hooks_path, newer_user_hooks).unwrap();
+        let cas_err = compare_and_replace_file(&hooks_path, "0000000000000000000000000000000000000000000000000000000000000000", b"{}\n").unwrap_err();
+        assert!(!cas_err.1, "concurrent sha mismatch must report touched_live=false");
+        assert_eq!(fs::read_to_string(&hooks_path).unwrap(), newer_user_hooks);
         let comp_rb = perform_rollback_internal(&cfg, &shome, &bid, false, false);
         assert_eq!(comp_rb["ok"], true, "{:?}", comp_rb);
         assert_eq!(fs::read_to_string(&hooks_path).unwrap(), newer_user_hooks);
+
+        // Codex C1b R2 #4 & #7: compound unpruned `tokenade-hook` invocation fails closed even though `bin/carbon-stack` stays in manifest, while an absolute hook targeting a DIFFERENT profile's `plugins/gemini-carbon-stack/hooks/audit.py` is allowed!
+        let compound_tok = json!({
+            "u": { "PreToolUse": [{"type": "command", "command": format!("echo hi && \"{}\" tokenade-hook --event PreToolUse", bin_hook_path.replace('\\', "/")), "timeout": 10}] }
+        });
+        fs::write(&hooks_path, serde_json::to_string_pretty(&compound_tok).unwrap()).unwrap();
+        let blk_tok = perform_install(&repo, &cfg, &shome, false, true);
+        assert_eq!(blk_tok["ok"], false, "compound tokenade-hook must fail closed: {:?}", blk_tok);
+        let other_prof = json!({
+            "other-profile": { "PreToolUse": [{"type": "command", "command": "python \"/other-profile/plugins/gemini-carbon-stack/hooks/audit.py\"", "timeout": 10}] }
+        });
+        fs::write(&hooks_path, serde_json::to_string_pretty(&other_prof).unwrap()).unwrap();
+        let ok_other = perform_install(&repo, &cfg, &shome, false, true);
+        assert_eq!(ok_other["ok"], true, "other-profile plugin path must not block install: {:?}", ok_other);
     }
 
     #[test]

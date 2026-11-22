@@ -10366,6 +10366,7 @@ mod tests {
                         "role": "worker",
                         "conversation_id": "cid-simplify-wait",
                         "model": cwg_common::SONNET_HIGH_MODEL,
+                        "brief": "Read-only single-pass simplify across Reuse, Quality, Efficiency. Emit SIMPLIFY_LENS: ALL and SIMPLIFY_VERDICT: CLEAN or POLISH_AVAILABLE with behavior-preservation proof.",
                         "killed": false
                     },
                     "doc-helper": {
@@ -10383,9 +10384,10 @@ mod tests {
                 }
             }),
             &[
-                json!({"seq": 1, "agent": "simplify-reviewer", "time": "2026-11-22T09:59:55Z", "text": "@coordinator [done] advisory simplify pass complete"}),
-                json!({"seq": 2, "agent": "doc-helper", "time": "2026-11-22T10:00:00Z", "text": "@coordinator [done] updated docs index"}),
-                json!({"seq": 3, "agent": "helper-1", "time": "2026-11-22T10:00:05Z", "text": "@coordinator [done] helper slice complete"}),
+                json!({"seq": 1, "agent": "coordinator", "time": "2026-11-22T09:59:50Z", "text": "@simplify-reviewer single-pass advisory simplify across Reuse/Quality/Efficiency; emit SIMPLIFY_LENS: ALL and SIMPLIFY_VERDICT: CLEAN or POLISH_AVAILABLE"}),
+                json!({"seq": 2, "agent": "simplify-reviewer", "time": "2026-11-22T09:59:55Z", "text": "@coordinator [done] advisory simplify pass complete\nSIMPLIFY_VERDICT: CLEAN"}),
+                json!({"seq": 3, "agent": "doc-helper", "time": "2026-11-22T10:00:00Z", "text": "@coordinator [done] updated docs index"}),
+                json!({"seq": 4, "agent": "helper-1", "time": "2026-11-22T10:00:05Z", "text": "@coordinator [done] helper slice complete"}),
             ],
             &[],
         );
