@@ -8890,6 +8890,46 @@ mod tests {
             why_stale
         );
 
+        let mut steps_with_list_only = base_steps.clone();
+        steps_with_list_only.extend([
+            json!({
+                "step_index": 11491,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-22T16:04:00Z",
+                "tool_calls": [{"name": "run_command", "args": {"CommandLine": "$null | npx --workspace backend jest --listTests"}}]
+            }),
+            json!({
+                "step_index": 11492,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": "2026-11-22T16:04:02Z",
+                "content": "Command exited with code 0.\n\nCommand output:\nsrc/__tests__/foo.test.ts\n"
+            }),
+        ]);
+        let ev_list_only = read_checks_evidence_with_steps_in_cwd(sess, first_ts, &steps_with_list_only, "");
+        assert!(
+            ev_list_only.passed_count == 0 && ev_list_only.latest_fail_ts > ev_list_only.latest_pass_ts,
+            "`npx --workspace backend jest --listTests` must NEVER be credited as a passing verification run or clear a prior failure: {:?}",
+            ev_list_only
+        );
+        let (ok_list, _) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_std),
+            marker_in: &marker,
+            checks_ev: &ev_list_only,
+            sub_ev: &SubagentEvidence::default(),
+            swarm_ev: &SwarmEvidence::default(),
+            codex_reviews: &[],
+            ctx: None,
+            steps: None,
+            transcript_path: None,
+        });
+        assert!(
+            !ok_list,
+            "`npx --workspace backend jest --listTests` exiting 0 must keep the gate blocked after a prior test failure"
+        );
+
         let mut steps_with_standalone = base_steps;
         steps_with_standalone.extend([
             json!({

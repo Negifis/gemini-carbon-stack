@@ -697,6 +697,174 @@ fn is_benign_ps_env_assign(seg: &str) -> bool {
         && !up.starts_with("NPM_CONFIG_")
 }
 
+fn tokenize_validation_segment(seg: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = seg.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if let Some(q) = quote {
+            if q == '\'' && ch == '\'' && chars.peek() == Some(&'\'') {
+                cur.push('\'');
+                chars.next();
+            } else if q == '"' && ch == '"' && chars.peek() == Some(&'"') {
+                cur.push('"');
+                chars.next();
+            } else if q == '"' && ch == '`' {
+                if let Some(nc) = chars.next() {
+                    cur.push(nc);
+                }
+            } else if ch == q {
+                quote = None;
+            } else {
+                cur.push(ch);
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+        } else if ch.is_whitespace() {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+        } else {
+            cur.push(ch);
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn has_non_executing_validation_arg(seg: &str) -> bool {
+    // SAFETY: Reject test/check runner discovery-only, config-dump, help/version, and no-run flags structurally on quote-unwrapped tokens so commands that exit 0 without executing tests/checks (e.g. `jest --listTests`, `vitest list`, `pytest --collect-only`, `cargo test --no-run`, `playwright test --list`, `tsc --showConfig`) can never clear a failed check or satisfy the gate.
+    let raw_tokens = tokenize_validation_segment(seg);
+    let mut idx = 0usize;
+    while idx < raw_tokens.len() {
+        let t = raw_tokens[idx].as_str();
+        if t.eq_ignore_ascii_case("$null") || t == "|" || t == "&" {
+            idx += 1;
+            continue;
+        }
+        break;
+    }
+    let tokens = &raw_tokens[idx..];
+    if tokens.is_empty() {
+        return false;
+    }
+    let cmd_base = Path::new(&tokens[0])
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&tokens[0])
+        .to_ascii_lowercase();
+    let is_install_cmd = (cmd_base.starts_with("carbon-stack")
+        && tokens.get(1).is_some_and(|t| t.eq_ignore_ascii_case("install")))
+        || tokens.iter().skip(1).any(|t| {
+            Path::new(t)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case("install.py"))
+        });
+    let is_dotnet = matches!(cmd_base.as_str(), "dotnet" | "dotnet.exe");
+    let is_go = matches!(cmd_base.as_str(), "go" | "go.exe");
+    let is_npx = matches!(cmd_base.as_str(), "npx" | "npx.cmd");
+    let mut is_vitest = matches!(cmd_base.as_str(), "vitest" | "vitest.cmd");
+    let mut is_tsc = matches!(cmd_base.as_str(), "tsc" | "tsc.cmd");
+    let mut is_js_v_version = matches!(
+        cmd_base.as_str(),
+        "jest" | "jest.cmd" | "vitest" | "vitest.cmd" | "eslint" | "eslint.cmd" | "tsc" | "tsc.cmd"
+    );
+    let mut arg_start = 1usize;
+    if is_npx {
+        let mut i = 1usize;
+        while i < tokens.len() {
+            let t = tokens[i].to_ascii_lowercase();
+            if matches!(t.as_str(), "--no" | "--no-install" | "--") {
+                i += 1;
+                continue;
+            }
+            if t == "-w" || t == "--workspace" {
+                i += 2;
+                continue;
+            }
+            if t.starts_with("-w=") || t.starts_with("--workspace=") {
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        if let Some(runner) = tokens.get(i) {
+            let r = runner.to_ascii_lowercase();
+            is_vitest = r == "vitest";
+            is_tsc = r == "tsc";
+            is_js_v_version = matches!(r.as_str(), "jest" | "vitest" | "eslint" | "tsc");
+            arg_start = i + 1;
+        }
+    }
+    let mut vitest_saw_run = false;
+    for tok in tokens.iter().skip(arg_start) {
+        let key_raw = tok.split_once('=').map_or(tok.as_str(), |(k, _)| k);
+        if matches!(key_raw, "-h" | "-?" | "-V") {
+            return true;
+        }
+        if is_js_v_version && key_raw == "-v" {
+            return true;
+        }
+        if is_dotnet && key_raw == "-t" {
+            return true;
+        }
+        let key = key_raw.to_ascii_lowercase();
+        if is_go && key == "-list" {
+            return true;
+        }
+        if is_vitest {
+            if key == "run" {
+                vitest_saw_run = true;
+            } else if !vitest_saw_run && key == "list" {
+                return true;
+            }
+        }
+        if matches!(
+            key.as_str(),
+            "--help"
+                | "--version"
+                | "--list"
+                | "--list-tests"
+                | "--listtests"
+                | "--list-files-only"
+                | "--listfilesonly"
+                | "--collect-only"
+                | "--collectonly"
+                | "--co"
+                | "--no-run"
+                | "--norun"
+                | "--show-config"
+                | "--showconfig"
+                | "--print-config"
+                | "--printconfig"
+                | "--clear-cache"
+                | "--clearcache"
+                | "--init"
+                | "--fixtures"
+                | "--markers"
+                | "--setup-only"
+                | "--setup-plan"
+                | "--pass-with-no-tests"
+                | "--passwithnotests"
+        ) {
+            return true;
+        }
+        if is_tsc && key == "--all" {
+            return true;
+        }
+        if !is_install_cmd && matches!(key.as_str(), "--dry-run" | "--dryrun") {
+            return true;
+        }
+    }
+    false
+}
+
 fn is_validation_segment_with_mode(
     seg: &str,
     allow_extended: bool,
@@ -708,6 +876,9 @@ fn is_validation_segment_with_mode(
     }
     if low.contains("--if-present") && if_present_flag_re().is_match(seg) {
         // SAFETY: `--if-present` lets npm/pnpm/yarn/bun exit 0 without executing a missing script.
+        return false;
+    }
+    if has_non_executing_validation_arg(seg) {
         return false;
     }
     if validation_non_runner_re().is_match(seg) {
@@ -4512,6 +4683,27 @@ mod tests {
             ("npx -p fake-jest jest", "UNCERTAIN"),
             (r#"npx --workspace backend -c "echo ok" jest"#, "UNCERTAIN"),
             ("npx --workspace backend --if-present jest", "UNCERTAIN"),
+            ("npx --workspace backend jest --listTests", "UNCERTAIN"),
+            ("npx --workspace backend jest '--listTests'", "UNCERTAIN"),
+            ("npx --workspace backend jest --listTests=true", "UNCERTAIN"),
+            ("npx --workspace backend jest --showConfig", "UNCERTAIN"),
+            ("npx --workspace backend jest -v", "UNCERTAIN"),
+            ("npx --workspace backend jest --passWithNoTests", "UNCERTAIN"),
+            ("npm test -w backend -- --listTests", "UNCERTAIN"),
+            ("npx --workspace backend vitest list", "UNCERTAIN"),
+            ("npx --workspace backend playwright test --list", "UNCERTAIN"),
+            ("npx --workspace backend tsc --showConfig", "UNCERTAIN"),
+            ("npx --workspace backend tsc -v", "UNCERTAIN"),
+            ("cargo test --no-run", "UNCERTAIN"),
+            ("cargo test -- --list", "UNCERTAIN"),
+            ("pytest --collect-only", "UNCERTAIN"),
+            ("pytest --co", "UNCERTAIN"),
+            ("go test -list .", "UNCERTAIN"),
+            ("dotnet test -t", "UNCERTAIN"),
+            ("npx --workspace backend jest -t \"specific case\" --runInBand", "VALIDATION"),
+            ("pytest -v tests/test_ok.py", "VALIDATION"),
+            ("go test -v ./...", "VALIDATION"),
+            ("carbon-stack install --dry-run", "VALIDATION"),
             ("npx -w -c jest", "UNCERTAIN"),
             (r#"npx --workspace backend node -e "process.exit(0)""#, "UNCERTAIN"),
             (

@@ -1626,7 +1626,7 @@ fn compensate_rollback(st: &RollbackStage<'_>, mut_plugin: bool, mut_rule: bool,
 }
 
 fn compare_and_replace_file(target: &Path, expected_sha: &str, new_bytes: &[u8]) -> Result<(), String> {
-    // INVARIANT: Create stage privately (`0600` on Unix) preserving original mode, swap crash-atomically capturing displaced bytes, and NEVER delete any displaced file whose SHA-256 is not proven to be `expected_sha` or `written_sha`.
+    // INVARIANT: Create empty stage privately (`0600` on Unix), verify/strip ACLs and preserve `orig_gid` BEFORE writing a single byte, apply `orig_mode` after write, swap crash-atomically capturing displaced bytes, and NEVER delete any displaced file whose SHA-256 is not proven to be `expected_sha` or `written_sha`.
     static SWAP_SEQ: AtomicU64 = AtomicU64::new(1);
     if win32_sqlite::is_link_or_junction(target) { return Err(format!("Refusing symlink/junction {}", target.display())); }
     let parent = target.parent().ok_or_else(|| format!("Invalid target path {}", target.display()))?;
@@ -1636,8 +1636,9 @@ fn compare_and_replace_file(target: &Path, expected_sha: &str, new_bytes: &[u8])
     oo.write(true).create_new(true);
     #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; oo.mode(0o600); }
     let write_res = oo.open(&stage).and_then(|mut f| {
+        #[cfg(unix)] let orig_mode = win32_sqlite::prepare_unix_stage_access_or_refuse(target, &f)?;
         f.write_all(new_bytes)?;
-        #[cfg(unix)] { win32_sqlite::preserve_unix_access_or_refuse(target, &f)?; }
+        #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; f.set_permissions(fs::Permissions::from_mode(orig_mode))?; }
         f.sync_all()
     });
     if let Err(e) = write_res { let _ = fs::remove_file(&stage); return Err(format!("Stage {} failed: {}", target.display(), e)); }

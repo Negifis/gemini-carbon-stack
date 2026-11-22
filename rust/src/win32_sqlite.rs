@@ -1315,10 +1315,10 @@ pub(crate) fn atomic_swap_capturing_displaced(_target: &Path, _replacement: &Pat
 }
 
 #[cfg(unix)]
-pub(crate) fn preserve_unix_access_or_refuse(src_target: &Path, stage_file: &fs::File) -> std::io::Result<()> {
+pub(crate) fn prepare_unix_stage_access_or_refuse(src_target: &Path, stage_file: &fs::File) -> std::io::Result<u32> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::os::unix::io::AsRawFd;
-    // INVARIANT: Never widen Unix access on `hooks.json` replacement: preserve original group (`fchown` when group bits are non-zero and gid differs), refuse replacing files carrying extended POSIX/macOS ACLs, and apply exact `orig_mode & 0o777`.
+    // INVARIANT: Verify/strip ACLs and preserve `orig_gid` on the empty `0600` stage file BEFORE `write_all` so no bytes of `hooks.json` are ever written to a file with inherited group/other ACL read access.
     let orig_meta = fs::symlink_metadata(src_target)?;
     let orig_mode = orig_meta.mode() & 0o777;
     let orig_gid = orig_meta.gid();
@@ -1331,14 +1331,15 @@ pub(crate) fn preserve_unix_access_or_refuse(src_target: &Path, stage_file: &fs:
         }
         let tc = path_cstr(src_target)?;
         let acl_attr = b"system.posix_acl_access\0".as_ptr() as *const c_char;
-        // SAFETY: Valid NUL-terminated paths and open fd; query ACL length without writing, and strip any directory-inherited ACL on `stage_file` BEFORE applying `orig_mode`.
+        // SAFETY: Valid NUL-terminated paths and open fd; query ACL length without writing, and strip any directory-inherited ACL on the empty `stage_file` BEFORE writing any bytes.
         if unsafe { lgetxattr(tc.as_ptr(), acl_attr, ptr::null_mut(), 0) } > 0 {
             return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "global hooks.json has extended POSIX ACL; refusing to replace"));
         }
-        if unsafe { fgetxattr(stage_file.as_raw_fd(), acl_attr, ptr::null_mut(), 0) } > 0
-            && unsafe { fremovexattr(stage_file.as_raw_fd(), acl_attr) } != 0
-        {
-            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "cannot strip directory-inherited POSIX ACL from staged hooks.json"));
+        if unsafe { fgetxattr(stage_file.as_raw_fd(), acl_attr, ptr::null_mut(), 0) } > 0 {
+            if unsafe { fremovexattr(stage_file.as_raw_fd(), acl_attr) } != 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "cannot strip directory-inherited POSIX ACL from staged hooks.json"));
+            }
+            stage_file.set_permissions(fs::Permissions::from_mode(0o600))?;
         }
     }
     #[cfg(target_os = "macos")]
@@ -1349,7 +1350,7 @@ pub(crate) fn preserve_unix_access_or_refuse(src_target: &Path, stage_file: &fs:
             fn acl_free(obj_p: *mut c_void) -> c_int;
         }
         let tc = path_cstr(src_target)?;
-        // SAFETY: Valid NUL-terminated path and open fd; `0x100` is `ACL_TYPE_EXTENDED` on Darwin; refuse if either source or stage carries extended ACLs.
+        // SAFETY: Valid NUL-terminated path and open fd; `0x100` is `ACL_TYPE_EXTENDED` on Darwin; refuse on the empty stage file BEFORE writing any bytes if either source or stage carries extended ACLs.
         let acl = unsafe { acl_get_link_np(tc.as_ptr(), 0x100) };
         if !acl.is_null() {
             unsafe { acl_free(acl); }
@@ -1363,12 +1364,12 @@ pub(crate) fn preserve_unix_access_or_refuse(src_target: &Path, stage_file: &fs:
     }
     if (orig_mode & 0o070) != 0 && stage_file.metadata()?.gid() != orig_gid {
         extern "C" { fn fchown(fd: c_int, owner: u32, group: u32) -> c_int; }
-        // SAFETY: Valid open fd; `u32::MAX` (`-1`) leaves owner unchanged and sets group to `orig_gid`.
+        // SAFETY: Valid open fd; `u32::MAX` (`-1`) leaves owner unchanged and sets group to `orig_gid` while stage file is still empty and `0600`.
         if unsafe { fchown(stage_file.as_raw_fd(), u32::MAX, orig_gid) } != 0 {
             return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "cannot preserve original group ownership of global hooks.json"));
         }
     }
-    stage_file.set_permissions(fs::Permissions::from_mode(orig_mode))
+    Ok(orig_mode)
 }
 
 #[cfg(unix)]
