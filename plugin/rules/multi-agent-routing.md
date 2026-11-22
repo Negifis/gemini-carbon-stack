@@ -5,8 +5,9 @@ description: "Load ONLY when delegating to swarm workers, Hydrogen browser/trans
 
 # Multi-Agent & Swarm 2.0 Routing
 
-1. **Запрет `Gemini Flash` и матрица моделей:** никогда не используйте `flash`, `flash_lite` или `gemini-3.8-flash-*`, особенно на фиксах по ревью.
-   - **Координатор:** `Orchestrator (Neon)` / `Gemini 4 Carbon` — планирование, интеграция, гейт.
+1. **Запрет `gemini-3.8-flash-*` и матрица моделей:** никогда не используйте `flash`, `flash_lite` или `gemini-3.8-flash-*` в субагентах/рое.
+   - **Прямой инженер (сложная архитектура, интеграция, фиксы по ревью Codex `R1 → R4`):** прямой **`Gemini 4 Neon (High/XHigh)`** (`gemini-4-neon-high`/`gemini-4-neon-xhigh`).
+   - **Координатор (планирование и рутина):** `Orchestrator (Neon)` допустим только для планирования и рутинных правок (его Execution Mode выполняется на лёгком `gemini-flash-worker-agy`), либо `Gemini 4 Carbon` для оркестрации.
    - **Быстрые / механические роли:** `Gemini 4 Hydrogen` (`low`..`xhigh` — `browser`, `translator`, быстрые скауты, простые параллельные билдеры).
    - **Сложная разведка, отладка, UI, тесты и архитектура:** `Gemini 4 Neon` (`low`..`xhigh`).
    - **Совещательный `Simplify`:** `claude-sonnet-5-5-high` (fallback `gemini-4-neon-xhigh`, вторичный резерв `gemini-4-hydrogen-xhigh`, никогда Carbon).

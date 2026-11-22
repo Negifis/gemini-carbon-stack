@@ -19,7 +19,7 @@ A subagent's report is a lead/evidence — never self-validating truth. Before r
 
 ## 3. Antigravity 2.0 Model Routing Matrix
 
-`invoke_subagent` exposes tier choices (`inherit`, `flash_lite`, `flash`, `pro`), while `swarm` pins explicit models. **`Gemini Flash` (`flash`, `flash_lite`, `gemini-3.8-flash-*`) is banned across the stack** — never use Flash anywhere, especially not on review fixes.
+`invoke_subagent` exposes tier choices (`inherit`, `flash_lite`, `flash`, `pro`), while `swarm` pins explicit models. **`gemini-3.8-flash-*` (`flash`, `flash_lite`) is banned across the stack.** `Orchestrator (Neon)` is acceptable only for planning and routine edits (its Execution Mode runs on the lightweight `gemini-flash-worker-agy`); **use direct `Gemini 4 Neon (High/XHigh)` for complex architecture and Codex review fixes (`R1 -> R4`)**.
 
 | Task | Tool / Agent | Model |
 |---|---|---|

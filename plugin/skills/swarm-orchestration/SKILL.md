@@ -19,7 +19,8 @@ Three-phase orchestration for parallel discovery, isolated disjoint building, an
 
 | Phase / Role | Model Tier | Use Case |
 |---|---|---|
-| Coordinator | `Orchestrator (Neon)` / `Gemini 4 Carbon` | Task slicing, worktree isolation, integration, verification |
+| Direct Architecture & Review Fixes (`R1 -> R4`) | `gemini-4-neon-high` / `-xhigh` | Direct `Gemini 4 Neon` for architecture, integration, and Codex review remediation |
+| Coordinator (Planning / Routine) | `Orchestrator (Neon)` / `Gemini 4 Carbon` | Planning, task slicing, routine edits (`Orchestrator (Neon)` Execution Mode uses `gemini-flash-worker-agy`) |
 | Fast Scouts & Mechanical Builders | `gemini-4-hydrogen-medium` / `-high` | Multi-subsystem exploration (`3+` areas), `browser` QA, `translator`, straightforward edits |
 | Architecture, Debugging, UI, Tests | `gemini-4-neon-medium`..`-xhigh` | Call graphs/contracts, race/flakiness debugging, complex UI-to-code, unit/E2E tests |
 | Advisory Simplify (once before review) | `claude-sonnet-5-5-high` (fallback `gemini-4-neon-xhigh`, then `gemini-4-hydrogen-xhigh`) | Combined `simplify-reviewer` (`<=2` files / `<=30` LOC) or 3 parallel lenses |

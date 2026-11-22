@@ -11,7 +11,7 @@ description: "Pragmatic independent adversarial code review (codex-lane primary,
 
 - State `3–5` core invariants before coding and split work into atomic commits/worktrees **`<= 30–40 KB`** (~500–1,000 LOC). Split candidates `> 80 KB` before launching Round 1.
 - Complete local tests/checks first; optionally run one advisory `simplify` pass before Round 1 (`simplify` skill).
-- Never use `Gemini Flash` (`flash`/`flash_lite`) when fixing review findings.
+- Never use `gemini-3.8-flash-*` (`flash`/`flash_lite`); run complex architecture and Codex review fixes (`R1 -> R4`) on direct **`Gemini 4 Neon (High/XHigh)`** (not `Orchestrator (Neon)`, whose Execution Mode delegates to `gemini-flash-worker-agy`).
 
 ## 2. Primary Review: OpenAI Codex (`carbon-stack codex-lane`)
 
@@ -55,4 +55,4 @@ Only when `codex-lane check` reports unavailable/open breaker or live Codex outa
          --finding "<short title>" --category "<intent-conflict|accepted-risk|no-practical-gain|deferred-improvement>" `
          --reason "<evidence-backed rationale>"
        ```
-- **`Round 4: ESCALATE`** -> execute **one** focused research pass, then either `REMEDIATE` (`<= 2` `--closure` passes: `READY` -> `verified`/`pr-ready`; 2nd `BLOCKED` -> `[gate] draft-blocked`) or architectural reset (`carbon-stack codex-lane research-reset` / `redesign-reset`).
+- **`Round 4: ESCALATE`** -> execute **one** focused research pass, then fix + re-test and run `<= 2` `--closure` passes in the same session (`READY` -> `verified`/`pr-ready`; 2nd `BLOCKED` -> `[gate] draft-blocked`). No reset cycles.

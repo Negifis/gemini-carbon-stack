@@ -44,9 +44,8 @@ Determine risk by blast radius, data sensitivity, reversibility, and security bo
 
 - **Advisory `simplify` (`simplify` skill):** recommended once before Round 1 review on `HIGH`/`XHIGH` (`simplify-reviewer` or 3 lenses via `swarm`; never blocks `Stop` and never repeats after review).
 - **Review loop (`1..4` rounds, `BLOCKING_THRESHOLD = HIGH`):** only `CRITICAL`/`HIGH` defects with concrete reachable triggers (and broken acceptance criteria) block. Dismiss `Class C/D` / intent-conflicting noise via `carbon-stack codex-lane dispose`.
-- **After `Round 4: ESCALATE`:** freeze open blockers, run **one** focused evidence pass (code, tests, Context7, web), then choose:
-  - **`REMEDIATE`:** stay in same session, fix + re-test, run `<= 2` `--closure` passes (`CLOSURE_VALIDATION: READY` -> `[gate] verified` / `[gate] pr-ready`; 2nd `BLOCKED` -> terminal `[gate] draft-blocked: <blocker and handoff>`).
-  - **`REDESIGN`:** call `carbon-stack codex-lane research-reset` or `redesign-reset` (1 reset allowed per candidate) for a clean architectural cycle.
+- **After `Round 4: ESCALATE`:** freeze open blockers, run **one** focused evidence pass (code, tests, Context7, web), then fix + re-test and run `<= 2` `--closure` passes in the same session (`CLOSURE_VALIDATION: READY` -> `[gate] verified` / `[gate] pr-ready`; 2nd `BLOCKED` -> terminal `[gate] draft-blocked: <blocker and handoff>`). No reset cycles.
+- **Comment hygiene (`comment-density-guard`):** `PreToolUse` rejects overly dense/narration comments on code edits; keep comments limited to `INVARIANT:`, `SAFETY:`, and `WORKAROUND:`.
 - **Active production incident:** apply smallest reversible mitigation + smoke check to stop user harm first, then complete proportionate verification and report both states distinctly.
 
 ## 6. Terminal Receipts & Anomalies

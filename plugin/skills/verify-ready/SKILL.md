@@ -10,6 +10,6 @@ description: "Pre-closure readiness audit: intent match, checks, review freshnes
 3. **Gate Risk Alignment (`development-verification`):**
    - `LOW`: content/links/deterministic check verified.
    - `STANDARD`: affected local tests/linters green (optional advisory `simplify-reviewer`).
-   - `HIGH` / `XHIGH`: tests green → optional advisory `simplify` once before review → independent review via `carbon-stack codex-lane review --intent "..."` (`1..4` rounds, `DISPOSE` recorded for Class C/D/intent conflicts; `VERDICT: APPROVED` closes gate; after `Round 4: ESCALATE` → 1 research pass → `<= 2` `--closure` passes -> `verified`/`pr-ready` or terminal `[gate] draft-blocked`, or 1 `research-reset`/`redesign-reset`).
+   - `HIGH` / `XHIGH`: tests green → optional advisory `simplify` once before review → independent review via `carbon-stack codex-lane review --intent "..."` (`1..4` rounds, `DISPOSE` recorded for intent conflicts/noise; `VERDICT: APPROVED` closes gate; after `Round 4: ESCALATE` → 1 research pass → `<= 2` `--closure` passes -> `verified`/`pr-ready` or terminal `[gate] draft-blocked`).
    - If visual UI files changed meaningfully: live browser screenshots checked + `VISUAL_REVIEW_VERDICT: APPROVED` from read-only `visual-qa-reviewer`.
 4. **Handoffs, Memory & Receipt:** confirm child chips closed via `carbon-stack chip-handoff status`, record any confirmed `DECISION`/`GOTCHA` via `nlm-memory remember`, and finish with exact final `[gate]` receipt.

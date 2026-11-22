@@ -14,7 +14,7 @@ Locate definitions and blast radius before reading full blocks:
 
 ## 2. Explicit `tokenade` CLI (No Auto-Wrap Hook)
 
-`tokenade-hook` automatic `CommandLine` wrapping is disabled to prevent shell/quoting breakage; invoke `tokenade` explicitly when needed:
+Automatic `CommandLine` wrapping for `tokenade` has been removed to prevent shell/quoting breakage; invoke `tokenade` explicitly when needed:
 - `tokenade read <office-doc> --prompt "q1, q2"` for PDF/Office passage extraction across multiple questions in one call.
 - `tokenade search "<q1>" "<q2>"` and `tokenade web <u1> <u2>` for concurrent compact web lookups.
 - `cmd | tokenade exec --lang python --script '<=20L>'` to filter/aggregate noisy command output before it enters context.

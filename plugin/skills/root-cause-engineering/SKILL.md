@@ -28,3 +28,5 @@ Apply for any bug, failing/flaky test, lint/type regression, unclear failure, or
    - Write/update a regression test that fails before the fix and passes after it.
    - Run narrow checks first, then affected suites.
    - Record confirmed root causes (`GOTCHA`) or open hazards (`RISK`) with `nlm-memory remember` / `carbon-stack carbon-memory remember`.
+
+If you cannot reproduce, characterize with logs, code paths, version/config boundaries, and plausible failure invariants. Be explicit about what is confirmed versus assumed.
