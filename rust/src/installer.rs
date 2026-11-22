@@ -458,43 +458,24 @@ fn norm_instance_path(tok: &str, case_fold: bool) -> String {
     out
 }
 
-fn matches_target_plugin_subpath(
-    raw_tok: &str,
-    config_dir: &Path,
-    target_plugin_dir: &Path,
-    is_windows: bool,
-    rel_subpath: &str,
-) -> bool {
-    let expanded = if matches!(raw_tok, "~" | "$HOME" | "${HOME}") || raw_tok.eq_ignore_ascii_case("%userprofile%") {
-        rio::home_dir().to_string_lossy().into_owned()
-    } else if let Some(rest) = raw_tok
-        .strip_prefix("~/")
-        .or_else(|| raw_tok.strip_prefix("~\\"))
-        .or_else(|| raw_tok.strip_prefix("$HOME/"))
-        .or_else(|| raw_tok.strip_prefix("${HOME}/"))
-    {
-        format!("{}/{}", rio::home_dir().to_string_lossy(), rest)
-    } else if let (Some(h), Some(t)) = (raw_tok.get(..14), raw_tok.get(14..)) {
-        if h.eq_ignore_ascii_case("%userprofile%/") || h.eq_ignore_ascii_case("%userprofile%\\") {
-            format!("{}/{}", rio::home_dir().to_string_lossy(), t)
-        } else {
-            raw_tok.to_string()
-        }
-    } else {
-        raw_tok.to_string()
-    };
-    let trimmed = expanded.strip_prefix("./").or_else(|| expanded.strip_prefix(".\\")).unwrap_or(&expanded);
-    if trimmed.is_empty() || has_dot_components(Path::new(trimmed)) {
-        return false;
-    }
+fn expand_home_prefix(raw: &str, home: &str, is_windows: bool) -> String {
+    let s = raw.replace('\\', "/");
+    if home.is_empty() { return s; }
+    let ht = home.trim_end_matches('/');
+    if matches!(s.as_str(), "~" | "$HOME" | "${HOME}") || (is_windows && s.eq_ignore_ascii_case("%userprofile%")) { return ht.to_string(); }
+    for p in ["~/", "$HOME/", "${HOME}/"] { if let Some(r) = s.strip_prefix(p) { return format!("{}/{}", ht, r); } }
+    if is_windows && s.len() >= 14 && s[..14].eq_ignore_ascii_case("%userprofile%/") { return format!("{}/{}", ht, &s[14..]); }
+    s
+}
+
+fn matches_target_plugin_subpath(raw_tok: &str, config_dir: &Path, target_plugin_dir: &Path, is_windows: bool, rel_subpath: &str) -> bool {
+    let home = rio::home_dir().to_string_lossy().replace('\\', "/");
+    let expanded = expand_home_prefix(raw_tok, &home, is_windows);
+    let trimmed = expanded.strip_prefix("./").unwrap_or(&expanded);
+    if trimmed.is_empty() || has_dot_components(Path::new(trimmed)) { return false; }
     let has_drive = trimmed.as_bytes().get(1) == Some(&b':') && trimmed.as_bytes()[0].is_ascii_alphabetic();
-    let candidate = if has_drive || trimmed.starts_with(['/', '\\', '~', '$', '%']) {
-        PathBuf::from(trimmed)
-    } else {
-        config_dir.join(trimmed)
-    };
-    norm_instance_path(&candidate.to_string_lossy(), is_windows)
-        == norm_instance_path(&target_plugin_dir.join(rel_subpath).to_string_lossy(), is_windows)
+    let candidate = if has_drive || trimmed.starts_with(['/', '~', '$', '%']) { PathBuf::from(trimmed) } else { config_dir.join(trimmed) };
+    norm_instance_path(&candidate.to_string_lossy(), is_windows) == norm_instance_path(&target_plugin_dir.join(rel_subpath).to_string_lossy(), is_windows)
 }
 
 fn split_simple_hook_tokens(cmd: &str) -> Option<Vec<String>> {
@@ -677,65 +658,76 @@ fn collect_hook_commands<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
     }
 }
 
-fn token_prefix_before<'a>(hay: &'a str, start: usize) -> (&'a str, Option<u8>) {
-    let before = &hay[..start];
-    let tok_start = before
-        .char_indices()
-        .rev()
-        .find(|&(_, c)| c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '&' | '|' | '(' | '=' | ','))
-        .map_or(0, |(idx, c)| idx + c.len_utf8());
-    let q_before = tok_start.checked_sub(1).and_then(|i| hay.as_bytes().get(i)).copied().filter(|&b| b == b'"' || b == b'\'');
-    (&hay[tok_start..start], q_before)
+fn lexical_resolve_norm(base: &str, raw_path: &str, is_windows: bool) -> String {
+    let p = raw_path.replace('\\', "/");
+    let full = if (p.as_bytes().get(1) == Some(&b':') && p.as_bytes()[0].is_ascii_alphabetic()) || p.starts_with('/') { p } else { format!("{}/{}", base.trim_end_matches('/'), p) };
+    let (prefix, rest) = if full.as_bytes().get(1) == Some(&b':') { (&full[..2], &full[2..]) } else if full.starts_with('/') { ("/", &full[1..]) } else { ("", full.as_str()) };
+    let mut segs: Vec<&str> = Vec::new();
+    for seg in rest.split('/') { match seg { "" | "." => {} ".." => { segs.pop(); } _ => segs.push(seg) } }
+    let joined = if prefix == "/" { format!("/{}", segs.join("/")) } else if !prefix.is_empty() { format!("{}/{}", prefix, segs.join("/")) } else { segs.join("/") };
+    if is_windows { joined.to_ascii_lowercase() } else { joined }
 }
 
-fn find_dangling_plugin_hook_ref(root: &Value, target_plugin_dir: &Path, next_manifest: Option<&BTreeMap<String, String>>, is_windows: bool) -> Option<String> {
+fn shell_segments_with_tokens(cmd: &str, depth: u8) -> Vec<Vec<String>> {
+    // INVARIANT: Quote-aware shell argument lexer preserving spaces inside quoted paths and unwrapping `sh -c`/`cmd /c`/`pwsh -Command` wrappers recursively.
+    let (mut segs, mut seg, mut cur, mut has_tok, mut in_sq, mut in_dq) = (Vec::new(), Vec::new(), String::new(), false, false, false);
+    let mut chars = cmd.trim().chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' if in_sq => in_sq = false,
+            _ if in_sq => cur.push(ch),
+            '"' if in_dq => in_dq = false,
+            '\\' if in_dq && matches!(chars.peek(), Some('"' | '\\')) => { cur.push(chars.next().unwrap()); }
+            _ if in_dq => cur.push(ch),
+            c if c.is_whitespace() => { if has_tok { seg.push(std::mem::take(&mut cur)); has_tok = false; } }
+            ';' | '|' | '&' | '\n' | '\r' => {
+                if has_tok { seg.push(std::mem::take(&mut cur)); has_tok = false; }
+                if ch == '&' && seg.is_empty() && chars.peek().is_some_and(|c| c.is_whitespace()) { continue; }
+                if !seg.is_empty() { segs.push(std::mem::take(&mut seg)); }
+            }
+            '\'' => { in_sq = true; has_tok = true; }
+            '"' => { in_dq = true; has_tok = true; }
+            _ => { cur.push(ch); has_tok = true; }
+        }
+    }
+    if has_tok { seg.push(cur); }
+    if !seg.is_empty() { segs.push(seg); }
+    if depth >= 2 { return segs; }
+    segs.into_iter().flat_map(|s| match unwrap_single_shell_wrapper(&s) { Some(inner) => shell_segments_with_tokens(inner, depth + 1), None => vec![s] }).collect()
+}
+
+fn find_dangling_plugin_hook_ref(root: &Value, config_dir: &Path, target_plugin_dir: &Path, next_manifest: Option<&BTreeMap<String, String>>, is_windows: bool) -> Option<String> {
     let Some(manifest) = next_manifest.filter(|m| !m.is_empty()) else { return None };
     let mut cmds = Vec::new();
     collect_hook_commands(root, &mut cmds);
     if cmds.is_empty() { return None; }
-    let abs_pref = format!("{}/", norm_instance_path(&target_plugin_dir.to_string_lossy(), is_windows));
-    let rel_pref = if is_windows { format!("plugins/{}/", PLUGIN_NAME.to_ascii_lowercase()) } else { format!("plugins/{}/", PLUGIN_NAME) };
-    let home_norm = rio::home_dir().to_string_lossy().replace('\\', "/");
+    let (home_norm, cfg_norm) = (rio::home_dir().to_string_lossy().replace('\\', "/"), lexical_resolve_norm("", &config_dir.to_string_lossy(), is_windows));
+    let abs_pref = format!("{}/", lexical_resolve_norm("", &target_plugin_dir.to_string_lossy(), is_windows));
     let manifest_keys: Vec<String> = manifest.keys().map(|k| if is_windows { k.to_ascii_lowercase() } else { k.clone() }).collect();
     for cmd in cmds {
-        let mut norm = cmd.replace('\\', "/");
-        if !home_norm.is_empty() {
-            let ht = home_norm.trim_end_matches('/');
-            for pat in ["~/", "$HOME/", "${HOME}/"] { norm = norm.replace(pat, &format!("{}/", ht)); }
-            if is_windows && norm.to_ascii_lowercase().contains("%userprofile%/") {
-                norm = norm.to_ascii_lowercase().replace("%userprofile%/", &format!("{}/", ht.to_ascii_lowercase()));
+        let mut cur_dir = cfg_norm.clone();
+        for seg in shell_segments_with_tokens(cmd, 0) {
+            if seg.is_empty() { continue; }
+            if matches!(seg[0].to_ascii_lowercase().as_str(), "cd" | "chdir" | "pushd" | "set-location" | "sl") {
+                if let Some(arg) = seg[1..].iter().find(|a| !a.starts_with('-') && !a.eq_ignore_ascii_case("/d")) {
+                    cur_dir = lexical_resolve_norm(&cur_dir, &expand_home_prefix(arg, &home_norm, is_windows), is_windows);
+                }
+                continue;
             }
-        }
-        let hay = if is_windows { norm.to_ascii_lowercase() } else { norm };
-        let mut offset = 0usize;
-        while let Some(pos) = hay[offset..].find(rel_pref.as_str()) {
-            let start = offset + pos;
-            offset = start + rel_pref.len();
-            // INVARIANT: Walk back UTF-8-safely to token start; check relative prefixes (`""`, `./`, `../`) or absolute paths matching THIS `target_plugin_dir` only, ignoring other profiles (`/home/иван/plugins/...`).
-            let (tok_prefix, q_before) = token_prefix_before(&hay, start);
-            let is_rel_target = !tok_prefix.starts_with('/') && !tok_prefix.contains(':')
-                && tok_prefix.split('/').all(|seg| seg.is_empty() || seg == "." || seg == "..");
-            let is_abs_target = format!("{}{}", tok_prefix, rel_pref) == abs_pref;
-            if !is_rel_target && !is_abs_target { continue; }
-            let rest = &hay[offset..];
-            let end = rest.find(|c: char| match q_before {
-                Some(q) => c as u32 == q as u32 || matches!(c, '\n' | '\r'),
-                None => c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '&' | '|' | '>' | '<' | ')' | ',' | '\n' | '\r'),
-            }).unwrap_or(rest.len());
-            let rel = rest[..end].trim_start_matches("./").trim_end_matches('/');
-            if rel.is_empty() { continue; }
-            if !manifest_keys.iter().any(|k| k == rel) { return Some(rel.to_string()); }
-            let after = rest[end..].trim_start_matches(['"', '\'', ' ', '\t']);
-            let next_tok = after.split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '&' | '|')).next().unwrap_or("");
-            if matches!(rel, "bin/carbon-stack" | "bin/carbon-stack.exe") && next_tok.eq_ignore_ascii_case("tokenade-hook") {
-                return Some(format!("{} tokenade-hook", rel));
+            for (idx, tok) in seg.iter().enumerate() {
+                let next_tok_hook = seg.get(idx + 1).is_some_and(|t| t.eq_ignore_ascii_case("tokenade-hook"));
+                if next_tok_hook && matches!(tok.replace('\\', "/").to_ascii_lowercase().as_str(), "carbon-stack" | "carbon-stack.exe") {
+                    return Some("carbon-stack tokenade-hook".to_string());
+                }
+                let exp = expand_home_prefix(tok, &home_norm, is_windows);
+                if !exp.contains('/') { continue; }
+                if let Some(rel) = lexical_resolve_norm(&cur_dir, &exp, is_windows).strip_prefix(&abs_pref) {
+                    let rel = rel.trim_end_matches('/');
+                    if rel.is_empty() { continue; }
+                    if !manifest_keys.iter().any(|k| k == rel) { return Some(rel.to_string()); }
+                    if next_tok_hook && matches!(rel, "bin/carbon-stack" | "bin/carbon-stack.exe") { return Some(format!("{} tokenade-hook", rel)); }
+                }
             }
-        }
-        let low_hay = hay.to_ascii_lowercase();
-        if let Some(tp) = low_hay.find("tokenade-hook") {
-            let before = low_hay[..tp].trim_end();
-            let prev_tok = before.rsplit(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '&' | '|')).next().unwrap_or("");
-            if matches!(prev_tok, "carbon-stack" | "carbon-stack.exe") { return Some("carbon-stack tokenade-hook".to_string()); }
         }
     }
     None
@@ -772,7 +764,7 @@ fn plan_global_hooks_prune(
     };
     let pruned = prune_managed_tokenade_entries(&mut parsed, config_dir, target_plugin_dir, is_windows);
     // INVARIANT: Fail closed BEFORE modifying/pruning the plugin tree if any unpruned global hook still targets a plugin file absent from the incoming manifest.
-    if let Some(dangling) = find_dangling_plugin_hook_ref(&parsed, target_plugin_dir, next_manifest, is_windows) {
+    if let Some(dangling) = find_dangling_plugin_hook_ref(&parsed, config_dir, target_plugin_dir, next_manifest, is_windows) {
         return Err(format!(
             "Global {} still references plugin target '{}' that this install would remove; update or remove that hook entry before installing",
             hooks_path.display(),
@@ -1634,15 +1626,23 @@ fn compensate_rollback(st: &RollbackStage<'_>, mut_plugin: bool, mut_rule: bool,
 }
 
 fn compare_and_replace_file(target: &Path, expected_sha: &str, new_bytes: &[u8]) -> Result<(), String> {
-    // INVARIANT: Publish `hooks.json` crash-atomically via fully synced temp file + kernel `ReplaceFileW`/`RENAME_EXCHANGE`/`RENAME_SWAP`, capturing the displaced live file; if its SHA-256 differs from `expected_sha`, atomically swap the user's newer version back and never clobber concurrent edits.
+    // INVARIANT: Create stage privately (`0600` on Unix) preserving original mode, swap crash-atomically capturing displaced bytes, and NEVER delete any displaced file whose SHA-256 is not proven to be `expected_sha` or `written_sha`.
     static SWAP_SEQ: AtomicU64 = AtomicU64::new(1);
     if win32_sqlite::is_link_or_junction(target) { return Err(format!("Refusing symlink/junction {}", target.display())); }
     let parent = target.parent().ok_or_else(|| format!("Invalid target path {}", target.display()))?;
+    #[cfg(unix)]
+    let orig_mode = { use std::os::unix::fs::PermissionsExt; fs::symlink_metadata(target).map_err(|e| format!("Cannot stat {}: {}", target.display(), e))?.permissions().mode() & 0o777 };
     let (seq, pid) = (SWAP_SEQ.fetch_add(1, Ordering::Relaxed), std::process::id());
     let (stage, disp_slot, rev_slot) = (parent.join(format!(".hooks.stage.{}.{}.tmp", pid, seq)), parent.join(format!(".hooks.disp.{}.{}.tmp", pid, seq)), parent.join(format!(".hooks.rev.{}.{}.tmp", pid, seq)));
-    if let Err(e) = fs::OpenOptions::new().write(true).create_new(true).open(&stage).and_then(|mut f| { f.write_all(new_bytes)?; f.sync_all() }) {
-        let _ = fs::remove_file(&stage); return Err(format!("Stage {} failed: {}", target.display(), e));
-    }
+    let mut oo = fs::OpenOptions::new();
+    oo.write(true).create_new(true);
+    #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; oo.mode(0o600); }
+    let write_res = oo.open(&stage).and_then(|mut f| {
+        f.write_all(new_bytes)?;
+        #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; f.set_permissions(fs::Permissions::from_mode(orig_mode))?; }
+        f.sync_all()
+    });
+    if let Err(e) = write_res { let _ = fs::remove_file(&stage); return Err(format!("Stage {} failed: {}", target.display(), e)); }
     let displaced = match win32_sqlite::atomic_swap_capturing_displaced(target, &stage, &disp_slot) {
         Ok(p) => p,
         Err(e) => { let _ = fs::remove_file(&stage); return Err(format!("Atomic swap {} failed: {}", target.display(), e)); }
@@ -1653,10 +1653,13 @@ fn compare_and_replace_file(target: &Path, expected_sha: &str, new_bytes: &[u8])
         Ok(rev) if sha256_file_full(&rev).ok().as_deref() == Some(written_sha.as_str()) => {
             let _ = fs::remove_file(&rev); Err(format!("Global {} changed concurrently; user edits restored untouched", target.display()))
         }
-        Ok(rev) => {
-            if let Ok(stale_v2) = win32_sqlite::atomic_swap_capturing_displaced(target, &rev, &parent.join(format!(".hooks.rev2.{}.{}.tmp", pid, seq))) { let _ = fs::remove_file(&stale_v2); }
-            Err(format!("Global {} changed concurrently during recovery; latest user edits preserved", target.display()))
-        }
+        Ok(rev) => match win32_sqlite::atomic_swap_capturing_displaced(target, &rev, &parent.join(format!(".hooks.rev2.{}.{}.tmp", pid, seq))) {
+            Ok(out2) if matches!(sha256_file_full(&out2).ok().as_deref(), Some(s) if s == written_sha || s == expected_sha) => {
+                let _ = fs::remove_file(&out2); Err(format!("Global {} changed concurrently during recovery; latest user edits preserved", target.display()))
+            }
+            Ok(out2) => Err(format!("Global {} changed concurrently multiple times; conflicting user version preserved at {}", target.display(), out2.display())),
+            Err(e) => Err(format!("Global {} changed concurrently; newer user edits preserved at {} (restore swap failed: {})", target.display(), rev.display(), e)),
+        },
         Err(e) => Err(format!("Global {} changed concurrently and restore swap failed ({}); user version preserved at {}", target.display(), e, displaced.display())),
     }
 }
@@ -2636,12 +2639,26 @@ mod tests {
         fs::write(&hooks_path, serde_json::to_string_pretty(&parent_rel_tok).unwrap()).unwrap();
         let blk_rel = perform_install(&repo, &cfg, &shome, false, true);
         assert_eq!(blk_rel["ok"], false, "relative ../plugins/gemini-carbon-stack/hooks/tokenade_hook.py must fail closed: {:?}", blk_rel);
-        let other_prof = json!({
-            "other-profile": { "PreToolUse": [{"type": "command", "command": "python \"/home/иван/plugins/gemini-carbon-stack/hooks/audit.py\"", "timeout": 10}] }
+        // Codex C1b Closure #4 & #7: quoted path WITH SPACES targeting THIS profile MUST fail closed, while `cd '/other-profile/.gemini/config/rules' && python ../plugins/gemini-carbon-stack/hooks/audit.py` and Cyrillic `/home/иван/plugins/...` MUST be allowed!
+        let spaced_cfg = tmp.0.join("Users").join("Jane Doe").join(".gemini").join("config");
+        let spaced_plug = spaced_cfg.join("plugins").join(PLUGIN_NAME);
+        let spaced_audit = spaced_plug.join("hooks").join("audit.py");
+        let spaced_hooks = json!({
+            "u": { "PreToolUse": [{"type": "command", "command": format!("python \"{}\"", spaced_audit.to_string_lossy().replace('\\', "/")), "timeout": 10}] }
         });
-        fs::write(&hooks_path, serde_json::to_string_pretty(&other_prof).unwrap()).unwrap();
+        let src_mf = effective_source_manifest_for_target(&repo.join("plugin"), Some(&spaced_plug), cfg!(windows));
+        assert_eq!(
+            find_dangling_plugin_hook_ref(&spaced_hooks, &spaced_cfg, &spaced_plug, Some(&src_mf), cfg!(windows)).as_deref(),
+            Some("hooks/audit.py"),
+            "quoted path with spaces targeting this profile must be caught"
+        );
+        let other_cd_hooks = json!({
+            "other-cd": { "PreToolUse": [{"type": "command", "command": "sh -c \"cd '/other-profile/.gemini/config/rules' && python ../plugins/gemini-carbon-stack/hooks/audit.py\"", "timeout": 10}] },
+            "other-cyrillic": { "PreToolUse": [{"type": "command", "command": "python \"/home/иван/plugins/gemini-carbon-stack/hooks/audit.py\"", "timeout": 10}] }
+        });
+        fs::write(&hooks_path, serde_json::to_string_pretty(&other_cd_hooks).unwrap()).unwrap();
         let ok_other = perform_install(&repo, &cfg, &shome, false, true);
-        assert_eq!(ok_other["ok"], true, "Cyrillic other-profile plugin path must not panic or block install: {:?}", ok_other);
+        assert_eq!(ok_other["ok"], true, "other-profile cd ../ and Cyrillic paths must not block install: {:?}", ok_other);
     }
 
     #[test]
