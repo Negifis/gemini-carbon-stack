@@ -2244,7 +2244,7 @@ pub fn resolve_command_cwd(cmd: &str, default_cwd: &str, fallback_dir: &str) -> 
     default_cwd.to_string()
 }
 
-fn run_git_raw(
+pub fn run_git_raw(
     cwd: &str,
     args: &[&str],
     timeout_sec: f64,

@@ -3499,6 +3499,7 @@ pub struct PendingMarkerDelta<'a> {
     pub ts: f64,
     pub cwd: &'a str,
     pub git_root: &'a str,
+    pub opening_head: Option<&'a str>,
     pub durable_new_paths: &'a [String],
     pub operational_mutation: bool,
     pub changed_lines_delta: i64,
@@ -3515,6 +3516,7 @@ pub fn append_pending_marker_delta(delta: PendingMarkerDelta<'_>) -> Option<Stri
         ts,
         cwd,
         git_root,
+        opening_head,
         durable_new_paths,
         operational_mutation,
         changed_lines_delta,
@@ -3537,7 +3539,7 @@ pub fn append_pending_marker_delta(delta: PendingMarkerDelta<'_>) -> Option<Stri
         Some(fp) => Value::String(fp.to_string()),
         None => Value::Null,
     };
-    let entry = json!({
+    let mut entry = json!({
         "id": delta_id,
         "ts": ts,
         "cwd": if cwd.is_empty() { String::new() } else { rio::normalize_path(cwd) },
@@ -3551,6 +3553,11 @@ pub fn append_pending_marker_delta(delta: PendingMarkerDelta<'_>) -> Option<Stri
         "measured_fp": mfp_val,
         "measured_paths": norm_mpaths,
     });
+    if let Some(oh) = opening_head.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert("opening_head".to_string(), Value::String(oh.to_string()));
+        }
+    }
     let dst_path = marker_pending_dir(session).join(format!("{}.json", delta_id));
     if let Err(e) = rio::write_json(&dst_path, &entry) {
         rio::log_hook_event(
@@ -3677,7 +3684,12 @@ pub fn apply_pending_marker_deltas(
                 .get("git_root")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            json!({
+            let row_oh = first_robj
+                .get("opening_head")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            let mut m = json!({
                 "session": session,
                 "first_ts": first_row_ts,
                 "last_ts": first_row_ts,
@@ -3693,7 +3705,13 @@ pub fn apply_pending_marker_deltas(
                 "applied_pending_ids": [],
                 "gate_max_review_rounds": MAX_ORDINARY_REVIEW_ROUNDS,
                 "closed": false,
-            })
+            });
+            if !row_oh.is_empty() {
+                if let Some(obj) = m.as_object_mut() {
+                    obj.insert("opening_head".to_string(), Value::String(row_oh.to_string()));
+                }
+            }
+            m
         }
     };
 

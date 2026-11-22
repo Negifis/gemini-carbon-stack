@@ -504,11 +504,16 @@ pub fn candidate_restored_to_clean_head(marker: &Value) -> (bool, String) {
         );
     }
     let oh = val_to_str(marker.get("opening_head"));
-    if !oh.is_empty() {
-        let ch = rio::git_head_oid(&git_root);
-        if ch.is_empty() || ch != oh { return (false, "HEAD moved away from opening commit; candidate commits remain active".into()); }
-        if let Some(why) = kept_commit_blocker(&git_root, &oh, val_to_f64(marker.get("first_ts"))) { return (false, why); }
+    if oh.is_empty() {
+        return (
+            false,
+            "opening HEAD commit was not recorded; cannot prove candidate changes were undone rather than committed"
+                .to_string(),
+        );
     }
+    let ch = rio::git_head_oid(&git_root);
+    if ch.is_empty() || ch != oh { return (false, "HEAD moved away from opening commit; candidate commits remain active".into()); }
+    if let Some(why) = kept_commit_blocker(&git_root, &oh, val_to_f64(marker.get("first_ts"))) { return (false, why); }
     (true, String::new())
 }
 
@@ -8169,6 +8174,7 @@ mod tests {
                 "operational": false,
                 "cwd": git_big_norm,
                 "git_root": git_big_norm,
+                "opening_head": rio::git_head_oid(&git_big_norm),
                 "paths": [tracked_big_norm],
                 "content_marks": [{"ts": 310.0, "fp": Value::Null}],
                 "closed": false,
@@ -10998,6 +11004,64 @@ mod tests {
         assert!(
             res_shell_stop.is_some(),
             "first shell command commit must block Stop without receipt"
+        );
+
+        // Case D: Pending delta journal preserves `opening_head` when marker lock is contended, AND missing `opening_head` fails closed for both undo-clean and `[gate] no-change`.
+        let sess_pending_commit = "sess-stage2-pending-commit";
+        let _pend_id = cwg_common::append_pending_marker_delta(cwg_common::PendingMarkerDelta {
+            session: sess_pending_commit,
+            ts: 300.0,
+            cwd: &repo_norm,
+            git_root: &repo_norm,
+            opening_head: Some(&h0),
+            durable_new_paths: std::slice::from_ref(&lib_norm),
+            operational_mutation: false,
+            changed_lines_delta: 2,
+            shell_durable_edit: true,
+            unknown_barrier: false,
+            cause_label: "run_command:commit",
+            measured_fp: Some(&fp_commit),
+            measured_paths: std::slice::from_ref(&lib_norm),
+        })
+        .unwrap();
+        let folded_pending = cwg_common::read_marker_with_pending(sess_pending_commit).unwrap();
+        assert_eq!(val_to_str(folded_pending.get("opening_head")), h0);
+        assert!(
+            decide_stop(&json!({
+                "conversationId": sess_pending_commit,
+                "transcriptPath": tp.to_string_lossy(),
+                "lastAssistantMessage": "[gate] no-change: claiming clean tree after contended commit",
+            }))
+            .is_some(),
+            "contended pending delta with opening_head H0 != H1 must block [gate] no-change"
+        );
+
+        let sess_no_oh = "sess-stage2-missing-opening-head";
+        rio::write_json(
+            &cwg_common::marker_path(sess_no_oh),
+            &json!({
+                "session": sess_no_oh,
+                "class": cwg_common::WORK_PERSISTENT,
+                "operational": false,
+                "closed": false,
+                "first_ts": 400.0,
+                "last_ts": 410.0,
+                "last_durable_ts": 410.0,
+                "edits": 1,
+                "cwd": repo_norm,
+                "git_root": repo_norm,
+                "paths": [lib_norm],
+            }),
+        )
+        .unwrap();
+        assert!(
+            decide_stop(&json!({
+                "conversationId": sess_no_oh,
+                "transcriptPath": tp.to_string_lossy(),
+                "lastAssistantMessage": "[gate] no-change: claiming clean tree without recorded opening_head",
+            }))
+            .is_some(),
+            "missing opening_head must fail closed for [gate] no-change"
         );
     }
 }

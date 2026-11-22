@@ -2522,11 +2522,16 @@ fn update_candidate_marker_unlocked(
         } else {
             cwg_common::last_mark_fp(&marker)
         };
+        let m_oh = marker
+            .get("opening_head")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
         persisted_ok = cwg_common::append_pending_marker_delta(cwg_common::PendingMarkerDelta {
             session,
             ts: now,
             cwd: m_cwd,
             git_root: m_gr,
+            opening_head: m_oh,
             durable_new_paths,
             operational_mutation: false,
             changed_lines_delta,
@@ -4715,6 +4720,7 @@ mod tests {
             ts: 10.0,
             cwd: &tmp_home_str,
             git_root: "",
+            opening_head: Some("h0-deadbeef"),
             durable_new_paths: &race_paths,
             operational_mutation: false,
             changed_lines_delta: 1,
@@ -4733,6 +4739,7 @@ mod tests {
             ts: 20.0,
             cwd: &tmp_home_str,
             git_root: "",
+            opening_head: None,
             durable_new_paths: &race_paths,
             operational_mutation: false,
             changed_lines_delta: 1,
@@ -4746,6 +4753,10 @@ mod tests {
         let (folded_opt, cids) = cwg_common::apply_pending_marker_deltas(sess_race, None);
         assert_eq!(cids, vec![id1.clone(), id2.clone()]);
         let folded_m = folded_opt.unwrap();
+        assert_eq!(
+            folded_m.get("opening_head").and_then(|v| v.as_str()),
+            Some("h0-deadbeef")
+        );
         let rev_at_15 = json!({"launch_ts": 15.0});
         assert!(!crate::cwg_stop::is_review_fresh(&rev_at_15, &folded_m));
         let rev_at_25 = json!({"launch_ts": 25.0});
@@ -4756,6 +4767,7 @@ mod tests {
             ts: 30.0,
             cwd: &tmp_home_str,
             git_root: "",
+            opening_head: None,
             durable_new_paths: &race_paths,
             operational_mutation: false,
             changed_lines_delta: 1,

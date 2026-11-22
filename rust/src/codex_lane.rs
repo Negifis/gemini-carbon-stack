@@ -4755,21 +4755,6 @@ VERDICT: REVISE"
             .to_string()
     };
 
-    if spec.is_timeout_resume {
-        return format!(
-            "REVIEW_ID: {}\nPACKET_NONCE: {}\n{}\n\
-ROUND_MODE: timeout_continuation (same review thread — your previous turn hit the wall-clock timeout before emitting a final verdict; continue from context already inspected without re-reading settled files, and finish with your findings and exact standalone verdict line).\n\n{}\n",
-            spec.review_id,
-            spec.packet_nonce,
-            round_header.trim_end(),
-            verdict_rule
-        );
-    }
-
-    let dispositions_section = format_dispositions_ledger(spec.rejected_findings);
-    let use_interdiff = !spec.interdiff_text.trim().is_empty()
-        || !spec.interdiff_stat.trim().is_empty();
-
     let resume_intent_section = if !spec.business_intent.trim().is_empty() {
         format!(
             "\nBUSINESS_INTENT (authoritative current goal — supersedes any older goal in prior turns):\n{}\n",
@@ -4778,6 +4763,38 @@ ROUND_MODE: timeout_continuation (same review thread — your previous turn hit 
     } else {
         String::new()
     };
+
+    if spec.is_timeout_resume {
+        let delta_section = if !spec.interdiff_stat.trim().is_empty()
+            || !spec.interdiff_text.trim().is_empty()
+        {
+            format!(
+                "\n{}\n",
+                format_diff_block(
+                    "CHANGES SINCE TIMED-OUT ATTEMPT",
+                    spec.interdiff_stat,
+                    spec.interdiff_text,
+                    spec.inspect_hint,
+                )
+            )
+        } else {
+            String::new()
+        };
+        return format!(
+            "REVIEW_ID: {}\nPACKET_NONCE: {}\n{}\n\
+ROUND_MODE: timeout_continuation (same review thread — your previous turn hit the wall-clock timeout before emitting a final verdict; continue from context already inspected without re-reading settled files, inspect any updated intent/changes below, and finish with your findings and exact standalone verdict line).{}{}\n\n{}\n",
+            spec.review_id,
+            spec.packet_nonce,
+            round_header.trim_end(),
+            resume_intent_section,
+            delta_section,
+            verdict_rule
+        );
+    }
+
+    let dispositions_section = format_dispositions_ledger(spec.rejected_findings);
+    let use_interdiff = !spec.interdiff_text.trim().is_empty()
+        || !spec.interdiff_stat.trim().is_empty();
 
     if spec.is_resume {
         let (d_label, d_stat, d_body) = if use_interdiff {
@@ -5976,6 +5993,18 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
     } else {
         cwd.as_str()
     };
+    let resolved_diff_file: String = if args.diff_file.trim().is_empty() {
+        String::new()
+    } else {
+        let dp = Path::new(args.diff_file.trim());
+        if dp.is_absolute() {
+            rio::resolve_abs_path(dp).to_string_lossy().into_owned()
+        } else {
+            rio::resolve_abs_path(&Path::new(&cwd).join(dp))
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
     let effort = if args.xhigh { "ultra" } else { "high" };
     let eff_model = resolve_review_model(&args.model, args.xhigh);
     let phase = if args.closure || args.phase == "closure" {
@@ -6281,7 +6310,7 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
         );
         return 2;
     }
-    let curr_worktree_tree = if args.diff_file.is_empty()
+    let curr_worktree_tree = if resolved_diff_file.is_empty()
         && !git_root.is_empty()
         && rio::git_toplevel(&git_root, false).is_some()
     {
@@ -6290,14 +6319,14 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
         String::new()
     };
 
-    let (diff_stat, diff_text, base_inspect_hint) = if !args.diff_file.is_empty()
-        && Path::new(&args.diff_file).is_file()
+    let (diff_stat, diff_text, base_inspect_hint) = if !resolved_diff_file.is_empty()
+        && Path::new(&resolved_diff_file).is_file()
     {
-        let body = read_diff_file(&args.diff_file);
+        let body = read_diff_file(&resolved_diff_file);
         let st = summarize_diff_file_stat(&body);
         let hint = format!(
             "Read diff file directly: {} (or inspect changed files via git diff / file reads)",
-            args.diff_file
+            resolved_diff_file
         );
         (st, body, hint)
     } else if cwg_common::is_git_oid(&curr_worktree_tree) {
@@ -6425,7 +6454,7 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
             .map(|st| val_to_str(st.get("last_reviewed_tree_oid")))
             .unwrap_or_default();
         // INVARIANT: Diff `prev_reviewed_tree` against `curr_worktree_tree` (`git add -A` temp-index snapshot) so remediation rounds that modify a tracked file AND add a new untracked file include both in `interdiff_text` under `Settled-Scope Freeze`.
-        let (cur_interdiff_stat, cur_interdiff_text, cur_inspect_hint) = if args.diff_file.is_empty()
+        let (cur_interdiff_stat, cur_interdiff_text, cur_inspect_hint) = if resolved_diff_file.is_empty()
             && !prev_reviewed_tree.is_empty()
             && cwg_common::is_git_oid(&prev_reviewed_tree)
         {
@@ -6505,9 +6534,25 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
         args.summary.clone()
     };
 
-    let is_timeout_continuation = saved_thread
+    let has_pending_timeout = saved_thread
         .as_ref()
         .map_or(false, |st| json_truthy(st.get("pending_timeout_resume")));
+    let saved_timeout_phase = saved_thread
+        .as_ref()
+        .map(|st| val_to_str(st.get("phase")))
+        .unwrap_or_default();
+    let expected_round_num = if phase == "closure" {
+        effective_cls_done + 1
+    } else {
+        effective_ord_done + 1
+    };
+    let saved_timeout_round = saved_thread
+        .as_ref()
+        .map(|st| rio::val_to_i64(st.get("pending_timeout_round")).max(0) as usize)
+        .unwrap_or(0);
+    let is_timeout_continuation = has_pending_timeout
+        && (saved_timeout_phase.is_empty() || saved_timeout_phase == phase)
+        && (saved_timeout_round == 0 || saved_timeout_round == expected_round_num);
     if !is_timeout_continuation {
         if phase == "ordinary" && effective_ord_done >= crate::cwg_stop::MAX_REVIEW_ROUNDS {
             rio::print_cli_json(
@@ -6540,6 +6585,29 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
                 args.pretty,
             );
             return 2;
+        }
+    } else if resolved_diff_file.is_empty() {
+        let timeout_tree = saved_thread
+            .as_ref()
+            .map(|st| val_to_str(st.get("timeout_worktree_tree_oid")))
+            .unwrap_or_default();
+        if !timeout_tree.is_empty()
+            && cwg_common::is_git_oid(&timeout_tree)
+            && cwg_common::is_git_oid(&curr_worktree_tree)
+        {
+            if timeout_tree != curr_worktree_tree {
+                let (td_st, td_body) =
+                    run_git_diff_with_stat(review_root, &timeout_tree, Some(&curr_worktree_tree));
+                let t1 = &timeout_tree[..timeout_tree.len().min(12)];
+                let t2 = &curr_worktree_tree[..curr_worktree_tree.len().min(12)];
+                interdiff_stat = td_st;
+                interdiff_text = td_body;
+                inspect_hint =
+                    format!("git diff --stat {} {}; git diff {} {} -- <file>", t1, t2, t1, t2);
+            } else {
+                interdiff_stat.clear();
+                interdiff_text.clear();
+            }
         }
     }
     let saved_next_timeout: i64 = if is_timeout_continuation {
@@ -6783,6 +6851,8 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
                         "ordinary_rounds_completed": attempt_ord_done,
                         "closure_passes_completed": attempt_cls_done,
                         "last_reviewed_tree_oid": prev_tree_oid,
+                        "timeout_worktree_tree_oid": curr_worktree_tree,
+                        "pending_timeout_round": attempt_round_num,
                         "last_review_output": attempt_prior_ledger,
                         "pending_timeout_resume": true,
                         "last_timeout_seconds": eff_timeout as i64,
@@ -6813,7 +6883,7 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
                     closure: phase == "closure",
                     session: &eff_session,
                     cwd: &args.cwd,
-                    diff_file: &args.diff_file,
+                    diff_file: &resolved_diff_file,
                     summary: &args.summary,
                     pretty: args.pretty,
                 });
@@ -12077,10 +12147,34 @@ exit 0
             is_resume: true,
             is_timeout_resume: true,
         });
-        assert!(p_timeout.len() < 1_000, "timeout_continuation too large: {}", p_timeout.len());
+        assert!(p_timeout.len() < 1_100, "timeout_continuation too large: {}", p_timeout.len());
         assert!(p_timeout.contains("ROUND_MODE: timeout_continuation"));
+        assert!(p_timeout.contains("BUSINESS_INTENT (authoritative current goal"));
+        assert!(p_timeout.contains("Keep parser strict"));
         assert!(!p_timeout.contains("GIT DIFF SNAPSHOT"));
         assert!(!p_timeout.contains("REMEDIATION INTERDIFF"));
+        assert!(!p_timeout.contains("CHANGES SINCE TIMED-OUT ATTEMPT"));
+
+        let p_timeout_delta = build_adversarial_prompt(PromptBuildSpec {
+            review_id: "cwg-to2",
+            packet_nonce: "888899990000",
+            scope_summary: "Refactor parser invariants",
+            business_intent: "Updated goal after timeout",
+            rejected_findings: &[],
+            diff_stat: "",
+            diff_text: "",
+            interdiff_stat: " src/lib.rs | 2 +-\n",
+            interdiff_text: "diff --git a/src/lib.rs b/src/lib.rs\n+fixed();\n",
+            inspect_hint: "git diff t1 t2",
+            prior_ledger: "",
+            phase: "ordinary",
+            round_num: 2,
+            is_resume: true,
+            is_timeout_resume: true,
+        });
+        assert!(p_timeout_delta.contains("Updated goal after timeout"));
+        assert!(p_timeout_delta.contains("CHANGES SINCE TIMED-OUT ATTEMPT:"));
+        assert!(p_timeout_delta.contains("+fixed();"));
     }
 
     #[test]
@@ -12204,6 +12298,22 @@ print(verdict)
                 "MOCK_SLEEP_TIMEOUT Pass 1".to_string(),
             ]);
             assert_eq!(rc_to, 3);
+            // Phase-mismatched ordinary call after timed-out `--closure` must NOT bypass ordinary round cap!
+            let rc_ord_after_cls_to = run_cli(&[
+                "review".to_string(),
+                "--cwd".to_string(),
+                repo_s.clone(),
+                "--session".to_string(),
+                sess.to_string(),
+                "--diff-file".to_string(),
+                diff_s.clone(),
+                "--summary".to_string(),
+                "Phase-mismatch bypass blocked".to_string(),
+            ]);
+            assert_eq!(
+                rc_ord_after_cls_to, 2,
+                "ordinary run after timed-out closure must not bypass cap"
+            );
             for p in 1..=2usize {
                 let rc = run_cli(&[
                     "review".to_string(),
@@ -12303,6 +12413,16 @@ print(verdict)
             assert!(st.contains("rust/src/a.rs"), "stat missing rust/src/a.rs: {}", st);
             assert!(body.contains("plugin/hooks.json"), "body missing plugin/hooks.json: {}", body);
             assert!(body.contains("rust/src/a.rs"), "body missing rust/src/a.rs: {}", body);
+
+            // Relative `--diff-file candidate.diff` resolved from `--cwd <repo>/rust` reaches `<repo>/rust/candidate.diff` via absolute path even when Codex runs in `<repo>`.
+            let rel_cand = repo_dir.join("rust").join("candidate.diff");
+            fs::write(&rel_cand, "diff --git a/rust/src/a.rs b/rust/src/a.rs\n+pub fn b() {}\n").unwrap();
+            let resolved_rel = rio::resolve_abs_path(&Path::new(&subdir).join("candidate.diff"))
+                .to_string_lossy()
+                .into_owned();
+            assert!(Path::new(&resolved_rel).is_absolute());
+            assert!(Path::new(&resolved_rel).is_file());
+            assert!(read_diff_file(&resolved_rel).contains("pub fn b()"));
         }
     }
 }

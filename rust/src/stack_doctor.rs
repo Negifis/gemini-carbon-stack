@@ -375,6 +375,12 @@ fn extract_leading_command_exe(cmd: &str) -> String {
     s.split_whitespace().next().unwrap_or("").to_string()
 }
 
+fn is_carbon_stack_exe_token(exe: &str) -> bool {
+    let norm = exe.replace('\\', "/");
+    let fname = norm.rsplit('/').next().unwrap_or("").to_ascii_lowercase();
+    fname == "carbon-stack" || fname == "carbon-stack.exe"
+}
+
 fn is_explicit_abs_path(raw: &str) -> bool {
     let bytes = raw.as_bytes();
     raw.starts_with('/')
@@ -510,7 +516,7 @@ pub(crate) fn inspect_hooks_json_for_os_with_target(
 
     for cmd in &commands {
         let exe = extract_leading_command_exe(cmd);
-        if is_explicit_abs_path(&exe) {
+        if is_explicit_abs_path(&exe) && is_carbon_stack_exe_token(&exe) {
             let exe_abs = rio::resolve_abs_path(Path::new(&exe));
             let target_matches_bundle = norm_for_os(&exe_abs) == norm_for_os(&exp_abs);
             let eff_bin = if same_bundle {
@@ -1704,5 +1710,27 @@ mod tests {
         );
         assert!(!cmds_bad);
         assert!(!info_bad["missing_targets"].as_array().unwrap().is_empty());
+
+        // 3. Legacy Python backup using absolute interpreter path (`C:\Python311\python.exe -X utf8 hooks/cwg_stop.py`) validates referenced script cleanly!
+        let legacy_bundle = tmp.0.join("legacy-py-bak");
+        fs::create_dir_all(legacy_bundle.join("hooks")).unwrap();
+        fs::write(legacy_bundle.join("hooks").join("cwg_stop.py"), "# stop\n").unwrap();
+        let legacy_hooks = json!({
+            "carbon-stack": {
+                "SessionStart": [{"type": "command", "command": "C:\\Python311\\python.exe -X utf8 hooks/cwg_stop.py"}],
+                "PreInvocation": [{"type": "command", "command": "C:\\Python311\\python.exe -X utf8 hooks/cwg_stop.py"}],
+                "PreToolUse": [{"matcher": "run_command|edit_file|write_file|swarm_wait", "hooks": [{"type": "command", "command": "C:\\Python311\\python.exe -X utf8 hooks/cwg_stop.py"}]}],
+                "PostToolUse": [{"type": "command", "command": "C:\\Python311\\python.exe -X utf8 hooks/cwg_stop.py"}],
+                "Stop": [{"type": "command", "command": "C:\\Python311\\python.exe -X utf8 hooks/cwg_stop.py"}],
+            }
+        });
+        let (_, leg_guards, leg_cmds) = inspect_hooks_json_for_os_with_target(
+            &legacy_bundle,
+            Some(&legacy_hooks),
+            true,
+            Some(&tmp.0.join("other-live-target")),
+        );
+        assert!(leg_guards);
+        assert!(leg_cmds);
     }
 }
