@@ -726,6 +726,21 @@ fn is_direct_codex_invocation(cmd_str: &str) -> bool {
     if exe == "carbon-stack" && tokens.len() >= 3 && matches!(tokens[1].to_ascii_lowercase().as_str(), "codex-lane" | "codex_lane") {
         return validate_codex_lane_subcmd_tokens(&tokens[2].to_ascii_lowercase(), &tokens[3..]);
     }
+    // INVARIANT: Retain historical `python ... codex_lane.py <subcmd>` recognition for transcript replay in `Stop` across upgrades.
+    let is_py = matches!(exe, "python" | "python3" | "py")
+        || exe.strip_prefix("python3.").is_some_and(|r| !r.is_empty() && r.chars().all(|c| c.is_ascii_digit()));
+    if is_py {
+        let mut idx = 1usize;
+        while idx < tokens.len() {
+            let f = tokens[idx].as_str();
+            if matches!(f, "-3" | "-u" | "-B" | "-E" | "-s" | "-S") || (f.starts_with("-X") && f.len() > 2) { idx += 1; }
+            else if f == "-X" && idx + 1 < tokens.len() { idx += 2; }
+            else { break; }
+        }
+        if idx + 1 < tokens.len() && tokens[idx].replace('\\', "/").to_ascii_lowercase().rsplit('/').next() == Some("codex_lane.py") {
+            return validate_codex_lane_subcmd_tokens(&tokens[idx + 1].to_ascii_lowercase(), &tokens[idx + 2..]);
+        }
+    }
     false
 }
 
@@ -2755,6 +2770,16 @@ mod tests {
         })
         .to_string();
         assert!(is_verified_codex_cmd_outage(cmd_lane, "ERROR", &fallback_out));
+        let cmd_legacy_py = r#"$null | python -X utf8 C:\Users\in\.gemini\hooks\codex_lane.py review --cwd C:\repo"#;
+        let net_out = json!({
+            "ok": false,
+            "review_id": "cwg-net01",
+            "network_outage": true,
+            "fallback": "adversarial-reviewer",
+            "error": "network timeout"
+        })
+        .to_string();
+        assert!(is_verified_codex_cmd_outage(cmd_legacy_py, "ERROR", &net_out));
 
         let cmd_direct = r#"codex exec -s read-only -C C:\repo -"#;
         assert!(is_verified_codex_cmd_outage(
