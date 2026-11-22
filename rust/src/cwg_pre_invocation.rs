@@ -34,9 +34,16 @@ pub fn evaluate_pre_invocation(payload: &Value) -> Option<String> {
             let reqs = cc::receipt_requirements_summary(&fl, pol, ht);
             let ts = rio::val_to_f64(m.get("first_ts"));
             let since = (ts > 0.0).then(|| format_iso_utc(ts)).filter(|x| x.len() >= 16).map_or_else(String::new, |x| format!(", open since {}", &x[11..16]));
+            let first_ts_ms: i64 = if ts.is_finite() && ts > 0.0 { (ts * 1000.0).round() as i64 } else { 0 };
             let ui = payload.get("lastUserInput").and_then(|v| v.as_str()).unwrap_or("").trim();
             let uh = if ui.is_empty() { String::new() } else { rio::sha256_hex(ui.as_bytes())[..16].to_string() };
-            let key = format!("{}|{}|{}|{}", uh, cc::candidate_key(&m), fl, n);
+            let user_turn_key = match (rio::last_user_input_step(tp).map(|(idx, _)| idx), !uh.is_empty()) {
+                (Some(idx), true) => format!("t:{}|u:{}", idx, uh),
+                (Some(idx), false) => format!("t:{}", idx),
+                (None, true) => format!("u:{}", uh),
+                (None, false) => String::new(),
+            };
+            let key = format!("{}|{}|{}", first_ts_ms, fl, user_turn_key);
             if key != rio::val_to_str(st.get("last_open_reminder_key")) {
                 notes.push(format!("[gate] Open candidate: PERSISTENT, path floor {} ({} lasting file{}{}). Requires {}. End the final message with `[gate] verified: {}; <candidate and decisive checks>` (or pr-ready/draft-blocked after autonomous closure); a closing message without a receipt is blocked.", fl, n, if n == 1 { "" } else { "s" }, since, reqs, fl));
                 st.insert("last_open_reminder_key".into(), json!(key)); chg = true;
@@ -227,6 +234,194 @@ mod tests {
             "lastUserInput": "op turn"
         });
         assert_eq!(evaluate_pre_invocation(&op_payload), None);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("CARBON_STACK_HOME", v),
+                None => std::env::remove_var("CARBON_STACK_HOME"),
+            }
+        }
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_open_reminder_dedups_across_edits_without_last_user_input() {
+        let _guard = crate::win32_sqlite::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp_dir =
+            std::env::temp_dir().join(format!("cwg-pre-inv-dedup-reg-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let stack_home = tmp_dir.join("stack");
+        let work_dir = tmp_dir.join("work");
+        fs::create_dir_all(&stack_home).unwrap();
+        fs::create_dir_all(&work_dir).unwrap();
+        let prev = std::env::var_os("CARBON_STACK_HOME");
+        unsafe { std::env::set_var("CARBON_STACK_HOME", &stack_home) };
+
+        let tp = tmp_dir.join("transcript.jsonl");
+        let turn1_transcript = concat!(
+            "{\"step_index\":0,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"init\"}\n",
+            "{\"step_index\":1,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"content\":\"ok\"}\n",
+            "{\"step_index\":5,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"edit files\"}\n"
+        );
+        fs::write(&tp, turn1_transcript).unwrap();
+
+        let f1 = work_dir.join("step1.rs");
+        let f2 = work_dir.join("step2.rs");
+        let f3 = work_dir.join("step3.rs");
+        let f4 = work_dir.join("step4.rs");
+        let high_file = work_dir.join("rust").join("src").join("cwg_pre_invocation.rs");
+        fs::create_dir_all(high_file.parent().unwrap()).unwrap();
+        fs::write(&f1, "pub fn s1() {}\n").unwrap();
+        fs::write(&f2, "pub fn s2() {}\n").unwrap();
+        fs::write(&f3, "pub fn s3() {}\n").unwrap();
+        fs::write(&f4, "pub fn s4() {}\n").unwrap();
+        fs::write(&high_file, "pub fn high_risk() {}\n").unwrap();
+
+        let f1_norm = rio::normalize_path(&f1.to_string_lossy());
+        let f2_norm = rio::normalize_path(&f2.to_string_lossy());
+        let f3_norm = rio::normalize_path(&f3.to_string_lossy());
+        let f4_norm = rio::normalize_path(&f4.to_string_lossy());
+        let high_norm = rio::normalize_path(&high_file.to_string_lossy());
+        let cwd_norm = rio::normalize_path(&work_dir.to_string_lossy());
+
+        let sid = "sess-dedup-antigravity";
+        let first_ts = 1700000200.0;
+        let payload_omitted = json!({
+            "conversationId": sid,
+            "transcriptPath": tp.to_string_lossy(),
+        });
+        let payload_empty = json!({
+            "conversationId": sid,
+            "transcriptPath": tp.to_string_lossy(),
+            "lastUserInput": "",
+        });
+
+        // Edit 1 (STANDARD, 1 file): emits exactly 1 reminder.
+        let m1 = json!({
+            "session": sid,
+            "class": cwg_common::WORK_PERSISTENT,
+            "closed": false,
+            "first_ts": first_ts,
+            "last_ts": first_ts,
+            "last_durable_ts": first_ts,
+            "edits": 1,
+            "cwd": &cwd_norm,
+            "paths": [&f1_norm],
+            "content_marks": [{"path": &f1_norm, "fp": "fp-edit-1"}],
+        });
+        rio::write_json(&cwg_common::marker_path(sid), &m1).unwrap();
+        let rem1 = evaluate_pre_invocation(&payload_omitted).unwrap();
+        assert!(rem1.contains("[gate] Open candidate: PERSISTENT, path floor STANDARD"));
+
+        // Edit 2 (STANDARD, 2 files, bumped timestamps & latest_fp): must NOT re-fire.
+        let m2 = json!({
+            "session": sid,
+            "class": cwg_common::WORK_PERSISTENT,
+            "closed": false,
+            "first_ts": first_ts,
+            "last_ts": first_ts + 10.0,
+            "last_durable_ts": first_ts + 10.0,
+            "edits": 2,
+            "cwd": &cwd_norm,
+            "paths": [&f1_norm, &f2_norm],
+            "content_marks": [
+                {"path": &f1_norm, "fp": "fp-edit-1"},
+                {"path": &f2_norm, "fp": "fp-edit-2"}
+            ],
+        });
+        assert_ne!(cc::candidate_key(&m1), cc::candidate_key(&m2));
+        rio::write_json(&cwg_common::marker_path(sid), &m2).unwrap();
+        assert_eq!(evaluate_pre_invocation(&payload_omitted), None);
+
+        // Edit 3 (STANDARD, 3 files, explicit empty lastUserInput): must NOT re-fire.
+        let m3 = json!({
+            "session": sid,
+            "class": cwg_common::WORK_PERSISTENT,
+            "closed": false,
+            "first_ts": first_ts,
+            "last_ts": first_ts + 20.0,
+            "last_durable_ts": first_ts + 20.0,
+            "edits": 3,
+            "cwd": &cwd_norm,
+            "paths": [&f1_norm, &f2_norm, &f3_norm],
+            "content_marks": [
+                {"path": &f1_norm, "fp": "fp-edit-1"},
+                {"path": &f2_norm, "fp": "fp-edit-2"},
+                {"path": &f3_norm, "fp": "fp-edit-3"}
+            ],
+        });
+        rio::write_json(&cwg_common::marker_path(sid), &m3).unwrap();
+        assert_eq!(evaluate_pre_invocation(&payload_empty), None);
+
+        // Floor escalation STANDARD -> HIGH: emits 1 new HIGH reminder.
+        let m_high1 = json!({
+            "session": sid,
+            "class": cwg_common::WORK_PERSISTENT,
+            "closed": false,
+            "first_ts": first_ts,
+            "last_ts": first_ts + 30.0,
+            "last_durable_ts": first_ts + 30.0,
+            "edits": 4,
+            "cwd": &cwd_norm,
+            "paths": [&f1_norm, &f2_norm, &f3_norm, &high_norm],
+            "content_marks": [
+                {"path": &f3_norm, "fp": "fp-edit-3"},
+                {"path": &high_norm, "fp": "fp-edit-4"}
+            ],
+        });
+        rio::write_json(&cwg_common::marker_path(sid), &m_high1).unwrap();
+        let rem_high = evaluate_pre_invocation(&payload_omitted).unwrap();
+        assert!(rem_high.contains("[gate] Open candidate: PERSISTENT, path floor HIGH"));
+
+        // Another edit while staying at HIGH: must NOT re-fire.
+        let m_high2 = json!({
+            "session": sid,
+            "class": cwg_common::WORK_PERSISTENT,
+            "closed": false,
+            "first_ts": first_ts,
+            "last_ts": first_ts + 40.0,
+            "last_durable_ts": first_ts + 40.0,
+            "edits": 5,
+            "cwd": &cwd_norm,
+            "paths": [&f1_norm, &f2_norm, &f3_norm, &high_norm, &f4_norm],
+            "content_marks": [
+                {"path": &high_norm, "fp": "fp-edit-4"},
+                {"path": &f4_norm, "fp": "fp-edit-5"}
+            ],
+        });
+        rio::write_json(&cwg_common::marker_path(sid), &m_high2).unwrap();
+        assert_eq!(evaluate_pre_invocation(&payload_omitted), None);
+
+        // Append new USER_INPUT (step_index: 12): emits 1 reminder for the new user turn, then dedups.
+        let turn2_transcript = format!(
+            "{}{}",
+            turn1_transcript,
+            "{\"step_index\":12,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"continue checks\"}\n"
+        );
+        fs::write(&tp, turn2_transcript).unwrap();
+        let rem_turn2 = evaluate_pre_invocation(&payload_omitted).unwrap();
+        assert!(rem_turn2.contains("[gate] Open candidate: PERSISTENT, path floor HIGH"));
+        assert_eq!(evaluate_pre_invocation(&payload_omitted), None);
+
+        // New candidate (different first_ts in the same turn) resets reminder once, then dedups.
+        let m_new_cand = json!({
+            "session": sid,
+            "class": cwg_common::WORK_PERSISTENT,
+            "closed": false,
+            "first_ts": first_ts + 500.0,
+            "last_ts": first_ts + 500.0,
+            "last_durable_ts": first_ts + 500.0,
+            "edits": 1,
+            "cwd": &cwd_norm,
+            "paths": [&f1_norm],
+            "content_marks": [{"path": &f1_norm, "fp": "fp-new-1"}],
+        });
+        rio::write_json(&cwg_common::marker_path(sid), &m_new_cand).unwrap();
+        let rem_new = evaluate_pre_invocation(&payload_omitted).unwrap();
+        assert!(rem_new.contains("[gate] Open candidate: PERSISTENT, path floor STANDARD"));
+        assert_eq!(evaluate_pre_invocation(&payload_omitted), None);
 
         unsafe {
             match prev {

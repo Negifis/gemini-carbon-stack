@@ -2101,6 +2101,192 @@ pub fn last_assistant_message(steps: &[Value]) -> String {
     String::new()
 }
 
+fn bytes_contain_ascii_ci(haystack: &[u8], needle_lower: &[u8]) -> bool {
+    let n = needle_lower.len();
+    if n == 0 {
+        return true;
+    }
+    if haystack.len() < n {
+        return false;
+    }
+    let first = needle_lower[0];
+    let first_up = first.to_ascii_uppercase();
+    let last = needle_lower[n - 1];
+    let last_up = last.to_ascii_uppercase();
+    let limit = haystack.len() - n;
+    let mut i = 0;
+    while i <= limit {
+        let b = haystack[i];
+        if b == first || b == first_up {
+            let b_end = haystack[i + n - 1];
+            if (b_end == last || b_end == last_up)
+                && haystack[i..i + n].eq_ignore_ascii_case(needle_lower)
+            {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+enum UserInputMatch {
+    Preferred(i64, String),
+    Fallback(i64, String),
+    None,
+}
+
+fn inspect_user_input_line(raw: &[u8]) -> UserInputMatch {
+    let mut slice = raw;
+    if slice.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        slice = &slice[3..];
+    }
+    while let Some(&last) = slice.last() {
+        if last == b'\r' || last == b'\n' || last == b' ' || last == b'\t' {
+            slice = &slice[..slice.len() - 1];
+        } else {
+            break;
+        }
+    }
+    while let Some(&first) = slice.first() {
+        if first == b' ' || first == b'\t' || first == b'\r' || first == b'\n' {
+            slice = &slice[1..];
+        } else {
+            break;
+        }
+    }
+    if slice.is_empty() || slice[0] != b'{' || !bytes_contain_ascii_ci(slice, b"user_input") {
+        return UserInputMatch::None;
+    }
+    let parsed = serde_json::from_slice::<Value>(slice).ok().or_else(|| {
+        let lossy = String::from_utf8_lossy(slice);
+        serde_json::from_str::<Value>(&lossy).ok()
+    });
+    let Some(val) = parsed else {
+        return UserInputMatch::None;
+    };
+    let Some(obj) = val.as_object() else {
+        return UserInputMatch::None;
+    };
+    let stype = val_to_str(obj.get("type"));
+    if !stype.trim().eq_ignore_ascii_case("USER_INPUT") {
+        return UserInputMatch::None;
+    }
+    let step_idx = val_to_i64(obj.get("step_index"));
+    let content = val_to_str(obj.get("content"));
+    let source = val_to_str(obj.get("source"));
+    let src_trimmed = source.trim();
+    if src_trimmed.is_empty() || src_trimmed.eq_ignore_ascii_case("USER_EXPLICIT") {
+        UserInputMatch::Preferred(step_idx, content)
+    } else {
+        UserInputMatch::Fallback(step_idx, content)
+    }
+}
+
+fn check_user_input_line(
+    line: &[u8],
+    fallback: &mut Option<(i64, String)>,
+) -> Option<(i64, String)> {
+    match inspect_user_input_line(line) {
+        UserInputMatch::Preferred(idx, content) => Some((idx, content)),
+        UserInputMatch::Fallback(idx, content) => {
+            if fallback.is_none() {
+                *fallback = Some((idx, content));
+            }
+            None
+        }
+        UserInputMatch::None => None,
+    }
+}
+
+fn last_user_input_step_from_file(path: &Path, chunk_size: usize) -> Option<(i64, String)> {
+    // INVARIANT: Scan backward from EOF in fixed-size byte chunks (splitting strictly on raw `b'\n'` before UTF-8/JSON decoding) so 20–50 MB transcripts are never read from byte 0 on every `PreInvocation`.
+    let mut fh = File::open(path).ok()?;
+    let file_len = fh.seek(SeekFrom::End(0)).ok()?;
+    if file_len == 0 {
+        return None;
+    }
+    let step_bytes = chunk_size.max(1);
+    let mut pos: u64 = file_len;
+    let mut pending_frags: Vec<Vec<u8>> = Vec::new();
+    let mut pending_len: usize = 0;
+    let mut fallback: Option<(i64, String)> = None;
+
+    while pos > 0 {
+        let read_len = (pos.min(step_bytes as u64)) as usize;
+        pos -= read_len as u64;
+        fh.seek(SeekFrom::Start(pos)).ok()?;
+        let mut buf = vec![0u8; read_len];
+        fh.read_exact(&mut buf).ok()?;
+
+        let Some(last_nl) = buf.iter().rposition(|&b| b == b'\n') else {
+            pending_len = pending_len.saturating_add(buf.len());
+            pending_frags.push(buf);
+            continue;
+        };
+
+        let right = &buf[last_nl + 1..];
+        if !pending_frags.is_empty() {
+            let mut combined = Vec::with_capacity(right.len().saturating_add(pending_len));
+            combined.extend_from_slice(right);
+            for frag in pending_frags.drain(..).rev() {
+                combined.extend_from_slice(&frag);
+            }
+            pending_len = 0;
+            if let Some(hit) = check_user_input_line(&combined, &mut fallback) {
+                return Some(hit);
+            }
+        } else if !right.is_empty() {
+            if let Some(hit) = check_user_input_line(right, &mut fallback) {
+                return Some(hit);
+            }
+        }
+
+        let mut end = last_nl;
+        loop {
+            match buf[..end].iter().rposition(|&b| b == b'\n') {
+                Some(prev_nl) => {
+                    if let Some(hit) = check_user_input_line(&buf[prev_nl + 1..end], &mut fallback)
+                    {
+                        return Some(hit);
+                    }
+                    end = prev_nl;
+                }
+                None => {
+                    if pos == 0 {
+                        if end > 0 {
+                            if let Some(hit) = check_user_input_line(&buf[..end], &mut fallback) {
+                                return Some(hit);
+                            }
+                        }
+                    } else if end > 0 {
+                        pending_frags.push(buf[..end].to_vec());
+                        pending_len = end;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    if !pending_frags.is_empty() {
+        let mut combined = Vec::with_capacity(pending_len);
+        for frag in pending_frags.drain(..).rev() {
+            combined.extend_from_slice(&frag);
+        }
+        if let Some(hit) = check_user_input_line(&combined, &mut fallback) {
+            return Some(hit);
+        }
+    }
+
+    fallback
+}
+
+pub fn last_user_input_step(transcript_path: &str) -> Option<(i64, String)> {
+    let tp = resolve_transcript_path(transcript_path)?;
+    last_user_input_step_from_file(&tp, 64 * 1024)
+}
+
 pub fn extract_bg_task_id(text: &str) -> Option<String> {
     let header_end = text
         .find("Command output:")
@@ -3383,5 +3569,126 @@ mod tests {
             None => unsafe { env::remove_var("CARBON_STACK_HOME") },
         }
         let _ = fs::remove_dir_all(&tmp_home);
+    }
+
+    #[test]
+    fn test_last_user_input_step_tail_scan_and_source_preference() {
+        let base = env::temp_dir().join(format!("rio-last-user-input-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        assert_eq!(last_user_input_step(""), None);
+        assert_eq!(
+            last_user_input_step(&base.join("missing.jsonl").to_string_lossy()),
+            None
+        );
+
+        let empty_tp = base.join("empty.jsonl");
+        fs::write(&empty_tp, "").unwrap();
+        assert_eq!(last_user_input_step(&empty_tp.to_string_lossy()), None);
+
+        // Single-line file with BOM and no trailing newline.
+        let single_tp = base.join("single.jsonl");
+        fs::write(
+            &single_tp,
+            "\u{feff}{\"step_index\":0,\"type\":\"USER_INPUT\",\"content\":\"привет мир\"}",
+        )
+        .unwrap();
+        assert_eq!(
+            last_user_input_step(&single_tp.to_string_lossy()),
+            Some((0, "привет мир".to_string()))
+        );
+        // Exercise tiny odd chunk sizes crossing multi-byte UTF-8 boundaries.
+        assert_eq!(
+            last_user_input_step_from_file(&single_tp, 7),
+            Some((0, "привет мир".to_string()))
+        );
+
+        // Prefer USER_EXPLICIT over a later non-explicit USER_INPUT; ignore GENERIC mentioning USER_INPUT.
+        let pref_tp = base.join("pref.jsonl");
+        let pref_lines = [
+            json!({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "turn zero"}).to_string(),
+            json!({"step_index": 5, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "turn five"}).to_string(),
+            json!({"step_index": 8, "source": "SYSTEM", "type": "USER_INPUT", "content": "synthetic"}).to_string(),
+            json!({"step_index": 9, "source": "SYSTEM", "type": "GENERIC", "content": "mentions USER_INPUT in stdout"}).to_string(),
+        ];
+        fs::write(&pref_tp, pref_lines.join("\r\n") + "\r\n").unwrap();
+        assert_eq!(
+            last_user_input_step(&pref_tp.to_string_lossy()),
+            Some((5, "turn five".to_string()))
+        );
+        assert_eq!(
+            last_user_input_step_from_file(&pref_tp, 17),
+            Some((5, "turn five".to_string()))
+        );
+
+        // Fallback when only non-explicit USER_INPUT exists.
+        let fb_tp = base.join("fallback.jsonl");
+        let fb_lines = [
+            json!({"step_index": 2, "source": "SYSTEM", "type": "USER_INPUT", "content": "first"}).to_string(),
+            json!({"step_index": 7, "source": "USER_QUEUED", "type": "USER_INPUT", "content": "latest fallback"}).to_string(),
+        ];
+        fs::write(&fb_tp, fb_lines.join("\n") + "\n").unwrap();
+        assert_eq!(
+            last_user_input_step(&fb_tp.to_string_lossy()),
+            Some((7, "latest fallback".to_string()))
+        );
+
+        // Multi-chunk (>200 KiB, >500 trailing steps) transcript where USER_INPUT sits far behind EOF.
+        let big_tp = base.join("big.jsonl");
+        let mut big_body = String::new();
+        big_body.push_str(
+            &json!({"step_index": 3, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "deep turn"})
+                .to_string(),
+        );
+        big_body.push('\n');
+        let pad = "x".repeat(420);
+        for i in 4..540i64 {
+            big_body.push_str(
+                &json!({"step_index": i, "source": "MODEL", "type": "GENERIC", "content": pad.as_str()})
+                    .to_string(),
+            );
+            big_body.push('\n');
+        }
+        assert!(big_body.len() > 200 * 1024);
+        fs::write(&big_tp, &big_body).unwrap();
+        assert_eq!(
+            last_user_input_step(&big_tp.to_string_lossy()),
+            Some((3, "deep turn".to_string()))
+        );
+
+        // Append a new USER_INPUT near EOF and verify tail scan picks it up immediately.
+        big_body.push_str(
+            &json!({"step_index": 540, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "tail turn"})
+                .to_string(),
+        );
+        big_body.push('\n');
+        fs::write(&big_tp, &big_body).unwrap();
+        assert_eq!(
+            last_user_input_step(&big_tp.to_string_lossy()),
+            Some((540, "tail turn".to_string()))
+        );
+
+        // Sibling `transcript_full.jsonl` preference via `resolve_transcript_path`.
+        let sib_dir = base.join("sib");
+        fs::create_dir_all(&sib_dir).unwrap();
+        let compact = sib_dir.join("transcript.jsonl");
+        let full = sib_dir.join("transcript_full.jsonl");
+        fs::write(
+            &compact,
+            "{\"step_index\":1,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"compact\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            &full,
+            "{\"step_index\":1,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"full untruncated\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            last_user_input_step(&compact.to_string_lossy()),
+            Some((1, "full untruncated".to_string()))
+        );
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

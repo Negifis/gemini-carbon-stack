@@ -16,8 +16,8 @@ use crate::win32_sqlite::{now_sec, run_command_with_job};
 pub const BREAKER_TTL_SECONDS: i64 = 1800;
 pub const BREAKER_LIMIT_TTL_SECONDS: i64 = 3 * 3600;
 pub const BREAKER_MAX_TTL_SECONDS: i64 = 6 * 3600;
-pub const DEFAULT_REVIEW_TIMEOUT_SECONDS: i64 = 1800;
-pub const DEFAULT_XHIGH_REVIEW_TIMEOUT_SECONDS: i64 = 3600;
+pub const DEFAULT_REVIEW_TIMEOUT_SECONDS: i64 = 3600;
+pub const DEFAULT_XHIGH_REVIEW_TIMEOUT_SECONDS: i64 = 7000;
 pub const TIMEOUT_STEP_SECONDS: i64 = 900;
 pub const MAX_REVIEW_TIMEOUT_SECONDS: i64 = 7000;
 pub const PACKET_TTL_SECONDS: f64 = 86400.0;
@@ -578,8 +578,10 @@ pub fn format_review_retry_cmd(model: &str, xhigh: bool) -> String {
 }
 
 pub fn next_timeout_after(timeout_sec: i64) -> i64 {
-    MAX_REVIEW_TIMEOUT_SECONDS
-        .min((timeout_sec + TIMEOUT_STEP_SECONDS).max(DEFAULT_XHIGH_REVIEW_TIMEOUT_SECONDS))
+    MAX_REVIEW_TIMEOUT_SECONDS.min(
+        (timeout_sec + TIMEOUT_STEP_SECONDS)
+            .max(DEFAULT_REVIEW_TIMEOUT_SECONDS + TIMEOUT_STEP_SECONDS),
+    )
 }
 
 pub fn required_review_timeout(xhigh: bool, saved_next_sec: i64) -> i64 {
@@ -4176,6 +4178,12 @@ const INLINE_DIFF_EXCLUDES: &[&str] = &[
     ":(exclude)*.sqlite",
     ":(exclude)Cargo.lock",
     ":(exclude)package-lock.json",
+    ":(exclude)yarn.lock",
+    ":(exclude)pnpm-lock.yaml",
+    ":(exclude)*.min.js",
+    ":(exclude)*.map",
+    ":(exclude)*.wasm",
+    ":(exclude)*.svg",
 ];
 
 fn truncate_diff_stat(raw: &str) -> String {
@@ -4194,6 +4202,9 @@ fn run_git_diff_with_stat(cwd: &str, base_ref: &str, target_ref: Option<&str>) -
     if let Some(t) = target_ref.filter(|s| !s.trim().is_empty()) {
         stat_args.push(t);
     }
+    stat_args.push("--");
+    stat_args.push(".");
+    stat_args.extend_from_slice(INLINE_DIFF_EXCLUDES);
     let (rc_s, out_s, _) = rio::run_git(cwd, &stat_args, 10.0);
     let diff_stat = if rc_s == 0 {
         truncate_diff_stat(&out_s)
@@ -4290,10 +4301,7 @@ fn build_codex_exec_args(
         format!("model_reasoning_effort=\"{}\"", effort),
         "-c".to_string(),
         "tools.web_search=true".to_string(),
-        "-c".to_string(),
-        "sandbox_mode=\"read-only\"".to_string(),
-        "-c".to_string(),
-        "approval_policy=\"never\"".to_string(),
+        "--dangerously-bypass-approvals-and-sandbox".to_string(),
         "--skip-git-repo-check".to_string(),
     ]);
     if !model.is_empty() {
@@ -4310,8 +4318,6 @@ fn build_codex_exec_args(
     } else {
         args.push("-C".to_string());
         args.push(cwd.to_string());
-        args.push("-s".to_string());
-        args.push("read-only".to_string());
         args.extend(common_opts);
         args.push("-".to_string());
     }
@@ -4456,7 +4462,7 @@ fn format_dispositions_ledger(items: &[Value]) -> String {
     }
     let mut lines = Vec::with_capacity(items.len() + 3);
     lines.push("SUBSTANTIVELY REJECTED / SETTLED FINDINGS (ANTI-BOOMERANG LEDGER — DO NOT RE-RAISE):".to_string());
-    lines.push("The following items were evaluated against BUSINESS_INTENT and substantively disposed. Treat them as SETTLED; do NOT re-raise, rephrase, or escalate them unless a brand-new Class-A defect (crash, data loss, credential leak, or broken requested behavior) appears in newly edited lines of the current interdiff:".to_string());
+    lines.push("The following items were evaluated against BUSINESS_INTENT and substantively disposed. Treat them as SETTLED; do NOT re-raise, rephrase, or escalate them unless a brand-new HIGH/CRITICAL defect (crash, data loss, credential leak, or broken requested behavior) appears in newly edited lines of the current interdiff:".to_string());
     for (idx, it) in items.iter().enumerate() {
         let cat = val_to_str(it.get("category"));
         let finding = val_to_str(it.get("finding"));
@@ -6704,7 +6710,7 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
         .unwrap_or(false);
     if let Some(custom_to) = args.timeout {
         if !has_codex_override {
-            // INVARIANT: Reject upfront or shrunk custom `--timeout` in live runs; standard defaults are 600s (HIGH) and 900s (XHIGH).
+            // INVARIANT: Reject upfront or shrunk custom `--timeout` in live runs; standard defaults are 3600s (HIGH) and 7000s (XHIGH).
             if !is_timeout_continuation {
                 rio::print_cli_json(
                     &json!({
@@ -12085,15 +12091,15 @@ exit 0
         let fresh_args = build_codex_exec_args(r"C:\repo", "ultra", "gpt-6.2-astra", "");
         assert_eq!(fresh_args[0], "exec");
         assert!(fresh_args.contains(&"--ignore-user-config".to_string()));
-        assert!(!fresh_args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+        assert!(fresh_args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
         assert!(fresh_args.contains(&"--skip-git-repo-check".to_string()));
         assert!(fresh_args.contains(&"tools.web_search=true".to_string()));
         assert!(fresh_args.contains(&"model_reasoning_effort=\"ultra\"".to_string()));
-        assert!(fresh_args.windows(2).any(|w| w[0] == "-s" && w[1] == "read-only"));
-        assert!(fresh_args
+        assert!(!fresh_args.windows(2).any(|w| w[0] == "-s" && w[1] == "read-only"));
+        assert!(!fresh_args
             .windows(2)
             .any(|w| w[0] == "-c" && w[1] == "sandbox_mode=\"read-only\""));
-        assert!(fresh_args
+        assert!(!fresh_args
             .windows(2)
             .any(|w| w[0] == "-c" && w[1] == "approval_policy=\"never\""));
         for feat in CODEX_DISABLED_FEATURES {
@@ -12108,12 +12114,13 @@ exit 0
         let res_args = build_codex_exec_args(r"C:\repo", "high", "gpt-6.2-sol", "sid-123");
         assert_eq!(&res_args[0..3], &["exec", "resume", "--all"]);
         assert!(res_args.contains(&"--ignore-user-config".to_string()));
-        assert!(!res_args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+        assert!(res_args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
         assert!(res_args.contains(&"model_reasoning_effort=\"high\"".to_string()));
-        assert!(res_args
+        assert!(!res_args.windows(2).any(|w| w[0] == "-s" && w[1] == "read-only"));
+        assert!(!res_args
             .windows(2)
             .any(|w| w[0] == "-c" && w[1] == "sandbox_mode=\"read-only\""));
-        assert!(res_args
+        assert!(!res_args
             .windows(2)
             .any(|w| w[0] == "-c" && w[1] == "approval_policy=\"never\""));
         assert!(!res_args.contains(&"codex_hooks".to_string()));
@@ -12715,6 +12722,107 @@ print(verdict)
             assert!(p_large_res.contains("INSPECT COMMANDS: Read diff file directly:"));
             assert!(p_large_res.contains(&large_moved.to_string_lossy().into_owned()));
             assert!(!p_large_res.contains("large_orig.diff"));
+        }
+    }
+
+    #[test]
+    fn test_timeout_parity_stepping_and_inline_diff_excludes() {
+        assert_eq!(DEFAULT_REVIEW_TIMEOUT_SECONDS, 3600);
+        assert_eq!(DEFAULT_XHIGH_REVIEW_TIMEOUT_SECONDS, 7000);
+        assert_eq!(TIMEOUT_STEP_SECONDS, 900);
+        assert_eq!(MAX_REVIEW_TIMEOUT_SECONDS, 7000);
+
+        assert_eq!(next_timeout_after(1), 4500);
+        assert_eq!(next_timeout_after(3600), 4500);
+        assert_eq!(next_timeout_after(4500), 5400);
+        assert_eq!(next_timeout_after(5400), 6300);
+        assert_eq!(next_timeout_after(6300), 7000);
+        assert_eq!(next_timeout_after(7000), 7000);
+
+        assert_eq!(required_review_timeout(false, 0), 3600);
+        assert_eq!(required_review_timeout(false, 4500), 4500);
+        assert_eq!(required_review_timeout(false, 9999), 7000);
+        assert_eq!(required_review_timeout(true, 0), 7000);
+        assert_eq!(required_review_timeout(true, 4500), 7000);
+
+        let ledger = format_dispositions_ledger(&[json!({
+            "category": "accepted-risk",
+            "finding": "keep retry loop",
+            "reason": "bounded by timeout",
+        })]);
+        assert!(ledger.contains("brand-new HIGH/CRITICAL defect"));
+        assert!(!ledger.contains("Class-A"));
+
+        let tmp = TempTestDir::new("wavea-inline-diff-excludes");
+        let repo_dir = tmp.0.join("repo");
+        fs::create_dir_all(repo_dir.join("src")).unwrap();
+        fs::create_dir_all(repo_dir.join("dist")).unwrap();
+        fs::create_dir_all(repo_dir.join("pkg")).unwrap();
+        fs::create_dir_all(repo_dir.join("assets")).unwrap();
+        let repo_s = repo_dir.to_string_lossy().into_owned();
+        if rio::run_git(&repo_s, &["init"], 5.0).0 == 0 {
+            let _ = rio::run_git(&repo_s, &["config", "user.email", "t@example.com"], 5.0);
+            let _ = rio::run_git(&repo_s, &["config", "user.name", "Test"], 5.0);
+            fs::write(repo_dir.join("src").join("lib.rs"), "pub fn v() -> i32 { 1 }\n").unwrap();
+            fs::write(repo_dir.join("yarn.lock"), "a@1:\n  version \"1.0.0\"\n").unwrap();
+            fs::write(repo_dir.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+            fs::write(repo_dir.join("dist").join("bundle.min.js"), "var a=1;\n").unwrap();
+            fs::write(repo_dir.join("dist").join("app.js.map"), "{\"version\":3}\n").unwrap();
+            fs::write(repo_dir.join("pkg").join("mod.wasm"), b"\x00asm\x01\x00\x00\x00").unwrap();
+            fs::write(repo_dir.join("assets").join("icon.svg"), "<svg>v1</svg>\n").unwrap();
+            assert_eq!(rio::run_git(&repo_s, &["add", "."], 5.0).0, 0);
+            assert_eq!(rio::run_git(&repo_s, &["commit", "-m", "init"], 5.0).0, 0);
+
+            fs::write(repo_dir.join("src").join("lib.rs"), "pub fn v() -> i32 { 2 }\n").unwrap();
+            fs::write(repo_dir.join("yarn.lock"), "a@1:\n  version \"2.0.0\"\n").unwrap();
+            fs::write(repo_dir.join("pnpm-lock.yaml"), "lockfileVersion: '9.1'\n").unwrap();
+            fs::write(repo_dir.join("dist").join("bundle.min.js"), "var a=2;\n").unwrap();
+            fs::write(repo_dir.join("dist").join("app.js.map"), "{\"version\":4}\n").unwrap();
+            fs::write(repo_dir.join("pkg").join("mod.wasm"), b"\x00asm\x02\x00\x00\x00").unwrap();
+            fs::write(repo_dir.join("assets").join("icon.svg"), "<svg>v2</svg>\n").unwrap();
+
+            let tree_oid = rio::capture_worktree_tree_oid(&repo_s, 5.0);
+            let mut cases: Vec<(&str, (String, String))> =
+                vec![("worktree", run_git_diff_with_stat(&repo_s, "HEAD", None))];
+            if !tree_oid.is_empty() {
+                cases.push((
+                    "tree_oid",
+                    run_git_diff_with_stat(&repo_s, "HEAD", Some(&tree_oid)),
+                ));
+            }
+            for (label, (st, body)) in cases {
+                assert!(st.contains("src/lib.rs"), "{} stat missing src/lib.rs: {}", label, st);
+                assert!(body.contains("src/lib.rs"), "{} body missing src/lib.rs: {}", label, body);
+                assert!(
+                    body.contains("pub fn v() -> i32 { 2 }"),
+                    "{} body missing code delta: {}",
+                    label,
+                    body
+                );
+                for excluded in [
+                    "yarn.lock",
+                    "pnpm-lock.yaml",
+                    "bundle.min.js",
+                    "app.js.map",
+                    "mod.wasm",
+                    "icon.svg",
+                ] {
+                    assert!(
+                        !st.contains(excluded),
+                        "{} stat must exclude {}: {}",
+                        label,
+                        excluded,
+                        st
+                    );
+                    assert!(
+                        !body.contains(excluded),
+                        "{} body must exclude {}: {}",
+                        label,
+                        excluded,
+                        body
+                    );
+                }
+            }
         }
     }
 }
