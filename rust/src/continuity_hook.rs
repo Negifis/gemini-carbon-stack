@@ -252,7 +252,7 @@ pub fn evaluate_pre_invocation(payload: &Value) -> Option<String> {
     // INVARIANT: Live Antigravity `PreInvocation` leaves `lastUserInput` empty; fall back to `rio::last_user_input_step(tp)` with monotonic turn dedup, while never binding a new post-answer `lastUserInput` to an already answered/closed transcript step.
     let (ui, tx_step) = (payload.get("lastUserInput").and_then(Value::as_str).unwrap_or("").trim(), rio::last_user_input_step(tp));
     let tx_idx = tx_step.as_ref().map(|(i, _)| *i);
-    let ui_fresh_turn = !ui.is_empty() && (json_truthy(state.get("turn_closed")) || tx_idx.is_some_and(|ti| steps.iter().any(|st| st.get("source").and_then(Value::as_str) == Some("MODEL") && st.get("type").and_then(Value::as_str) == Some("PLANNER_RESPONSE") && val_to_i64(st.get("step_index")) > ti)));
+    let ui_fresh_turn = !ui.is_empty() && (json_truthy(state.get("turn_closed")) || tx_idx.is_some_and(|ti| steps.iter().any(|st| st.get("source").and_then(Value::as_str) == Some("MODEL") && st.get("type").and_then(Value::as_str) == Some("PLANNER_RESPONSE") && val_to_i64(st.get("step_index")) > ti && st.get("tool_calls").and_then(Value::as_array).is_none_or(Vec::is_empty))));
     let (user_text, cur_step) = if !ui.is_empty() { (ui.to_string(), (!ui_fresh_turn).then(|| tx_step.as_ref().filter(|(_, c)| c.trim() == ui).map(|(i, _)| *i)).flatten()) }
         else if let Some((idx, content)) = tx_step { (content.trim().to_string(), Some(idx)) } else { (String::new(), None) };
     if !user_text.is_empty() {
@@ -716,21 +716,34 @@ mod tests {
         }));
         assert!(yo_upper_blk.unwrap().contains("Continuity Output Lint"));
 
-        // (d) Codex C3 #4: repeating the exact same correction phrase in a new turn while transcript still lags on the answered step must still fire PreInvocation and enforce Stop lint, and a late-flushed transcript USER_INPUT must be caught in Stop.
+        // (d) Codex C3 #4 & R2 #1: mid-turn tool-call PLANNER_RESPONSE must NOT re-trigger the same correction when lastUserInput repeats; repeating identical correction AFTER a completed turn with lagging transcript MUST fire PreInvocation and re-arm Stop lint; late-flushed transcript USER_INPUT must be caught in Stop.
         let sid_rep = "sess-repeat-corr-01";
         let tp_rep = env.1.join("transcript_repeat.jsonl");
-        let rep_t1 = concat!(
+        let rep_mid = concat!(
             "{\"step_index\":0,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"Нет, переделай\"}\n",
-            "{\"step_index\":1,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"content\":\"Готово.\"}\n"
+            "{\"step_index\":1,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"content\":\"Читаю файл\",\"tool_calls\":[{\"name\":\"read_file\"}]}\n"
         );
-        fs::write(&tp_rep, rep_t1).unwrap();
+        fs::write(&tp_rep, rep_mid).unwrap();
         assert!(evaluate_pre_invocation(&json!({
             "conversationId": sid_rep, "transcriptPath": tp_rep.to_string_lossy(), "lastUserInput": "Нет, переделай"
         })).is_some());
+        assert_eq!(evaluate_pre_tool_use(&json!({
+            "conversationId": sid_rep,
+            "toolCall": { "id": "c-mid", "name": "read_file", "args": { "Path": sample.to_string_lossy() } }
+        })).0, "allow");
+        assert!(evaluate_pre_invocation(&json!({
+            "conversationId": sid_rep, "transcriptPath": tp_rep.to_string_lossy(), "lastUserInput": "Нет, переделай"
+        })).is_none(), "mid-turn tool-call PLANNER_RESPONSE must NOT re-fire same user turn");
+        let st_rep_mid = load_session_state(sid_rep);
+        assert_eq!(val_to_i64(st_rep_mid.get("strong_correction_streak")), 1);
+        assert!(!st_rep_mid.get("tool_counts").and_then(Value::as_object).unwrap().is_empty());
+
+        let rep_t1 = format!("{}{}", rep_mid, "{\"step_index\":2,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"content\":\"Готово.\",\"tool_calls\":[]}\n");
+        fs::write(&tp_rep, &rep_t1).unwrap();
         assert!(decide_stop(&json!({
             "conversationId": sid_rep, "transcriptPath": tp_rep.to_string_lossy(), "lastAssistantMessage": "Готово начисто."
         })).is_none());
-        // New turn repeats identical text while transcript still shows step 0/1 -> MUST fire and re-arm Stop lint!
+        // New turn repeats identical text while transcript still shows step 0..2 -> MUST fire and re-arm Stop lint!
         let rep_inj = evaluate_pre_invocation(&json!({
             "conversationId": sid_rep, "transcriptPath": tp_rep.to_string_lossy(), "lastUserInput": "Нет, переделай"
         }));

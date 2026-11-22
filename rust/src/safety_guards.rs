@@ -264,7 +264,7 @@ fn resolve_brain_root_for_payload(payload: &Value) -> PathBuf {
     rio::resolve_brain_root("")
 }
 
-fn worker_turn_after_wake(brain_root: &Path, minfo: &Value, last_assign_seq: i64) -> Option<Value> {
+fn worker_turn_after_wake(brain_root: &Path, minfo: &Value, last_assign_seq: i64) -> Option<(Value, bool)> {
     let w_cid = minfo
         .get("conversation_id")
         .or_else(|| minfo.get("conversationId"))
@@ -279,10 +279,18 @@ fn worker_turn_after_wake(brain_root: &Path, minfo: &Value, last_assign_seq: i64
     if w_steps.is_empty() {
         return None;
     }
-    Some(rio::inspect_worker_turn_after_wake(&w_steps, last_assign_seq))
+    let turn = rio::inspect_worker_turn_after_wake(&w_steps, last_assign_seq);
+    // INVARIANT: An earlier error followed by recovery work (peer post / tool calls) is NOT terminal; treat error as terminal ONLY when the latest transcript step itself is an error.
+    let last_step_is_error = w_steps.last().is_some_and(|st| {
+        let ssource = st.get("source").and_then(|v| v.as_str()).unwrap_or("");
+        let stype = st.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let sstatus = st.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        stype == "ERROR_MESSAGE" || (ssource == "MODEL" && stype != "GENERIC" && sstatus == "ERROR")
+    });
+    Some((turn, last_step_is_error))
 }
 
-fn turn_is_terminally_finished(turn: &Value) -> bool {
+fn turn_is_terminally_finished(turn: &Value, last_step_is_error: bool) -> bool {
     let pending_nonempty = turn
         .get("pending_bg")
         .and_then(|v| v.as_array())
@@ -290,7 +298,7 @@ fn turn_is_terminally_finished(turn: &Value) -> bool {
     if !json_truthy(turn.get("woke_for_assign")) || !json_truthy(turn.get("has_tail")) || pending_nonempty {
         return false;
     }
-    json_truthy(turn.get("has_error"))
+    last_step_is_error
         || (json_truthy(turn.get("saw_model")) && json_truthy(turn.get("terminal_parked")))
 }
 
@@ -303,15 +311,15 @@ fn is_worker_silently_parked(brain_root: &Path, minfo: &Value, last_assign_seq: 
     {
         return true;
     }
-    let Some(turn) = worker_turn_after_wake(brain_root, minfo, last_assign_seq) else {
+    let Some((turn, last_err)) = worker_turn_after_wake(brain_root, minfo, last_assign_seq) else {
         return false;
     };
-    !json_truthy(turn.get("called_post")) && turn_is_terminally_finished(&turn)
+    !json_truthy(turn.get("called_post")) && turn_is_terminally_finished(&turn, last_err)
 }
 
 fn is_worker_turn_terminally_parked(brain_root: &Path, minfo: &Value, last_assign_seq: i64) -> bool {
     worker_turn_after_wake(brain_root, minfo, last_assign_seq)
-        .is_some_and(|turn| turn_is_terminally_finished(&turn))
+        .is_some_and(|(turn, last_err)| turn_is_terminally_finished(&turn, last_err))
 }
 
 pub fn guard_swarm_wait(payload: &Value, args: Option<&Value>) -> (String, Option<String>) {
@@ -823,6 +831,21 @@ mod tests {
         let (dec_parked_post, reason_parked_post) = guard_swarm_wait(&payload, Some(&args));
         assert_eq!(dec_parked_post, "deny");
         assert!(reason_parked_post.unwrap().contains("Swarm Wait Guard"));
+
+        // Codex C3 R2 #2: worker recovered after an earlier error, posted a peer message, and is actively continuing work (`state == "working"`, non-terminal latest step) -> MUST allow!
+        fs::write(
+            &w_tp,
+            concat!(
+                "{\"step_index\":0,\"source\":\"SYSTEM\",\"type\":\"SYSTEM_MESSAGE\",\"status\":\"DONE\",\"content\":\"[swarm] new board message #1\"}\n",
+                "{\"step_index\":1,\"source\":\"MODEL\",\"type\":\"ERROR_MESSAGE\",\"status\":\"ERROR\",\"content\":\"transient tool error\"}\n",
+                "{\"step_index\":2,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"content\":\"Recovered, syncing peer.\",\"tool_calls\":[{\"name\":\"post_message\"}]}\n",
+                "{\"step_index\":3,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"content\":\"Continuing edit.\",\"tool_calls\":[{\"name\":\"edit_file\"}]}\n"
+            ),
+        )
+        .unwrap();
+        let (dec_recovered, reason_recovered) = guard_swarm_wait(&payload, Some(&args));
+        assert_eq!(dec_recovered, "allow", "recovered working worker must be allowed, got: {:?}", reason_recovered);
+        assert!(reason_recovered.is_none());
 
         let _ = fs::remove_dir_all(&root);
     }
