@@ -9010,6 +9010,46 @@ mod tests {
             "`npx --workspace backend jest@29.7.0 -v` exiting 0 must keep the gate blocked after a prior test failure"
         );
 
+        let mut steps_with_smart_quotes = base_steps.clone();
+        steps_with_smart_quotes.extend([
+            json!({
+                "step_index": 11497,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-22T16:04:08Z",
+                "tool_calls": [{"name": "run_command", "args": {"CommandLine": "$null | npx --workspace \u{201C}backend\u{201D} jest \u{201C}--listTests\u{201D}"}}]
+            }),
+            json!({
+                "step_index": 11498,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": "2026-11-22T16:04:09Z",
+                "content": "Command exited with code 0.\n\nCommand output:\nsrc/__tests__/foo.test.ts\n"
+            }),
+        ]);
+        let ev_smart_quotes = read_checks_evidence_with_steps_in_cwd(sess, first_ts, &steps_with_smart_quotes, "");
+        assert!(
+            ev_smart_quotes.passed_count == 0 && ev_smart_quotes.latest_fail_ts > ev_smart_quotes.latest_pass_ts,
+            "typographic smart-quoted `npx --workspace \u{201C}backend\u{201D} jest \u{201C}--listTests\u{201D}` must NEVER be credited or clear a prior failure: {:?}",
+            ev_smart_quotes
+        );
+        let (ok_smart_quotes, _) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_std),
+            marker_in: &marker,
+            checks_ev: &ev_smart_quotes,
+            sub_ev: &SubagentEvidence::default(),
+            swarm_ev: &SwarmEvidence::default(),
+            codex_reviews: &[],
+            ctx: None,
+            steps: None,
+            transcript_path: None,
+        });
+        assert!(
+            !ok_smart_quotes,
+            "typographic smart-quoted `npx --workspace \u{201C}backend\u{201D} jest \u{201C}--listTests\u{201D}` exiting 0 must keep the gate blocked after a prior test failure"
+        );
+
         let mut steps_with_standalone = base_steps;
         steps_with_standalone.extend([
             json!({

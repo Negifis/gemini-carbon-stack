@@ -695,12 +695,33 @@ fn is_benign_ps_env_assign(seg: &str) -> bool {
         && !up.starts_with("NPM_CONFIG_")
 }
 
+fn is_ps_typographic_syntax_char(ch: char) -> bool {
+    // SAFETY: PowerShell `CharTraits.cs` normalizes Unicode curly/smart quotes (`‘’‚‛“”„`) and dashes (`–—―`) in its lexer; fail closed on them so copy-pasted or crafted typographic syntax can never smuggle flags past ASCII quote/flag analysis.
+    matches!(
+        ch,
+        '\u{2018}'
+            | '\u{2019}'
+            | '\u{201A}'
+            | '\u{201B}'
+            | '\u{201C}'
+            | '\u{201D}'
+            | '\u{201E}'
+            | '\u{2013}'
+            | '\u{2014}'
+            | '\u{2015}'
+    )
+}
+
 fn tokenize_validation_segment(seg: &str) -> Option<Vec<String>> {
+    let body = rio::leading_null_pipe_re().replace(seg.trim_start(), "");
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;
-    let mut chars = seg.chars().peekable();
+    let mut chars = body.chars().peekable();
     while let Some(ch) = chars.next() {
+        if is_ps_typographic_syntax_char(ch) {
+            return None;
+        }
         if let Some(q) = quote {
             if q == '\'' && ch == '\'' && chars.peek() == Some(&'\'') {
                 cur.push('\'');
@@ -709,9 +730,14 @@ fn tokenize_validation_segment(seg: &str) -> Option<Vec<String>> {
                 cur.push('"');
                 chars.next();
             } else if q == '"' && ch == '`' {
-                if let Some(nc) = chars.next() {
-                    cur.push(nc);
+                let nc = chars.next()?;
+                if is_ps_typographic_syntax_char(nc) {
+                    return None;
                 }
+                cur.push(nc);
+            } else if q == '"' && ch == '$' {
+                // SAFETY: Unescaped `$` inside double quotes performs runtime PowerShell variable expansion (e.g. `"$env:F"` -> `--listTests`); fail closed.
+                return None;
             } else if ch == q {
                 quote = None;
             } else {
@@ -719,9 +745,16 @@ fn tokenize_validation_segment(seg: &str) -> Option<Vec<String>> {
             }
             continue;
         }
+        if ch == '$' {
+            // SAFETY: Unquoted `$` performs runtime PowerShell variable expansion (e.g. `$env:F` -> `--listTests`); fail closed.
+            return None;
+        }
         if ch == '\'' || ch == '"' {
             quote = Some(ch);
         } else if ch.is_whitespace() {
+            if !ch.is_ascii_whitespace() {
+                return None;
+            }
             if !cur.is_empty() {
                 out.push(std::mem::take(&mut cur));
             }
@@ -4790,6 +4823,12 @@ mod tests {
             (r#"npx --workspace backend -c "echo ok" jest"#, "UNCERTAIN"),
             ("npx --workspace backend --if-present jest", "UNCERTAIN"),
             ("npx --workspace backend jest --listTests", "UNCERTAIN"),
+            ("npx --workspace \u{201C}backend\u{201D} jest \u{201C}--listTests\u{201D}", "UNCERTAIN"),
+            ("npx --workspace backend jest \u{2018}--listTests\u{2019}", "UNCERTAIN"),
+            ("npx --workspace backend tsc \u{2014}build \u{2014}dry", "UNCERTAIN"),
+            ("$env:F='--listTests'; npx --workspace backend jest $env:F", "UNCERTAIN"),
+            (r#"$env:F='--listTests'; npx --workspace backend jest "$env:F""#, "UNCERTAIN"),
+            ("pytest -k 'price $100'", "VALIDATION"),
             ("npx --workspace backend jest '--listTests'", "UNCERTAIN"),
             ("npx --workspace backend jest --listTests=true", "UNCERTAIN"),
             ("npx --workspace backend jest --showConfig", "UNCERTAIN"),
