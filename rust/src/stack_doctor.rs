@@ -800,6 +800,64 @@ fn collect_hook_error_breakdown(err_records: &[Value]) -> BTreeMap<String, usize
     counts
 }
 
+fn is_plugin_disabled_in_config(config_json: Option<&Value>, plugin_name: &str) -> bool {
+    let Some(cfg) = config_json else {
+        return false;
+    };
+    if cfg
+        .get("plugins")
+        .and_then(|p| p.get(plugin_name))
+        .and_then(|entry| entry.get("enabled"))
+        .and_then(|v| v.as_bool())
+        == Some(false)
+    {
+        return true;
+    }
+    if cfg
+        .get(plugin_name)
+        .and_then(|entry| entry.get("enabled"))
+        .and_then(|v| v.as_bool())
+        == Some(false)
+    {
+        return true;
+    }
+    false
+}
+
+fn audit_mcp_servers_map(
+    servers: &Map<String, Value>,
+    prefix: &str,
+    non_lazy: &mut BTreeSet<String>,
+    per_tool_eager: &mut BTreeSet<String>,
+) {
+    for (name, cfg) in servers {
+        let is_disabled = cfg
+            .get("disabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if is_disabled {
+            continue;
+        }
+        let qualified_server = format!("{}{}", prefix, name);
+        if cfg.get("eager").and_then(|v| v.as_bool()) != Some(false) {
+            non_lazy.insert(qualified_server.clone());
+        }
+        if let Some(tools) = cfg.get("tools").and_then(|v| v.as_object()) {
+            for (tool_name, tool_cfg) in tools {
+                let tool_disabled = tool_cfg
+                    .get("disabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !tool_disabled
+                    && tool_cfg.get("eager").and_then(|v| v.as_bool()) == Some(true)
+                {
+                    per_tool_eager.insert(format!("{}.{}", qualified_server, tool_name));
+                }
+            }
+        }
+    }
+}
+
 fn collect_engineering_suite_status(
     gemini_dir: &Path,
     mcp_servers: Option<&Map<String, Value>>,
@@ -809,8 +867,14 @@ fn collect_engineering_suite_status(
     let local_bin = home.join(".local").join("bin");
     let mut active_mcp: Vec<String> = Vec::new();
     let mut disabled_mcp: Vec<String> = Vec::new();
-    let mut eager_true_mcp: Vec<String> = Vec::new();
+    let mut non_lazy_mcp_set: BTreeSet<String> = BTreeSet::new();
+    let mut per_tool_eager_set: BTreeSet<String> = BTreeSet::new();
+    let mut checked_mcp_configs: Vec<String> = Vec::new();
 
+    let primary_mcp_path = gemini_dir.join("config").join("mcp_config.json");
+    if primary_mcp_path.is_file() {
+        checked_mcp_configs.push(rio::normalize_path(&primary_mcp_path.to_string_lossy()));
+    }
     if let Some(servers) = mcp_servers {
         for (name, cfg) in servers {
             let is_disabled = cfg
@@ -821,15 +885,89 @@ fn collect_engineering_suite_status(
                 disabled_mcp.push(name.clone());
             } else {
                 active_mcp.push(name.clone());
-                if cfg.get("eager").and_then(|v| v.as_bool()) != Some(false) {
-                    eager_true_mcp.push(name.clone());
+            }
+        }
+        audit_mcp_servers_map(servers, "", &mut non_lazy_mcp_set, &mut per_tool_eager_set);
+    }
+
+    for (rel_dir, prefix) in [
+        ("antigravity", "antigravity:"),
+        ("antigravity-cli", "antigravity-cli:"),
+    ] {
+        let cfg_path = gemini_dir.join(rel_dir).join("mcp_config.json");
+        if cfg_path.is_file() {
+            checked_mcp_configs.push(rio::normalize_path(&cfg_path.to_string_lossy()));
+            if let Some(val) = rio::read_json(&cfg_path) {
+                if let Some(servers) = val.get("mcpServers").and_then(|v| v.as_object()) {
+                    audit_mcp_servers_map(
+                        servers,
+                        prefix,
+                        &mut non_lazy_mcp_set,
+                        &mut per_tool_eager_set,
+                    );
                 }
             }
         }
     }
+
+    let global_cfg_json = rio::read_json(&gemini_dir.join("config").join("config.json"));
+    let plugins_root = gemini_dir.join("config").join("plugins");
+    if let Ok(rd) = fs::read_dir(&plugins_root) {
+        let mut plugin_dirs: Vec<(String, PathBuf)> = rd
+            .flatten()
+            .filter_map(|ent| {
+                let p = ent.path();
+                if !p.is_dir() {
+                    return None;
+                }
+                let name = ent.file_name().to_string_lossy().into_owned();
+                Some((name, p))
+            })
+            .collect();
+        plugin_dirs.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (plug_name, plug_dir) in plugin_dirs {
+            if is_plugin_disabled_in_config(global_cfg_json.as_ref(), &plug_name) {
+                continue;
+            }
+            let prefix = format!("plugin:{}:", plug_name);
+            let plug_mcp = plug_dir.join("mcp_config.json");
+            if plug_mcp.is_file() {
+                checked_mcp_configs.push(rio::normalize_path(&plug_mcp.to_string_lossy()));
+                if let Some(val) = rio::read_json(&plug_mcp) {
+                    if let Some(servers) = val.get("mcpServers").and_then(|v| v.as_object()) {
+                        audit_mcp_servers_map(
+                            servers,
+                            &prefix,
+                            &mut non_lazy_mcp_set,
+                            &mut per_tool_eager_set,
+                        );
+                    }
+                }
+            }
+            let plug_ext = plug_dir.join("gemini-extension.json");
+            if plug_ext.is_file() {
+                if let Some(val) = rio::read_json(&plug_ext) {
+                    if let Some(servers) = val.get("mcpServers").and_then(|v| v.as_object()) {
+                        checked_mcp_configs.push(rio::normalize_path(&plug_ext.to_string_lossy()));
+                        audit_mcp_servers_map(
+                            servers,
+                            &prefix,
+                            &mut non_lazy_mcp_set,
+                            &mut per_tool_eager_set,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     active_mcp.sort();
     disabled_mcp.sort();
-    eager_true_mcp.sort();
+    let non_lazy_mcp_servers: Vec<String> = non_lazy_mcp_set.into_iter().collect();
+    let per_tool_eager_mcp: Vec<String> = per_tool_eager_set.into_iter().collect();
+    let all_lazy_eager_false = mcp_servers.is_some() && non_lazy_mcp_servers.is_empty();
+    let all_tools_lazy_eager_false = all_lazy_eager_false && per_tool_eager_mcp.is_empty();
 
     let la_dir = env::var_os("LOCALAPPDATA").map(PathBuf::from);
     let appdata_dir = env::var_os("APPDATA").map(PathBuf::from);
@@ -936,8 +1074,11 @@ fn collect_engineering_suite_status(
         "active_mcp_count": active_mcp.len(),
         "disabled_mcp_servers": disabled_mcp,
         "disabled_mcp_count": disabled_mcp.len(),
-        "all_lazy_eager_false": mcp_servers.is_some() && eager_true_mcp.is_empty(),
-        "non_lazy_mcp_servers": eager_true_mcp,
+        "checked_mcp_configs": checked_mcp_configs,
+        "all_lazy_eager_false": all_lazy_eager_false,
+        "non_lazy_mcp_servers": non_lazy_mcp_servers,
+        "per_tool_eager_mcp": per_tool_eager_mcp,
+        "all_tools_lazy_eager_false": all_tools_lazy_eager_false,
         "mcp_env_launcher_present": launcher_path.is_file(),
         "configured_secret_keys": configured_secret_keys,
         "cli_ready": cli_ready,
@@ -1223,27 +1364,34 @@ pub(crate) fn collect_doctor_report_for_os(
             "model_routing".to_string(),
             json!({
                 "coordinator": cwg_common::ORCHESTRATOR_NEON_MODEL,
+                "coordinator_scope": "planning and routine tasks only (never architecture or review fixes)",
+                "direct_engineering": {
+                    "architecture_and_review_fixes": [
+                        cwg_common::NEON_HIGH_MODEL,
+                        cwg_common::NEON_XHIGH_MODEL,
+                    ],
+                    "planning_and_routine": cwg_common::ORCHESTRATOR_NEON_MODEL,
+                },
                 "pipeline_order": format!(
-                    "unittest -> simplify once -> batch kill -> re-test after edits -> primary review (1..{}) -> APPROVED | (Round {} ESCALATE -> mandatory research -> fix + re-test -> <={} --closure passes | 1 redesign-reset)",
+                    "unittest -> optional advisory simplify -> primary review (1..{}) -> APPROVED | (Round {} ESCALATE -> mandatory research -> fix + re-test -> <={} --closure passes -> pr-ready/draft-blocked)",
                     max_rounds, max_rounds, max_closure
                 ),
-                "simplify_lenses": {
-                    "lenses": cwg_common::SIMPLIFY_LENSES,
-                    "standard_mode": "opt_in single_combined (simplify-reviewer) via .agents/carbon-gate.json",
-                    "high_xhigh_mode": format!(
-                        "fast_path ALL (<={} files & <={} lines) else {}_parallel_lenses ({})",
-                        cwg_common::FAST_PATH_MAX_FILES,
-                        cwg_common::FAST_PATH_MAX_LINES,
-                        cwg_common::SIMPLIFY_LENSES.len(),
-                        cwg_common::SIMPLIFY_LENSES.join(", ")
-                    ),
+                "advisory_simplify": {
+                    "mode": "optional single advisory pass (simplify-reviewer) before primary review",
                     "primary_model": cwg_common::SONNET_HIGH_MODEL,
                     "fallback_model": cwg_common::SIMPLIFY_FALLBACK_MODEL,
                     "secondary_fallback_model": cwg_common::HYDROGEN_XHIGH_MODEL,
                     "prompt_cache_ttl_seconds": cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
                 },
+                "plugin_agents": [
+                    "adversarial-reviewer",
+                    "adversarial-reviewer-xhigh",
+                    "code-explorer",
+                    "simplify-reviewer",
+                    "translator",
+                ],
                 "external_review": format!(
-                    "codex-cli (1..{} rounds in one session; after Round {} ESCALATE: mandatory research -> fix + re-test -> <={} --closure passes)",
+                    "codex-cli (1..{} rounds in one session; after Round {} ESCALATE: mandatory research -> fix + re-test -> <={} --closure passes -> pr-ready/draft-blocked)",
                     max_rounds, max_rounds, max_closure
                 ),
                 "internal_review": {
@@ -1254,7 +1402,7 @@ pub(crate) fn collect_doctor_report_for_os(
                 "neon_swarm": {
                     "replaces": "gemini-4-argon (superseded)",
                     "models_by_complexity": neon_levels,
-                    "roles": [
+                    "swarm_brief_roles": [
                         "root-cause-debugger",
                         "frontend-ui-builder",
                         "repo-architect-scout",
@@ -1268,7 +1416,7 @@ pub(crate) fn collect_doctor_report_for_os(
                 "auxiliary_hydrogen": {
                     "replaces": "gemini-flash (disabled)",
                     "models_by_complexity": hydrogen_levels,
-                    "roles": [
+                    "swarm_brief_roles": [
                         "browser",
                         "translator",
                         "gitlab-delivery-analyst",
@@ -1560,13 +1708,28 @@ mod tests {
             report["model_routing"]["coordinator"],
             cwg_common::ORCHESTRATOR_NEON_MODEL
         );
+        assert!(report["model_routing"].get("simplify_lenses").is_none());
         assert_eq!(
-            report["model_routing"]["simplify_lenses"]["fallback_model"],
+            report["model_routing"]["advisory_simplify"]["fallback_model"],
             cwg_common::NEON_XHIGH_MODEL
         );
         assert_eq!(
-            report["model_routing"]["simplify_lenses"]["secondary_fallback_model"],
+            report["model_routing"]["advisory_simplify"]["secondary_fallback_model"],
             cwg_common::HYDROGEN_XHIGH_MODEL
+        );
+        assert_eq!(
+            report["model_routing"]["direct_engineering"]["architecture_and_review_fixes"],
+            json!([cwg_common::NEON_HIGH_MODEL, cwg_common::NEON_XHIGH_MODEL])
+        );
+        assert_eq!(
+            report["model_routing"]["plugin_agents"],
+            json!([
+                "adversarial-reviewer",
+                "adversarial-reviewer-xhigh",
+                "code-explorer",
+                "simplify-reviewer",
+                "translator",
+            ])
         );
         assert_eq!(
             report["model_routing"]["internal_review"]["high_escalation_model"],
@@ -1599,14 +1762,17 @@ mod tests {
         assert!(txt.contains("bundle_dir:"));
         assert!(txt.contains("rust_engine:"));
         assert!(txt.contains("engineering_suite:"));
-        assert!(report["model_routing"]["pipeline_order"]
+        let pipeline = report["model_routing"]["pipeline_order"]
             .as_str()
-            .unwrap_or("")
-            .starts_with("unittest -> simplify once -> batch kill -> re-test after edits -> primary review"));
-        assert!(report["model_routing"]["pipeline_order"]
-            .as_str()
-            .unwrap_or("")
-            .contains("mandatory research -> fix + re-test -> <=2 --closure passes"));
+            .unwrap_or("");
+        assert!(pipeline.starts_with(
+            "unittest -> optional advisory simplify -> primary review (1..4) -> APPROVED"
+        ));
+        assert!(pipeline.contains(
+            "mandatory research -> fix + re-test -> <=2 --closure passes -> pr-ready/draft-blocked"
+        ));
+        assert!(!pipeline.contains("redesign-reset"));
+        assert!(!pipeline.contains("research-reset"));
         assert!(report["engineering_suite"].is_object());
 
         match prev_home {
@@ -1732,5 +1898,184 @@ mod tests {
         );
         assert!(leg_guards);
         assert!(leg_cmds);
+    }
+
+    #[test]
+    fn test_multi_config_lazy_mcp_audit() {
+        let tmp = TempDir::new("sd-mcp-audit");
+        let gdir = &tmp.0;
+
+        fs::create_dir_all(gdir.join("config").join("plugins").join("disabled-plug")).unwrap();
+        fs::create_dir_all(gdir.join("config").join("plugins").join("legacy-disabled-plug")).unwrap();
+        fs::create_dir_all(gdir.join("config").join("plugins").join("active-plug")).unwrap();
+        fs::create_dir_all(gdir.join("config").join("plugins").join("implicit-plug")).unwrap();
+        fs::create_dir_all(gdir.join("config").join("plugins").join("chat-bus")).unwrap();
+        fs::create_dir_all(gdir.join("antigravity")).unwrap();
+        fs::create_dir_all(gdir.join("antigravity-cli")).unwrap();
+
+        fs::write(
+            gdir.join("config").join("mcp_config.json"),
+            r#"{"mcpServers":{"serena":{"eager":false}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            gdir.join("config").join("config.json"),
+            r#"{
+                "plugins": {
+                    "disabled-plug": {"enabled": false},
+                    "active-plug": {"enabled": true},
+                    "chat-bus": {"enabled": true}
+                },
+                "legacy-disabled-plug": {"enabled": false}
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            gdir.join("antigravity").join("mcp_config.json"),
+            r#"{"mcpServers":{"ag_missing":{"command":"x"},"ag_lazy":{"eager":false},"ag_off":{"disabled":true}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            gdir.join("antigravity-cli").join("mcp_config.json"),
+            r#"{"mcpServers":{"cli_eager":{"eager":true}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            gdir.join("config")
+                .join("plugins")
+                .join("disabled-plug")
+                .join("mcp_config.json"),
+            r#"{"mcpServers":{"should_skip":{"eager":true}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            gdir.join("config")
+                .join("plugins")
+                .join("legacy-disabled-plug")
+                .join("mcp_config.json"),
+            r#"{"mcpServers":{"should_skip_legacy":{"eager":true}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            gdir.join("config")
+                .join("plugins")
+                .join("active-plug")
+                .join("mcp_config.json"),
+            r#"{"mcpServers":{"no_eager":{"command":"y"}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            gdir.join("config")
+                .join("plugins")
+                .join("implicit-plug")
+                .join("gemini-extension.json"),
+            r#"{"name":"implicit-plug","mcpServers":{"ext_srv":{"httpUrl":"https://example.com"}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            gdir.join("config")
+                .join("plugins")
+                .join("chat-bus")
+                .join("mcp_config.json"),
+            r#"{"mcpServers":{"peers":{"eager":false,"tools":{"chat_list":{"eager":false},"chat_search":{"eager":true},"chat_reply":{"eager":true}}}}}"#,
+        )
+        .unwrap();
+
+        let mut primary = Map::new();
+        primary.insert("serena".to_string(), json!({"eager": false}));
+
+        let suite = collect_engineering_suite_status(gdir, Some(&primary), &[]);
+        assert_eq!(suite["all_lazy_eager_false"], false);
+        assert_eq!(suite["all_tools_lazy_eager_false"], false);
+        assert_eq!(
+            suite["non_lazy_mcp_servers"],
+            json!([
+                "antigravity-cli:cli_eager",
+                "antigravity:ag_missing",
+                "plugin:active-plug:no_eager",
+                "plugin:implicit-plug:ext_srv",
+            ])
+        );
+        assert_eq!(
+            suite["per_tool_eager_mcp"],
+            json!([
+                "plugin:chat-bus:peers.chat_reply",
+                "plugin:chat-bus:peers.chat_search",
+            ])
+        );
+        let checked: Vec<String> = suite["checked_mcp_configs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        assert!(checked.iter().any(|p| p.ends_with("/config/mcp_config.json")));
+        assert!(checked.iter().any(|p| p.ends_with("/antigravity/mcp_config.json")));
+        assert!(checked.iter().any(|p| p.ends_with("/antigravity-cli/mcp_config.json")));
+        assert!(checked
+            .iter()
+            .any(|p| p.ends_with("/config/plugins/active-plug/mcp_config.json")));
+        assert!(checked
+            .iter()
+            .any(|p| p.ends_with("/config/plugins/chat-bus/mcp_config.json")));
+        assert!(checked
+            .iter()
+            .any(|p| p.ends_with("/config/plugins/implicit-plug/gemini-extension.json")));
+        assert!(!checked.iter().any(|p| p.contains("disabled-plug")));
+        assert!(!checked.iter().any(|p| p.contains("legacy-disabled-plug")));
+
+        // Fix server-level eager flags while keeping per-tool eager: true in chat-bus.
+        fs::write(
+            gdir.join("antigravity").join("mcp_config.json"),
+            r#"{"mcpServers":{"ag_missing":{"eager":false}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            gdir.join("antigravity-cli").join("mcp_config.json"),
+            r#"{"mcpServers":{"cli_eager":{"eager":false}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            gdir.join("config")
+                .join("plugins")
+                .join("active-plug")
+                .join("mcp_config.json"),
+            r#"{"mcpServers":{"no_eager":{"eager":false}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            gdir.join("config")
+                .join("plugins")
+                .join("implicit-plug")
+                .join("gemini-extension.json"),
+            r#"{"name":"implicit-plug","mcpServers":{"ext_srv":{"eager":false}}}"#,
+        )
+        .unwrap();
+
+        let suite2 = collect_engineering_suite_status(gdir, Some(&primary), &[]);
+        assert_eq!(suite2["all_lazy_eager_false"], true);
+        assert_eq!(suite2["all_tools_lazy_eager_false"], false);
+        assert_eq!(suite2["non_lazy_mcp_servers"], json!([]));
+        assert_eq!(
+            suite2["per_tool_eager_mcp"],
+            json!([
+                "plugin:chat-bus:peers.chat_reply",
+                "plugin:chat-bus:peers.chat_search",
+            ])
+        );
+
+        // Now mark per-tool eager: false as well.
+        fs::write(
+            gdir.join("config")
+                .join("plugins")
+                .join("chat-bus")
+                .join("mcp_config.json"),
+            r#"{"mcpServers":{"peers":{"eager":false,"tools":{"chat_list":{"eager":false},"chat_search":{"eager":false},"chat_reply":{"eager":false}}}}}"#,
+        )
+        .unwrap();
+        let suite3 = collect_engineering_suite_status(gdir, Some(&primary), &[]);
+        assert_eq!(suite3["all_lazy_eager_false"], true);
+        assert_eq!(suite3["all_tools_lazy_eager_false"], true);
+        assert_eq!(suite3["per_tool_eager_mcp"], json!([]));
     }
 }

@@ -25,17 +25,51 @@ pub mod worktree_guard;
 use std::env;
 use std::process;
 
+fn print_help() {
+    println!(
+        concat!(
+            "carbon-stack {}\n",
+            "Usage: carbon-stack <command> [args...]\n\n",
+            "Commands:\n",
+            "  install               Install, diagnose, list backups, or rollback the plugin bundle\n",
+            "  hook                  Unified Antigravity hook dispatcher (--event <Event>)\n",
+            "  continuity            Session continuity ledger and resume directives\n",
+            "  codex-lane            External Codex adversarial review lane and status\n",
+            "  gate-inbox            Code Work Gate anomaly inbox (report/list/show/resolve)\n",
+            "  swarm-cache           Swarm shared context snapshot cache\n",
+            "  swarm-ctl             Swarm worker lifecycle and worktree control\n",
+            "  worktree-guard        Safe git worktree audit, snapshot, removal, and link unlinking\n",
+            "  carbon-memory         Local project memory store (recall/remember/sync)\n",
+            "  chip-handoff          Autonomous chip task handoff cards and trees\n",
+            "  code-search           Fast code search helpers\n",
+            "  stack-doctor          Inspect plugin health, MCP configs, hooks, and tooling\n",
+            "  claude-chat-importer  Import Claude Code chat history into Antigravity\n",
+            "  --version, version    Print version and exit\n",
+            "  --help, -h, help      Show this help message and exit\n\n",
+            "Internal hook entrypoints:\n",
+            "  safety-guards, comment-density-guard, tokenade-hook, chip-hooks,\n",
+            "  cwg-pre-invocation, cwg-mark, cwg-stop\n\n",
+            "Run 'carbon-stack <command> --help' for command-specific options."
+        ),
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
 fn main() {
     let all_args: Vec<String> = env::args().collect();
     if all_args.len() < 2 {
         eprintln!(
-            "usage: carbon-stack <install|hook|safety-guards|comment-density-guard|tokenade-hook|continuity|chip-hooks|cwg-pre-invocation|cwg-mark|cwg-stop|codex-lane|gate-inbox|swarm-cache|swarm-ctl|worktree-guard|carbon-memory|chip-handoff|code-search|stack-doctor|claude-chat-importer|--version> [args...]"
+            "usage: carbon-stack <install|hook|safety-guards|comment-density-guard|tokenade-hook|continuity|chip-hooks|cwg-pre-invocation|cwg-mark|cwg-stop|codex-lane|gate-inbox|swarm-cache|swarm-ctl|worktree-guard|carbon-memory|chip-handoff|code-search|stack-doctor|claude-chat-importer|--version|--help> [args...]"
         );
         process::exit(2);
     }
     let sub = all_args[1].as_str();
     let rest = &all_args[2..];
     let code = match sub {
+        "--help" | "-h" | "help" => {
+            print_help();
+            0
+        }
         "--version" | "version" => {
             println!("carbon-stack {}", env!("CARGO_PKG_VERSION"));
             0

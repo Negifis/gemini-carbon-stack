@@ -10,11 +10,6 @@ sha2 = "=0.10.9"
 hex = "=0.4.3"
 regex = "=1.12.3"
 globset = "=0.4.18"
-oxc_allocator = "=0.133.0"
-oxc_ast = "=0.133.0"
-oxc_ast_visit = "=0.133.0"
-oxc_parser = { version = "=0.133.0", default-features = false }
-oxc_span = "=0.133.0"
 
 [profile.release]
 strip = true

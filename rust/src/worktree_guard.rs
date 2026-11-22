@@ -329,18 +329,6 @@ pub fn snapshot_for_removal(p: &str, name: Option<&str>, br: Option<&str>) -> Op
     }
     Some(out)
 }
-pub fn evaluate_worktree_remove(payload: &Value) {
-    let p = payload.get("worktree_path").or_else(|| payload.get("worktreePath")).or_else(|| payload.get("path")).and_then(|v| v.as_str()).unwrap_or("").trim();
-    if p.is_empty() { return; }
-    let (sid, name, br) = (rio::session_key(payload), payload.get("name").and_then(|v| v.as_str()), payload.get("branch").and_then(|v| v.as_str()));
-    let Some(res) = snapshot_for_removal(p, name, br) else { return; };
-    if let Some(err) = res.get("error").and_then(|v| v.as_str()) {
-        rio::log_hook_event("worktree-snapshots", "snapshot_failed", json!({"session_id": sid, "worktree": p, "removed_branch": br, "failed": err}));
-        eprintln_line(&format!("Could NOT save unfinished work from {}: {}. The worktree is being removed anyway.", p, err));
-    } else {
-        rio::log_hook_event("worktree-snapshots", "snapshot_saved", json!({"session_id": sid, "worktree": p, "removed_branch": br, "saved_to": res["branch"], "mode": res["mode"], "files": res["files"], "ahead": res["ahead"], "head": res["head"], "staged_commit": res.get("staged_commit").cloned().unwrap_or(Value::Null), "conflicts_commit": res.get("conflicts_commit").cloned().unwrap_or(Value::Null)}));
-    }
-}
 
 pub fn snapshot_dirty_worktree(worktree_dir: &str, label: &str) -> Value {
     let wt = abs_clean_path(worktree_dir);
@@ -647,29 +635,15 @@ fn take_flag_value(args: &[String], idx: &mut usize, flag_name: &str) -> Result<
 pub fn run_cli(args: &[String]) -> i32 {
     if args.is_empty() {
         eprintln_line(
-            "usage: worktree_guard <audit|snapshot|remove|unlink-links|hook-remove> [options]",
+            "usage: worktree_guard <audit|snapshot|remove|unlink-links> [options]",
         );
         return 2;
     }
     match args[0].as_str() {
         "-h" | "--help" => {
             eprintln_line(
-                "usage: worktree_guard <audit|snapshot|remove|unlink-links|hook-remove> [options]",
+                "usage: worktree_guard <audit|snapshot|remove|unlink-links> [options]",
             );
-            0
-        }
-        "hook-remove" => {
-            match rio::read_hook_stdin() {
-                Ok(payload) => evaluate_worktree_remove(&payload),
-                Err(err) => {
-                    rio::log_hook_event(
-                        "hook-errors",
-                        "stdin_error",
-                        json!({"hook": "worktree_guard_hook_remove", "error": err}),
-                    );
-                }
-            }
-            rio::emit_json(&json!({}));
             0
         }
         "audit" => {
@@ -830,7 +804,6 @@ pub fn run_cli(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::win32_sqlite::TEST_ENV_LOCK;
 
     static TEST_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -928,13 +901,8 @@ mod tests {
     }
 
     #[test]
-    fn test_evaluate_worktree_remove_snapshots_dirty_and_clean_ref_and_fails_closed() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let base = make_temp_dir("wguard-hook");
-        let stack_home = base.join("stack");
-        fs::create_dir_all(&stack_home).unwrap();
-        let prev_home = env::var_os("CARBON_STACK_HOME");
-        unsafe { env::set_var("CARBON_STACK_HOME", &stack_home) };
+    fn test_snapshot_for_removal_dirty_clean_ahead_conflicted_and_fails_closed() {
+        let base = make_temp_dir("wguard-snap");
 
         let repo = base.join("repo");
         let wt_dirty = base.join("wt-dirty");
@@ -948,7 +916,7 @@ mod tests {
             let _ = rio::run_git(&repo_s, &["add", "base.txt"], 5.0);
             let _ = rio::run_git(&repo_s, &["commit", "-m", "init"], 5.0);
 
-            // 1. Dirty worktree -> mode: "commit" on wip/<label>-<YYYYMMDD>, log written, index untouched.
+            // 1. Dirty worktree -> mode: "commit" on wip/<label>-<YYYYMMDD>, real index untouched.
             let wt_dirty_s = wt_dirty.to_string_lossy().into_owned();
             assert_eq!(
                 rio::run_git(
@@ -960,12 +928,18 @@ mod tests {
                 0
             );
             fs::write(wt_dirty.join("untracked.txt"), "rescue me\n").unwrap();
-            evaluate_worktree_remove(&json!({
-                "session_id": "sess-wg-1",
-                "worktree_path": wt_dirty_s,
-                "name": "feat-dirty",
-                "branch": "feat/dirty",
-            }));
+            let snap_dirty =
+                snapshot_for_removal(&wt_dirty_s, Some("feat-dirty"), Some("feat/dirty"))
+                    .expect("dirty worktree must produce a commit snapshot");
+            assert_eq!(snap_dirty["mode"], json!("commit"));
+            assert_eq!(snap_dirty["files"], json!(1));
+            let dirty_br = snap_dirty["branch"].as_str().unwrap();
+            assert!(dirty_br.starts_with("wip/feat-dirty-"), "{}", snap_dirty);
+            let dirty_head = snap_dirty["head"].as_str().unwrap();
+            assert_eq!(
+                rio::run_git(&repo_s, &["show", &format!("{}:untracked.txt", dirty_head)], 5.0).1,
+                "rescue me\n"
+            );
             let (rc_b1, branches1, _) =
                 rio::run_git(&repo_s, &["branch", "--list", "wip/feat-dirty-*"], 5.0);
             assert_eq!(rc_b1, 0);
@@ -990,25 +964,17 @@ mod tests {
             fs::write(wt_clean.join("committed.txt"), "ahead\n").unwrap();
             let _ = rio::run_git(&wt_clean_s, &["add", "committed.txt"], 5.0);
             let _ = rio::run_git(&wt_clean_s, &["commit", "-m", "ahead commit"], 5.0);
-            evaluate_worktree_remove(&json!({
-                "session_id": "sess-wg-2",
-                "worktree_path": wt_clean_s,
-                "name": "feat-ahead",
-                "branch": "feat/ahead",
-            }));
+            let snap_clean =
+                snapshot_for_removal(&wt_clean_s, Some("feat-ahead"), Some("feat/ahead"))
+                    .expect("clean-ahead worktree must produce a ref snapshot");
+            assert_eq!(snap_clean["mode"], json!("ref"));
+            assert_eq!(snap_clean["files"], json!(0));
+            assert!(snap_clean["ahead"].as_u64().unwrap_or(0) >= 1);
+            let clean_br = snap_clean["branch"].as_str().unwrap();
+            assert!(clean_br.starts_with("wip/feat-ahead-"), "{}", snap_clean);
             let (_, branches2, _) =
                 rio::run_git(&repo_s, &["branch", "--list", "wip/feat-ahead-*"], 5.0);
             assert!(!branches2.trim().is_empty());
-
-            let snap_log = fs::read_to_string(
-                stack_home
-                    .join("state")
-                    .join("logs")
-                    .join("worktree-snapshots.jsonl"),
-            )
-            .unwrap_or_default();
-            assert!(snap_log.contains("\"mode\":\"commit\""));
-            assert!(snap_log.contains("\"mode\":\"ref\""));
 
             // 2b. Staged index (V2) + worktree reverted to HEAD (V1) preserves BOTH V1 and V2 in both snapshot_for_removal and safe_remove_worktree!
             let wt_staged_hook = base.join("wt-staged-hook");
@@ -1121,19 +1087,14 @@ mod tests {
             assert_eq!(rio::run_git(&repo_s, &["merge-base", "--is-ancestor", &cf_c, &tip_c], 5.0).0, 0);
         }
 
-        // 3. Non-repo path in safe_remove_worktree fails closed with git_status_failed instead of clean.
+        // 3. Non-repo path returns None from snapshot_for_removal and fails closed with git_status_failed in safe_remove_worktree.
         let not_repo = base.join("not-a-repo");
         fs::create_dir_all(&not_repo).unwrap();
+        assert!(snapshot_for_removal(&not_repo.to_string_lossy(), None, None).is_none());
         let failed = safe_remove_worktree(&not_repo.to_string_lossy(), "", false);
         assert_eq!(failed["ok"], json!(false));
         assert!(failed["error"].as_str().unwrap().starts_with("git_status_failed:"));
 
-        unsafe {
-            match prev_home {
-                Some(v) => env::set_var("CARBON_STACK_HOME", v),
-                None => env::remove_var("CARBON_STACK_HOME"),
-            }
-        }
         let _ = fs::remove_dir_all(&base);
     }
 }

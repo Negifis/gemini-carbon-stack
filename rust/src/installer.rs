@@ -19,6 +19,7 @@ const PLUGIN_NAME: &str = "gemini-carbon-stack";
 const RETIRED_BINS_DIR_NAME: &str = ".retired_bins";
 const SKIP_NAMES: &[&str] = &["__pycache__", ".DS_Store", RETIRED_BINS_DIR_NAME];
 const ROLLBACK_V2_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_INSTALL_BACKUPS: usize = 10;
 
 fn sha256_file_full(path: &Path) -> Result<String, String> {
     match cwg_common::sha256_file_bounded(path, u64::MAX) {
@@ -744,6 +745,43 @@ fn prepare_retired_slot(retired_dir: &Path, dst_file: &Path) -> Result<PathBuf, 
         .and_then(|s| s.to_str())
         .unwrap_or("bin.exe");
     Ok(retired_dir.join(format!("retired-{}-{}-{}-{}", std::process::id(), ms, seq, fname)))
+}
+
+fn sweep_retired_bins_dir(dir: &Path) {
+    // INVARIANT: Refuse symlinks/junctions on `dir`, its parent, and entries; best-effort delete unlocked regular files and remove `dir` only when empty, never failing callers on locked files.
+    if has_dot_components(dir) || win32_sqlite::is_link_or_junction(dir) {
+        return;
+    }
+    if let Some(parent) = dir.parent() {
+        if win32_sqlite::is_link_or_junction(parent) {
+            return;
+        }
+    }
+    match fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_dir() => {}
+        _ => return,
+    }
+    let Ok(rd) = fs::read_dir(dir) else {
+        return;
+    };
+    for ent_res in rd {
+        let Ok(ent) = ent_res else {
+            continue;
+        };
+        let p = ent.path();
+        if win32_sqlite::is_link_or_junction(&p) {
+            continue;
+        }
+        if fs::symlink_metadata(&p)
+            .map(|m| m.file_type().is_file())
+            .unwrap_or(false)
+        {
+            let _ = fs::remove_file(&p);
+        }
+    }
+    if !win32_sqlite::is_link_or_junction(dir) {
+        let _ = fs::remove_dir(dir);
+    }
 }
 
 fn retire_locked_windows_pe(dst_file: &Path, tmp: &Path) -> Result<bool, String> {
@@ -3695,6 +3733,9 @@ pub(crate) fn perform_install_with_drain_timeout(
         }
         ensure_state_subdirs(stack_home);
         let _ = write_v2_plugin_digest(&state_root, &src_manifest);
+        sweep_retired_bins_dir(&target_plugin_dir.join("bin").join(RETIRED_BINS_DIR_NAME));
+        sweep_retired_bins_dir(&state_root.join(RETIRED_BINS_DIR_NAME));
+        sweep_retired_bins_dir(&config_dir.join(RETIRED_BINS_DIR_NAME));
         return json!({
             "ok": true,
             "dry_run": false,
@@ -3914,6 +3955,10 @@ pub(crate) fn perform_install_with_drain_timeout(
 
     ensure_state_subdirs(stack_home);
     let _ = write_v2_plugin_digest(&state_root, &tree_manifest(&target_plugin_dir));
+    sweep_retired_bins_dir(&target_plugin_dir.join("bin").join(RETIRED_BINS_DIR_NAME));
+    sweep_retired_bins_dir(&retired_state);
+    sweep_retired_bins_dir(&retired_cfg);
+    let _ = prune_old_install_backups(stack_home, MAX_INSTALL_BACKUPS);
 
     json!({
         "ok": true,
@@ -4475,17 +4520,67 @@ fn list_orphaned_stage_retire_dirs(config_dir: &Path) -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn try_auto_heal_default_stage_retire() {
-    let (cfg, shome) = resolve_paths("", "");
-    if list_orphaned_stage_retire_dirs(&cfg).is_empty() {
+fn is_plain_existing_dir(p: &Path) -> bool {
+    fs::symlink_metadata(p)
+        .map(|m| m.file_type().is_dir())
+        .unwrap_or(false)
+        && !win32_sqlite::is_link_or_junction(p)
+}
+
+fn try_auto_heal_stage_retire_for_paths(cfg: &Path, shome: &Path) {
+    let has_orphaned_stage = !list_orphaned_stage_retire_dirs(cfg).is_empty();
+    let plugins_dir = cfg.join("plugins");
+    let plugin_dir = plugins_dir.join(PLUGIN_NAME);
+    let plugin_bin_dir = plugin_dir.join("bin");
+    let ret_plugin_bin = plugin_bin_dir.join(RETIRED_BINS_DIR_NAME);
+    let state_dir = shome.join("state");
+    let ret_state = state_dir.join(RETIRED_BINS_DIR_NAME);
+    let ret_cfg = cfg.join(RETIRED_BINS_DIR_NAME);
+
+    let safe_ret_plugin_bin = is_plain_existing_dir(&ret_plugin_bin)
+        && !win32_sqlite::is_link_or_junction(cfg)
+        && !win32_sqlite::is_link_or_junction(&plugins_dir)
+        && !win32_sqlite::is_link_or_junction(&plugin_dir)
+        && !win32_sqlite::is_link_or_junction(&plugin_bin_dir);
+    let safe_ret_state = is_plain_existing_dir(&ret_state)
+        && !win32_sqlite::is_link_or_junction(shome)
+        && !win32_sqlite::is_link_or_junction(&state_dir);
+    let safe_ret_cfg =
+        is_plain_existing_dir(&ret_cfg) && !win32_sqlite::is_link_or_junction(cfg);
+
+    if !has_orphaned_stage && !safe_ret_plugin_bin && !safe_ret_state && !safe_ret_cfg {
         return;
     }
-    let Ok(_guard) = acquire_installer_mutex(&cfg, &shome, Duration::from_secs(2)) else {
+    let Ok(_guard) = acquire_installer_mutex(cfg, shome, Duration::from_secs(2)) else {
         return;
     };
-    let ret_state = shome.join("state").join(RETIRED_BINS_DIR_NAME);
-    let ret_cfg = cfg.join(RETIRED_BINS_DIR_NAME);
-    let _ = recover_interrupted_stage_retire_dirs(&cfg, &[&ret_state, &ret_cfg]);
+    if has_orphaned_stage {
+        let _ = recover_interrupted_stage_retire_dirs(cfg, &[&ret_state, &ret_cfg]);
+    }
+    if safe_ret_plugin_bin
+        || (has_orphaned_stage
+            && !win32_sqlite::is_link_or_junction(cfg)
+            && !win32_sqlite::is_link_or_junction(&plugins_dir)
+            && !win32_sqlite::is_link_or_junction(&plugin_dir)
+            && !win32_sqlite::is_link_or_junction(&plugin_bin_dir))
+    {
+        sweep_retired_bins_dir(&ret_plugin_bin);
+    }
+    if safe_ret_state
+        || (has_orphaned_stage
+            && !win32_sqlite::is_link_or_junction(shome)
+            && !win32_sqlite::is_link_or_junction(&state_dir))
+    {
+        sweep_retired_bins_dir(&ret_state);
+    }
+    if safe_ret_cfg || (has_orphaned_stage && !win32_sqlite::is_link_or_junction(cfg)) {
+        sweep_retired_bins_dir(&ret_cfg);
+    }
+}
+
+pub(crate) fn try_auto_heal_default_stage_retire() {
+    let (cfg, shome) = resolve_paths("", "");
+    try_auto_heal_stage_retire_for_paths(&cfg, &shome);
 }
 
 fn recover_interrupted_stage_retire_dirs(
@@ -5337,6 +5432,61 @@ pub fn list_backups_strict(stack_home: &Path) -> Result<Vec<PathBuf>, String> {
     }
     out.sort();
     Ok(out)
+}
+
+fn prune_old_install_backups(stack_home: &Path, keep: usize) -> usize {
+    // INVARIANT: Only prune regular `install-*` directories directly inside `<stack_home>/backups` (never symlinks/junctions, never other directories); retain the `keep` lexicographically newest backups and never fail install on I/O errors.
+    if has_dot_components(stack_home) || win32_sqlite::is_link_or_junction(stack_home) {
+        return 0;
+    }
+    let broot = stack_home.join("backups");
+    if win32_sqlite::is_link_or_junction(&broot) {
+        return 0;
+    }
+    match fs::symlink_metadata(&broot) {
+        Ok(meta) if meta.file_type().is_dir() => {}
+        _ => return 0,
+    }
+    let Ok(rd) = fs::read_dir(&broot) else {
+        return 0;
+    };
+    let mut install_dirs: Vec<(String, PathBuf)> = Vec::new();
+    for ent_res in rd {
+        let Ok(ent) = ent_res else {
+            continue;
+        };
+        let fname = ent.file_name();
+        let Some(name) = fname.to_str() else {
+            continue;
+        };
+        if !name.starts_with("install-") {
+            continue;
+        }
+        let p = ent.path();
+        if win32_sqlite::is_link_or_junction(&p) {
+            continue;
+        }
+        if fs::symlink_metadata(&p)
+            .map(|m| m.file_type().is_dir())
+            .unwrap_or(false)
+        {
+            install_dirs.push((name.to_string(), p));
+        }
+    }
+    if install_dirs.len() <= keep {
+        return 0;
+    }
+    install_dirs.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut removed = 0usize;
+    for (_, path) in install_dirs.into_iter().skip(keep) {
+        if win32_sqlite::is_link_or_junction(&path) {
+            continue;
+        }
+        if fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 pub fn perform_rollback(config_dir: &Path, stack_home: &Path, backup_selector: &str) -> Value {
@@ -11083,5 +11233,78 @@ mod tests {
                 "v1"
             );
         }
+    }
+
+    #[test]
+    fn test_sweep_retired_bins_and_auto_heal_cleans_plugin_bin_dir() {
+        let tmp = TempDirGuard::new("sweep-retired");
+        let cfg = tmp.0.join("config");
+        let shome = tmp.0.join("stack-home");
+        let plugin_ret = cfg
+            .join("plugins")
+            .join(PLUGIN_NAME)
+            .join("bin")
+            .join(RETIRED_BINS_DIR_NAME);
+        let state_ret = shome.join("state").join(RETIRED_BINS_DIR_NAME);
+        let cfg_ret = cfg.join(RETIRED_BINS_DIR_NAME);
+        fs::create_dir_all(&plugin_ret).unwrap();
+        fs::create_dir_all(&state_ret).unwrap();
+        fs::create_dir_all(&cfg_ret).unwrap();
+        fs::write(plugin_ret.join("retired-1-carbon-stack.exe"), b"old-pe-1").unwrap();
+        fs::write(state_ret.join("retired-2-carbon-stack.exe"), b"old-pe-2").unwrap();
+        fs::write(cfg_ret.join("retired-3-carbon-stack.exe"), b"old-pe-3").unwrap();
+
+        assert!(list_orphaned_stage_retire_dirs(&cfg).is_empty());
+        try_auto_heal_stage_retire_for_paths(&cfg, &shome);
+        assert!(!plugin_ret.exists());
+        assert!(!state_ret.exists());
+        assert!(!cfg_ret.exists());
+
+        let direct_ret = tmp.0.join("direct").join(RETIRED_BINS_DIR_NAME);
+        fs::create_dir_all(&direct_ret).unwrap();
+        fs::write(direct_ret.join("retired-9-carbon-stack.exe"), b"old-pe").unwrap();
+        sweep_retired_bins_dir(&direct_ret);
+        assert!(!direct_ret.exists());
+
+        let partial_ret = tmp.0.join("partial").join(RETIRED_BINS_DIR_NAME);
+        let kept_sub = partial_ret.join("keep-subdir");
+        fs::create_dir_all(&kept_sub).unwrap();
+        fs::write(partial_ret.join("unlocked.exe"), b"old-pe").unwrap();
+        sweep_retired_bins_dir(&partial_ret);
+        assert!(!partial_ret.join("unlocked.exe").exists());
+        assert!(kept_sub.is_dir());
+        assert!(partial_ret.is_dir());
+    }
+
+    #[test]
+    fn test_prune_old_install_backups_keeps_newest_and_preserves_other_dirs() {
+        let tmp = TempDirGuard::new("prune-backups");
+        let shome = tmp.0.join("stack-home");
+        let broot = shome.join("backups");
+        fs::create_dir_all(&broot).unwrap();
+
+        for day in 1..=14u32 {
+            let bdir = broot.join(format!("install-202611{:02}-120000", day));
+            fs::create_dir_all(&bdir).unwrap();
+            fs::write(bdir.join("manifest.json"), "{}\n").unwrap();
+        }
+        let manual_dir = broot.join("manual-snapshot");
+        fs::create_dir_all(&manual_dir).unwrap();
+        fs::write(manual_dir.join("keep.txt"), "do-not-delete\n").unwrap();
+        let stray_file = broot.join("install-not-a-dir.txt");
+        fs::write(&stray_file, "file\n").unwrap();
+
+        let pruned = prune_old_install_backups(&shome, MAX_INSTALL_BACKUPS);
+        assert_eq!(pruned, 4);
+
+        for day in 1..=4u32 {
+            assert!(!broot.join(format!("install-202611{:02}-120000", day)).exists());
+        }
+        for day in 5..=14u32 {
+            assert!(broot.join(format!("install-202611{:02}-120000", day)).is_dir());
+        }
+        assert!(manual_dir.join("keep.txt").is_file());
+        assert!(stray_file.is_file());
+        assert_eq!(prune_old_install_backups(&shome, MAX_INSTALL_BACKUPS), 0);
     }
 }

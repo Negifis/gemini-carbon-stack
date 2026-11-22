@@ -2,7 +2,7 @@ use serde_json::json;
 
 use crate::{
     chip_hooks, comment_density_guard, continuity_hook, cwg_mark, cwg_pre_invocation, cwg_stop,
-    rio, safety_guards, worktree_guard,
+    rio, safety_guards,
 };
 
 pub fn run_unified_hook(args: &[String]) -> i32 {
@@ -98,10 +98,6 @@ pub fn run_unified_hook(args: &[String]) -> i32 {
         }
         "PostToolUse" => {
             return cwg_mark::evaluate_post_tool_use(&payload);
-        }
-        "WorktreeRemove" => {
-            worktree_guard::evaluate_worktree_remove(&payload);
-            rio::emit_json(&json!({}));
         }
         "Stop" => {
             if let Some(cont_reason) = continuity_hook::decide_stop(&payload) {
