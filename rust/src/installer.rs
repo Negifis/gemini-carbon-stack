@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -677,11 +677,15 @@ fn collect_hook_commands<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
     }
 }
 
-fn has_token_boundary_before(hay: &str, start: usize, allow_dot_slash: bool) -> bool {
-    if start == 0 { return true; }
-    let prev = hay[..start].chars().next_back().unwrap_or('\0');
-    if prev.is_whitespace() || matches!(prev, '"' | '\'' | ';' | '&' | '|' | '(' | '=' | ',') { return true; }
-    allow_dot_slash && start >= 2 && &hay[start - 2..start] == "./" && has_token_boundary_before(hay, start - 2, false)
+fn token_prefix_before<'a>(hay: &'a str, start: usize) -> (&'a str, Option<u8>) {
+    let before = &hay[..start];
+    let tok_start = before
+        .char_indices()
+        .rev()
+        .find(|&(_, c)| c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '&' | '|' | '(' | '=' | ','))
+        .map_or(0, |(idx, c)| idx + c.len_utf8());
+    let q_before = tok_start.checked_sub(1).and_then(|i| hay.as_bytes().get(i)).copied().filter(|&b| b == b'"' || b == b'\'');
+    (&hay[tok_start..start], q_before)
 }
 
 fn find_dangling_plugin_hook_ref(root: &Value, target_plugin_dir: &Path, next_manifest: Option<&BTreeMap<String, String>>, is_windows: bool) -> Option<String> {
@@ -703,28 +707,28 @@ fn find_dangling_plugin_hook_ref(root: &Value, target_plugin_dir: &Path, next_ma
             }
         }
         let hay = if is_windows { norm.to_ascii_lowercase() } else { norm };
-        for (pref, is_rel) in [(&abs_pref, false), (&rel_pref, true)] {
-            let mut offset = 0usize;
-            while let Some(pos) = hay[offset..].find(pref.as_str()) {
-                let start = offset + pos;
-                offset = start + pref.len();
-                // INVARIANT: Require token boundary so `/other-profile/plugins/gemini-carbon-stack/...` never matches relative `plugins/gemini-carbon-stack/`.
-                if !has_token_boundary_before(&hay, start, is_rel) { continue; }
-                let q_before = start.checked_sub(1).and_then(|i| hay.as_bytes().get(i)).copied().filter(|&b| b == b'"' || b == b'\'');
-                let rest = &hay[offset..];
-                let end = rest.find(|c: char| match q_before {
-                    Some(q) => c as u32 == q as u32 || matches!(c, '\n' | '\r'),
-                    None => c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '&' | '|' | '>' | '<' | ')' | ',' | '\n' | '\r'),
-                }).unwrap_or(rest.len());
-                let rel = rest[..end].trim_start_matches("./").trim_end_matches('/');
-                if rel.is_empty() { continue; }
-                if !manifest_keys.iter().any(|k| k == rel) { return Some(rel.to_string()); }
-                // INVARIANT: Even though `bin/carbon-stack[.exe]` stays in manifest, any unpruned invocation of removed `tokenade-hook` fails closed.
-                let after = rest[end..].trim_start_matches(['"', '\'', ' ', '\t']);
-                let next_tok = after.split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '&' | '|')).next().unwrap_or("");
-                if matches!(rel, "bin/carbon-stack" | "bin/carbon-stack.exe") && next_tok.eq_ignore_ascii_case("tokenade-hook") {
-                    return Some(format!("{} tokenade-hook", rel));
-                }
+        let mut offset = 0usize;
+        while let Some(pos) = hay[offset..].find(rel_pref.as_str()) {
+            let start = offset + pos;
+            offset = start + rel_pref.len();
+            // INVARIANT: Walk back UTF-8-safely to token start; check relative prefixes (`""`, `./`, `../`) or absolute paths matching THIS `target_plugin_dir` only, ignoring other profiles (`/home/иван/plugins/...`).
+            let (tok_prefix, q_before) = token_prefix_before(&hay, start);
+            let is_rel_target = !tok_prefix.starts_with('/') && !tok_prefix.contains(':')
+                && tok_prefix.split('/').all(|seg| seg.is_empty() || seg == "." || seg == "..");
+            let is_abs_target = format!("{}{}", tok_prefix, rel_pref) == abs_pref;
+            if !is_rel_target && !is_abs_target { continue; }
+            let rest = &hay[offset..];
+            let end = rest.find(|c: char| match q_before {
+                Some(q) => c as u32 == q as u32 || matches!(c, '\n' | '\r'),
+                None => c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '&' | '|' | '>' | '<' | ')' | ',' | '\n' | '\r'),
+            }).unwrap_or(rest.len());
+            let rel = rest[..end].trim_start_matches("./").trim_end_matches('/');
+            if rel.is_empty() { continue; }
+            if !manifest_keys.iter().any(|k| k == rel) { return Some(rel.to_string()); }
+            let after = rest[end..].trim_start_matches(['"', '\'', ' ', '\t']);
+            let next_tok = after.split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '&' | '|')).next().unwrap_or("");
+            if matches!(rel, "bin/carbon-stack" | "bin/carbon-stack.exe") && next_tok.eq_ignore_ascii_case("tokenade-hook") {
+                return Some(format!("{} tokenade-hook", rel));
             }
         }
         let low_hay = hay.to_ascii_lowercase();
@@ -1629,40 +1633,32 @@ fn compensate_rollback(st: &RollbackStage<'_>, mut_plugin: bool, mut_rule: bool,
     err_resp
 }
 
-fn compare_and_replace_file(target: &Path, expected_sha: &str, new_bytes: &[u8]) -> Result<(), (String, bool)> {
-    // INVARIANT: Serialize conditional `hooks.json` update against concurrent editors via kernel exclusive open (`share_mode(0)` on Windows; `flock` + `(dev, ino)` verification on Unix) and return `touched_live` so compensation never overwrites untouched user edits.
-    if win32_sqlite::is_link_or_junction(target) { return Err((format!("Refusing symlink/junction {}", target.display()), false)); }
-    #[cfg(windows)]
-    let mut fh = { use std::os::windows::fs::OpenOptionsExt; fs::OpenOptions::new().read(true).write(true).share_mode(0).open(target).map_err(|e| (format!("Cannot lock {} exclusively: {}", target.display(), e), false))? };
-    #[cfg(not(windows))]
-    let mut fh = {
-        let f = fs::OpenOptions::new().read(true).write(true).open(target).map_err(|e| (format!("Cannot open {}: {}", target.display(), e), false))?;
-        let dl = Instant::now() + Duration::from_secs(2);
-        loop {
-            match f.try_lock() { Ok(()) => break, Err(fs::TryLockError::WouldBlock) if Instant::now() < dl => thread::sleep(Duration::from_millis(10)), Err(e) => return Err((format!("Cannot lock {}: {:?}", target.display(), e), false)) }
-        }
-        f
-    };
-    #[cfg(unix)]
-    let same_inode = |f: &fs::File| -> bool { use std::os::unix::fs::MetadataExt; matches!((f.metadata(), fs::symlink_metadata(target)), (Ok(fm), Ok(pm)) if pm.file_type().is_file() && fm.dev() == pm.dev() && fm.ino() == pm.ino()) };
-    #[cfg(unix)]
-    if !same_inode(&fh) { return Err((format!("Global {} was replaced concurrently; refusing to overwrite user edits", target.display()), false)); }
-    let mut cur = Vec::new();
-    fh.read_to_end(&mut cur).map_err(|e| (format!("Cannot read {}: {}", target.display(), e), false))?;
-    if rio::sha256_hex(&cur) != expected_sha { return Err((format!("Global {} changed concurrently; refusing to overwrite user edits", target.display()), false)); }
-    #[cfg(unix)]
-    if !same_inode(&fh) { return Err((format!("Global {} was replaced concurrently; refusing to overwrite user edits", target.display()), false)); }
-    fh.seek(SeekFrom::Start(0)).map_err(|e| (format!("Seek {} failed: {}", target.display(), e), false))?;
-    if let Err(e) = fh.write_all(new_bytes).and_then(|()| fh.set_len(new_bytes.len() as u64)).and_then(|()| fh.sync_all()) {
-        #[cfg(unix)]
-        let touched = same_inode(&fh);
-        #[cfg(not(unix))]
-        let touched = true;
-        return Err((format!("Write {} failed: {}", target.display(), e), touched));
+fn compare_and_replace_file(target: &Path, expected_sha: &str, new_bytes: &[u8]) -> Result<(), String> {
+    // INVARIANT: Publish `hooks.json` crash-atomically via fully synced temp file + kernel `ReplaceFileW`/`RENAME_EXCHANGE`/`RENAME_SWAP`, capturing the displaced live file; if its SHA-256 differs from `expected_sha`, atomically swap the user's newer version back and never clobber concurrent edits.
+    static SWAP_SEQ: AtomicU64 = AtomicU64::new(1);
+    if win32_sqlite::is_link_or_junction(target) { return Err(format!("Refusing symlink/junction {}", target.display())); }
+    let parent = target.parent().ok_or_else(|| format!("Invalid target path {}", target.display()))?;
+    let (seq, pid) = (SWAP_SEQ.fetch_add(1, Ordering::Relaxed), std::process::id());
+    let (stage, disp_slot, rev_slot) = (parent.join(format!(".hooks.stage.{}.{}.tmp", pid, seq)), parent.join(format!(".hooks.disp.{}.{}.tmp", pid, seq)), parent.join(format!(".hooks.rev.{}.{}.tmp", pid, seq)));
+    if let Err(e) = fs::OpenOptions::new().write(true).create_new(true).open(&stage).and_then(|mut f| { f.write_all(new_bytes)?; f.sync_all() }) {
+        let _ = fs::remove_file(&stage); return Err(format!("Stage {} failed: {}", target.display(), e));
     }
-    #[cfg(unix)]
-    if !same_inode(&fh) { return Err((format!("Global {} was replaced concurrently during write; preserving user edits", target.display()), false)); }
-    Ok(())
+    let displaced = match win32_sqlite::atomic_swap_capturing_displaced(target, &stage, &disp_slot) {
+        Ok(p) => p,
+        Err(e) => { let _ = fs::remove_file(&stage); return Err(format!("Atomic swap {} failed: {}", target.display(), e)); }
+    };
+    if sha256_file_full(&displaced).ok().as_deref() == Some(expected_sha) { let _ = fs::remove_file(&displaced); return Ok(()); }
+    let written_sha = rio::sha256_hex(new_bytes);
+    match win32_sqlite::atomic_swap_capturing_displaced(target, &displaced, &rev_slot) {
+        Ok(rev) if sha256_file_full(&rev).ok().as_deref() == Some(written_sha.as_str()) => {
+            let _ = fs::remove_file(&rev); Err(format!("Global {} changed concurrently; user edits restored untouched", target.display()))
+        }
+        Ok(rev) => {
+            if let Ok(stale_v2) = win32_sqlite::atomic_swap_capturing_displaced(target, &rev, &parent.join(format!(".hooks.rev2.{}.{}.tmp", pid, seq))) { let _ = fs::remove_file(&stale_v2); }
+            Err(format!("Global {} changed concurrently during recovery; latest user edits preserved", target.display()))
+        }
+        Err(e) => Err(format!("Global {} changed concurrently and restore swap failed ({}); user version preserved at {}", target.display(), e, displaced.display())),
+    }
 }
 
 fn perform_install(repo_root: &Path, config_dir: &Path, stack_home: &Path, dry_run: bool, force_foreign: bool) -> Value {
@@ -1796,8 +1792,8 @@ fn perform_install(repo_root: &Path, config_dir: &Path, stack_home: &Path, dry_r
         }
     }
     if let Some((rendered_hooks, _, planned_sha)) = hooks_prune {
-        if let Err((e, touched_live)) = compare_and_replace_file(&target_global_hooks, &planned_sha, rendered_hooks.as_bytes()) {
-            return fail_comp("prune_global_hooks", e, touched_live);
+        if let Err(e) = compare_and_replace_file(&target_global_hooks, &planned_sha, rendered_hooks.as_bytes()) {
+            return fail_comp("prune_global_hooks", e, false);
         }
     }
 
@@ -2617,29 +2613,35 @@ mod tests {
         assert!(custom_plugin_script.is_file(), "install must fail before pruning referenced plugin script");
         let _ = fs::remove_file(&custom_plugin_script);
 
-        // Codex C1b #1: compare_and_replace_file fails closed with `touched_live = false` if hooks.json changed concurrently, AND compensation rollback with `restore_global_hooks = false` preserves newer user edits.
+        // Codex C1b #1 & #8: compare_and_replace_file swaps crash-atomically and restores user edits untouched if hooks.json changed concurrently; compensation rollback with `restore_global_hooks = false` also preserves newer user edits.
         let newer_user_hooks = "{\"user-new\":{\"enabled\":true,\"Stop\":[{\"type\":\"command\",\"command\":\"echo keep-new\"}]}}\n";
         fs::write(&hooks_path, newer_user_hooks).unwrap();
         let cas_err = compare_and_replace_file(&hooks_path, "0000000000000000000000000000000000000000000000000000000000000000", b"{}\n").unwrap_err();
-        assert!(!cas_err.1, "concurrent sha mismatch must report touched_live=false");
+        assert!(cas_err.contains("changed concurrently"), "{}", cas_err);
         assert_eq!(fs::read_to_string(&hooks_path).unwrap(), newer_user_hooks);
         let comp_rb = perform_rollback_internal(&cfg, &shome, &bid, false, false);
         assert_eq!(comp_rb["ok"], true, "{:?}", comp_rb);
         assert_eq!(fs::read_to_string(&hooks_path).unwrap(), newer_user_hooks);
 
-        // Codex C1b R2 #4 & #7: compound unpruned `tokenade-hook` invocation fails closed even though `bin/carbon-stack` stays in manifest, while an absolute hook targeting a DIFFERENT profile's `plugins/gemini-carbon-stack/hooks/audit.py` is allowed!
+        // Codex C1b R2 #4, #7 & R3 #4, #7: compound unpruned `tokenade-hook` AND `cd ... && python ../plugins/gemini-carbon-stack/hooks/tokenade_hook.py` MUST fail closed, while a Cyrillic other-profile path `/home/иван/plugins/gemini-carbon-stack/hooks/audit.py` MUST NOT panic or block install!
         let compound_tok = json!({
             "u": { "PreToolUse": [{"type": "command", "command": format!("echo hi && \"{}\" tokenade-hook --event PreToolUse", bin_hook_path.replace('\\', "/")), "timeout": 10}] }
         });
         fs::write(&hooks_path, serde_json::to_string_pretty(&compound_tok).unwrap()).unwrap();
         let blk_tok = perform_install(&repo, &cfg, &shome, false, true);
         assert_eq!(blk_tok["ok"], false, "compound tokenade-hook must fail closed: {:?}", blk_tok);
+        let parent_rel_tok = json!({
+            "u": { "PreToolUse": [{"type": "command", "command": format!("sh -c \"cd '{}/rules' && python ../plugins/gemini-carbon-stack/hooks/tokenade_hook.py\"", cfg.to_string_lossy().replace('\\', "/")), "timeout": 10}] }
+        });
+        fs::write(&hooks_path, serde_json::to_string_pretty(&parent_rel_tok).unwrap()).unwrap();
+        let blk_rel = perform_install(&repo, &cfg, &shome, false, true);
+        assert_eq!(blk_rel["ok"], false, "relative ../plugins/gemini-carbon-stack/hooks/tokenade_hook.py must fail closed: {:?}", blk_rel);
         let other_prof = json!({
-            "other-profile": { "PreToolUse": [{"type": "command", "command": "python \"/other-profile/plugins/gemini-carbon-stack/hooks/audit.py\"", "timeout": 10}] }
+            "other-profile": { "PreToolUse": [{"type": "command", "command": "python \"/home/иван/plugins/gemini-carbon-stack/hooks/audit.py\"", "timeout": 10}] }
         });
         fs::write(&hooks_path, serde_json::to_string_pretty(&other_prof).unwrap()).unwrap();
         let ok_other = perform_install(&repo, &cfg, &shome, false, true);
-        assert_eq!(ok_other["ok"], true, "other-profile plugin path must not block install: {:?}", ok_other);
+        assert_eq!(ok_other["ok"], true, "Cyrillic other-profile plugin path must not panic or block install: {:?}", ok_other);
     }
 
     #[test]

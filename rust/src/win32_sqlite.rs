@@ -1256,11 +1256,62 @@ pub fn release_legacy_lock_token(lock_path: &Path, token: LegacyLockToken) {
     let _ = fs::remove_dir(lock_path);
 }
 
+#[cfg(windows)]
+fn path_to_wide_nul(p: &Path) -> std::io::Result<Vec<u16>> {
+    let mut w: Vec<u16> = p.as_os_str().encode_wide().collect();
+    if w.contains(&0) { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path")); }
+    w.push(0);
+    Ok(w)
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn path_cstr(p: &Path) -> std::io::Result<CString> {
     use std::os::unix::ffi::OsStrExt;
     CString::new(p.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))
+}
+
+#[cfg(windows)]
+pub(crate) fn atomic_swap_capturing_displaced(target: &Path, replacement: &Path, displaced_out: &Path) -> std::io::Result<PathBuf> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn ReplaceFileW(lpReplacedFileName: *const u16, lpReplacementFileName: *const u16, lpBackupFileName: *const u16, dwReplaceFlags: u32, lpExclude: *mut c_void, lpReserved: *mut c_void) -> c_int;
+        fn MoveFileExW(lpExistingFileName: *const u16, lpNewFileName: *const u16, dwFlags: u32) -> c_int;
+    }
+    let (tw, rw, dw) = (path_to_wide_nul(target)?, path_to_wide_nul(replacement)?, path_to_wide_nul(displaced_out)?);
+    // SAFETY: All three buffers are NUL-terminated UTF-16 with no interior NULs; `0x6` (`IGNORE_MERGE_ERRORS | IGNORE_ACL_ERRORS`) atomically moves live `target` to `displaced_out` and puts `replacement` at `target`.
+    if unsafe { ReplaceFileW(tw.as_ptr(), rw.as_ptr(), dw.as_ptr(), 0x0000_0006, ptr::null_mut(), ptr::null_mut()) } == 0 {
+        let err = std::io::Error::last_os_error();
+        if displaced_out.exists() {
+            // SAFETY: `dwFlags = 0` omits `MOVEFILE_REPLACE_EXISTING`, so a concurrently recreated `target` is never overwritten.
+            let _ = unsafe { MoveFileExW(dw.as_ptr(), tw.as_ptr(), 0) };
+        }
+        return Err(err);
+    }
+    Ok(displaced_out.to_path_buf())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn atomic_swap_capturing_displaced(target: &Path, replacement: &Path, _displaced_out: &Path) -> std::io::Result<PathBuf> {
+    extern "C" { fn renameat2(olddirfd: c_int, oldpath: *const c_char, newdirfd: c_int, newpath: *const c_char, flags: u32) -> c_int; }
+    let (tc, rc_p) = (path_cstr(target)?, path_cstr(replacement)?);
+    // SAFETY: NUL-terminated C paths; `RENAME_EXCHANGE` (`2`) atomically swaps `replacement` and `target` so `replacement` holds the exact displaced inode.
+    if unsafe { renameat2(-100, rc_p.as_ptr(), -100, tc.as_ptr(), 2) } != 0 { return Err(std::io::Error::last_os_error()); }
+    Ok(replacement.to_path_buf())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn atomic_swap_capturing_displaced(target: &Path, replacement: &Path, _displaced_out: &Path) -> std::io::Result<PathBuf> {
+    extern "C" { fn renamex_np(from: *const c_char, to: *const c_char, flags: u32) -> c_int; }
+    let (tc, rc_p) = (path_cstr(target)?, path_cstr(replacement)?);
+    // SAFETY: NUL-terminated C paths; `RENAME_SWAP` (`2`) atomically swaps `replacement` and `target` so `replacement` holds the exact displaced inode.
+    if unsafe { renamex_np(rc_p.as_ptr(), tc.as_ptr(), 2) } != 0 { return Err(std::io::Error::last_os_error()); }
+    Ok(replacement.to_path_buf())
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+pub(crate) fn atomic_swap_capturing_displaced(_target: &Path, _replacement: &Path, _displaced_out: &Path) -> std::io::Result<PathBuf> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "atomic file swap unsupported on this OS"))
 }
 
 #[cfg(unix)]
