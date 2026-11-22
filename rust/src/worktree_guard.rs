@@ -107,11 +107,13 @@ fn git_out(p: &str, a: &[&str]) -> Result<String, String> {
     if rc == 0 { Ok(o) } else { Err(if e.trim().is_empty() { format!("exit_{}", rc) } else { e.trim().into() }) }
 }
 fn pending_files(p: &str) -> Result<Vec<String>, String> { Ok(git_out(p, &["status", "--porcelain"])?.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect()) }
-fn commit_tree_obj(top: &str, tree: &str, parent: Option<&str>, msg: &str) -> Result<String, String> {
+fn commit_tree_obj(top: &str, tree: &str, parents: &[&str], msg: &str) -> Result<String, String> {
     let mut args: Vec<&str> = vec!["commit-tree", tree];
-    if let Some(p) = parent.filter(|s| !s.trim().is_empty()) {
-        args.push("-p");
-        args.push(p);
+    for p in parents {
+        if !p.trim().is_empty() {
+            args.push("-p");
+            args.push(p);
+        }
     }
     args.push("-m");
     args.push(msg);
@@ -128,8 +130,8 @@ fn commit_tree_obj(top: &str, tree: &str, parent: Option<&str>, msg: &str) -> Re
     }
 }
 
-fn capture_conflicted_index_tree(top: &str) -> Result<String, String> {
-    // SAFETY: Build `idx_tree` inside an isolated copy of the real `.git/index` so stage-0 staged files survive verbatim alongside preserved conflict stages (`.cwg-unmerged/stage<N>/<path>`) while leaving `.git/index` untouched.
+fn capture_conflicted_index_trees(top: &str) -> Result<(String, String), String> {
+    // SAFETY: Build `staged_tree` (verbatim stage-0 staged files) and `conflicts_tree` (pure `stage<N>/<path>` entries) in TWO separate temp index files so synthetic stage prefixes can never overwrite or collide with staged user paths.
     let (rc_ip, raw_ip, err_ip) = rio::run_git(top, &["rev-parse", "--git-path", "index"], 5.0);
     let ip_rel = raw_ip.trim();
     if rc_ip != 0 || ip_rel.is_empty() {
@@ -147,31 +149,36 @@ fn capture_conflicted_index_tree(top: &str) -> Result<String, String> {
     ));
     fs::create_dir_all(&dir).map_err(|e| format!("temp index dir failed: {}", e))?;
     let _guard = TempDirGuard(dir.clone());
-    let tmp_idx = dir.join("index");
-    fs::copy(&src_idx, &tmp_idx).map_err(|e| format!("copy git index failed: {}", e))?;
-    let tmp_idx_s = tmp_idx.to_string_lossy().into_owned();
-    let ge = [("GIT_INDEX_FILE", tmp_idx_s.as_str())];
+    let tmp_idx_staged = dir.join("index-staged");
+    fs::copy(&src_idx, &tmp_idx_staged).map_err(|e| format!("copy git index failed: {}", e))?;
+    let tmp_idx_staged_s = tmp_idx_staged.to_string_lossy().into_owned();
+    let ge_staged = [("GIT_INDEX_FILE", tmp_idx_staged_s.as_str())];
 
-    let (rc_u, out_u, err_u) = rio::run_git_raw(top, &["ls-files", "-u", "-z"], 10.0, None, &ge);
+    let (rc_u, out_u, err_u) = rio::run_git_raw(top, &["ls-files", "-u", "-z"], 10.0, None, &ge_staged);
     if rc_u != 0 || out_u.is_empty() {
         return Err(format!("ls-files -u -z failed: {}", truncate_chars(err_u.trim(), 120)));
     }
-    let mut unmerged_paths = BTreeSet::<String>::new();
-    let mut info_buf = Vec::<u8>::new();
+    let mut unmerged_paths = BTreeSet::<Vec<u8>>::new();
+    let mut conflict_info_buf = Vec::<u8>::new();
     for rec in out_u.split(|&b| b == 0).filter(|s| !s.is_empty()) {
-        let rec_s = std::str::from_utf8(rec).map_err(|_| "non-utf8 path in unmerged index".to_string())?;
-        let (meta, path) = rec_s.split_once('\t').ok_or_else(|| "malformed ls-files -u record".to_string())?;
+        let Some(tab) = rec.iter().position(|&b| b == b'\t') else {
+            return Err("malformed ls-files -u record".into());
+        };
+        let meta = std::str::from_utf8(&rec[..tab])
+            .map_err(|_| "non-ascii metadata in unmerged index".to_string())?;
         let mut parts = meta.split_whitespace();
         let (Some(mode), Some(oid), Some(stage)) = (parts.next(), parts.next(), parts.next()) else {
             return Err("malformed ls-files -u metadata".into());
         };
-        unmerged_paths.insert(path.to_string());
-        let line = format!("{} {} 0\t.cwg-unmerged/stage{}/{}\0", mode, oid, stage, path);
-        info_buf.extend_from_slice(line.as_bytes());
+        let path_bytes = &rec[tab + 1..];
+        unmerged_paths.insert(path_bytes.to_vec());
+        conflict_info_buf.extend_from_slice(format!("{} {} 0\tstage{}/", mode, oid, stage).as_bytes());
+        conflict_info_buf.extend_from_slice(path_bytes);
+        conflict_info_buf.push(0);
     }
     let mut rm_buf = Vec::<u8>::new();
     for p in &unmerged_paths {
-        rm_buf.extend_from_slice(p.as_bytes());
+        rm_buf.extend_from_slice(p);
         rm_buf.push(0);
     }
     let (rc_rm, _, err_rm) = rio::run_git_raw(
@@ -179,41 +186,52 @@ fn capture_conflicted_index_tree(top: &str) -> Result<String, String> {
         &["update-index", "-z", "--force-remove", "--stdin"],
         30.0,
         Some(&rm_buf),
-        &ge,
+        &ge_staged,
     );
     if rc_rm != 0 {
         return Err(format!("update-index remove unmerged failed: {}", truncate_chars(err_rm.trim(), 120)));
     }
+    let (rc_wt_st, out_wt_st, err_wt_st) = rio::run_git_env(top, &["write-tree"], 30.0, &ge_staged);
+    let staged_tree = out_wt_st.trim().to_string();
+    if rc_wt_st != 0 || staged_tree.is_empty() {
+        return Err(format!("staged write-tree failed: {}", truncate_chars(err_wt_st.trim(), 120)));
+    }
+
+    let tmp_idx_conflicts = dir.join("index-conflicts");
+    let tmp_idx_conflicts_s = tmp_idx_conflicts.to_string_lossy().into_owned();
+    let ge_conflicts = [("GIT_INDEX_FILE", tmp_idx_conflicts_s.as_str())];
     let (rc_up, _, err_up) = rio::run_git_raw(
         top,
         &["update-index", "-z", "--index-info"],
         30.0,
-        Some(&info_buf),
-        &ge,
+        Some(&conflict_info_buf),
+        &ge_conflicts,
     );
     if rc_up != 0 {
         return Err(format!("update-index preserve conflict stages failed: {}", truncate_chars(err_up.trim(), 120)));
     }
-    let (rc_wt, out_wt, err_wt) = rio::run_git_env(top, &["write-tree"], 30.0, &ge);
-    let tree = out_wt.trim().to_string();
-    if rc_wt != 0 || tree.is_empty() {
-        return Err(format!("conflicted write-tree failed: {}", truncate_chars(err_wt.trim(), 120)));
+    let (rc_wt_cf, out_wt_cf, err_wt_cf) = rio::run_git_env(top, &["write-tree"], 30.0, &ge_conflicts);
+    let conflicts_tree = out_wt_cf.trim().to_string();
+    if rc_wt_cf != 0 || conflicts_tree.is_empty() {
+        return Err(format!("conflicts write-tree failed: {}", truncate_chars(err_wt_cf.trim(), 120)));
     }
-    Ok(tree)
+    Ok((staged_tree, conflicts_tree))
 }
 
 fn capture_snapshot_commits(
     top: &str,
     head: Option<&str>,
     msg: &str,
-) -> Result<(String, Option<String>), String> {
-    // SAFETY: Capture staged index (including conflict stages when unmerged) BEFORE working-tree snapshot via isolated/read-only `git write-tree` so neither staged changes nor conflict resolutions are overwritten by `git add -A`.
+) -> Result<(String, Option<String>, Option<String>), String> {
+    // SAFETY: Capture staged index (and conflict stages in a disjoint tree when unmerged) BEFORE working-tree snapshot via isolated/read-only `git write-tree` so neither staged changes nor conflict stages can overwrite each other or be lost to `git add -A`.
+    let head_parents: Vec<&str> = head.iter().copied().collect();
     let (rc_u, out_u, err_u) = rio::run_git(top, &["ls-files", "-u"], 10.0);
     if rc_u != 0 {
         return Err(format!("git ls-files failed: {}", truncate_chars(err_u.trim(), 120)));
     }
     let mut idx_tree = String::new();
     let mut idx_commit: Option<String> = None;
+    let mut conflicts_commit: Option<String> = None;
     if out_u.trim().is_empty() {
         let (rc_wt, out_wt, err_wt) = rio::run_git(top, &["write-tree"], 30.0);
         if rc_wt == 0 {
@@ -229,7 +247,7 @@ fn capture_snapshot_commits(
             if staged_differs {
                 idx_tree = candidate_idx_tree;
                 let idx_msg = format!("staged index before {}", msg);
-                idx_commit = Some(commit_tree_obj(top, &idx_tree, head, &idx_msg)?);
+                idx_commit = Some(commit_tree_obj(top, &idx_tree, &head_parents, &idx_msg)?);
             }
         } else {
             return Err(format!(
@@ -238,24 +256,32 @@ fn capture_snapshot_commits(
             ));
         }
     } else {
-        idx_tree = capture_conflicted_index_tree(top)?;
-        let idx_msg = format!("staged index + conflict stages before {}", msg);
-        idx_commit = Some(commit_tree_obj(top, &idx_tree, head, &idx_msg)?);
+        let (staged_tree, conflicts_tree) = capture_conflicted_index_trees(top)?;
+        idx_tree = staged_tree;
+        let idx_msg = format!("staged index before {}", msg);
+        let cf_msg = format!("conflict stages before {}", msg);
+        idx_commit = Some(commit_tree_obj(top, &idx_tree, &head_parents, &idx_msg)?);
+        conflicts_commit = Some(commit_tree_obj(top, &conflicts_tree, &head_parents, &cf_msg)?);
     }
 
     let wt_tree = rio::capture_worktree_tree_oid(top, SNAPSHOT_PROBE_TIMEOUT);
     if wt_tree.is_empty() {
         return Err("capture_worktree_tree_oid_failed".into());
     }
+    if let (Some(ref sc), Some(ref cc)) = (&idx_commit, &conflicts_commit) {
+        // SAFETY: Always create `wt_commit` with both `sc` and `cc` as parents so BOTH disjoint snapshots stay reachable from the snapshot branch/ref even if `wt_tree == idx_tree`.
+        let wt_commit = commit_tree_obj(top, &wt_tree, &[sc.as_str(), cc.as_str()], msg)?;
+        return Ok((wt_commit, idx_commit, conflicts_commit));
+    }
     if let Some(ref ic) = idx_commit {
         if wt_tree == idx_tree {
-            return Ok((ic.clone(), idx_commit));
+            return Ok((ic.clone(), idx_commit, None));
         }
-        let wt_commit = commit_tree_obj(top, &wt_tree, Some(ic.as_str()), msg)?;
-        return Ok((wt_commit, idx_commit));
+        let wt_commit = commit_tree_obj(top, &wt_tree, &[ic.as_str()], msg)?;
+        return Ok((wt_commit, idx_commit, None));
     }
-    let wt_commit = commit_tree_obj(top, &wt_tree, head, msg)?;
-    Ok((wt_commit, None))
+    let wt_commit = commit_tree_obj(top, &wt_tree, &head_parents, msg)?;
+    Ok((wt_commit, None, None))
 }
 
 pub fn snapshot_for_removal(p: &str, name: Option<&str>, br: Option<&str>) -> Option<Value> {
@@ -283,20 +309,23 @@ pub fn snapshot_for_removal(p: &str, name: Option<&str>, br: Option<&str>) -> Op
     let Some(target) = (0..50).filter(|&i| i != 1).map(|i| if i == 0 { base.clone() } else { format!("{}-{}", base, i) }).find(|c| rio::run_git(p, &["rev-parse", "--verify", "--quiet", c], 5.0).0 != 0) else { return err(format!("no free wip/ branch name for {}", lbl)); };
     let head = ne(git_out(p, &["rev-parse", "HEAD"]));
     if head.is_none() && pend.is_empty() { return None; }
-    let (mode, files, commit, staged_commit) = if pend.is_empty() {
-        ("ref", 0, head.unwrap_or_default(), None)
+    let (mode, files, commit, staged_commit, conflicts_commit) = if pend.is_empty() {
+        ("ref", 0, head.unwrap_or_default(), None, None)
     } else {
         let msg = format!("snapshot: unfinished work from worktree {}", lbl);
-        let (wt_c, st_c) = match capture_snapshot_commits(p, head.as_deref(), &msg) {
-            Ok(pair) => pair,
+        let (wt_c, st_c, cf_c) = match capture_snapshot_commits(p, head.as_deref(), &msg) {
+            Ok(triple) => triple,
             Err(m) => return err(m),
         };
-        ("commit", pend.len(), wt_c, st_c)
+        ("commit", pend.len(), wt_c, st_c, cf_c)
     };
     if rio::run_git(p, &["branch", &target, &commit], 10.0).0 != 0 { return err(format!("could not create branch {}", target)); }
     let mut out = json!({"branch": target, "mode": mode, "files": files, "ahead": ahead, "head": commit});
     if let Some(sc) = staged_commit {
         out["staged_commit"] = Value::String(sc);
+    }
+    if let Some(cc) = conflicts_commit {
+        out["conflicts_commit"] = Value::String(cc);
     }
     Some(out)
 }
@@ -309,7 +338,7 @@ pub fn evaluate_worktree_remove(payload: &Value) {
         rio::log_hook_event("worktree-snapshots", "snapshot_failed", json!({"session_id": sid, "worktree": p, "removed_branch": br, "failed": err}));
         eprintln_line(&format!("Could NOT save unfinished work from {}: {}. The worktree is being removed anyway.", p, err));
     } else {
-        rio::log_hook_event("worktree-snapshots", "snapshot_saved", json!({"session_id": sid, "worktree": p, "removed_branch": br, "saved_to": res["branch"], "mode": res["mode"], "files": res["files"], "ahead": res["ahead"], "head": res["head"], "staged_commit": res.get("staged_commit").cloned().unwrap_or(Value::Null)}));
+        rio::log_hook_event("worktree-snapshots", "snapshot_saved", json!({"session_id": sid, "worktree": p, "removed_branch": br, "saved_to": res["branch"], "mode": res["mode"], "files": res["files"], "ahead": res["ahead"], "head": res["head"], "staged_commit": res.get("staged_commit").cloned().unwrap_or(Value::Null), "conflicts_commit": res.get("conflicts_commit").cloned().unwrap_or(Value::Null)}));
     }
 }
 
@@ -336,8 +365,8 @@ pub fn snapshot_dirty_worktree(worktree_dir: &str, label: &str) -> Value {
         label,
         win32_sqlite::format_iso_utc(now)
     );
-    let (commit_sha, staged_commit) = match capture_snapshot_commits(&top, head_opt, &commit_msg) {
-        Ok(pair) => pair,
+    let (commit_sha, staged_commit, conflicts_commit) = match capture_snapshot_commits(&top, head_opt, &commit_msg) {
+        Ok(triple) => triple,
         Err(err_s) => {
             return json!({
                 "ok": false,
@@ -366,6 +395,9 @@ pub fn snapshot_dirty_worktree(worktree_dir: &str, label: &str) -> Value {
     });
     if let Some(sc) = staged_commit {
         out["staged_commit"] = Value::String(sc);
+    }
+    if let Some(cc) = conflicts_commit {
+        out["conflicts_commit"] = Value::String(cc);
     }
     out
 }
@@ -1033,12 +1065,14 @@ mod tests {
             let snap_br = rm_det["snapshot"]["branch"].as_str().unwrap();
             assert_eq!(rio::run_git(&repo_s, &["show", &format!("{}:detached.txt", snap_br)], 5.0).1, "keep-commit\n");
 
-            // 2d. Conflicted index (a.rs unmerged) + staged b.rs (V2) + reverted working-tree b.rs (V1) preserves BOTH staged b.rs and conflict stages!
+            // 2d. Conflicted index (a.rs unmerged) + staged user files at b.rs, .cwg-unmerged/stage2/a.rs, and stage2/a.rs + reverted worktree preserves ALL staged, worktree, and conflict trees without collision!
             assert_eq!(rio::run_git(&repo_s, &["branch", "conflict-src"], 5.0).0, 0);
             fs::write(repo.join("a.rs"), "ours-conflict\n").unwrap();
             fs::write(repo.join("b.rs"), "base-b\n").unwrap();
             assert_eq!(rio::run_git(&repo_s, &["add", "a.rs", "b.rs"], 5.0).0, 0);
             assert_eq!(rio::run_git(&repo_s, &["commit", "-m", "main conflict side"], 5.0).0, 0);
+            let conflict_target_oid = rio::git_head_oid(&repo_s);
+            assert!(!conflict_target_oid.is_empty());
 
             let wt_conf = base.join("wt-conflict-staged");
             let wt_conf_s = wt_conf.to_string_lossy().into_owned();
@@ -1052,14 +1086,21 @@ mod tests {
             fs::write(wt_conf.join("b.rs"), "base-b\n").unwrap();
             assert_eq!(rio::run_git(&wt_conf_s, &["add", "a.rs", "b.rs"], 5.0).0, 0);
             assert_eq!(rio::run_git(&wt_conf_s, &["commit", "-m", "branch conflict side"], 5.0).0, 0);
-            let (rc_merge, _, _) = rio::run_git(&wt_conf_s, &["merge", "master"], 5.0);
-            if rc_merge == 0 {
-                // Fallback if default branch was `main`
-                let _ = rio::run_git(&wt_conf_s, &["merge", "main"], 5.0);
-            }
+            let (rc_merge, _, _) = rio::run_git(&wt_conf_s, &["merge", &conflict_target_oid], 5.0);
+            assert_ne!(rc_merge, 0, "expected real merge conflict");
             assert!(!rio::run_git(&wt_conf_s, &["ls-files", "-u"], 5.0).1.trim().is_empty());
+
+            fs::create_dir_all(wt_conf.join(".cwg-unmerged").join("stage2")).unwrap();
+            fs::create_dir_all(wt_conf.join("stage2")).unwrap();
+            fs::write(wt_conf.join(".cwg-unmerged").join("stage2").join("a.rs"), "user-staged-cwg\n").unwrap();
+            fs::write(wt_conf.join("stage2").join("a.rs"), "user-staged-s2\n").unwrap();
             fs::write(wt_conf.join("b.rs"), "staged-b-v2\n").unwrap();
-            assert_eq!(rio::run_git(&wt_conf_s, &["add", "b.rs"], 5.0).0, 0);
+            assert_eq!(
+                rio::run_git(&wt_conf_s, &["add", "b.rs", ".cwg-unmerged/stage2/a.rs", "stage2/a.rs"], 5.0).0,
+                0
+            );
+            fs::write(wt_conf.join(".cwg-unmerged").join("stage2").join("a.rs"), "user-wt-cwg\n").unwrap();
+            fs::write(wt_conf.join("stage2").join("a.rs"), "user-wt-s2\n").unwrap();
             fs::write(wt_conf.join("b.rs"), "base-b\n").unwrap();
 
             let rm_conf = safe_remove_worktree(&wt_conf_s, &repo_s, true);
@@ -1067,10 +1108,17 @@ mod tests {
             assert!(!wt_conf.exists());
             let tip_c = rm_conf["snapshot"]["commit"].as_str().unwrap().to_string();
             let st_c = rm_conf["snapshot"]["staged_commit"].as_str().unwrap().to_string();
+            let cf_c = rm_conf["snapshot"]["conflicts_commit"].as_str().unwrap().to_string();
             assert_eq!(rio::run_git(&repo_s, &["show", &format!("{}:b.rs", st_c)], 5.0).1, "staged-b-v2\n");
+            assert_eq!(rio::run_git(&repo_s, &["show", &format!("{}:.cwg-unmerged/stage2/a.rs", st_c)], 5.0).1, "user-staged-cwg\n");
+            assert_eq!(rio::run_git(&repo_s, &["show", &format!("{}:stage2/a.rs", st_c)], 5.0).1, "user-staged-s2\n");
             assert_eq!(rio::run_git(&repo_s, &["show", &format!("{}:b.rs", tip_c)], 5.0).1, "base-b\n");
-            assert_eq!(rio::run_git(&repo_s, &["show", &format!("{}:.cwg-unmerged/stage2/a.rs", st_c)], 5.0).0, 0);
-            assert_eq!(rio::run_git(&repo_s, &["show", &format!("{}:.cwg-unmerged/stage3/a.rs", st_c)], 5.0).0, 0);
+            assert_eq!(rio::run_git(&repo_s, &["show", &format!("{}:.cwg-unmerged/stage2/a.rs", tip_c)], 5.0).1, "user-wt-cwg\n");
+            assert_eq!(rio::run_git(&repo_s, &["show", &format!("{}:stage2/a.rs", tip_c)], 5.0).1, "user-wt-s2\n");
+            assert_eq!(rio::run_git(&repo_s, &["show", &format!("{}:stage2/a.rs", cf_c)], 5.0).1, "theirs-conflict\n");
+            assert_eq!(rio::run_git(&repo_s, &["show", &format!("{}:stage3/a.rs", cf_c)], 5.0).1, "ours-conflict\n");
+            assert_eq!(rio::run_git(&repo_s, &["merge-base", "--is-ancestor", &st_c, &tip_c], 5.0).0, 0);
+            assert_eq!(rio::run_git(&repo_s, &["merge-base", "--is-ancestor", &cf_c, &tip_c], 5.0).0, 0);
         }
 
         // 3. Non-repo path in safe_remove_worktree fails closed with git_status_failed instead of clean.

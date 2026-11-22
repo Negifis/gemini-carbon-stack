@@ -4105,10 +4105,12 @@ fn extract_cli_diagnostic_text(
     parts.join("\n")
 }
 
-fn read_diff_file(path: &str) -> String {
-    let Ok(raw) = fs::read(path) else {
-        return String::new();
-    };
+fn read_diff_file_strict(path: &str) -> Result<String, String> {
+    let meta = fs::metadata(path).map_err(|e| format!("{}: {}", path, e))?;
+    if !meta.is_file() {
+        return Err(format!("not a regular file: {}", path));
+    }
+    let raw = fs::read(path).map_err(|e| format!("{}: {}", path, e))?;
     let text = if raw.starts_with(&[0xFF, 0xFE]) {
         let units: Vec<u16> = raw[2..]
             .chunks_exact(2)
@@ -4126,7 +4128,22 @@ fn read_diff_file(path: &str) -> String {
     } else {
         String::from_utf8_lossy(&raw).into_owned()
     };
-    text.replace('\0', "")
+    Ok(text.replace('\0', ""))
+}
+
+fn resolve_path_from_dir(raw: &str, base_dir: &Path) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let p = Path::new(trimmed);
+    if p.is_absolute() {
+        rio::resolve_abs_path(p).to_string_lossy().into_owned()
+    } else {
+        rio::resolve_abs_path(&base_dir.join(p))
+            .to_string_lossy()
+            .into_owned()
+    }
 }
 
 const CODEX_DISABLED_FEATURES: &[&str] = &[
@@ -5953,6 +5970,11 @@ struct ReviewArgs {
 }
 
 fn cmd_review(args: &ReviewArgs) -> i32 {
+    let inv_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    cmd_review_in_dir(args, &inv_dir)
+}
+
+fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
     if !args.review_id.is_empty() {
         if !aborted_rid_re().is_match(&args.review_id) {
             rio::print_cli_json(
@@ -5978,33 +6000,45 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
         }
     }
 
-    let cwd_raw = if args.cwd.trim().is_empty() {
-        env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
+    let cwd = if args.cwd.trim().is_empty() {
+        rio::resolve_abs_path(invocation_dir)
             .to_string_lossy()
             .into_owned()
     } else {
-        args.cwd.clone()
+        resolve_path_from_dir(&args.cwd, invocation_dir)
     };
-    let cwd = abs_path_from_str(&cwd_raw).to_string_lossy().into_owned();
     let git_root = rio::git_toplevel(&cwd, false).unwrap_or_else(|| cwd.clone());
     let review_root = if !git_root.is_empty() && Path::new(&git_root).is_dir() {
         git_root.as_str()
     } else {
         cwd.as_str()
     };
-    let resolved_diff_file: String = if args.diff_file.trim().is_empty() {
-        String::new()
-    } else {
-        let dp = Path::new(args.diff_file.trim());
-        if dp.is_absolute() {
-            rio::resolve_abs_path(dp).to_string_lossy().into_owned()
+    let resolved_diff_file = resolve_path_from_dir(&args.diff_file, invocation_dir);
+    let (explicit_diff_body, explicit_diff_sha): (Option<String>, String) =
+        if resolved_diff_file.is_empty() {
+            (None, String::new())
         } else {
-            rio::resolve_abs_path(&Path::new(&cwd).join(dp))
-                .to_string_lossy()
-                .into_owned()
-        }
-    };
+            match read_diff_file_strict(&resolved_diff_file) {
+                Ok(body) => {
+                    let digest = sha256_hex(body.as_bytes());
+                    (Some(body), digest)
+                }
+                Err(detail) => {
+                    rio::print_cli_json(
+                        &json!({
+                            "ok": false,
+                            "round_consumed": false,
+                            "error": "diff_file_unreadable",
+                            "diff_file": resolved_diff_file,
+                            "detail": detail,
+                            "hint": "Explicit --diff-file could not be read; pass an existing readable file path (relative paths resolve from the caller's current directory).",
+                        }),
+                        args.pretty,
+                    );
+                    return 2;
+                }
+            }
+        };
     let effort = if args.xhigh { "ultra" } else { "high" };
     let eff_model = resolve_review_model(&args.model, args.xhigh);
     let phase = if args.closure || args.phase == "closure" {
@@ -6319,16 +6353,13 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
         String::new()
     };
 
-    let (diff_stat, diff_text, base_inspect_hint) = if !resolved_diff_file.is_empty()
-        && Path::new(&resolved_diff_file).is_file()
-    {
-        let body = read_diff_file(&resolved_diff_file);
-        let st = summarize_diff_file_stat(&body);
+    let (diff_stat, diff_text, base_inspect_hint) = if let Some(ref body) = explicit_diff_body {
+        let st = summarize_diff_file_stat(body);
         let hint = format!(
             "Read diff file directly: {} (or inspect changed files via git diff / file reads)",
             resolved_diff_file
         );
-        (st, body, hint)
+        (st, body.clone(), hint)
     } else if cwg_common::is_git_oid(&curr_worktree_tree) {
         let (st, body) = run_git_diff_with_stat(review_root, "HEAD", Some(&curr_worktree_tree));
         let tree12 = &curr_worktree_tree[..curr_worktree_tree.len().min(12)];
@@ -6586,27 +6617,57 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
             );
             return 2;
         }
-    } else if resolved_diff_file.is_empty() {
-        let timeout_tree = saved_thread
+    } else {
+        let saved_timeout_diff_sha = saved_thread
             .as_ref()
-            .map(|st| val_to_str(st.get("timeout_worktree_tree_oid")))
+            .map(|st| val_to_str(st.get("timeout_diff_file_sha256")))
             .unwrap_or_default();
-        if !timeout_tree.is_empty()
-            && cwg_common::is_git_oid(&timeout_tree)
-            && cwg_common::is_git_oid(&curr_worktree_tree)
-        {
-            if timeout_tree != curr_worktree_tree {
-                let (td_st, td_body) =
-                    run_git_diff_with_stat(review_root, &timeout_tree, Some(&curr_worktree_tree));
-                let t1 = &timeout_tree[..timeout_tree.len().min(12)];
-                let t2 = &curr_worktree_tree[..curr_worktree_tree.len().min(12)];
-                interdiff_stat = td_st;
-                interdiff_text = td_body;
-                inspect_hint =
-                    format!("git diff --stat {} {}; git diff {} {} -- <file>", t1, t2, t1, t2);
-            } else {
+        if !resolved_diff_file.is_empty() {
+            if !saved_timeout_diff_sha.is_empty() && saved_timeout_diff_sha == explicit_diff_sha {
                 interdiff_stat.clear();
                 interdiff_text.clear();
+            } else {
+                interdiff_stat = if diff_stat.trim().is_empty() && diff_text.trim().is_empty() {
+                    format!(
+                        "Explicit diff file {} is now empty (0 diff lines).",
+                        resolved_diff_file
+                    )
+                } else {
+                    diff_stat.clone()
+                };
+                interdiff_text = diff_text.clone();
+                inspect_hint = base_inspect_hint.clone();
+            }
+        } else {
+            let timeout_tree = saved_thread
+                .as_ref()
+                .map(|st| val_to_str(st.get("timeout_worktree_tree_oid")))
+                .unwrap_or_default();
+            if !timeout_tree.is_empty()
+                && cwg_common::is_git_oid(&timeout_tree)
+                && cwg_common::is_git_oid(&curr_worktree_tree)
+            {
+                if timeout_tree != curr_worktree_tree {
+                    let (td_st, td_body) =
+                        run_git_diff_with_stat(review_root, &timeout_tree, Some(&curr_worktree_tree));
+                    let t1 = &timeout_tree[..timeout_tree.len().min(12)];
+                    let t2 = &curr_worktree_tree[..curr_worktree_tree.len().min(12)];
+                    interdiff_stat = td_st;
+                    interdiff_text = td_body;
+                    inspect_hint =
+                        format!("git diff --stat {} {}; git diff {} {} -- <file>", t1, t2, t1, t2);
+                } else {
+                    interdiff_stat.clear();
+                    interdiff_text.clear();
+                }
+            } else if !saved_timeout_diff_sha.is_empty() {
+                interdiff_stat = if diff_stat.trim().is_empty() && diff_text.trim().is_empty() {
+                    "Switched from --diff-file to live worktree (0 local diff lines).".to_string()
+                } else {
+                    diff_stat.clone()
+                };
+                interdiff_text = diff_text.clone();
+                inspect_hint = base_inspect_hint.clone();
             }
         }
     }
@@ -6852,6 +6913,8 @@ fn cmd_review(args: &ReviewArgs) -> i32 {
                         "closure_passes_completed": attempt_cls_done,
                         "last_reviewed_tree_oid": prev_tree_oid,
                         "timeout_worktree_tree_oid": curr_worktree_tree,
+                        "timeout_diff_file_sha256": explicit_diff_sha,
+                        "timeout_diff_file_path": resolved_diff_file,
                         "pending_timeout_round": attempt_round_num,
                         "last_review_output": attempt_prior_ledger,
                         "pending_timeout_resume": true,
@@ -12357,6 +12420,7 @@ print(verdict)
             assert!(val_to_str(rows[4].get("prompt")).contains("MODE: CLOSURE_VALIDATION (Pass 1/2)"));
             assert!(val_to_str(rows[5].get("prompt")).contains("ROUND_MODE: timeout_continuation"));
             assert!(val_to_str(rows[5].get("prompt")).contains("MODE: CLOSURE_VALIDATION (Pass 1/2)"));
+            assert!(!val_to_str(rows[5].get("prompt")).contains("CHANGES SINCE TIMED-OUT ATTEMPT"));
             assert!(val_to_str(rows[6].get("prompt")).contains("MODE: CLOSURE_VALIDATION (Pass 2/2"));
         }
     }
@@ -12414,15 +12478,166 @@ print(verdict)
             assert!(body.contains("plugin/hooks.json"), "body missing plugin/hooks.json: {}", body);
             assert!(body.contains("rust/src/a.rs"), "body missing rust/src/a.rs: {}", body);
 
-            // Relative `--diff-file candidate.diff` resolved from `--cwd <repo>/rust` reaches `<repo>/rust/candidate.diff` via absolute path even when Codex runs in `<repo>`.
-            let rel_cand = repo_dir.join("rust").join("candidate.diff");
-            fs::write(&rel_cand, "diff --git a/rust/src/a.rs b/rust/src/a.rs\n+pub fn b() {}\n").unwrap();
-            let resolved_rel = rio::resolve_abs_path(&Path::new(&subdir).join("candidate.diff"))
-                .to_string_lossy()
-                .into_owned();
+            // Finding #9: Relative `--diff-file candidate.diff` resolves from caller invocation dir, NOT `--cwd` repo subdir.
+            let caller_dir = tmp.0.join("caller");
+            fs::create_dir_all(&caller_dir).unwrap();
+            let caller_cand = caller_dir.join("candidate.diff");
+            fs::write(&caller_cand, "diff --git a/rust/src/a.rs b/rust/src/a.rs\n+pub fn from_caller() {}\n").unwrap();
+            let resolved_rel = resolve_path_from_dir("candidate.diff", &caller_dir);
             assert!(Path::new(&resolved_rel).is_absolute());
-            assert!(Path::new(&resolved_rel).is_file());
-            assert!(read_diff_file(&resolved_rel).contains("pub fn b()"));
+            assert_eq!(resolved_rel, caller_cand.to_string_lossy());
+            assert!(read_diff_file_strict(&resolved_rel).unwrap().contains("pub fn from_caller()"));
+        }
+    }
+
+    #[test]
+    fn test_diff_file_caller_cwd_fail_closed_and_timeout_update() {
+        let _lock = crate::win32_sqlite::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = TempTestDir::new("stage4-r3-diff-file");
+        let stack_home = tmp.0.join("stack");
+        let sessions_dir = tmp.0.join("sessions");
+        let caller_dir = tmp.0.join("caller");
+        let repo_dir = tmp.0.join("other-repo");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        fs::create_dir_all(&caller_dir).unwrap();
+        fs::create_dir_all(&repo_dir).unwrap();
+
+        let repo_s = repo_dir.to_string_lossy().into_owned();
+        if rio::run_git(&repo_s, &["init"], 5.0).0 == 0 {
+            let _ = rio::run_git(&repo_s, &["config", "user.email", "t@example.com"], 5.0);
+            let _ = rio::run_git(&repo_s, &["config", "user.name", "Test"], 5.0);
+            fs::write(repo_dir.join("base.rs"), "pub fn base() {}\n").unwrap();
+            assert_eq!(rio::run_git(&repo_s, &["add", "base.rs"], 5.0).0, 0);
+            assert_eq!(rio::run_git(&repo_s, &["commit", "-m", "init"], 5.0).0, 0);
+            fs::write(repo_dir.join("base.rs"), "pub fn local_repo_only_fn() {}\n").unwrap();
+        }
+
+        let cand_diff = caller_dir.join("candidate.diff");
+        let other_diff = caller_dir.join("other.diff");
+        let empty_diff = caller_dir.join("empty.diff");
+        fs::write(&cand_diff, "diff --git a/c.rs b/c.rs\n+pub fn explicit_caller_diff_fn() {}\n").unwrap();
+        fs::write(&other_diff, "diff --git a/o.rs b/o.rs\n+pub fn swapped_diff_file_fn() {}\n").unwrap();
+        fs::write(&empty_diff, "").unwrap();
+
+        assert_eq!(resolve_path_from_dir("candidate.diff", &caller_dir), cand_diff.to_string_lossy());
+        assert!(read_diff_file_strict(&resolve_path_from_dir("missing.diff", &caller_dir)).is_err());
+
+        #[cfg(windows)]
+        {
+            let py_path = tmp.0.join("mock_codex_diff.py");
+            let py_body = r#"import datetime, json, os, pathlib, sys, time
+argv = sys.argv[1:]
+prompt = sys.stdin.read() if not sys.stdin.isatty() else ""
+if len(argv) >= 2 and argv[0] == "login" and argv[1] == "status":
+    print("Logged in using ChatGPT")
+    sys.exit(0)
+plog = os.environ.get("DIFF_FILE_PROMPT_LOG", "")
+if plog:
+    with open(plog, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"argv": argv, "prompt": prompt}) + "\n")
+if "MOCK_SLEEP_TIMEOUT" in prompt:
+    time.sleep(2.5)
+    sys.exit(0)
+sess_root = pathlib.Path(os.environ["CARBON_CODEX_SESSIONS_DIR"])
+sess_root.mkdir(parents=True, exist_ok=True)
+sid = "sess-df-fixed-01"
+iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+verdict = "VERDICT: REVISE"
+rows = [
+    {"type": "session_meta", "timestamp": iso, "payload": {"id": sid, "session_id": sid, "source": "exec", "thread_source": "user"}},
+    {"type": "turn_context", "timestamp": iso, "payload": {"model": "gpt-6.2-sol", "effort": "high"}},
+    {"type": "response_item", "timestamp": iso, "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": prompt}]}},
+    {"type": "event_msg", "timestamp": iso, "payload": {"type": "task_complete", "last_agent_message": verdict}},
+]
+(sess_root / f"rollout-primary-{sid}.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+print(verdict)
+"#;
+            fs::write(&py_path, py_body).unwrap();
+            let mock_bin = tmp.0.join("codex.cmd");
+            fs::write(&mock_bin, "@echo off\r\npython -X utf8 \"%~dp0mock_codex_diff.py\" %*\r\n").unwrap();
+
+            let prompt_log = tmp.0.join("df_prompts.jsonl");
+            let _env = EnvVarGuard::set(&[
+                ("CARBON_STACK_HOME", Some(&stack_home.to_string_lossy())),
+                ("CARBON_CODEX_SESSIONS_DIR", Some(&sessions_dir.to_string_lossy())),
+                ("CARBON_CODEX_BIN", Some(&mock_bin.to_string_lossy())),
+                ("DIFF_FILE_PROMPT_LOG", Some(&prompt_log.to_string_lossy())),
+            ]);
+            wipe_breaker_for_test();
+
+            let make_args = |diff_rel: &str, summary: &str, timeout: Option<i64>| ReviewArgs {
+                cwd: repo_s.clone(),
+                summary: summary.to_string(),
+                intent: String::new(),
+                diff_file: diff_rel.to_string(),
+                review_id: String::new(),
+                session: "sess-diff-file-01".to_string(),
+                model: String::new(),
+                resume: String::new(),
+                new_session: false,
+                xhigh: false,
+                closure: false,
+                phase: "ordinary".to_string(),
+                timeout,
+                pretty: false,
+            };
+
+            // 1. Relative `--diff-file candidate.diff` resolves against `caller_dir`, NOT `--cwd repo_s`.
+            let rc1 = cmd_review_in_dir(&make_args("candidate.diff", "Initial caller cwd check", None), &caller_dir);
+            assert_eq!(rc1, 0);
+
+            // 2. Missing `--diff-file missing_patch.diff` fails closed WITHOUT falling back to local repo git diff or calling Codex.
+            let rc_missing = cmd_review_in_dir(&make_args("missing_patch.diff", "Should fail closed", None), &caller_dir);
+            assert_eq!(rc_missing, 2);
+
+            // 3. Round 2 times out (`MOCK_SLEEP_TIMEOUT`), then `candidate.diff` is updated to V2 before timeout continuation.
+            let rc_to1 = cmd_review_in_dir(&make_args("candidate.diff", "MOCK_SLEEP_TIMEOUT v1", Some(1)), &caller_dir);
+            assert_eq!(rc_to1, 3);
+            fs::write(&cand_diff, "diff --git a/c.rs b/c.rs\n+pub fn post_timeout_updated_patch_fn() {}\n").unwrap();
+            let rc_res1 = cmd_review_in_dir(&make_args("candidate.diff", "Resume after editing candidate.diff", None), &caller_dir);
+            assert_eq!(rc_res1, 0);
+
+            // 4. Round 3 times out on V2, swaps to `other.diff`, then times out on another round and swaps to `empty.diff`.
+            let rc_to2 = cmd_review_in_dir(&make_args("candidate.diff", "MOCK_SLEEP_TIMEOUT v2", Some(1)), &caller_dir);
+            assert_eq!(rc_to2, 3);
+            let rc_res2 = cmd_review_in_dir(&make_args("other.diff", "Resume with swapped other.diff", None), &caller_dir);
+            assert_eq!(rc_res2, 0);
+
+            let rc_to3 = cmd_review_in_dir(&make_args("other.diff", "MOCK_SLEEP_TIMEOUT before empty", Some(1)), &caller_dir);
+            assert_eq!(rc_to3, 3);
+            let rc_res3 = cmd_review_in_dir(&make_args("empty.diff", "Resume with empty.diff", None), &caller_dir);
+            assert_eq!(rc_res3, 0);
+
+            let rows: Vec<Value> = fs::read_to_string(&prompt_log)
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str::<Value>(l).unwrap())
+                .collect();
+            // 1 (ok) + 0 (missing failed closed!) + 1 (to1) + 1 (res1) + 1 (to2) + 1 (res2) + 1 (to3) + 1 (res3) = 7 invocations
+            assert_eq!(rows.len(), 7, "expected 7 Codex calls; missing file must not invoke Codex");
+
+            let p0 = val_to_str(rows[0].get("prompt"));
+            assert!(p0.contains("explicit_caller_diff_fn"), "p0 missing explicit diff: {}", p0);
+            assert!(p0.contains(&cand_diff.to_string_lossy().into_owned()), "p0 missing abs diff path: {}", p0);
+            assert!(!p0.contains("local_repo_only_fn"), "p0 leaked local git diff: {}", p0);
+
+            let p_res1 = val_to_str(rows[2].get("prompt"));
+            assert!(p_res1.contains("ROUND_MODE: timeout_continuation"));
+            assert!(p_res1.contains("CHANGES SINCE TIMED-OUT ATTEMPT:"));
+            assert!(p_res1.contains("INSPECT COMMANDS: Read diff file directly:"));
+            assert!(p_res1.contains("post_timeout_updated_patch_fn"));
+
+            let p_res2 = val_to_str(rows[4].get("prompt"));
+            assert!(p_res2.contains("ROUND_MODE: timeout_continuation"));
+            assert!(p_res2.contains(&other_diff.to_string_lossy().into_owned()));
+            assert!(p_res2.contains("swapped_diff_file_fn"));
+
+            let p_res3 = val_to_str(rows[6].get("prompt"));
+            assert!(p_res3.contains("ROUND_MODE: timeout_continuation"));
+            assert!(p_res3.contains(&empty_diff.to_string_lossy().into_owned()));
+            assert!(p_res3.contains("is now empty (0 diff lines)"));
         }
     }
 }
