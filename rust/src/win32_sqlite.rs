@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::env;
 use std::ffi::{c_char, c_double, c_int, c_void, CStr, CString};
 use std::fs;
@@ -9,6 +8,9 @@ use std::ptr;
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(windows)]
+use std::collections::HashSet;
 
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;

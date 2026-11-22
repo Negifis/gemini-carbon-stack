@@ -72,8 +72,16 @@ pub const REVIEW_ENGINE_INTERNAL_OPUS: &str = "internal-opus";
 pub const REVIEW_ENGINE_INTERNAL_NEON: &str = "internal-neon";
 pub const REVIEW_ENGINE_INTERNAL_CARBON: &str = "internal-carbon";
 
+fn is_advisory_simplify_worker_name(low_name: &str) -> bool {
+    low_name.contains("simplify") || low_name.starts_with("simp-") || low_name.starts_with("simp_")
+}
+
 pub fn is_review_worker_name(name: &str) -> bool {
     let low_name = name.trim().to_ascii_lowercase();
+    // INVARIANT: Advisory simplify workers (`simplify-reviewer`, `simplify-reuse`, `simp-*`) are strictly non-blocking and must never be classified as mandatory gate reviewers.
+    if is_advisory_simplify_worker_name(&low_name) {
+        return false;
+    }
     low_name.contains("review")
         || low_name.contains("adversarial")
         || low_name.contains("critic")
@@ -5569,6 +5577,9 @@ pub fn is_review_swarm_worker_with_brief(
     brief: &str,
 ) -> bool {
     let low = name.trim().to_ascii_lowercase();
+    if is_advisory_simplify_worker_name(&low) {
+        return !brief.trim().is_empty() && is_review_worker_hint(name, brief);
+    }
     let mdl = meta
         .and_then(|m| {
             m.get("model")

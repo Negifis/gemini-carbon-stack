@@ -10362,6 +10362,12 @@ mod tests {
             "",
             json!({
                 "members": {
+                    "simplify-reviewer": {
+                        "role": "worker",
+                        "conversation_id": "cid-simplify-wait",
+                        "model": cwg_common::SONNET_HIGH_MODEL,
+                        "killed": false
+                    },
                     "doc-helper": {
                         "role": "worker",
                         "conversation_id": "cid-doc-wait",
@@ -10377,8 +10383,9 @@ mod tests {
                 }
             }),
             &[
-                json!({"seq": 1, "agent": "doc-helper", "time": "2026-11-22T10:00:00Z", "text": "@coordinator [done] updated docs index"}),
-                json!({"seq": 2, "agent": "helper-1", "time": "2026-11-22T10:00:05Z", "text": "@coordinator [done] helper slice complete"}),
+                json!({"seq": 1, "agent": "simplify-reviewer", "time": "2026-11-22T09:59:55Z", "text": "@coordinator [done] advisory simplify pass complete"}),
+                json!({"seq": 2, "agent": "doc-helper", "time": "2026-11-22T10:00:00Z", "text": "@coordinator [done] updated docs index"}),
+                json!({"seq": 3, "agent": "helper-1", "time": "2026-11-22T10:00:05Z", "text": "@coordinator [done] helper slice complete"}),
             ],
             &[],
         );

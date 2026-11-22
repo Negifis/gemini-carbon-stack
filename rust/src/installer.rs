@@ -523,10 +523,56 @@ fn split_simple_hook_tokens(cmd: &str) -> Option<Vec<String>> {
     (!out.is_empty()).then_some(out)
 }
 
+fn unwrap_single_shell_wrapper(tokens: &[String]) -> Option<&str> {
+    let first_norm = norm_instance_path(&tokens[0], true);
+    let base = first_norm.rsplit('/').next().unwrap_or(&first_norm);
+    let mut i = 1usize;
+    if matches!(base, "sh" | "bash" | "dash" | "zsh" | "ash" | "ksh" | "sh.exe" | "bash.exe") {
+        while let Some(f) = tokens.get(i).map(String::as_str) {
+            if matches!(f, "-l" | "-e" | "-u" | "-f" | "--login") { i += 1; } else { break; }
+        }
+        let flag = tokens.get(i)?.as_str();
+        if matches!(flag, "-c" | "-lc" | "-ec" | "-ce") && i + 2 == tokens.len() {
+            return Some(tokens[i + 1].as_str());
+        }
+    } else if matches!(base, "cmd" | "cmd.exe") {
+        while let Some(f) = tokens.get(i).map(String::as_str) {
+            if matches!(f.to_ascii_lowercase().as_str(), "/d" | "/q" | "/s" | "/a" | "/u") { i += 1; } else { break; }
+        }
+        if tokens.get(i).is_some_and(|f| f.eq_ignore_ascii_case("/c")) && i + 2 == tokens.len() {
+            return Some(tokens[i + 1].as_str());
+        }
+    } else if matches!(base, "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe") {
+        while let Some(f) = tokens.get(i).map(String::as_str) {
+            let fl = f.to_ascii_lowercase();
+            if matches!(fl.as_str(), "-noprofile" | "-noninteractive" | "-nologo" | "-nop") {
+                i += 1;
+            } else if matches!(fl.as_str(), "-executionpolicy" | "-ep") && i + 1 < tokens.len() {
+                i += 2;
+            } else {
+                break;
+            }
+        }
+        if tokens.get(i).is_some_and(|f| matches!(f.to_ascii_lowercase().as_str(), "-command" | "-c")) && i + 2 == tokens.len() {
+            return Some(tokens[i + 1].as_str());
+        }
+    }
+    None
+}
+
 fn is_legacy_managed_tokenade_command(cmd: &str, config_dir: &Path, target_plugin_dir: &Path, is_windows: bool) -> bool {
+    is_legacy_managed_tokenade_command_depth(cmd, config_dir, target_plugin_dir, is_windows, 0)
+}
+
+fn is_legacy_managed_tokenade_command_depth(cmd: &str, config_dir: &Path, target_plugin_dir: &Path, is_windows: bool, depth: u8) -> bool {
     let Some(tokens) = split_simple_hook_tokens(cmd) else {
         return false;
     };
+    if depth < 2 {
+        if let Some(inner) = unwrap_single_shell_wrapper(&tokens) {
+            return is_legacy_managed_tokenade_command_depth(inner, config_dir, target_plugin_dir, is_windows, depth + 1);
+        }
+    }
     if tokens.len() >= 2 && (tokens[1] == "tokenade-hook" || (is_windows && tokens[1].eq_ignore_ascii_case("tokenade-hook"))) {
         let bin_norm = norm_instance_path(&tokens[0], is_windows);
         if matches_target_plugin_subpath(&tokens[0], config_dir, target_plugin_dir, is_windows, "bin/carbon-stack")
@@ -623,7 +669,74 @@ fn prune_managed_tokenade_entries(root: &mut Value, config_dir: &Path, target_pl
     total
 }
 
-fn plan_global_hooks_prune(config_dir: &Path, target_plugin_dir: &Path, is_windows: bool) -> Result<Option<(String, usize)>, String> {
+fn collect_hook_commands<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
+    match v {
+        Value::Array(arr) => for item in arr { collect_hook_commands(item, out); },
+        Value::Object(map) => {
+            if let Some(cmd) = map.get("command").and_then(Value::as_str) { out.push(cmd); }
+            for (k, val) in map {
+                if k != "command" { collect_hook_commands(val, out); }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn find_dangling_plugin_hook_ref(
+    root: &Value,
+    target_plugin_dir: &Path,
+    next_manifest: Option<&BTreeMap<String, String>>,
+    is_windows: bool,
+) -> Option<String> {
+    let Some(manifest) = next_manifest.filter(|m| !m.is_empty()) else { return None };
+    let mut cmds = Vec::new();
+    collect_hook_commands(root, &mut cmds);
+    if cmds.is_empty() { return None; }
+    let abs_pref = format!("{}/", norm_instance_path(&target_plugin_dir.to_string_lossy(), is_windows));
+    let rel_pref = if is_windows { format!("plugins/{}/", PLUGIN_NAME.to_ascii_lowercase()) } else { format!("plugins/{}/", PLUGIN_NAME) };
+    let home_norm = rio::home_dir().to_string_lossy().replace('\\', "/");
+    let manifest_keys: Vec<String> = manifest.keys().map(|k| if is_windows { k.to_ascii_lowercase() } else { k.clone() }).collect();
+    for cmd in cmds {
+        let mut norm = cmd.replace('\\', "/");
+        if !home_norm.is_empty() {
+            for pat in ["~/", "$HOME/", "${HOME}/"] {
+                norm = norm.replace(pat, &format!("{}/", home_norm.trim_end_matches('/')));
+            }
+            if is_windows {
+                let low = norm.to_ascii_lowercase();
+                if low.contains("%userprofile%/") {
+                    norm = low.replace("%userprofile%/", &format!("{}/", home_norm.trim_end_matches('/').to_ascii_lowercase()));
+                }
+            }
+        }
+        let hay = if is_windows { norm.to_ascii_lowercase() } else { norm };
+        for pref in [&abs_pref, &rel_pref] {
+            let mut offset = 0usize;
+            while let Some(pos) = hay[offset..].find(pref.as_str()) {
+                let start = offset + pos;
+                let quote_before = start.checked_sub(1).and_then(|idx| hay.as_bytes().get(idx)).copied().filter(|&b| b == b'"' || b == b'\'');
+                let rest = &hay[start + pref.len()..];
+                let end = rest.find(|c: char| match quote_before {
+                    Some(q) => c as u32 == q as u32 || matches!(c, '\n' | '\r'),
+                    None => c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '&' | '|' | '>' | '<' | ')' | ',' | '\n' | '\r'),
+                }).unwrap_or(rest.len());
+                let rel = rest[..end].trim_start_matches("./").trim_end_matches('/');
+                if !rel.is_empty() && !manifest_keys.iter().any(|k| k == rel) {
+                    return Some(rel.to_string());
+                }
+                offset = start + pref.len();
+            }
+        }
+    }
+    None
+}
+
+fn plan_global_hooks_prune(
+    config_dir: &Path,
+    target_plugin_dir: &Path,
+    next_manifest: Option<&BTreeMap<String, String>>,
+    is_windows: bool,
+) -> Result<Option<(String, usize, String)>, String> {
     let hooks_path = config_dir.join("hooks.json");
     if win32_sqlite::is_link_or_junction(&hooks_path) {
         return Err(format!("Refusing symlink/junction global hooks.json: {}", hooks_path.display()));
@@ -634,22 +747,32 @@ fn plan_global_hooks_prune(config_dir: &Path, target_plugin_dir: &Path, is_windo
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("Cannot inspect {}: {}", hooks_path.display(), e)),
     }
-    let raw = fs::read_to_string(&hooks_path).map_err(|e| format!("Cannot read {}: {}", hooks_path.display(), e))?;
+    let raw_bytes = fs::read(&hooks_path).map_err(|e| format!("Cannot read {}: {}", hooks_path.display(), e))?;
+    let source_sha = rio::sha256_hex(&raw_bytes);
+    let raw = String::from_utf8(raw_bytes).map_err(|e| format!("Cannot decode {}: {}", hooks_path.display(), e))?;
     let mut parsed: Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
         Err(e) => {
             let lower = raw.to_ascii_lowercase();
-            if lower.contains("tokenade_hook.py") || lower.contains("tokenade-hook") {
-                return Err(format!("Invalid JSON in {} prevents pruning legacy tokenade hook: {}", hooks_path.display(), e));
+            if lower.contains("tokenade_hook.py") || lower.contains("tokenade-hook") || lower.contains(PLUGIN_NAME) {
+                return Err(format!("Invalid JSON in {} prevents validating legacy plugin hooks: {}", hooks_path.display(), e));
             }
             return Ok(None);
         }
     };
     let pruned = prune_managed_tokenade_entries(&mut parsed, config_dir, target_plugin_dir, is_windows);
+    // INVARIANT: Fail closed BEFORE modifying/pruning the plugin tree if any unpruned global hook still targets a plugin file absent from the incoming manifest.
+    if let Some(dangling) = find_dangling_plugin_hook_ref(&parsed, target_plugin_dir, next_manifest, is_windows) {
+        return Err(format!(
+            "Global {} still references plugin target '{}' that this install would remove; update or remove that hook entry before installing",
+            hooks_path.display(),
+            dangling
+        ));
+    }
     if pruned == 0 {
         return Ok(None);
     }
-    Ok(Some((format!("{}\n", serde_json::to_string_pretty(&parsed).map_err(|e| e.to_string())?), pruned)))
+    Ok(Some((format!("{}\n", serde_json::to_string_pretty(&parsed).map_err(|e| e.to_string())?), pruned, source_sha)))
 }
 
 fn preflight_check_for_os_mode(repo_root: &Path, config_dir: &Path, is_windows: bool, allow_unbuilt_hook_bin: bool) -> Value {
@@ -701,7 +824,9 @@ fn preflight_check_for_os_mode(repo_root: &Path, config_dir: &Path, is_windows: 
     let mut src_links = Vec::new();
     collect_links_under_tree(&source_plugin_dir, &mut src_links);
     errors.extend(src_links.into_iter().map(|l| format!("Refusing nested symlink/junction: {}", l.display())));
-    if let Err(e) = plan_global_hooks_prune(config_dir, &target_plugin_dir, is_windows) {
+    let preflight_manifest = (!bootstrap_build_required && source_plugin_dir.is_dir())
+        .then(|| effective_source_manifest_for_target(&source_plugin_dir, Some(&target_plugin_dir), is_windows));
+    if let Err(e) = plan_global_hooks_prune(config_dir, &target_plugin_dir, preflight_manifest.as_ref(), is_windows) {
         errors.push(e);
     }
 
@@ -1547,11 +1672,11 @@ fn perform_install(repo_root: &Path, config_dir: &Path, stack_home: &Path, dry_r
     }
 
     let target_global_hooks = config_dir.join("hooks.json");
-    let hooks_prune = match plan_global_hooks_prune(config_dir, &target_plugin_dir, cfg!(windows)) {
+    let src_manifest = effective_source_manifest_for_target(&source_plugin_dir, Some(&target_plugin_dir), cfg!(windows));
+    let hooks_prune = match plan_global_hooks_prune(config_dir, &target_plugin_dir, (!bootstrap_req).then_some(&src_manifest), cfg!(windows)) {
         Ok(p) => p,
         Err(e) => return stage_err("preflight", e),
     };
-    let src_manifest = effective_source_manifest_for_target(&source_plugin_dir, Some(&target_plugin_dir), cfg!(windows));
     let dst_manifest = tree_manifest(&target_plugin_dir);
     let src_rule_sha = sha256_file_full(&source_glob_rule).unwrap_or_default();
     let dst_rule_sha = if target_glob_rule.is_file() { sha256_file_full(&target_glob_rule).unwrap_or_default() } else { String::new() };
@@ -1575,7 +1700,7 @@ fn perform_install(repo_root: &Path, config_dir: &Path, stack_home: &Path, dry_r
     if !rule_identical {
         planned_actions.push(format!("{} glob rule -> {}", if target_glob_rule.exists() { "update" } else { "install" }, target_glob_rule.display()));
     }
-    if let Some((_, cnt)) = &hooks_prune {
+    if let Some((_, cnt, _)) = &hooks_prune {
         planned_actions.push(format!("prune {} legacy tokenade hook entry(ies) -> {}", cnt, target_global_hooks.display()));
     }
 
@@ -1598,29 +1723,47 @@ fn perform_install(repo_root: &Path, config_dir: &Path, stack_home: &Path, dry_r
         Ok(m) => m,
         Err(e) => return stage_err("backup", e),
     };
+    // INVARIANT: Bind global `hooks.json` publication to the exact backed-up SHA-256 and never restore `hooks.json` during compensation if install has not modified it.
+    if let Some((_, _, ref planned_sha)) = hooks_prune {
+        let bak_sha = backup_meta.pointer("/targets/global_hooks/sha256").and_then(Value::as_str);
+        if bak_sha != Some(planned_sha.as_str()) {
+            return stage_err(
+                "prune_global_hooks",
+                format!("Global {} changed concurrently before install; aborting without overwriting user edits", target_global_hooks.display()),
+            );
+        }
+    }
     let backup_id_str = backup_meta.get("backup_id").and_then(Value::as_str).unwrap_or("").to_string();
-    let fail_comp = |stage: &str, err: String| {
+    let fail_comp = |stage: &str, err: String, restore_hooks: bool| {
         let comp_ok = !backup_id_str.is_empty()
-            && perform_rollback_internal(config_dir, stack_home, &backup_id_str, true).get("ok").and_then(Value::as_bool) == Some(true);
+            && perform_rollback_internal(config_dir, stack_home, &backup_id_str, true, restore_hooks).get("ok").and_then(Value::as_bool) == Some(true);
         json!({ "ok": false, "stage": stage, "compensated_from_backup": comp_ok, "error": err })
     };
 
     if !plugin_identical {
         if let Err(e) = copy_clean_tree_additive_for_target(&source_plugin_dir, &target_plugin_dir, cfg!(windows), true) {
-            return fail_comp("copy_plugin", e);
+            return fail_comp("copy_plugin", e, false);
         }
         if let Err(e) = prune_stale_tree_entries(&source_plugin_dir, &target_plugin_dir, cfg!(windows), &retire_dirs) {
-            return fail_comp("prune_legacy_plugin", e);
+            return fail_comp("prune_legacy_plugin", e, false);
         }
     }
     if !rule_identical {
         if let Err(e) = atomic_copy_file(&source_glob_rule, &target_glob_rule) {
-            return fail_comp("copy_rule", e);
+            return fail_comp("copy_rule", e, false);
         }
     }
-    if let Some((rendered_hooks, _)) = hooks_prune {
+    if let Some((rendered_hooks, _, planned_sha)) = hooks_prune {
+        if sha256_file_full(&target_global_hooks).ok().as_deref() != Some(planned_sha.as_str()) {
+            return fail_comp(
+                "prune_global_hooks",
+                format!("Global {} changed concurrently during install; refusing to overwrite user edits", target_global_hooks.display()),
+                false,
+            );
+        }
         if let Err(e) = atomic_write_bytes_with_default_perms(&target_global_hooks, rendered_hooks.as_bytes(), None) {
-            return fail_comp("prune_global_hooks", e);
+            let live_changed = sha256_file_full(&target_global_hooks).ok().as_deref() != Some(planned_sha.as_str());
+            return fail_comp("prune_global_hooks", e, live_changed);
         }
     }
 
@@ -1639,7 +1782,7 @@ fn perform_install(repo_root: &Path, config_dir: &Path, stack_home: &Path, dry_r
 }
 
 fn perform_rollback(config_dir: &Path, stack_home: &Path, backup_selector: &str) -> Value {
-    perform_rollback_internal(config_dir, stack_home, backup_selector, false)
+    perform_rollback_internal(config_dir, stack_home, backup_selector, false, true)
 }
 
 fn resolve_rollback_backup_dir(stack_home: &Path, backup_selector: &str) -> Result<PathBuf, Value> {
@@ -1656,13 +1799,13 @@ fn resolve_rollback_backup_dir(stack_home: &Path, backup_selector: &str) -> Resu
     if valid { Ok(candidate) } else { Err(json!({ "ok": false, "error": format!("Backup '{}' not found", backup_selector) })) }
 }
 
-fn perform_rollback_internal(config_dir: &Path, stack_home: &Path, backup_selector: &str, caller_holds_mutex: bool) -> Value {
-    match perform_rollback_checked(config_dir, stack_home, backup_selector, caller_holds_mutex) {
+fn perform_rollback_internal(config_dir: &Path, stack_home: &Path, backup_selector: &str, caller_holds_mutex: bool, restore_global_hooks: bool) -> Value {
+    match perform_rollback_checked(config_dir, stack_home, backup_selector, caller_holds_mutex, restore_global_hooks) {
         Ok(v) | Err(v) => v,
     }
 }
 
-fn perform_rollback_checked(config_dir: &Path, stack_home: &Path, backup_selector: &str, caller_holds_mutex: bool) -> Result<Value, Value> {
+fn perform_rollback_checked(config_dir: &Path, stack_home: &Path, backup_selector: &str, caller_holds_mutex: bool, restore_global_hooks: bool) -> Result<Value, Value> {
     if !backup_selector.is_empty() && backup_selector != "latest" && !is_safe_backup_id(backup_selector) {
         return Err(json!({ "ok": false, "error": format!("Invalid backup id '{}'", backup_selector) }));
     }
@@ -1748,16 +1891,18 @@ fn perform_rollback_checked(config_dir: &Path, stack_home: &Path, backup_selecto
         }
     }
     let mut restore_hooks_sha: Option<String> = None;
-    if let Some(hi) = h_info {
-        if !matches_pinned_target_path(hi.get("path").and_then(Value::as_str).unwrap_or(""), &h_target) {
-            return Err(stage_err("rollback_validate", "Invalid backup manifest.json: global_hooks path mismatch"));
-        }
-        if let Some(hex) = hi.get("existed").and_then(Value::as_bool) {
-            if hex {
-                restore_hooks_sha = Some(verify_backup_file_sha(hi, &h_backup, "global_hooks").map_err(|e| stage_err("rollback_validate", e))?);
+    if restore_global_hooks {
+        if let Some(hi) = h_info {
+            if !matches_pinned_target_path(hi.get("path").and_then(Value::as_str).unwrap_or(""), &h_target) {
+                return Err(stage_err("rollback_validate", "Invalid backup manifest.json: global_hooks path mismatch"));
             }
-        } else if hi.get("migrations").and_then(Value::as_array).is_none() {
-            return Err(stage_err("rollback_validate", "Invalid backup manifest.json: missing `global_hooks.existed`"));
+            if let Some(hex) = hi.get("existed").and_then(Value::as_bool) {
+                if hex {
+                    restore_hooks_sha = Some(verify_backup_file_sha(hi, &h_backup, "global_hooks").map_err(|e| stage_err("rollback_validate", e))?);
+                }
+            } else if hi.get("migrations").and_then(Value::as_array).is_none() {
+                return Err(stage_err("rollback_validate", "Invalid backup manifest.json: missing `global_hooks.existed`"));
+            }
         }
     }
 
@@ -1844,9 +1989,9 @@ fn perform_diagnose_for_os(repo_root: &Path, config_dir: &Path, stack_home: &Pat
     let (target_plugin_dir, target_glob_rule) = (config_dir.join("plugins").join(PLUGIN_NAME), config_dir.join("rules").join("uiux-design.md"));
     let binary_path = target_plugin_dir.join(platform_hook_binary_rel(is_windows));
 
-    let plugin_trees_match = target_plugin_dir.is_dir()
-        && effective_source_manifest_for_target(&source_plugin_dir, Some(&target_plugin_dir), is_windows) == tree_manifest(&target_plugin_dir);
-    let hooks_clean = plan_global_hooks_prune(config_dir, &target_plugin_dir, is_windows).is_ok_and(|m| m.is_none());
+    let src_manifest = effective_source_manifest_for_target(&source_plugin_dir, Some(&target_plugin_dir), is_windows);
+    let plugin_trees_match = target_plugin_dir.is_dir() && src_manifest == tree_manifest(&target_plugin_dir);
+    let hooks_clean = plan_global_hooks_prune(config_dir, &target_plugin_dir, Some(&src_manifest), is_windows).is_ok_and(|m| m.is_none());
     let in_sync = plugin_trees_match
         && has_executable_hook_mode_for_os(&target_plugin_dir, is_windows)
         && hooks_clean
@@ -2351,6 +2496,10 @@ mod tests {
         assert!(!is_legacy_managed_tokenade_command(&format!("\"{}\" hook --event PreToolUse", bin_hook_path), &cfg, &target_plug, cfg!(windows)));
         assert!(is_legacy_managed_tokenade_command(&format!("PYTHON \"{}\"", py_hook_path.to_uppercase()), &cfg, &target_plug, true));
         assert!(is_legacy_managed_tokenade_command("carbon-stack tokenade-hook --event PreToolUse", &cfg, &target_plug, true));
+        // Codex C1b #4: unambiguous shell wrappers around managed legacy tokenade commands MUST be recognized & pruned.
+        assert!(is_legacy_managed_tokenade_command(&format!("sh -c \"python '{}'\"", py_hook_path), &cfg, &target_plug, false));
+        assert!(is_legacy_managed_tokenade_command("cmd /c \"carbon-stack tokenade-hook --event PreToolUse\"", &cfg, &target_plug, true));
+        assert!(!is_legacy_managed_tokenade_command(&format!("sh -c \"echo keep && python '{}'\"", py_hook_path), &cfg, &target_plug, false));
 
         let orig_hooks_str = format!(
             "{}\n",
@@ -2414,6 +2563,30 @@ mod tests {
         let rb = perform_rollback(&cfg, &shome, &bid);
         assert_eq!(rb["ok"], true, "{:?}", rb);
         assert_eq!(fs::read_to_string(&hooks_path).unwrap(), orig_hooks_str);
+
+        // Codex C1b #4: unpruned compound/custom reference to a plugin file absent from incoming manifest MUST fail closed BEFORE deleting plugin files.
+        let custom_plugin_script = target_plug.join("hooks").join("custom_user.py");
+        fs::create_dir_all(custom_plugin_script.parent().unwrap()).unwrap();
+        fs::write(&custom_plugin_script, "print('keep')\n").unwrap();
+        let dangling_hooks = json!({
+            "user-group": {
+                "enabled": true,
+                "PreToolUse": [{"type": "command", "command": format!("python \"{}\"", custom_plugin_script.to_string_lossy().replace('\\', "/")), "timeout": 10}]
+            }
+        });
+        fs::write(&hooks_path, serde_json::to_string_pretty(&dangling_hooks).unwrap()).unwrap();
+        let blocked = perform_install(&repo, &cfg, &shome, false, true);
+        assert_eq!(blocked["ok"], false, "dangling plugin hook ref must fail closed: {:?}", blocked);
+        assert_eq!(blocked["stage"], "preflight");
+        assert!(custom_plugin_script.is_file(), "install must fail before pruning referenced plugin script");
+        let _ = fs::remove_file(&custom_plugin_script);
+
+        // Codex C1b #1: compensation rollback with `restore_global_hooks = false` MUST NOT overwrite newer user edits in `hooks.json`.
+        let newer_user_hooks = "{\"user-new\":{\"enabled\":true,\"Stop\":[{\"type\":\"command\",\"command\":\"echo keep-new\"}]}}\n";
+        fs::write(&hooks_path, newer_user_hooks).unwrap();
+        let comp_rb = perform_rollback_internal(&cfg, &shome, &bid, false, false);
+        assert_eq!(comp_rb["ok"], true, "{:?}", comp_rb);
+        assert_eq!(fs::read_to_string(&hooks_path).unwrap(), newer_user_hooks);
     }
 
     #[test]

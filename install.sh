@@ -240,16 +240,25 @@ if [[ "${WITH_TOOLCHAINS}" -eq 1 ]]; then
   fi
 fi
 
+needs_rust_rebuild() {
+  local bin="$1"
+  if [[ ! -f "${bin}" ]]; then return 0; fi
+  if [[ -n "$(find "${SCRIPT_DIR}/rust/src" "${SCRIPT_DIR}/rust/Cargo.toml" "${SCRIPT_DIR}/rust/Cargo.lock" -type f -newer "${bin}" 2>/dev/null | head -n 1)" ]]; then
+    return 0
+  fi
+  return 1
+}
+
 if [[ "${IS_WIN_HOST}" -eq 1 ]]; then
   CARBON_BIN="${SCRIPT_DIR}/plugin/bin/carbon-stack.exe"
-  if [[ ! -f "${CARBON_BIN}" ]] && command -v cargo >/dev/null 2>&1; then
+  if needs_rust_rebuild "${CARBON_BIN}" && command -v cargo >/dev/null 2>&1; then
     cargo build --release --manifest-path "${SCRIPT_DIR}/rust/Cargo.toml"
     mkdir -p "${SCRIPT_DIR}/plugin/bin"
     cp "${SCRIPT_DIR}/rust/target/release/carbon-stack.exe" "${CARBON_BIN}"
   fi
 else
   CARBON_BIN="${SCRIPT_DIR}/plugin/bin/carbon-stack"
-  if [[ ! -x "${CARBON_BIN}" ]] && command -v cargo >/dev/null 2>&1; then
+  if { [[ ! -x "${CARBON_BIN}" ]] || needs_rust_rebuild "${CARBON_BIN}"; } && command -v cargo >/dev/null 2>&1; then
     cargo build --release --manifest-path "${SCRIPT_DIR}/rust/Cargo.toml"
     mkdir -p "${SCRIPT_DIR}/plugin/bin"
     cp "${SCRIPT_DIR}/rust/target/release/carbon-stack" "${CARBON_BIN}"
