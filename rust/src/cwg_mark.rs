@@ -2456,7 +2456,9 @@ fn is_clean_upstream_ff_reflog_transition(
     let mut saw_ff = false;
     for &(_, subj) in &entries[..delta] {
         let is_ff = (subj.starts_with("merge ") || subj.starts_with("pull "))
-            && subj.contains(": Fast-forward");
+            && subj.contains(": Fast-forward")
+            || (subj.starts_with("rebase")
+                && (subj.contains(": Fast-forward") || subj.contains("Fast-forwarded")));
         let is_move = subj.starts_with("checkout: moving from ");
         if is_ff {
             saw_ff = true;
@@ -2465,6 +2467,121 @@ fn is_clean_upstream_ff_reflog_transition(
         }
     }
     saw_ff
+}
+
+fn merge_tree_diff_rel_paths(
+    root: &str,
+    left_oid: &str,
+    right_oid: &str,
+    target_oid: &str,
+) -> Option<HashSet<String>> {
+    let (rc_m, mo) = run_git_bytes(root, &["merge-tree", "--write-tree", "--no-messages", left_oid, right_oid], 5.0);
+    let ms = String::from_utf8_lossy(&mo);
+    let mt = ms.lines().next().unwrap_or("").trim();
+    if !matches!(rc_m, 0 | 1) || mt.len() < 40 || !mt.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    if rc_m == 0 && rio::run_git(root, &["rev-parse", &format!("{}^{{tree}}", target_oid)], 3.0).1.trim() == mt {
+        return Some(HashSet::new());
+    }
+    let (rc_d, db) = run_git_bytes(root, &["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--no-renames", mt, target_oid], 4.0);
+    if rc_d != 0 {
+        return None;
+    }
+    Some(db.split(|&b| b == 0).filter(|b| !b.is_empty()).map(|b| String::from_utf8_lossy(b).into_owned()).collect())
+}
+
+fn clean_rebase_rel_paths(
+    root: &str,
+    bh: &str,
+    ah: &str,
+    b_reflog_len: usize,
+    a_reflog_len: usize,
+) -> Option<HashSet<String>> {
+    // INVARIANT: Verify `[commit... -> ] rebase (start..[pick..|finish])` via HEAD reflog + cryptographic `merge-tree(pre_rebase, onto)` vs `ah`, so upstream files from `onto` never leak on clean rebase or mid-rebase conflict pause while local commits, `--ours` conflict resolutions, and `rebase -x` mutations remain attributed.
+    if bh.is_empty() || ah.is_empty() || bh == ah || b_reflog_len == 0 || a_reflog_len <= b_reflog_len {
+        return None;
+    }
+    let delta = a_reflog_len - b_reflog_len;
+    if delta == 0 || delta > 256 {
+        return None;
+    }
+    let count_arg = (delta + 1).to_string();
+    let (rc_rl, rl_out, _) = rio::run_git(root, &["reflog", "show", "-n", &count_arg, "--format=%H %gs", "HEAD"], 3.0);
+    if rc_rl != 0 {
+        return None;
+    }
+    let entries: Vec<(&str, &str)> = rl_out.lines().filter_map(|l| l.split_once(' ')).collect();
+    if entries.len() != delta + 1 || entries[0].0 != ah || entries[delta].0 != bh {
+        return None;
+    }
+    let start_idx = entries[..delta].iter().position(|&(_, s)| s.starts_with("rebase (start): checkout "))?;
+    if !entries[start_idx + 1..delta].iter().all(|&(_, s)| {
+        s.starts_with("commit: ") || s.starts_with("commit (amend): ") || s.starts_with("commit (initial): ")
+    }) {
+        return None;
+    }
+    let onto_oid = entries[start_idx].0;
+    let pre_rebase_oid = entries[start_idx + 1].0;
+    let aborted = start_idx > 0 && entries[0].1.starts_with("rebase (abort): ") && ah == pre_rebase_oid;
+    let finished = start_idx > 0 && entries[0].1.starts_with("rebase (finish): ");
+    let clean_mid_pause = !finished
+        && !aborted
+        && entries[..start_idx].iter().all(|&(_, s)| s.starts_with("rebase (pick): "));
+    let all_rebase_steps = entries[..start_idx]
+        .iter()
+        .all(|&(_, s)| s.starts_with("rebase (") && !s.starts_with("rebase (start):"));
+    let mut local_rel = if aborted {
+        HashSet::new()
+    } else if finished && all_rebase_steps {
+        merge_tree_diff_rel_paths(root, pre_rebase_oid, onto_oid, ah)?
+    } else if clean_mid_pause {
+        if ah == onto_oid {
+            HashSet::new()
+        } else {
+            let (rc_p, pb) = run_git_bytes(root, &["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--no-renames", onto_oid, ah], 4.0);
+            let (rc_h, hb) = run_git_bytes(root, &["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--no-renames", bh, ah], 4.0);
+            if rc_p != 0 || rc_h != 0 {
+                return None;
+            }
+            let bh_set: HashSet<String> = hb.split(|&b| b == 0).filter(|b| !b.is_empty()).map(|b| String::from_utf8_lossy(b).into_owned()).collect();
+            pb.split(|&b| b == 0)
+                .filter(|b| !b.is_empty())
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .filter(|p| bh_set.contains(p))
+                .collect()
+        }
+    } else {
+        // SAFETY: Any mixed/non-clean rebase (finished or paused after e.g. `rebase -x` `commit (amend)`) fails closed: keep all `bh..ah`, `onto..ah`, and `merge-tree(pre_rebase, onto)..ah` paths so reverting an upstream file back to `bh` content is always attributed.
+        let mut full = merge_tree_diff_rel_paths(root, pre_rebase_oid, onto_oid, ah).unwrap_or_default();
+        let (rc_all, ab) = run_git_bytes(root, &["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--no-renames", bh, ah], 4.0);
+        if rc_all != 0 {
+            return None;
+        }
+        for p in ab.split(|&b| b == 0).filter(|b| !b.is_empty()) {
+            full.insert(String::from_utf8_lossy(p).into_owned());
+        }
+        if ah != onto_oid {
+            let (rc_o, ob) = run_git_bytes(root, &["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--no-renames", onto_oid, ah], 4.0);
+            if rc_o != 0 {
+                return None;
+            }
+            for p in ob.split(|&b| b == 0).filter(|b| !b.is_empty()) {
+                full.insert(String::from_utf8_lossy(p).into_owned());
+            }
+        }
+        full
+    };
+    if pre_rebase_oid != bh {
+        let (rc_l, lb) = run_git_bytes(root, &["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--no-renames", bh, pre_rebase_oid], 4.0);
+        if rc_l != 0 {
+            return None;
+        }
+        for p in lb.split(|&b| b == 0).filter(|b| !b.is_empty()) {
+            local_rel.insert(String::from_utf8_lossy(p).into_owned());
+        }
+    }
+    Some(local_rel)
 }
 
 fn clean_integration_rel_paths(
@@ -2482,16 +2599,11 @@ fn clean_integration_rel_paths(
     if let (0, po, _) = rio::run_git(root, &["rev-list", "--parents", "-n", "1", ah], 3.0) {
         let oids: Vec<&str> = po.split_whitespace().collect();
         if oids.len() >= 3 && oids[1] == bh {
-            let (rc_m, mo) = run_git_bytes(root, &["merge-tree", "--write-tree", "--no-messages", bh, oids[2]], 5.0);
-            let ms = String::from_utf8_lossy(&mo);
-            let mt = ms.lines().next().unwrap_or("").trim();
-            if matches!(rc_m, 0 | 1) && mt.len() >= 40 && mt.bytes().all(|b| b.is_ascii_hexdigit()) {
-                if rc_m == 0 && rio::run_git(root, &["rev-parse", &format!("{}^{{tree}}", ah)], 3.0).1.trim() == mt { return Some(HashSet::new()); }
-                let (rc_d, db) = run_git_bytes(root, &["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--no-renames", mt, ah], 4.0);
-                if rc_d == 0 { return Some(db.split(|&b| b == 0).filter(|b| !b.is_empty()).map(|b| String::from_utf8_lossy(b).into_owned()).collect()); }
-            }
-            return None;
+            return merge_tree_diff_rel_paths(root, bh, oids[2], ah);
         }
+    }
+    if let Some(rebase_rel) = clean_rebase_rel_paths(root, bh, ah, b_reflog_len, a_reflog_len) {
+        return Some(rebase_rel);
     }
     if !no_dirty || cmd.trim().is_empty() { return None; }
     let mut saw = false;
@@ -2510,7 +2622,7 @@ fn clean_integration_rel_paths(
             break t.to_ascii_lowercase();
         };
         if sub == "commit" || toks[i + 1..].iter().any(|x| x.eq_ignore_ascii_case("--amend")) { return None; }
-        if matches!(sub.as_str(), "pull" | "merge" | "checkout" | "switch" | "rebase") { saw = true; }
+        if matches!(sub.as_str(), "pull" | "merge" | "checkout" | "switch") { saw = true; }
         else if sub == "symbolic-ref" {
             let tail = &toks[i + 1..];
             let pos = tail.iter().filter(|x| !x.starts_with('-')).count();
@@ -2642,6 +2754,17 @@ pub fn diff_git_snapshots_for_cmd(
                 let is_clean_merged = merge_filter.as_ref().is_some_and(|cm| !cm.contains(&rel) && !a_entries.contains_key(&norm_p));
                 if !is_clean_merged && !unchanged_clean.contains(&norm_p) {
                     changed.insert(norm_p);
+                }
+            }
+        }
+        // INVARIANT: Include confirmed local paths from `merge_filter` even when final `a_head` matches pre-command `b_head` (e.g. `--ours` conflict override or `rebase -x` reverting an upstream edit).
+        if let Some(ref cm) = merge_filter {
+            for rel in cm {
+                if !cache_path_re().is_match(&rel.replace('\\', "/")) {
+                    let norm_p = rio::normalize_path(&Path::new(root).join(rel).to_string_lossy());
+                    if !unchanged_clean.contains(&norm_p) {
+                        changed.insert(norm_p);
+                    }
                 }
             }
         }
@@ -5528,6 +5651,195 @@ mod tests {
             "clean upstream ff onto conflict-resolved merge commit must not open local candidate: {:?}",
             up_merge_chg
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_commit_plus_rebase_excludes_upstream_files_and_keeps_local_edits() {
+        let root = std::env::temp_dir().join(format!(
+            "cwg-mark-rebase-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join("backend/migrations")).unwrap();
+        let repo_s = repo.to_string_lossy().into_owned();
+        let run_g = |args: &[&str]| {
+            let (rc, out, err) = rio::run_git(&repo_s, args, 10.0);
+            assert_eq!(rc, 0, "git {:?} failed: {} {}", args, out, err);
+        };
+        run_g(&["init"]);
+        run_g(&["config", "user.email", "t@example.com"]);
+        run_g(&["config", "user.name", "Tester"]);
+        run_g(&["config", "core.autocrlf", "false"]);
+        fs::write(repo.join("app.ts"), "export const v = 1;\n").unwrap();
+        run_g(&["add", "."]);
+        run_g(&["commit", "-m", "base"]);
+        let (_, br_out, _) = rio::run_git(&repo_s, &["branch", "--show-current"], 5.0);
+        let main_br = br_out.trim().to_string();
+
+        // Create feature branch with an already-dirty approved file, while upstream adds HIGH-risk migrations/auth files.
+        run_g(&["checkout", "-b", "feat"]);
+        run_g(&["checkout", &main_br]);
+        fs::write(repo.join("backend/migrations/350_up.sql"), "SELECT 1;\n").unwrap();
+        fs::write(repo.join("auth.ts"), "export const upAuth = true;\n").unwrap();
+        run_g(&["add", "."]);
+        run_g(&["commit", "-m", "upstream high-risk"]);
+        run_g(&["checkout", "feat"]);
+        fs::write(repo.join("app.ts"), "export const v = 2;\n").unwrap();
+
+        // Case 1 (anom-c89e0265): committing already-dirty app.ts + rebasing onto main must NOT attribute upstream migrations/auth.ts.
+        let before1 = take_git_snapshot(&repo_s, "", &[], None);
+        run_g(&["add", "app.ts"]);
+        run_g(&["commit", "-m", "feat change"]);
+        run_g(&["rebase", &main_br]);
+        let after1 = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg1, unm1) = diff_git_snapshots_for_cmd(
+            Some(&before1),
+            Some(&after1),
+            &format!("git add app.ts; git commit -m 'feat change'; git rebase {}", main_br),
+        );
+        assert!(!unm1);
+        assert!(chg1.is_empty(), "clean commit+rebase must not attribute upstream files: {:?}", chg1);
+
+        // Case 2 (security): a new file written + committed + rebased in one shell command MUST still be attributed while upstream files stay excluded.
+        run_g(&["checkout", &main_br]);
+        fs::write(repo.join("backend/migrations/351_up.sql"), "SELECT 2;\n").unwrap();
+        run_g(&["add", "."]);
+        run_g(&["commit", "-m", "upstream 351"]);
+        run_g(&["checkout", "feat"]);
+        let before2 = take_git_snapshot(&repo_s, "", &[], None);
+        fs::write(repo.join("secret.ts"), "export const secret = 1;\n").unwrap();
+        run_g(&["add", "secret.ts"]);
+        run_g(&["commit", "-m", "add secret"]);
+        run_g(&["rebase", &main_br]);
+        let after2 = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg2, unm2) = diff_git_snapshots_for_cmd(
+            Some(&before2),
+            Some(&after2),
+            &format!("echo x > secret.ts; git add secret.ts; git commit -m 'add secret'; git rebase {}", main_br),
+        );
+        assert!(!unm2);
+        assert!(chg2.iter().any(|p| p.ends_with("/secret.ts")), "new local file committed before rebase must be tracked: {:?}", chg2);
+        assert!(!chg2.iter().any(|p| p.ends_with("351_up.sql")), "upstream 351_up.sql must stay excluded: {:?}", chg2);
+
+        // Case 3a (security / R1 #3): rebase `-x` reverting an upstream edit to exact pre-rebase `b_head` content MUST still attribute auth.ts even when `diff(b_head, a_head)` omits auth.ts.
+        run_g(&["checkout", &main_br]);
+        fs::write(repo.join("auth.ts"), "export const upAuth = 'upstream-v2';\n").unwrap();
+        fs::write(repo.join("backend/migrations/352_up.sql"), "SELECT 3;\n").unwrap();
+        run_g(&["add", "."]);
+        run_g(&["commit", "-m", "upstream auth v2 + 352"]);
+        run_g(&["checkout", "feat"]);
+        let bh3 = rio::git_head_oid(&repo_s);
+        let before3 = take_git_snapshot(&repo_s, "", &[], None);
+        run_g(&["rebase", "-x", &format!("git checkout {} -- auth.ts && git add auth.ts && git commit --amend --no-edit", bh3), &main_br]);
+        let after3 = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg3, unm3) = diff_git_snapshots_for_cmd(
+            Some(&before3),
+            Some(&after3),
+            &format!("git rebase -x ... {}", main_br),
+        );
+        assert!(!unm3);
+        assert!(chg3.iter().any(|p| p.ends_with("/auth.ts")), "rebase -x reverting auth.ts back to b_head must still be attributed: {:?}", chg3);
+
+        // Case 3b (R1 #1): two separate shell calls across a rebase conflict pause (call 1 pauses on app.ts conflict; call 2 resolves + continues) MUST exclude unrelated upstream 353_up.sql in BOTH calls while attributing app.ts.
+        run_g(&["checkout", &main_br]);
+        fs::write(repo.join("app.ts"), "export const v = 99;\n").unwrap();
+        fs::write(repo.join("backend/migrations/353_up.sql"), "SELECT 4;\n").unwrap();
+        run_g(&["add", "."]);
+        run_g(&["commit", "-m", "upstream conflict + 353"]);
+        run_g(&["checkout", "feat"]);
+        let before4_start = take_git_snapshot(&repo_s, "", &[], None);
+        let (rc_rb, _, _) = rio::run_git(&repo_s, &["rebase", &main_br], 10.0);
+        assert_ne!(rc_rb, 0, "expected real conflict on app.ts");
+        let after4_pause = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg4_pause, unm4_pause) = diff_git_snapshots_for_cmd(
+            Some(&before4_start),
+            Some(&after4_pause),
+            &format!("git rebase {}", main_br),
+        );
+        assert!(!unm4_pause);
+        assert!(chg4_pause.iter().any(|p| p.ends_with("/app.ts")), "paused conflict on app.ts must be attributed: {:?}", chg4_pause);
+        assert!(!chg4_pause.iter().any(|p| p.ends_with("353_up.sql")), "paused rebase must NOT attribute unrelated upstream 353_up.sql: {:?}", chg4_pause);
+
+        let before4_cont = take_git_snapshot(&repo_s, "", &[], None);
+        fs::write(repo.join("app.ts"), "export const v = 100;\n").unwrap();
+        run_g(&["add", "app.ts"]);
+        let st_cont = std::process::Command::new("git")
+            .args(["-C", &repo_s, "rebase", "--continue"])
+            .env("GIT_EDITOR", "true")
+            .status()
+            .unwrap();
+        assert!(st_cont.success(), "rebase --continue failed: {:?}", st_cont);
+        let after4_cont = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg4_cont, unm4_cont) = diff_git_snapshots_for_cmd(
+            Some(&before4_cont),
+            Some(&after4_cont),
+            "resolve; git rebase --continue",
+        );
+        assert!(!unm4_cont);
+        assert!(chg4_cont.iter().any(|p| p.ends_with("/app.ts")), "conflict-resolved app.ts must be attributed on continue: {:?}", chg4_cont);
+        assert!(!chg4_cont.iter().any(|p| p.ends_with("353_up.sql")), "unrelated upstream 353_up.sql must stay excluded on continue: {:?}", chg4_cont);
+
+        // Case 3c (R2 #3): fresh branch without local auth.ts edits -> rebase `-x` cleanly picks unrelated commit, amends auth.ts back to exact `b_head` content, and exits 1 before `rebase (finish)` -> MUST still attribute auth.ts even when `diff(b_head, a_head)` omits auth.ts.
+        run_g(&["checkout", "-b", "feat-exec-pause", &main_br]);
+        fs::write(repo.join("note.txt"), "unrelated local commit\n").unwrap();
+        run_g(&["add", "note.txt"]);
+        run_g(&["commit", "-m", "add note"]);
+        run_g(&["checkout", &main_br]);
+        fs::write(repo.join("auth.ts"), "export const upAuth = 'upstream-v3';\n").unwrap();
+        run_g(&["add", "auth.ts"]);
+        run_g(&["commit", "-m", "upstream auth v3"]);
+        run_g(&["checkout", "feat-exec-pause"]);
+        let bh5 = rio::git_head_oid(&repo_s);
+        let before5 = take_git_snapshot(&repo_s, "", &[], None);
+        let (rc_rb5, _, _) = rio::run_git(
+            &repo_s,
+            &["rebase", "-x", &format!("git checkout {} -- auth.ts && git add auth.ts && git commit --amend --no-edit && exit 1", bh5), &main_br],
+            10.0,
+        );
+        assert_ne!(rc_rb5, 0, "expected rebase -x to pause on exit 1 after amend");
+        let ah5 = rio::git_head_oid(&repo_s);
+        let (_, st5, _) = rio::run_git(&repo_s, &["status", "--short"], 5.0);
+        assert!(st5.trim().is_empty(), "expected clean tree after exec amend + exit 1 (no conflict): {}", st5);
+        let (_, diff5, _) = rio::run_git(&repo_s, &["diff", "--name-only", &bh5, &ah5], 5.0);
+        assert!(!diff5.lines().any(|l| l.trim() == "auth.ts"), "precondition: diff(bh5, ah5) must omit auth.ts after reverting it to bh5: {}", diff5);
+        let after5 = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg5, unm5) = diff_git_snapshots_for_cmd(
+            Some(&before5),
+            Some(&after5),
+            &format!("git rebase -x ... {}", main_br),
+        );
+        assert!(!unm5);
+        assert!(chg5.iter().any(|p| p.ends_with("/auth.ts")), "paused rebase -x after amending auth.ts back to b_head must attribute auth.ts: {:?}", chg5);
+        run_g(&["rebase", "--abort"]);
+
+        // Case 3d (R3 #1): local commit + conflicting rebase + `rebase --abort` in one span MUST attribute the local commit while excluding upstream files from `onto`.
+        run_g(&["checkout", &main_br]);
+        fs::write(repo.join("note.txt"), "upstream note conflict\n").unwrap();
+        fs::write(repo.join("backend/migrations/354_up.sql"), "SELECT 5;\n").unwrap();
+        run_g(&["add", "."]);
+        run_g(&["commit", "-m", "upstream note conflict + 354"]);
+        run_g(&["checkout", "feat-exec-pause"]);
+        let before6 = take_git_snapshot(&repo_s, "", &[], None);
+        fs::write(repo.join("local_only.txt"), "local commit before abort\n").unwrap();
+        run_g(&["add", "local_only.txt"]);
+        run_g(&["commit", "-m", "local before aborted rebase"]);
+        let (rc_rb6, _, _) = rio::run_git(&repo_s, &["rebase", &main_br], 10.0);
+        assert_ne!(rc_rb6, 0, "expected conflict on note.txt before abort");
+        run_g(&["rebase", "--abort"]);
+        let after6 = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg6, unm6) = diff_git_snapshots_for_cmd(
+            Some(&before6),
+            Some(&after6),
+            &format!("git commit; git rebase {}; git rebase --abort", main_br),
+        );
+        assert!(!unm6);
+        assert!(chg6.iter().any(|p| p.ends_with("/local_only.txt")), "local commit before rebase --abort must stay attributed: {:?}", chg6);
+        assert!(!chg6.iter().any(|p| p.ends_with("354_up.sql")), "aborted rebase must NOT attribute upstream 354_up.sql: {:?}", chg6);
 
         let _ = fs::remove_dir_all(&root);
     }
