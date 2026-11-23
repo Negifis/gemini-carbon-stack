@@ -1448,8 +1448,8 @@ pub(crate) fn collect_doctor_report_for_os(
                     "translator",
                 ],
                 "external_review": format!(
-                    "codex-cli (1..{} rounds in one session; after Round {} ESCALATE: mandatory research -> fix + re-test -> <={} --closure passes -> pr-ready/draft-blocked)",
-                    max_rounds, max_rounds, max_closure
+                    "codex-cli (HIGH: {} medium, XHIGH: {} ultra; 1..{} rounds in one session; after Round {} ESCALATE: mandatory research -> fix + re-test -> <={} --closure passes -> pr-ready/draft-blocked)",
+                    cwg_common::CODEX_SOL_MODEL, cwg_common::CODEX_ASTRA_MODEL, max_rounds, max_rounds, max_closure
                 ),
                 "internal_review": {
                     "primary_model": cwg_common::OPUS_HIGH_MODEL,

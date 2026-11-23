@@ -2254,6 +2254,25 @@ fn last_user_input_step_from_file(path: &Path, chunk_size: usize) -> Option<(i64
     fallback
 }
 
+pub fn strip_user_request_wrapper(raw: &str) -> &str {
+    let mut s = raw.trim();
+    if let Some(cs_end) = s.find("</CONTEXT_SUMMARY>") {
+        if s[..cs_end].trim_start().starts_with("<CONTEXT_SUMMARY>") {
+            s = s[cs_end + "</CONTEXT_SUMMARY>".len()..].trim_start();
+        }
+    }
+    if let Some(after_open) = s.strip_prefix("<USER_REQUEST>") {
+        let body_end = after_open
+            .find("</USER_REQUEST>\n<ADDITIONAL_METADATA>")
+            .or_else(|| after_open.find("</USER_REQUEST>\r\n<ADDITIONAL_METADATA>"))
+            .or_else(|| after_open.rfind("</USER_REQUEST>"));
+        if let Some(end) = body_end {
+            return after_open[..end].trim();
+        }
+    }
+    s
+}
+
 pub fn last_user_input_step(transcript_path: &str) -> Option<(i64, String)> {
     let tp = resolve_transcript_path(transcript_path)?;
     last_user_input_step_from_file(&tp, 64 * 1024)
@@ -3627,6 +3646,17 @@ mod tests {
         assert_eq!(
             last_user_input_step(&big_tp.to_string_lossy()),
             Some((3, "deep turn".to_string()))
+        );
+        assert_eq!(strip_user_request_wrapper("plain prompt"), "plain prompt");
+        assert_eq!(
+            strip_user_request_wrapper("<USER_REQUEST>\nFix bug\n</USER_REQUEST>"),
+            "Fix bug"
+        );
+        assert_eq!(
+            strip_user_request_wrapper(
+                "<CONTEXT_SUMMARY>old</CONTEXT_SUMMARY>\n<USER_REQUEST>\nReal task\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nlocal time\n</ADDITIONAL_METADATA>"
+            ),
+            "Real task"
         );
 
         // Append a new USER_INPUT near EOF and verify tail scan picks it up immediately.

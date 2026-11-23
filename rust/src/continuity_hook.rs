@@ -250,12 +250,12 @@ pub fn evaluate_pre_invocation(payload: &Value) -> Option<String> {
     let mut injected: Vec<String> = state.get("pending_warnings").and_then(Value::as_array).map(|a| a.iter().map(|w| val_to_str(Some(w))).collect()).unwrap_or_default();
     state.insert("pending_warnings".into(), Value::Array(Vec::new()));
     // INVARIANT: Live Antigravity `PreInvocation` leaves `lastUserInput` empty; fall back to `rio::last_user_input_step(tp)` with monotonic turn dedup, while never binding a new post-answer `lastUserInput` to an already answered/closed transcript step.
-    let (ui, tx_step) = (payload.get("lastUserInput").and_then(Value::as_str).unwrap_or("").trim(), rio::last_user_input_step(tp));
+    let (ui, tx_step) = (rio::strip_user_request_wrapper(payload.get("lastUserInput").and_then(Value::as_str).unwrap_or("")), rio::last_user_input_step(tp));
     let tx_idx = tx_step.as_ref().map(|(i, _)| *i);
     // INVARIANT: Only `turn_closed` (set strictly when `decide_stop` allows a turn to finish, never on `Stop -> continue` lint blocks) marks a repeated identical `lastUserInput` with lagging transcript as a new user turn.
     let ui_fresh_turn = !ui.is_empty() && json_truthy(state.get("turn_closed"));
-    let (user_text, cur_step) = if !ui.is_empty() { (ui.to_string(), (!ui_fresh_turn).then(|| tx_step.as_ref().filter(|(_, c)| c.trim() == ui).map(|(i, _)| *i)).flatten()) }
-        else if let Some((idx, content)) = tx_step { (content.trim().to_string(), Some(idx)) } else { (String::new(), None) };
+    let (user_text, cur_step) = if !ui.is_empty() { (ui.to_string(), (!ui_fresh_turn).then(|| tx_step.as_ref().filter(|(_, c)| rio::strip_user_request_wrapper(c) == ui).map(|(i, _)| *i)).flatten()) }
+        else if let Some((idx, content)) = tx_step { (rio::strip_user_request_wrapper(&content).to_string(), Some(idx)) } else { (String::new(), None) };
     if !user_text.is_empty() {
         let (cur_hash, prev_step, prev_base, prev_hash) = (sha256_hex(user_text.as_bytes())[..16].to_string(), state.get("last_user_step").and_then(Value::as_i64), state.get("last_user_base_step").and_then(Value::as_i64), val_to_str(state.get("last_user_hash")));
         let same_turn = !ui_fresh_turn && match (prev_step, cur_step) {
@@ -327,7 +327,7 @@ pub fn decide_stop(payload: &Value) -> Option<String> {
     let (mut state, mut dirty) = (load_session_state(&session), false);
     // INVARIANT: Catch a newly flushed transcript USER_INPUT missed by an earlier PreInvocation lag before evaluating Stop output lint.
     if let Some((cs, content)) = rio::last_user_input_step(tp) {
-        let (trimmed, ps, pb, ph) = (content.trim(), state.get("last_user_step").and_then(Value::as_i64), state.get("last_user_base_step").and_then(Value::as_i64), val_to_str(state.get("last_user_hash")));
+        let (trimmed, ps, pb, ph) = (rio::strip_user_request_wrapper(&content), state.get("last_user_step").and_then(Value::as_i64), state.get("last_user_base_step").and_then(Value::as_i64), val_to_str(state.get("last_user_hash")));
         if !trimmed.is_empty() && ps.map_or(true, |p| cs > p) && pb.map_or(true, |b| cs > b) {
             if ps.is_none() && !json_truthy(state.get("turn_closed")) && !ph.is_empty() && sha256_hex(trimmed.as_bytes())[..16] == ph {
                 state.insert("last_user_step".into(), json!(cs)); state.remove("last_user_base_step");

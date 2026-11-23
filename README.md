@@ -25,7 +25,7 @@
 
 - **Линейный конечный контур (`HIGH` / `XHIGH`):**
   1. Детерминированные проверки/тесты -> опциональный однократный консультативный проход `simplify` (никогда не блокирует `Stop`).
-  2. Независимое состязательное ревью `carbon-stack codex-lane review` (`gpt-6.2-sol` / `high` для `HIGH`; `--xhigh` -> `gpt-6.2-astra` / `ultra` для `XHIGH`; `1..4` раунда, порог блокировки `CRITICAL`/`HIGH`). **`VERDICT: APPROVED` на любом раунде `1..4` сразу закрывает гейт.**
+  2. Независимое состязательное ревью `carbon-stack codex-lane review` (`gpt-6.2-sol` / `medium` для `HIGH`; `--xhigh` -> `gpt-6.2-astra` / `ultra` для `XHIGH`; `1..4` раунда, порог блокировки `CRITICAL`/`HIGH`). **`VERDICT: APPROVED` на любом раунде `1..4` сразу закрывает гейт.**
   3. При `Round 4: ESCALATE` -> 1 сфокусированный проход исследования -> до `2` проходов `carbon-stack codex-lane review --closure` (`CLOSURE_VALIDATION: READY` -> `[gate] verified` / `[gate] pr-ready`; 2-й `BLOCKED` -> терминальный `[gate] draft-blocked`). Циклов сброса (`redesign-reset`/`research-reset`) нет.
 - **Гигиена роя и дерева:**
   - `Swarm Wait Guard` + `Stall Watchdog` предотвращают вечное ожидание завершившихся/зависших воркеров, сохраняя поддержку активных `working`-воркеров при межагентной координации.

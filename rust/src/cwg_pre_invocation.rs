@@ -36,21 +36,23 @@ pub fn evaluate_pre_invocation(payload: &Value) -> Option<String> {
             let since = (ts > 0.0).then(|| format_iso_utc(ts)).filter(|x| x.len() >= 16).map_or_else(String::new, |x| format!(", open since {}", &x[11..16]));
             let first_ts_ms: i64 = if ts.is_finite() && ts > 0.0 { (ts * 1000.0).round() as i64 } else { 0 };
             let cand_key = format!("{}|{}", first_ts_ms, fl);
-            let ui = payload.get("lastUserInput").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let ui = rio::strip_user_request_wrapper(
+                payload.get("lastUserInput").and_then(|v| v.as_str()).unwrap_or(""),
+            );
             let ui_hash = (!ui.is_empty()).then(|| rio::sha256_hex(ui.as_bytes())[..16].to_string());
             let tx_step = rio::last_user_input_step(tp);
             let tx_idx = tx_step.as_ref().map(|(idx, _)| *idx);
             let (cur_step, cur_hash): (Option<i64>, Option<String>) = if ui.is_empty() {
                 match tx_step {
                     Some((idx, content)) => {
-                        let t = content.trim();
+                        let t = rio::strip_user_request_wrapper(&content);
                         (Some(idx), (!t.is_empty()).then(|| rio::sha256_hex(t.as_bytes())[..16].to_string()))
                     }
                     None => (None, None),
                 }
             } else {
                 match tx_step {
-                    Some((idx, content)) if content.trim() == ui => (Some(idx), ui_hash),
+                    Some((idx, content)) if rio::strip_user_request_wrapper(&content) == ui => (Some(idx), ui_hash),
                     _ => (None, ui_hash),
                 }
             };

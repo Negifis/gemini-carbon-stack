@@ -4941,6 +4941,29 @@ fn validate_candidate_closure_inner(
         }
         all_reviews.push(r.clone());
     }
+    // INVARIANT: Hydrate candidate-scoped saved-thread Round-4 `ESCALATE` proof once here so CLI `--closure` admission and `Stop` `READY` verification share one source of truth when older rollouts leave the scan window.
+    let eff_root = if !git_root.is_empty() { git_root.as_str() } else { cwd.as_str() };
+    if let Some((_, esc_ts, is_xh)) = codex_lane::saved_thread_escalate_evidence(&val_to_str(marker.get("session")), eff_root, first_ts_val, effective_risk == "XHIGH") {
+        let mut is_ok_ord = |r: &Value| val_to_str(r.get("kind")) == "ordinary" && eval.is_acceptable_engine(r);
+        let live_esc_ts = all_reviews.iter()
+            .filter(|r| is_ok_ord(r) && val_to_str(r.get("verdict")) == "ESCALATE" && (val_to_f64(r.get("verdict_ts")).max(val_to_f64(r.get("launch_ts"))) - esc_ts).abs() <= 5.0)
+            .map(|r| val_to_f64(r.get("verdict_ts")).max(val_to_f64(r.get("launch_ts"))))
+            .reduce(f64::max);
+        let anchor_ts = live_esc_ts.unwrap_or(esc_ts);
+        let has_newer = all_reviews.iter().any(|r| is_ok_ord(r) && val_to_f64(r.get("verdict_ts")).max(val_to_f64(r.get("launch_ts"))) > anchor_ts.max(esc_ts) + 1.0);
+        let live_n = all_reviews.iter().filter(|r| is_ok_ord(r)).count();
+        if !has_newer && anchor_ts >= first_ts_val - 2.0 && live_n < MAX_REVIEW_ROUNDS {
+            let rev_anchor = all_reviews.iter().filter(|r| is_ok_ord(r))
+                .map(|r| val_to_f64(r.get("verdict_ts")).max(val_to_f64(r.get("launch_ts")))).reduce(f64::min)
+                .map_or(anchor_ts, |m| m.min(anchor_ts));
+            let missing = MAX_REVIEW_ROUNDS - live_n;
+            for i in 0..missing {
+                let is_esc = live_esc_ts.is_none() && i + 1 == missing;
+                let ts = if is_esc { anchor_ts } else { rev_anchor - ((missing - i - usize::from(live_esc_ts.is_none())) as f64) * 0.001 };
+                all_reviews.push(json!({ "engine": "codex", "kind": "ordinary", "verdict": if is_esc { "ESCALATE" } else { "REVISE" }, "launch_ts": ts, "verdict_ts": ts, "xhigh": is_xh }));
+            }
+        }
+    }
     all_reviews.sort_by(|a, b| val_to_f64(a.get("verdict_ts")).total_cmp(&val_to_f64(b.get("verdict_ts"))));
 
     let all_ordinary_reviews: Vec<Value> = all_reviews

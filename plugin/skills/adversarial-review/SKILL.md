@@ -31,8 +31,8 @@ $null | carbon-stack codex-lane review `
   --summary "<changes made, touched contracts, verified checks>"
 ```
 
-- **`HIGH`** uses `gpt-6.2-sol` (`effort=high`); **`XHIGH`** (`--xhigh`) uses `gpt-6.2-astra` (`effort=ultra`).
-- **Compact packet + clean delta resume:** Round 1 sends concise context + `git diff --stat` (inline diff only if `< 25 KB`; explicit `[TRUNCATED]` marker when capped); Rounds `2..4` and `--closure` automatically resume the same Codex thread with lean remediation interdiff and active `ANTI-BOOMERANG LEDGER`. Do not wrap with short custom `--timeout` values; a local timeout does not burn rounds or permit fallback.
+- **`HIGH`** uses `gpt-6.2-sol` (`effort=medium`); **`XHIGH`** (`--xhigh`) uses `gpt-6.2-astra` (`effort=ultra`).
+- **Compact packet + clean delta resume:** Round 1 sends concise context + `git diff --stat` (inline diff only if `< 25 KB`; explicit `[TRUNCATED]` marker when capped); Rounds `2..4` and `--closure` automatically resume the same Codex thread with lean remediation interdiff and active `ANTI-BOOMERANG LEDGER`. Emits `LARGE_DIFF_WARNING` when Round 1 diff `> 80 KB` or delta interdiff `> 40 KB`. Do not wrap with short custom `--timeout` values; a local timeout does not burn rounds or permit fallback.
 
 ## 3. Fallback Engine (Only on Verified Codex Outage / Unavailability)
 
@@ -48,7 +48,7 @@ Only when `codex-lane check` reports unavailable/open breaker or live Codex outa
   2. Locate all callers/consumers (`carbon-stack code-search`, `tokenade impact`, `codebase-memory`) and read affected blocks cleanly.
   3. Decide per finding:
      - **`FIX`:** real `CRITICAL`/`HIGH` implementation bugs or missing proportional safeguards (`PRESERVES_INTENT: YES`, concrete `file:line` trigger) -> fix owning layer + add red→green regression test + rerun affected checks.
-     - **`DISPOSE`:** findings conflicting with `BUSINESS_INTENT`, requesting feature removal, synthetic non-reachable puzzles, or style/taste noise -> record disposition so Codex never boomerangs it:
+     - **`DISPOSE` (Anti-Overengineering stop-brake):** If fixing a finding would require more code than the original task or building a new subsystem (indexers/cursors/caches/background threads) for a rare/synthetic edge case, or if it conflicts with `BUSINESS_INTENT` / is Class C–D noise — STOP and record a disposition instead of bloating code:
        ```powershell
        $null | carbon-stack codex-lane dispose `
          --cwd "<repo_path>" --session "<conversation-id>" `

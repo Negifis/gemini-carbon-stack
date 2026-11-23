@@ -25,8 +25,8 @@
 ## 4. Code Work Gate и протокол `REVISE`
 
 - `NO_CHANGE`: без квитанции. `OPERATIONAL` (живая система): до запуска проверьте цель, откат и dry-run; на `Stop` закрывается сам. Прод-инцидент: минимальная обратимая митигация, затем верификация.
-- `PERSISTENT` (`[gate] verified: <RISK>; <кандидат и проверки>`): `LOW` (доки/тесты -> проверка), `STANDARD` (тесты + опц. `simplify-reviewer`), `HIGH`/`XHIGH` (тесты -> опц. 1 совещательный `simplify` до ревью -> `carbon-stack codex-lane review` 1..4 раунда; `APPROVED` закрывает сразу; `Round 4: ESCALATE` -> 1 исследование -> `<= 2` `--closure` -> `pr-ready`/`draft-blocked`). Чистый `undo` к `HEAD` закрывается сам.
-- **Протокол `REVISE`:** до правки (1) инвариант/владеющий слой, (2) поиск потребителей (`rg`/`tokenade impact`/`codebase-memory`) и чтение полных блоков, (3) `FIX` (структурно + тест) или `DISPOSE` (`carbon-stack codex-lane dispose`).
+- `PERSISTENT` (`[gate] verified: <RISK>; <кандидат и проверки>`): `LOW` (доки/тесты -> проверка), `STANDARD` (тесты + опц. `simplify-reviewer`), `HIGH`/`XHIGH` (тесты -> опц. 1 совещательный `simplify` до ревью -> `carbon-stack codex-lane review` 1..4 раунда: `HIGH` → `gpt-6.2-sol / medium`, `XHIGH` → `gpt-6.2-astra / ultra`; `APPROVED` закрывает сразу; `Round 4: ESCALATE` -> 1 исследование -> `<= 2` `--closure` -> `pr-ready`/`draft-blocked`). Чистый `undo` к `HEAD` закрывается сам.
+- **Протокол `REVISE` и Anti-Overengineering:** до правки (1) инвариант/владеющий слой, (2) поиск потребителей (`rg`/`tokenade impact`/`codebase-memory`) и чтение полных блоков, (3) `FIX` (структурно + тест) или `DISPOSE` (`carbon-stack codex-lane dispose`). **Стоп-кран от раздутия:** если фикс замечания Codex требует больше кода, чем исходная задача, или новой подсистемы (индексы/курсоры/кэши/потоки) ради редкого/синтетического edge-case — не раздувайте код, а применяйте `codex-lane dispose` (`accepted-risk`/`no-practical-gain`) или упростите решение.
 
 ## 5. Скиллы, память и ответ
 

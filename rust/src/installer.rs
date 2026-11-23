@@ -896,9 +896,12 @@ fn sweep_retired_bins_dir(dir: &Path) {
     {
         return;
     }
+    let only_legacy = dir.file_name().and_then(|n| n.to_str()) == Some("retired_bins");
     if let Ok(rd) = fs::read_dir(dir) {
         for p in rd.flatten().map(|e| e.path()) {
-            if !win32_sqlite::is_link_or_junction(&p) && fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_file()) {
+            let legacy_ok = !only_legacy || p.file_name().and_then(|n| n.to_str()).map(str::to_ascii_lowercase)
+                .and_then(|l| l.strip_prefix("retired-").and_then(|r| r.split_once('-')).map(|(d, t)| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()) && t.ends_with("carbon-stack.exe"))).unwrap_or(false);
+            if legacy_ok && !win32_sqlite::is_link_or_junction(&p) && fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_file()) {
                 let _ = fs::remove_file(&p);
             }
         }
@@ -911,6 +914,7 @@ fn sweep_retired_bins_dir(dir: &Path) {
 fn sweep_all_retired_bins(plugin_dir: &Path, stack_home: &Path, config_dir: &Path) {
     sweep_retired_bins_dir(&plugin_dir.join("bin").join(RETIRED_BINS_DIR_NAME));
     sweep_retired_bins_dir(&stack_home.join("state").join(RETIRED_BINS_DIR_NAME));
+    sweep_retired_bins_dir(&stack_home.join("state").join("retired_bins"));
     sweep_retired_bins_dir(&config_dir.join(RETIRED_BINS_DIR_NAME));
 }
 
@@ -1523,12 +1527,13 @@ fn try_auto_heal_stage_retire_for_paths(cfg: &Path, shome: &Path) {
         state_dir.join(RETIRED_BINS_DIR_NAME),
         cfg.join(RETIRED_BINS_DIR_NAME),
     );
+    let ret_legacy = state_dir.join("retired_bins");
     let is_plain = |p: &Path| fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_dir()) && !win32_sqlite::is_link_or_junction(p);
     let safe_plugin = [cfg, &plugins_dir, &plugin_dir, &plugin_bin].into_iter().all(|p| !win32_sqlite::is_link_or_junction(p));
     let safe_state = !win32_sqlite::is_link_or_junction(shome) && !win32_sqlite::is_link_or_junction(&state_dir);
     let safe_cfg = !win32_sqlite::is_link_or_junction(cfg);
 
-    if !has_orphaned && !(is_plain(&ret_bin) && safe_plugin) && !(is_plain(&ret_state) && safe_state) && !(is_plain(&ret_cfg) && safe_cfg) {
+    if !has_orphaned && !(is_plain(&ret_bin) && safe_plugin) && !((is_plain(&ret_state) || is_plain(&ret_legacy)) && safe_state) && !(is_plain(&ret_cfg) && safe_cfg) {
         return;
     }
     let Ok(_guard) = acquire_installer_mutex(cfg, shome, Duration::from_secs(2)) else { return };
@@ -1536,7 +1541,7 @@ fn try_auto_heal_stage_retire_for_paths(cfg: &Path, shome: &Path) {
         let _ = recover_interrupted_stage_retire_dirs(cfg, &[&ret_state, &ret_cfg]);
     }
     if safe_plugin { sweep_retired_bins_dir(&ret_bin); }
-    if safe_state { sweep_retired_bins_dir(&ret_state); }
+    if safe_state { sweep_retired_bins_dir(&ret_state); sweep_retired_bins_dir(&ret_legacy); }
     if safe_cfg { sweep_retired_bins_dir(&ret_cfg); }
 }
 
@@ -2827,6 +2832,17 @@ mod tests {
         fs::write(partial_ret.join("unlocked.exe"), b"old-pe").unwrap();
         sweep_retired_bins_dir(&partial_ret);
         assert!(!partial_ret.join("unlocked.exe").exists() && kept_sub.is_dir() && partial_ret.is_dir());
+
+        let legacy_ret = shome.join("state").join("retired_bins");
+        fs::create_dir_all(&legacy_ret).unwrap();
+        fs::write(legacy_ret.join("retired-42-1795-carbon-stack.exe"), b"old-pe").unwrap();
+        fs::write(legacy_ret.join("keep-note.txt"), b"keep").unwrap();
+        sweep_all_retired_bins(&cfg.join("plugins").join(PLUGIN_NAME), &shome, &cfg);
+        assert!(!legacy_ret.join("retired-42-1795-carbon-stack.exe").exists());
+        assert!(legacy_ret.join("keep-note.txt").is_file());
+        fs::remove_file(legacy_ret.join("keep-note.txt")).unwrap();
+        sweep_all_retired_bins(&cfg.join("plugins").join(PLUGIN_NAME), &shome, &cfg);
+        assert!(!legacy_ret.exists());
     }
 
     #[test]
