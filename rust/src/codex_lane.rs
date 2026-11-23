@@ -1294,7 +1294,7 @@ pub struct ClosureCycleSummary {
     pub has_fresh_ready: bool, pub counted_ordinary_rounds: usize, pub raw_ordinary_rounds: usize,
     pub ordinary_cap_reached: bool, pub has_round_cap_escalate: bool, pub escalate_verdict_ts: f64,
     pub has_post_escalate_research: bool, pub legacy_three_round_closure_active: bool,
-    pub has_fresh_ordinary_approved: bool,
+    pub has_fresh_ordinary_approved: bool, pub cycle_reset_ts: f64,
 }
 
 pub fn active_cycle_closure_summary_for_marker(marker: &Value, session: &str, git_root: &str, tp: &str) -> ClosureCycleSummary {
@@ -2018,6 +2018,20 @@ pub(crate) fn saved_thread_escalate_evidence(session: &str, git_root: &str, cand
     }).max_by(|a, b| a.1.total_cmp(&b.1))
 }
 
+pub(crate) fn saved_thread_cycle_reset_ts(session: &str, git_root: &str, cand_ts: f64) -> f64 {
+    if session.trim().is_empty() || cand_ts <= 0.0 { return 0.0; }
+    let dig = session_root_digest(session, git_root);
+    let (exact_name, lane_pref, now) = (format!("{}.json", dig), format!("{}-", dig), now_sec());
+    fs::read_dir(threads_dir()).ok().into_iter().flatten().flatten().filter_map(|ent| {
+        let name = ent.file_name().to_str()?.to_string();
+        if name.ends_with(".dispositions.json") || (name != exact_name && !(name.starts_with(&lane_pref) && name.ends_with(".json"))) { return None; }
+        let Value::Object(st) = rio::read_json(&ent.path())? else { return None; };
+        if !thread_entry_matches_candidate(&st, cand_ts, now, 0, 0.0) { return None; }
+        let ts = val_to_f64(st.get("cycle_reset_ts"));
+        (ts >= cand_ts - 2.0).then_some(ts)
+    }).reduce(f64::max).unwrap_or(0.0)
+}
+
 fn check_review_cycle_guards(cls: &ClosureCycleSummary, phase: &str, eff_sess: &str, pretty: bool) -> Option<i32> {
     let (max_cls, max_ord) = (cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE, crate::cwg_stop::MAX_REVIEW_ROUNDS);
     if cls.blocked_count >= max_cls {
@@ -2230,20 +2244,33 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
         break;
     }
 
-    let eff_ord = cls_summary.counted_ordinary_rounds.max(saved_thread.as_ref().map_or(0, |st| rio::val_to_i64(st.get("ordinary_rounds_completed")).max(0) as usize));
-    let eff_cls = cls_summary.effective_pass_count.max(saved_thread.as_ref().map_or(0, |st| rio::val_to_i64(st.get("closure_passes_completed")).max(0) as usize));
-    let (saved_escalated, saved_esc_ts) = saved_thread.as_ref().and_then(saved_thread_escalate_from_map)
+    // INVARIANT: When `cwg_stop` resets the cycle after an invalidated terminal `APPROVED`/`READY` (`cycle_reset_ts`), drop retired-cycle counts from `saved_thread` and persist the confirmed reset boundary so later delta rounds never regress if earlier rollouts leave the scan window.
+    let eff_cycle_reset_ts = if cand_ts > 0.0 {
+        cls_summary.cycle_reset_ts.max(saved_thread.as_ref().map_or(0.0, |st| val_to_f64(st.get("cycle_reset_ts"))))
+    } else {
+        0.0
+    };
+    let saved_retired = eff_cycle_reset_ts > 0.0
+        && saved_thread.as_ref().is_some_and(|st| {
+            let lts = val_to_f64(st.get("last_launch_ts"));
+            let ref_ts = if lts > 0.0 { lts } else { val_to_f64(st.get("updated_ts")) };
+            ref_ts < eff_cycle_reset_ts
+        });
+    let active_saved = (!saved_retired).then_some(saved_thread.as_ref()).flatten();
+    let eff_ord = cls_summary.counted_ordinary_rounds.max(active_saved.map_or(0, |st| rio::val_to_i64(st.get("ordinary_rounds_completed")).max(0) as usize));
+    let eff_cls = cls_summary.effective_pass_count.max(active_saved.map_or(0, |st| rio::val_to_i64(st.get("closure_passes_completed")).max(0) as usize));
+    let (saved_escalated, saved_esc_ts) = active_saved.and_then(saved_thread_escalate_from_map)
         .map_or((cls_summary.has_round_cap_escalate, cls_summary.escalate_verdict_ts), |(_, ts, _)| (true, ts));
     let scope_summary = if args.summary.is_empty() { "Review current repository candidate changes." } else { args.summary.as_str() };
     let exp_round = if phase == "closure" { eff_cls + 1 } else { eff_ord + 1 };
-    let to_phase = saved_thread.as_ref().map(|st| val_to_str(st.get("phase"))).unwrap_or_default();
-    let to_round = saved_thread.as_ref().map_or(0, |st| rio::val_to_i64(st.get("pending_timeout_round")).max(0) as usize);
-    let is_to_cont = saved_thread.as_ref().is_some_and(|st| json_truthy(st.get("pending_timeout_resume")))
+    let to_phase = active_saved.map(|st| val_to_str(st.get("phase"))).unwrap_or_default();
+    let to_round = active_saved.map_or(0, |st| rio::val_to_i64(st.get("pending_timeout_round")).max(0) as usize);
+    let is_to_cont = active_saved.is_some_and(|st| json_truthy(st.get("pending_timeout_resume")))
         && (to_phase.is_empty() || to_phase == phase) && (to_round == 0 || to_round == exp_round);
 
     if !is_to_cont {
         if phase == "ordinary" && eff_ord >= crate::cwg_stop::MAX_REVIEW_ROUNDS {
-            return fail_json("ordinary_round_cap_reached", &format!("Current review lane already consumed {0}/{0} ordinary rounds; transition to focused research + `--closure`, start `--new-session`, or close with `[gate] draft-blocked`.", crate::cwg_stop::MAX_REVIEW_ROUNDS), json!({ "round_consumed": false, "effective_ordinary_rounds": eff_ord, "escalated": cls_summary.has_round_cap_escalate, "terminal_draft_blocked": !cls_summary.has_round_cap_escalate }), args.pretty);
+            return fail_json("ordinary_round_cap_reached", &format!("Current review lane already consumed {0}/{0} ordinary rounds; transition to focused research + `--closure`, start `--new-session`, or close with `[gate] draft-blocked`.", crate::cwg_stop::MAX_REVIEW_ROUNDS), json!({ "round_consumed": false, "effective_ordinary_rounds": eff_ord, "escalated": saved_escalated, "terminal_draft_blocked": !saved_escalated }), args.pretty);
         }
         if phase == "closure" && eff_cls >= cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE {
             return fail_json("max_closure_passes_reached", &format!("Current review lane already consumed {0}/{0} closure passes; finish finitely with `[gate] draft-blocked` (never run a 3rd closure pass).", cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE), json!({ "round_consumed": false, "effective_closure_passes": eff_cls }), args.pretty);
@@ -2317,7 +2344,7 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
                     "ordinary_rounds_completed": att_ord, "closure_passes_completed": att_cls, "escalated": saved_escalated, "escalate_verdict_ts": saved_esc_ts, "last_reviewed_tree_oid": prev_t,
                     "timeout_worktree_tree_oid": curr_tree, "timeout_diff_file_sha256": explicit_diff_sha,
                     "timeout_diff_file_path": resolved_diff_file, "pending_timeout_round": att_round, "last_review_output": att_prior,
-                    "pending_timeout_resume": true, "last_timeout_seconds": eff_timeout as i64, "next_timeout_seconds": next_to, "updated_ts": now_sec(),
+                    "pending_timeout_resume": true, "last_timeout_seconds": eff_timeout as i64, "next_timeout_seconds": next_to, "cycle_reset_ts": eff_cycle_reset_ts, "last_launch_ts": launch_ts, "updated_ts": now_sec(),
                 }));
                 let (persisted, stale_ep) = (save_out == ThreadSaveOutcome::Saved, save_out == ThreadSaveOutcome::StaleGoalEpoch);
                 let eff_rec = if persisted { next_to } else {
@@ -2398,7 +2425,7 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
             "closure_passes_completed": win_cls + usize::from(phase == "closure"),
             "escalated": next_escalated, "escalate_verdict_ts": next_esc_ts,
             "last_reviewed_tree_oid": rev_tree, "last_review_output": rio::truncate_chars(exec_res.stdout.trim(), 12_000),
-            "updated_ts": now_sec(),
+            "cycle_reset_ts": eff_cycle_reset_ts, "last_launch_ts": launch_ts, "updated_ts": now_sec(),
         }));
         if saved_ok && cand_ts <= 0.0 && !prev_ml_sid.is_empty() && prev_ml_sid != actual_sid {
             if let Some(dp) = dispositions_state_path(&eff_session, &git_root, 0.0, &prev_ml_sid) { unlink_quiet(&dp); }
@@ -3070,7 +3097,7 @@ m = re.search(r"REVIEW_ID:\s*([A-Za-z0-9_-]+)", prompt)
 rid = m.group(1) if m else "cwg-unknown0"
 sid = "sess-live-" + uuid.uuid4().hex[:8]
 iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-verdict_line = "VERDICT: APPROVED" if "FORCE_ORDINARY_APPROVED_MOCK" in prompt else "CLOSURE_VALIDATION: READY"
+verdict_line = "VERDICT: REVISE" if "FORCE_ORDINARY_REVISE_MOCK" in prompt else ("VERDICT: APPROVED" if "FORCE_ORDINARY_APPROVED_MOCK" in prompt else "CLOSURE_VALIDATION: READY")
 rows = [
     {"type": "session_meta", "timestamp": iso, "payload": {"id": sid, "session_id": sid, "source": "exec", "thread_source": "user"}},
     {"type": "turn_context", "timestamp": iso, "payload": {"model": "gpt-6.2-sol", "effort": "high"}},
@@ -7166,5 +7193,195 @@ print(verdict)
             "session_id": "sid-astra-xh", "ordinary_rounds_completed": 4, "escalated": true, "escalate_verdict_ts": esc_ts, "xhigh": true, "updated_ts": esc_ts,
         })));
         assert!(saved_thread_escalate_evidence("sess-astra-xh", &repo_s, first_ts, true).is_some());
+    }
+
+    #[test]
+    fn test_post_ready_and_post_round4_approved_cycle_reset_unblocks_ordinary_review() {
+        let _guard = crate::win32_sqlite::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempTestDir::new("cl-post-ready-reset");
+        let (sh, br, sd, rd) = (tmp.0.join("sh"), tmp.0.join("br"), tmp.0.join("sd"), tmp.0.join("repo"));
+        fs::create_dir_all(&sd).unwrap();
+        fs::create_dir_all(&rd).unwrap();
+        let mock_bin = write_mock_codex_bin(&tmp.0);
+        let repo_s = rd.to_string_lossy().into_owned();
+        let diff_p = tmp.0.join("delta.diff");
+        fs::write(&diff_p, "diff --git a/auth.rs b/auth.rs\n+pub fn v2() {}\n").unwrap();
+        let diff_s = diff_p.to_string_lossy().into_owned();
+        let _env = EnvVarGuard::set(&[
+            ("CARBON_STACK_HOME", Some(&sh.to_string_lossy())),
+            ("ANTIGRAVITY_BRAIN_ROOT", Some(&br.to_string_lossy())),
+            ("CARBON_CODEX_SESSIONS_DIR", Some(&sd.to_string_lossy())),
+            ("CARBON_CODEX_BIN", Some(&mock_bin.to_string_lossy())),
+        ]);
+        reset_breaker();
+
+        // Subcase A (anom-4759625e): 4 ordinary rounds + ESCALATE + CLOSURE_VALIDATION: READY invalidated by later edit must unlock ordinary delta review (Round 1/4) instead of deadlocking at 4/4.
+        let sess_a = "sess-post-ready-reset";
+        let tp_a = br.join(sess_a).join(".system_generated").join("logs").join("transcript.jsonl");
+        fs::create_dir_all(tp_a.parent().unwrap()).unwrap();
+        let now = now_sec();
+        let (first_ts, esc_ts, ready_ts, edit2_ts) = (now - 100.0, now - 60.0, now - 30.0, now - 10.0);
+        fs::write(&tp_a, format!("{}\n{}\n",
+            json!({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(now - 45.0), "tool_calls": [{"name": "search_web", "args": {"query": "docs"}}]}),
+            json!({"step_index": 2, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(now - 44.0), "content": "ok"})
+        )).unwrap();
+        let auth_p = rd.join("auth.rs");
+        fs::write(&auth_p, "pub fn v1() {}\n").unwrap();
+        let auth_norm = rio::normalize_path(&auth_p.to_string_lossy());
+        let fp1 = cwg_common::content_fingerprint(std::slice::from_ref(&auth_norm), cwg_common::MAX_FINGERPRINT_FILE_BYTES);
+        fs::write(&auth_p, "pub fn v2() {}\n").unwrap();
+        let fp2 = cwg_common::content_fingerprint(std::slice::from_ref(&auth_norm), cwg_common::MAX_FINGERPRINT_FILE_BYTES);
+        assert_ne!(fp1, fp2);
+        rio::write_json(&cwg_common::marker_path(sess_a), &json!({
+            "session": sess_a, "first_ts": first_ts, "last_durable_ts": edit2_ts,
+            "cwd": rio::normalize_path(&repo_s), "git_root": rio::normalize_path(&repo_s),
+            "paths": [auth_norm],
+            "content_marks": [
+                {"ts": first_ts, "fp": fp1, "unknown": false},
+                {"ts": edit2_ts, "fp": fp2, "unknown": false}
+            ],
+            "gate_max_review_rounds": 4, "closed": false,
+        })).unwrap();
+        assert!(save_lane_thread_state(sess_a, &repo_s, first_ts, cwg_common::CODEX_SOL_MODEL, "high", json!({
+            "session_id": "sid-old-ready", "ordinary_rounds_completed": 4, "closure_passes_completed": 1,
+            "escalated": true, "escalate_verdict_ts": esc_ts, "xhigh": false,
+            "last_review_output": "CLOSURE_VALIDATION: READY", "updated_ts": ready_ts,
+        })));
+        let ptxt_r = "REVIEW_ID: cwg-oldready0001\nPACKET_NONCE: a1b2c3d4e5f6\n";
+        record_packet("cwg-oldready0001", ptxt_r, &repo_s, "high", "closure", sess_a);
+        let mut pr_doc = rio::read_json(&packet_path("cwg-oldready0001")).unwrap();
+        pr_doc["created_ts"] = json!(ready_ts - 2.0);
+        rio::write_json(&packet_path("cwg-oldready0001"), &pr_doc).unwrap();
+        let r_iso = crate::win32_sqlite::format_iso_utc(ready_ts);
+        fs::write(sd.join("rollout-old-ready.jsonl"), [
+            json!({"type": "session_meta", "timestamp": r_iso, "payload": {"id": "sid-old-ready", "source": "exec"}}),
+            json!({"type": "turn_context", "timestamp": r_iso, "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
+            json!({"type": "response_item", "timestamp": r_iso, "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": ptxt_r}]}}),
+            json!({"type": "event_msg", "timestamp": r_iso, "payload": {"type": "task_complete", "last_agent_message": "CLOSURE_VALIDATION: READY"}}),
+        ].into_iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n").unwrap();
+
+        for idx in 1..=3usize {
+            let rid = format!("cwg-oldpart0000{}", idx);
+            let ptxt = format!("REVIEW_ID: {}\nPACKET_NONCE: 11223344550{}\n", rid, idx);
+            record_packet(&rid, &ptxt, &repo_s, "high", "ordinary", sess_a);
+            let ts = first_ts + (idx as f64) * 10.0;
+            let mut pd = rio::read_json(&packet_path(&rid)).unwrap();
+            pd["created_ts"] = json!(ts - 1.0);
+            rio::write_json(&packet_path(&rid), &pd).unwrap();
+            let iso = crate::win32_sqlite::format_iso_utc(ts);
+            fs::write(sd.join(format!("rollout-old-part-{}.jsonl", idx)), [
+                json!({"type": "session_meta", "timestamp": iso, "payload": {"id": format!("sid-old-part-{}", idx), "source": "exec"}}),
+                json!({"type": "turn_context", "timestamp": iso, "payload": {"model": "gpt-6.2-sol", "effort": "high"}}),
+                json!({"type": "response_item", "timestamp": iso, "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": ptxt}]}}),
+                json!({"type": "event_msg", "timestamp": iso, "payload": {"type": "task_complete", "last_agent_message": "VERDICT: REVISE"}}),
+            ].into_iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n").unwrap();
+        }
+        let cls_a = active_cycle_closure_summary_with_risk(sess_a, &repo_s, "", "");
+        assert!((cls_a.cycle_reset_ts - edit2_ts).abs() < 0.01, "expected cycle_reset_ts={}, got {}", edit2_ts, cls_a.cycle_reset_ts);
+        assert_eq!(cls_a.counted_ordinary_rounds, 0);
+        assert_eq!(run_cli(&["review".into(), "--cwd".into(), repo_s.clone(), "--session".into(), sess_a.into(), "--closure".into(), "--diff-file".into(), diff_s.clone(), "--summary".into(), "stale closure attempt".into()]), 2);
+        // Delta Round 1 returns REVISE, overwriting saved ESCALATE; persisted cycle_reset_ts must keep Round 2 unlocked despite 3 remaining old ordinary rollouts.
+        let rc_ord_a1 = run_cli(&["review".into(), "--cwd".into(), repo_s.clone(), "--session".into(), sess_a.into(), "--diff-file".into(), diff_s.clone(), "--summary".into(), "FORCE_ORDINARY_REVISE_MOCK post-READY delta r1".into()]);
+        assert_eq!(rc_ord_a1, 0, "ordinary delta round 1 after invalidated READY must succeed");
+        let saved_a1 = active_thread_state_for_lane(sess_a, &repo_s, Some(first_ts), cwg_common::CODEX_SOL_MODEL, "medium").unwrap();
+        assert_eq!(rio::val_to_i64(saved_a1.get("ordinary_rounds_completed")), 1);
+        assert_eq!(rio::val_to_i64(saved_a1.get("closure_passes_completed")), 0);
+        assert!(!json_truthy(saved_a1.get("escalated")));
+        assert!((val_to_f64(saved_a1.get("cycle_reset_ts")) - edit2_ts).abs() < 0.01);
+        assert!(val_to_f64(saved_a1.get("last_launch_ts")) >= edit2_ts);
+        let cls_a1 = active_cycle_closure_summary_with_risk(sess_a, &repo_s, "", "");
+        assert_eq!(cls_a1.counted_ordinary_rounds, 1, "old 3 rollouts must stay excluded after Round 1 REVISE");
+        let rc_ord_a2 = run_cli(&["review".into(), "--cwd".into(), repo_s.clone(), "--session".into(), sess_a.into(), "--diff-file".into(), diff_s.clone(), "--summary".into(), "FORCE_ORDINARY_APPROVED_MOCK post-READY delta r2".into()]);
+        assert_eq!(rc_ord_a2, 0, "ordinary delta round 2 after Round 1 REVISE with partial old history must succeed");
+        let saved_a2 = active_thread_state_for_lane(sess_a, &repo_s, Some(first_ts), cwg_common::CODEX_SOL_MODEL, "medium").unwrap();
+        assert_eq!(rio::val_to_i64(saved_a2.get("ordinary_rounds_completed")), 2);
+        assert!(active_cycle_closure_summary_with_risk(sess_a, &repo_s, "", "").has_fresh_ordinary_approved);
+
+        // Subcase B (anom-6817f31d): Round 4 VERDICT: APPROVED invalidated by post-approval edit must also unlock ordinary delta review instead of deadlocking at 4/4.
+        let sess_b = "sess-post-r4-approved-reset";
+        rio::write_json(&cwg_common::marker_path(sess_b), &json!({
+            "session": sess_b, "first_ts": first_ts, "last_durable_ts": edit2_ts,
+            "cwd": rio::normalize_path(&repo_s), "git_root": rio::normalize_path(&repo_s),
+            "paths": [auth_norm],
+            "content_marks": [
+                {"ts": first_ts, "fp": fp1, "unknown": false},
+                {"ts": edit2_ts, "fp": fp2, "unknown": false}
+            ],
+            "gate_max_review_rounds": 4, "closed": false,
+        })).unwrap();
+        assert!(save_lane_thread_state(sess_b, &repo_s, first_ts, cwg_common::CODEX_SOL_MODEL, "medium", json!({
+            "session_id": "sid-old-r4app", "ordinary_rounds_completed": 4, "closure_passes_completed": 0,
+            "escalated": false, "xhigh": false, "last_review_output": "VERDICT: APPROVED", "updated_ts": ready_ts,
+        })));
+        for idx in 1..=4usize {
+            let rid = format!("cwg-oldr4app000{}", idx);
+            let ptxt = format!("REVIEW_ID: {}\nPACKET_NONCE: deadbeef000{}\n", rid, idx);
+            record_packet(&rid, &ptxt, &repo_s, "medium", "ordinary", sess_b);
+            let ts = first_ts + (idx as f64) * 15.0;
+            let mut pd = rio::read_json(&packet_path(&rid)).unwrap();
+            pd["created_ts"] = json!(ts - 1.0);
+            rio::write_json(&packet_path(&rid), &pd).unwrap();
+            let iso = crate::win32_sqlite::format_iso_utc(ts);
+            let verd = if idx == 4 { "VERDICT: APPROVED" } else { "VERDICT: REVISE" };
+            fs::write(sd.join(format!("rollout-old-r4app-{}.jsonl", idx)), [
+                json!({"type": "session_meta", "timestamp": iso, "payload": {"id": format!("sid-old-r4app-{}", idx), "source": "exec"}}),
+                json!({"type": "turn_context", "timestamp": iso, "payload": {"model": "gpt-6.2-sol", "effort": "medium"}}),
+                json!({"type": "response_item", "timestamp": iso, "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": ptxt}]}}),
+                json!({"type": "event_msg", "timestamp": iso, "payload": {"type": "task_complete", "last_agent_message": verd}}),
+            ].into_iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n").unwrap();
+        }
+        let cls_b = active_cycle_closure_summary_with_risk(sess_b, &repo_s, "", "");
+        assert!((cls_b.cycle_reset_ts - edit2_ts).abs() < 0.01);
+        let rc_ord_b = run_cli(&["review".into(), "--cwd".into(), repo_s.clone(), "--session".into(), sess_b.into(), "--diff-file".into(), diff_s, "--summary".into(), "FORCE_ORDINARY_APPROVED_MOCK post-R4-APPROVED delta".into()]);
+        assert_eq!(rc_ord_b, 0, "ordinary delta review after invalidated Round 4 APPROVED must succeed");
+        let saved_b = active_thread_state_for_lane(sess_b, &repo_s, Some(first_ts), cwg_common::CODEX_SOL_MODEL, "medium").unwrap();
+        assert_eq!(rio::val_to_i64(saved_b.get("ordinary_rounds_completed")), 1);
+        assert!(active_cycle_closure_summary_with_risk(sess_b, &repo_s, "", "").has_fresh_ordinary_approved);
+
+        // Subcase C (R2 regression): Post-reset cycle at 4/4 ESCALATE with 1 evicted post-reset rollout + 1 old pre-reset rollout still in window must still hydrate the missing post-reset round and admit `--closure`.
+        let sess_c = "sess-post-reset-partial-esc";
+        let tp_c = br.join(sess_c).join(".system_generated").join("logs").join("transcript.jsonl");
+        fs::create_dir_all(tp_c.parent().unwrap()).unwrap();
+        let (reset_c, esc2_c, res2_c) = (now - 40.0, now - 15.0, now - 5.0);
+        fs::write(&tp_c, format!("{}\n{}\n",
+            json!({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(res2_c), "tool_calls": [{"name": "search_web", "args": {"query": "docs"}}]}),
+            json!({"step_index": 2, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(res2_c + 1.0), "content": "ok"})
+        )).unwrap();
+        rio::write_json(&cwg_common::marker_path(sess_c), &json!({
+            "session": sess_c, "first_ts": first_ts, "last_durable_ts": reset_c,
+            "cwd": rio::normalize_path(&repo_s), "git_root": rio::normalize_path(&repo_s),
+            "paths": [auth_norm],
+            "content_marks": [{"ts": first_ts, "fp": fp1, "unknown": false}, {"ts": reset_c, "fp": fp2, "unknown": false}],
+            "gate_max_review_rounds": 4, "closed": false,
+        })).unwrap();
+        assert!(save_lane_thread_state(sess_c, &repo_s, first_ts, cwg_common::CODEX_SOL_MODEL, "medium", json!({
+            "session_id": "sid-c-esc", "ordinary_rounds_completed": 4, "closure_passes_completed": 0,
+            "escalated": true, "escalate_verdict_ts": esc2_c, "cycle_reset_ts": reset_c,
+            "last_launch_ts": esc2_c - 1.0, "xhigh": false, "last_review_output": "VERDICT: ESCALATE", "updated_ts": esc2_c,
+        })));
+        let rows_c = [
+            ("cwg-c-old000001", first_ts + 10.0, "VERDICT: REVISE"),
+            ("cwg-c-new000002", reset_c + 5.0, "VERDICT: REVISE"),
+            ("cwg-c-new000003", reset_c + 12.0, "VERDICT: REVISE"),
+            ("cwg-c-new000004", esc2_c, "VERDICT: ESCALATE"),
+        ];
+        for (idx, (rid, ts, verd)) in rows_c.iter().enumerate() {
+            let ptxt = format!("REVIEW_ID: {}\nPACKET_NONCE: cafe0000000{}\n", rid, idx);
+            record_packet(rid, &ptxt, &repo_s, "medium", "ordinary", sess_c);
+            let mut pd = rio::read_json(&packet_path(rid)).unwrap();
+            pd["created_ts"] = json!(ts - 0.5);
+            rio::write_json(&packet_path(rid), &pd).unwrap();
+            let iso = crate::win32_sqlite::format_iso_utc(*ts);
+            fs::write(sd.join(format!("rollout-subc-{}.jsonl", idx)), [
+                json!({"type": "session_meta", "timestamp": iso, "payload": {"id": format!("sid-c-{}", idx), "source": "exec"}}),
+                json!({"type": "turn_context", "timestamp": iso, "payload": {"model": "gpt-6.2-sol", "effort": "medium"}}),
+                json!({"type": "response_item", "timestamp": iso, "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": ptxt}]}}),
+                json!({"type": "event_msg", "timestamp": iso, "payload": {"type": "task_complete", "last_agent_message": verd}}),
+            ].into_iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n").unwrap();
+        }
+        let cls_c = active_cycle_closure_summary_with_risk(sess_c, &repo_s, "", "");
+        assert_eq!(cls_c.counted_ordinary_rounds, 4, "old pre-reset rollout must not block hydrating missing post-reset round");
+        assert!(cls_c.has_round_cap_escalate && cls_c.has_post_escalate_research);
+        assert!(check_review_cycle_guards(&cls_c, "closure", sess_c, false).is_none(), "--closure must be admitted after post-reset 4/4 ESCALATE with partial eviction");
     }
 }

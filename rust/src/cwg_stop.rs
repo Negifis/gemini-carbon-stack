@@ -4702,12 +4702,26 @@ fn validate_candidate_closure_inner(
         return (true, "operational".to_string());
     }
 
+    let first_ts_for_risk = val_to_f64(marker.get("first_ts"));
+    let mut cycle_risk_inputs = vec![floor.clone()];
+    let marker_dr = cwg_common::active_marker_declared_risk(marker);
+    if !marker_dr.is_empty() {
+        cycle_risk_inputs.push(marker_dr);
+    }
+    if let Some(tx_steps) = steps {
+        let tx_dr = max_cycle_declared_receipt_risk(tx_steps, first_ts_for_risk);
+        if !tx_dr.is_empty() {
+            cycle_risk_inputs.push(tx_dr);
+        }
+    }
+    let cycle_min_risk = cwg_common::max_risk(&cycle_risk_inputs);
+
     let Some(rcp) = receipt else {
         return (
             false,
             format!(
                 "missing terminal `[gate] verified: {}; <candidate and checks>` receipt on last line",
-                floor
+                cycle_min_risk
             ),
         );
     };
@@ -4765,19 +4779,6 @@ fn validate_candidate_closure_inner(
     }
 
     // INVARIANT: Evaluate PERSISTENT closure (`verified`, `pr-ready`, `draft-blocked`) against both candidate path risk floor and active-cycle escalated risk (`--xhigh` or cycle receipt).
-    let first_ts_for_risk = val_to_f64(marker.get("first_ts"));
-    let mut cycle_risk_inputs = vec![floor.clone()];
-    let marker_dr = cwg_common::active_marker_declared_risk(marker);
-    if !marker_dr.is_empty() {
-        cycle_risk_inputs.push(marker_dr);
-    }
-    if let Some(tx_steps) = steps {
-        let tx_dr = max_cycle_declared_receipt_risk(tx_steps, first_ts_for_risk);
-        if !tx_dr.is_empty() {
-            cycle_risk_inputs.push(tx_dr);
-        }
-    }
-    let cycle_min_risk = cwg_common::max_risk(&cycle_risk_inputs);
     let explicit_rcp_risk = rcp
         .get("risk")
         .and_then(|v| v.as_str())
@@ -4941,10 +4942,18 @@ fn validate_candidate_closure_inner(
         }
         all_reviews.push(r.clone());
     }
-    // INVARIANT: Hydrate candidate-scoped saved-thread Round-4 `ESCALATE` proof once here so CLI `--closure` admission and `Stop` `READY` verification share one source of truth when older rollouts leave the scan window.
+    // INVARIANT: Hydrate candidate-scoped saved-thread Round-4 `ESCALATE` proof once here so CLI `--closure` admission and `Stop` `READY` verification share one source of truth when older rollouts leave the scan window; ignore retired pre-reset evidence once a confirmed cycle reset boundary is persisted.
     let eff_root = if !git_root.is_empty() { git_root.as_str() } else { cwd.as_str() };
-    if let Some((_, esc_ts, is_xh)) = codex_lane::saved_thread_escalate_evidence(&val_to_str(marker.get("session")), eff_root, first_ts_val, effective_risk == "XHIGH") {
-        let mut is_ok_ord = |r: &Value| val_to_str(r.get("kind")) == "ordinary" && eval.is_acceptable_engine(r);
+    let marker_sess_saved = val_to_str(marker.get("session"));
+    let saved_cycle_reset_ts = codex_lane::saved_thread_cycle_reset_ts(&marker_sess_saved, eff_root, first_ts_val);
+    if let Some((_, esc_ts, is_xh)) = codex_lane::saved_thread_escalate_evidence(&marker_sess_saved, eff_root, first_ts_val, effective_risk == "XHIGH")
+        .filter(|&(_, esc_ts, _)| saved_cycle_reset_ts <= 0.0 || esc_ts >= saved_cycle_reset_ts)
+    {
+        let mut is_ok_ord = |r: &Value| {
+            val_to_str(r.get("kind")) == "ordinary"
+                && eval.is_acceptable_engine(r)
+                && (saved_cycle_reset_ts <= 0.0 || val_to_f64(r.get("launch_ts")) >= saved_cycle_reset_ts)
+        };
         let live_esc_ts = all_reviews.iter()
             .filter(|r| is_ok_ord(r) && val_to_str(r.get("verdict")) == "ESCALATE" && (val_to_f64(r.get("verdict_ts")).max(val_to_f64(r.get("launch_ts"))) - esc_ts).abs() <= 5.0)
             .map(|r| val_to_f64(r.get("verdict_ts")).max(val_to_f64(r.get("launch_ts"))))
@@ -4959,7 +4968,7 @@ fn validate_candidate_closure_inner(
             let missing = MAX_REVIEW_ROUNDS - live_n;
             for i in 0..missing {
                 let is_esc = live_esc_ts.is_none() && i + 1 == missing;
-                let ts = if is_esc { anchor_ts } else { rev_anchor - ((missing - i - usize::from(live_esc_ts.is_none())) as f64) * 0.001 };
+                let ts = if is_esc { anchor_ts } else { (rev_anchor - ((missing - i - usize::from(live_esc_ts.is_none())) as f64) * 0.001).max(saved_cycle_reset_ts) };
                 all_reviews.push(json!({ "engine": "codex", "kind": "ordinary", "verdict": if is_esc { "ESCALATE" } else { "REVISE" }, "launch_ts": ts, "verdict_ts": ts, "xhigh": is_xh }));
             }
         }
@@ -5006,7 +5015,7 @@ fn validate_candidate_closure_inner(
             .then_with(|| val_to_f64(a.get("launch_ts")).total_cmp(&val_to_f64(b.get("launch_ts"))))
     });
 
-    let mut cycle_cutoff_ts = 0.0;
+    let mut cycle_cutoff_ts = saved_cycle_reset_ts;
     let mut cycle_raw_ordinary: Vec<Value> = Vec::new();
     let mut cycle_counted_ordinary_n = 0usize;
     let mut cycle_raw_closure: Vec<Value> = Vec::new();
@@ -5019,6 +5028,9 @@ fn validate_candidate_closure_inner(
 
     for rev in &raw_eligible_reviews {
         let rev_lts = val_to_f64(rev.get("launch_ts"));
+        if cycle_cutoff_ts > 0.0 && rev_lts < cycle_cutoff_ts {
+            continue;
+        }
         if let Some(p_ts) = pending_reset_ts {
             if rev_lts >= p_ts {
                 cycle_cutoff_ts = p_ts;
@@ -5291,13 +5303,19 @@ fn validate_candidate_closure_inner(
                 .last()
                 .is_some_and(|r| is_fresh_tier_approved(r, &val_to_str(r.get("verdict")))));
 
-    if probing && pending_reset_ts.is_some_and(|p_ts| now_sec() >= p_ts) {
-        if let Some(probe) = cycle_probe {
-            *probe = codex_lane::ClosureCycleSummary::default();
+    if probing {
+        if let Some(p_ts) = pending_reset_ts.filter(|&p_ts| now_sec() >= p_ts) {
+            if let Some(probe) = cycle_probe {
+                *probe = codex_lane::ClosureCycleSummary {
+                    cycle_reset_ts: p_ts,
+                    ..Default::default()
+                };
+            }
+            return (false, String::new());
         }
-        return (false, String::new());
     }
     if let Some(ref mut probe) = cycle_probe {
+        probe.cycle_reset_ts = cycle_cutoff_ts;
         let mut blk_ids: Vec<String> = Vec::new();
         let mut last_blk_ts = 0.0f64;
         let mut last_cls_ts = 0.0f64;
@@ -6350,7 +6368,18 @@ pub fn format_block_message(
         }
     };
     let policy = cctx.get("policy");
-    let floor = val_to_str(cctx.get("floor"));
+    let path_floor = val_to_str(cctx.get("floor"));
+    // INVARIANT: Display and enforce guidance for the candidate's active escalated risk (`cycle_declared_risk` / `effective_risk`), never reverting to a lower path-only floor (e.g. `STANDARD` while checking `HIGH`).
+    let mut risk_inputs = vec![path_floor.clone()];
+    let marker_dr = cwg_common::active_marker_declared_risk(marker);
+    if !marker_dr.is_empty() {
+        risk_inputs.push(marker_dr);
+    }
+    let ctx_eff = val_to_str(cctx.get("effective_risk"));
+    if !ctx_eff.is_empty() {
+        risk_inputs.push(ctx_eff);
+    }
+    let floor = cwg_common::max_risk(&risk_inputs);
     let cwd = val_to_str(cctx.get("cwd"));
     let git_root = val_to_str(cctx.get("git_root"));
     let dpaths: Vec<String> = cctx
@@ -6358,9 +6387,18 @@ pub fn format_block_message(
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().map(|x| val_to_str(Some(x))).collect())
         .unwrap_or_default();
-    let has_tests = match cctx.get("require_tests").and_then(|v| v.as_bool()) {
-        Some(rt) => rt,
-        None => cwg_common::requires_tests(&floor, &cwd, &dpaths, policy, &git_root),
+    let has_tests = if floor == path_floor {
+        match cctx.get("require_tests").and_then(|v| v.as_bool()) {
+            Some(rt) => rt,
+            None => cwg_common::requires_tests(&floor, &cwd, &dpaths, policy, &git_root),
+        }
+    } else {
+        cwg_common::requires_tests(&floor, &cwd, &dpaths, policy, &git_root)
+    };
+    let needs_review = if floor == path_floor {
+        json_truthy(cctx.get("needs_review"))
+    } else {
+        json_truthy(cctx.get("needs_review")) || cwg_common::requires_review(&floor, policy)
     };
     let cs_bin = rio::normalize_path(&rio::carbon_stack_bin_path().to_string_lossy());
 
@@ -6377,7 +6415,7 @@ pub fn format_block_message(
         } else {
             ""
         };
-        let review_hint = if json_truthy(cctx.get("needs_review")) {
+        let review_hint = if needs_review {
             let has_cls = reason.contains(CLOSURE_PHASE_FLAG) || reason.contains("--closure");
             let phase_flag = if has_cls {
                 format!("{} ", CLOSURE_PHASE_FLAG)
@@ -6796,6 +6834,20 @@ pub fn decide_stop(payload: &Value) -> Option<String> {
             &cycle_receipt_risk,
         );
     }
+    let eff_block_risk = {
+        let mut inputs = vec![val_to_str(cctx.get("floor"))];
+        let mdr = cwg_common::active_marker_declared_risk(&marker);
+        if !mdr.is_empty() {
+            inputs.push(mdr);
+        }
+        if !cycle_receipt_risk.is_empty() {
+            inputs.push(cycle_receipt_risk.clone());
+        }
+        cwg_common::max_risk(&inputs)
+    };
+    if let Some(cobj) = cctx.as_object_mut() {
+        cobj.insert("effective_risk".to_string(), Value::String(eff_block_risk.clone()));
+    }
 
     let cls_summary = codex_lane::active_cycle_closure_summary_for_marker(
         &marker,
@@ -6861,7 +6913,7 @@ pub fn decide_stop(payload: &Value) -> Option<String> {
             "session": session,
             "block": next_blocks,
             "reason": reason,
-            "floor": val_to_str(cctx.get("floor")),
+            "floor": eff_block_risk,
         }),
     );
     Some(format_block_message(
@@ -11059,5 +11111,95 @@ mod tests {
             .is_some(),
             "missing opening_head must fail closed for [gate] no-change"
         );
+    }
+
+    #[test]
+    fn test_stop_block_message_uses_effective_escalated_risk_not_standard_floor() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let td = TempEnvDir::new("stop-eff-risk");
+        let repo = td.path.join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+
+        let app_p = repo.join("src").join("app.ts");
+        fs::write(&app_p, "export const x = 1;\n").unwrap();
+        let app_norm = rio::normalize_path(&app_p.to_string_lossy());
+        let repo_norm = rio::normalize_path(&repo.to_string_lossy());
+        let fp = cwg_common::content_fingerprint(
+            std::slice::from_ref(&app_norm),
+            cwg_common::MAX_FINGERPRINT_FILE_BYTES,
+        );
+        let tp = td.path.join("transcript.jsonl");
+        let now = now_sec();
+        let first_ts = now - 60.0;
+        let check_ts = now - 10.0;
+        fs::write(
+            &tp,
+            format!(
+                "{}\n",
+                json!({
+                    "step_index": 1,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": crate::win32_sqlite::format_iso_utc(check_ts),
+                    "tool_calls": [{"name": "run_command", "args": {"CommandLine": "npm test"}}]
+                })
+            ),
+        )
+        .unwrap();
+        let sess = "sess-std-path-high-cycle";
+        rio::write_json(
+            &cwg_common::checks_ledger_path(sess),
+            &json!([{
+                "ts": check_ts,
+                "start_ts": check_ts - 1.0,
+                "cmd": "npm test",
+                "cwd": repo_norm,
+                "ok": true,
+                "standalone": true,
+                "kind": "test"
+            }]),
+        )
+        .unwrap();
+        rio::write_json(
+            &cwg_common::marker_path(sess),
+            &json!({
+                "session": sess,
+                "class": cwg_common::WORK_PERSISTENT,
+                "operational": false,
+                "closed": false,
+                "first_ts": first_ts,
+                "last_ts": first_ts + 5.0,
+                "last_durable_ts": first_ts + 5.0,
+                "edits": 1,
+                "cwd": repo_norm,
+                "git_root": repo_norm,
+                "paths": [app_norm],
+                "content_marks": [{"ts": first_ts + 5.0, "fp": fp, "unknown": false}],
+            }),
+        )
+        .unwrap();
+
+        // Declaring HIGH on a STANDARD-path candidate must print risk HIGH + codex-lane guidance (never risk STANDARD).
+        let blk_hi = decide_stop(&json!({
+            "conversationId": sess,
+            "transcriptPath": tp.to_string_lossy(),
+            "lastAssistantMessage": "[gate] verified: HIGH; src/app.ts tested",
+        }))
+        .expect("HIGH receipt without review must block");
+        assert!(blk_hi.contains("риск `HIGH`"), "expected HIGH risk header, got: {}", blk_hi);
+        assert!(!blk_hi.contains("риск `STANDARD`"), "must not print STANDARD risk header: {}", blk_hi);
+        assert!(blk_hi.contains("codex-lane review"), "expected review hint for HIGH risk: {}", blk_hi);
+        assert!(blk_hi.contains("[gate] verified: HIGH;"), "expected HIGH receipt hint: {}", blk_hi);
+
+        // Next turn without receipt must also require latched HIGH risk (not STANDARD).
+        let blk_missing = decide_stop(&json!({
+            "conversationId": sess,
+            "transcriptPath": tp.to_string_lossy(),
+            "lastAssistantMessage": "done without receipt",
+        }))
+        .expect("missing receipt must block");
+        assert!(blk_missing.contains("missing terminal `[gate] verified: HIGH;"), "expected HIGH missing-receipt prompt, got: {}", blk_missing);
+        assert!(blk_missing.contains("риск `HIGH`"), "expected HIGH risk guidance on missing receipt: {}", blk_missing);
     }
 }
