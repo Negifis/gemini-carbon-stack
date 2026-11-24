@@ -234,6 +234,22 @@ fn read_only_cmd_re() -> &'static Regex {
     })
 }
 
+fn node_script_arg_pat(basename_pat: &str) -> String {
+    // SAFETY: Support relative, Windows drive (`C:\`), POSIX absolute (`/`), dot-dir (`.gemini\`), and matched quoted paths while rejecting `..` traversal segments, unmatched quotes, and `$`/backtick expansion.
+    let rp = r"(?:[A-Za-z]:[/\\]|[/\\]|\.[/\\])?";
+    let bare_dir = r"(?:(?:[A-Za-z0-9_][A-Za-z0-9_.-]*|\.[A-Za-z0-9_][A-Za-z0-9_.-]*)[/\\])*";
+    let dq_dir = r"(?:(?:[A-Za-z0-9_][A-Za-z0-9_ .'-]*|\.[A-Za-z0-9_][A-Za-z0-9_ .'-]*)[/\\])*";
+    let sq_dir = r"(?:(?:[A-Za-z0-9_](?:''|[A-Za-z0-9_ .-])*|\.[A-Za-z0-9_](?:''|[A-Za-z0-9_ .-])*)[/\\])*";
+    format!(
+        r#"(?:"{rp}{dq}{b}"|'{rp}{sq}{b}'|{rp}{bd}{b})(?:\z|[\s|;&])"#,
+        rp = rp,
+        dq = dq_dir,
+        sq = sq_dir,
+        bd = bare_dir,
+        b = basename_pat,
+    )
+}
+
 fn validation_non_runner_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -245,10 +261,13 @@ fn validation_non_runner_re() -> &'static Regex {
         let cs = exe_pat_followed_by_space("carbon-stack", r"(?:\.exe)?", false);
         let agy = exe_pat_followed_by_space("agy", EXT_CMD_EXE, false);
         let node = exe_pat_followed_by_space("node", r"(?:\.exe)?", false);
+        let node_test_arg = node_script_arg_pat(
+            r"(?:test[-_][A-Za-z0-9_.-]*|[A-Za-z0-9_][A-Za-z0-9_.-]*[-_.]tests?|[A-Za-z0-9_][A-Za-z0-9_.-]*\.spec)\.(?:c?js|mjs)",
+        );
         let pkg_script =
             r"(?:[A-Za-z0-9_.-]+:)*(?:test|tests|lint|build|typecheck|check)(?:[:_-][A-Za-z0-9_:.-]+)*";
         let pat = format!(
-            r#"(?i)\A\s*(?:\$null\s*\|\s*)?(?:&\s*)?(?:{ruff}\s+check\b|{py}\s+(?:-(?:X\s+utf8|[uBEsSO])\s+)*(?:-m\s+(?:pytest|unittest|py_compile|compileall|mypy|ruff|flake8)\b|{inst}\s+(?:[^\r\n|;&]*\s)?(?:--diagnose|--dry-run)(?:\z|[\s|;&])|{mcp}\s+--semgrep-scan\b)|{cs}\s+install\s+(?:[^\r\n|;&]*\s)?(?:--diagnose|--dry-run)(?:\z|[\s|;&])|(?:uvx(?:\.exe)?\s+(?:--offline\s+)?--from\s+semgrep\s+)?semgrep(?:\.exe)?\s+(?:--legacy\s+)?scan\b|{node}\s+(?:(?:--no-warnings|--experimental-[A-Za-z0-9_-]+)\s+)*(?:(?:--test|--check)(?:\z|[\s|;&])|["']?(?:\.[/\\])?(?:[A-Za-z0-9_][A-Za-z0-9_.-]*[/\\])*(?:test[-_][A-Za-z0-9_.-]*|[A-Za-z0-9_][A-Za-z0-9_.-]*[-_.]tests?|[A-Za-z0-9_][A-Za-z0-9_.-]*\.spec)\.(?:c?js|mjs)["']?(?:\z|[\s|;&]))|bun(?:\.exe)?\s+(?:test(?:\z|[\s|;&])|run\s+{pkg_s}\b)|deno(?:\.exe)?\s+(?:test|check|lint)(?:\z|[\s|;&])|npm(?:\.cmd)?\s+(?:test\b|run\s+{pkg_s}\b)|(?:pnpm|yarn)(?:\.cmd)?\s+(?:run\s+)?(?:test\b|{pkg_s}\b)|(?:flutter|dart)(?:\.bat|\.exe)?\s+(?:test|analyze)\b|cargo(?:\.exe)?\s+(?:\+[A-Za-z0-9._-]+\s+)?(?:test|check|clippy)\b|go(?:\.exe)?\s+(?:test|vet)\b|dotnet(?:\.exe)?\s+(?:test|build)\b|{agy}\s+plugin\s+validate\b)"#,
+            r#"(?i)\A\s*(?:\$null\s*\|\s*)?(?:&\s*)?(?:{ruff}\s+check\b|{py}\s+(?:-(?:X\s+utf8|[uBEsSO])\s+)*(?:-m\s+(?:pytest|unittest|py_compile|compileall|mypy|ruff|flake8)\b|{inst}\s+(?:[^\r\n|;&]*\s)?(?:--diagnose|--dry-run)(?:\z|[\s|;&])|{mcp}\s+--semgrep-scan\b)|{cs}\s+install\s+(?:[^\r\n|;&]*\s)?(?:--diagnose|--dry-run)(?:\z|[\s|;&])|(?:uvx(?:\.exe)?\s+(?:--offline\s+)?--from\s+semgrep\s+)?semgrep(?:\.exe)?\s+(?:--legacy\s+)?scan\b|{node}\s+(?:(?:--no-warnings|--experimental-[A-Za-z0-9_-]+)\s+)*(?:(?:--test|--check)(?:\z|[\s|;&])|{node_test_arg})|bun(?:\.exe)?\s+(?:test(?:\z|[\s|;&])|run\s+{pkg_s}\b)|deno(?:\.exe)?\s+(?:test|check|lint)(?:\z|[\s|;&])|npm(?:\.cmd)?\s+(?:test\b|run\s+{pkg_s}\b)|(?:pnpm|yarn)(?:\.cmd)?\s+(?:run\s+)?(?:test\b|{pkg_s}\b)|(?:flutter|dart)(?:\.bat|\.exe)?\s+(?:test|analyze)\b|cargo(?:\.exe)?\s+(?:\+[A-Za-z0-9._-]+\s+)?(?:test|check|clippy)\b|go(?:\.exe)?\s+(?:test|vet)\b|dotnet(?:\.exe)?\s+(?:test|build)\b|{agy}\s+plugin\s+validate\b)"#,
             ruff = ruff,
             py = py,
             inst = install,
@@ -256,6 +275,7 @@ fn validation_non_runner_re() -> &'static Regex {
             cs = cs,
             agy = agy,
             node = node,
+            node_test_arg = node_test_arg,
             pkg_s = pkg_script,
         );
         Regex::new(&pat).expect("validation_non_runner_re")
@@ -268,10 +288,14 @@ fn extended_gate_validation_re() -> &'static Regex {
         // SAFETY: Gate check tracking recognizes additional standalone Node validation scripts (`validate`/`verify`/`check`/`lint`) WITHOUT widening `classify_shell_command` (File Ownership Guard).
         let node = exe_pat_followed_by_space("node", r"(?:\.exe)?", false);
         let node_verbs = "validate|verify|check|lint";
-        let pat = format!(
-            r#"(?i)\A\s*(?:\$null\s*\|\s*)?(?:&\s*)?{node}\s+(?:(?:--no-warnings|--experimental-[A-Za-z0-9_-]+)\s+)*["']?(?:\.[/\\])?(?:[A-Za-z0-9_][A-Za-z0-9_.-]*[/\\])*(?:(?:{nv})(?:[-_][A-Za-z0-9_.-]*)?|[A-Za-z0-9_][A-Za-z0-9_.-]*[-_.](?:{nv}))\.(?:c?js|mjs)["']?(?:\z|[\s|;&])"#,
-            node = node,
+        let node_val_arg = node_script_arg_pat(&format!(
+            r"(?:(?:{nv})(?:[-_][A-Za-z0-9_.-]*)?|[A-Za-z0-9_][A-Za-z0-9_.-]*[-_.](?:{nv}))\.(?:c?js|mjs)",
             nv = node_verbs,
+        ));
+        let pat = format!(
+            r#"(?i)\A\s*(?:\$null\s*\|\s*)?(?:&\s*)?{node}\s+(?:(?:--no-warnings|--experimental-[A-Za-z0-9_-]+)\s+)*{node_val_arg}"#,
+            node = node,
+            node_val_arg = node_val_arg,
         );
         Regex::new(&pat).expect("extended_gate_validation_re")
     })
@@ -2349,14 +2373,55 @@ pub fn take_git_snapshot(
         entries.insert(norm_full, Value::String(tok));
     }
 
+    let merge_head = read_git_worktree_oid(&root, "MERGE_HEAD");
     json!({
         "in_git": true,
         "root": rio::normalize_path(&root),
         "head": head,
+        "merge_head": merge_head,
         "reflog_len": reflog_len,
         "entries": Value::Object(entries),
         "unmeasured": false,
     })
+}
+
+fn read_git_worktree_oid(root: &str, name: &str) -> String {
+    let dot_git = Path::new(root).join(".git");
+    let git_dir = if dot_git.is_dir() {
+        dot_git
+    } else if dot_git.is_file() {
+        let Ok(raw) = fs::read_to_string(&dot_git) else {
+            return String::new();
+        };
+        let Some(rest) = raw
+            .lines()
+            .next()
+            .and_then(|l| l.trim().strip_prefix("gitdir:"))
+        else {
+            return String::new();
+        };
+        let gd = Path::new(rest.trim());
+        if gd.is_absolute() {
+            gd.to_path_buf()
+        } else {
+            Path::new(root).join(gd)
+        }
+    } else {
+        return String::new();
+    };
+    let Ok(oid_raw) = fs::read_to_string(git_dir.join(name)) else {
+        return String::new();
+    };
+    let lines: Vec<&str> = oid_raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.len() == 1 && lines[0].len() >= 40 && lines[0].bytes().all(|b| b.is_ascii_hexdigit()) {
+        lines[0].to_string()
+    } else {
+        String::new()
+    }
 }
 
 fn strip_git_xy_prefix(tok: &str) -> &str {
@@ -2414,22 +2479,19 @@ fn git_entry_unchanged_on_disk(path: &str, b_tok: &str, a_tok: Option<&str>) -> 
     file_entry_token(p, "", Some(&st)) == b_ctok
 }
 
-fn is_clean_upstream_ff_reflog_transition(
+fn is_clean_upstream_reflog_transition(
     root: &str,
     bh: &str,
     ah: &str,
     b_reflog_len: usize,
     a_reflog_len: usize,
 ) -> bool {
-    // INVARIANT: Prove a clean fast-forward onto an existing remote-tracking commit by inspecting EVERY reflog entry added during `[b_reflog_len..a_reflog_len]` (never stopping early at a return to `bh`) plus git ancestry and `refs/remotes/`, BEFORE `merge-tree` reconstruction.
+    // INVARIANT: Prove a clean fast-forward or branch switch onto an existing remote-tracking commit by inspecting EVERY reflog entry added during `[b_reflog_len..a_reflog_len]` plus `refs/remotes/` (and ancestry for fast-forwards), BEFORE `merge-tree` reconstruction.
     if bh.is_empty() || ah.is_empty() || bh == ah || b_reflog_len == 0 || a_reflog_len <= b_reflog_len {
         return false;
     }
     let delta = a_reflog_len - b_reflog_len;
     if delta == 0 || delta > 20 {
-        return false;
-    }
-    if rio::run_git(root, &["merge-base", "--is-ancestor", bh, ah], 3.0).0 != 0 {
         return false;
     }
     let (rc_ref, ref_out, _) = rio::run_git(
@@ -2454,6 +2516,7 @@ fn is_clean_upstream_ff_reflog_transition(
         return false;
     }
     let mut saw_ff = false;
+    let mut saw_move = false;
     for &(_, subj) in &entries[..delta] {
         let is_ff = (subj.starts_with("merge ") || subj.starts_with("pull "))
             && subj.contains(": Fast-forward")
@@ -2462,11 +2525,16 @@ fn is_clean_upstream_ff_reflog_transition(
         let is_move = subj.starts_with("checkout: moving from ");
         if is_ff {
             saw_ff = true;
-        } else if !is_move {
+        } else if is_move {
+            saw_move = true;
+        } else {
             return false;
         }
     }
-    saw_ff
+    if saw_ff {
+        return rio::run_git(root, &["merge-base", "--is-ancestor", bh, ah], 3.0).0 == 0;
+    }
+    saw_move
 }
 
 fn merge_tree_diff_rel_paths(
@@ -2593,7 +2661,7 @@ fn clean_integration_rel_paths(
     cmd: &str,
     no_dirty: bool,
 ) -> Option<HashSet<String>> {
-    if no_dirty && is_clean_upstream_ff_reflog_transition(root, bh, ah, b_reflog_len, a_reflog_len) {
+    if no_dirty && is_clean_upstream_reflog_transition(root, bh, ah, b_reflog_len, a_reflog_len) {
         return Some(HashSet::new());
     }
     if let (0, po, _) = rio::run_git(root, &["rev-list", "--parents", "-n", "1", ah], 3.0) {
@@ -2631,6 +2699,273 @@ fn clean_integration_rel_paths(
         else if !matches!(sub.as_str(), "status" | "fetch" | "rev-parse" | "rev-list" | "branch" | "log" | "show" | "diff" | "describe" | "merge-base" | "for-each-ref" | "name-rev" | "shortlog" | "ls-remote") { return None; }
     }
     saw.then(HashSet::new)
+}
+
+fn is_clean_merge_pause_entry(tok: &str) -> bool {
+    let bytes = tok.as_bytes();
+    if bytes.len() < 3 || bytes[2] != b':' {
+        return false;
+    }
+    match &tok[..2] {
+        "M " | "A " | "R " | "C " | "T " => true,
+        "D " => strip_git_xy_prefix(tok) == "absent",
+        _ => false,
+    }
+}
+
+fn is_unmerged_or_untracked_entry(tok: &str) -> bool {
+    let bytes = tok.as_bytes();
+    if bytes.len() < 3 || bytes[2] != b':' {
+        return false;
+    }
+    matches!(&tok[..2], "UU" | "AA" | "DD" | "AU" | "UA" | "DU" | "UD" | "??")
+}
+
+fn is_pure_git_merge_abort_cmd(cmd: &str) -> bool {
+    // SAFETY: Allow merge-abort cleanup ONLY when `cmd` is structurally proven to be `git merge --abort` (plus optional benign nav/env/read-only git status), rejecting `git reset --hard`, `git checkout`, redirections, or trailing edits.
+    if cmd.trim().is_empty() {
+        return false;
+    }
+    let unquoted = strip_quoted(cmd);
+    if unquoted.contains('(')
+        || unquoted.contains(')')
+        || unquoted.contains('{')
+        || unquoted.contains('}')
+        || unquoted.contains('`')
+    {
+        return false;
+    }
+    let mut saw_abort = false;
+    let segments = split_shell_segments(cmd, false);
+    for (idx, (op, seg)) in segments.iter().enumerate() {
+        let s = seg.trim();
+        if idx > 0 && op == "|" && s.eq_ignore_ascii_case("Out-Null") {
+            continue;
+        }
+        if s.is_empty()
+            || s.eq_ignore_ascii_case("$null")
+            || nav_segment_re().is_match(s)
+            || is_benign_ps_env_assign(s)
+        {
+            continue;
+        }
+        let toks = ps_tokens(s);
+        let mut i = usize::from(toks.first().is_some_and(|t| t.eq_ignore_ascii_case("$null")));
+        if toks.get(i).is_some_and(|t| t == "&") {
+            i += 1;
+        }
+        let bin = toks
+            .get(i)
+            .and_then(|x| x.rsplit(['/', '\\']).next())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !matches!(bin.as_str(), "git" | "git.exe") {
+            return false;
+        }
+        i += 1;
+        let sub = loop {
+            let Some(t) = toks.get(i).map(String::as_str) else {
+                return false;
+            };
+            if matches!(
+                t,
+                "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--super-prefix" | "--exec-path"
+            ) {
+                i += 2;
+                continue;
+            }
+            if t.starts_with('-') {
+                i += 1;
+                continue;
+            }
+            break t.to_ascii_lowercase();
+        };
+        let tail = &toks[i + 1..];
+        if tail.iter().any(|t| {
+            (t.contains('>') || t.contains('<'))
+                && !t.eq_ignore_ascii_case("2>&1")
+                && !t.eq_ignore_ascii_case("2>$null")
+        }) {
+            return false;
+        }
+        if sub == "merge" {
+            let mut has_abort_flag = false;
+            for t in tail {
+                if t.eq_ignore_ascii_case("2>&1") || t.eq_ignore_ascii_case("2>$null") {
+                    continue;
+                }
+                if t == "--abort" {
+                    has_abort_flag = true;
+                } else if !matches!(
+                    t.as_str(),
+                    "-q" | "--quiet" | "-v" | "--verbose" | "--progress" | "--no-progress"
+                ) {
+                    return false;
+                }
+            }
+            if !has_abort_flag {
+                return false;
+            }
+            saw_abort = true;
+        } else if !matches!(
+            sub.as_str(),
+            "status"
+                | "rev-parse"
+                | "rev-list"
+                | "log"
+                | "show"
+                | "diff"
+                | "describe"
+                | "merge-base"
+                | "for-each-ref"
+                | "name-rev"
+                | "shortlog"
+                | "ls-remote"
+        ) {
+            return false;
+        }
+    }
+    saw_abort
+}
+
+fn is_synthetic_mt_aside(rel: &str, head: &str, merge_head: &str) -> bool {
+    let h_pat = format!("~{}", head);
+    let m_pat = format!("~{}", merge_head);
+    (!head.is_empty() && rel.contains(&h_pat)) || (!merge_head.is_empty() && rel.contains(&m_pat))
+}
+
+fn filter_merge_pause_or_abort_changed(
+    root: &str,
+    head: &str,
+    b_merge_head: &str,
+    a_merge_head: &str,
+    core_cmd: &str,
+    b_entries: &Map<String, Value>,
+    a_entries: &Map<String, Value>,
+    changed: &mut HashSet<String>,
+) {
+    // INVARIANT: On a mid-merge conflict pause or `--no-commit` (`b_merge_head == ""`, `a_merge_head == M`, `a_head == b_head`), cryptographically filter out ONLY untouched auto-merged upstream files matching `merge-tree(HEAD, M)` in both index and worktree (never conflicted, untracked, pre-existing dirty, or locally edited files); on a proven pure `git merge --abort`, drop only files touched by `merge-base(HEAD, M)..M` (plus conflict-aside renames like `config~HEAD` deleted on abort) that returned cleanly to `HEAD`.
+    if b_merge_head.is_empty() && !a_merge_head.is_empty() {
+        let (rc_m, mo) = run_git_bytes(
+            root,
+            &["merge-tree", "--write-tree", "--no-messages", head, a_merge_head],
+            5.0,
+        );
+        let ms = String::from_utf8_lossy(&mo);
+        let mt = ms.lines().next().unwrap_or("").trim();
+        if !matches!(rc_m, 0 | 1) || mt.len() < 40 || !mt.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return;
+        }
+        let (rc_w, wb) = run_git_bytes(root, &["diff", "--name-only", "-z", "--no-renames", mt], 4.0);
+        let (rc_i, ib) = run_git_bytes(root, &["diff", "--cached", "--name-only", "-z", "--no-renames", mt], 4.0);
+        let (rc_u, ub) = run_git_bytes(root, &["diff", "--name-only", "--diff-filter=U", "-z"], 4.0);
+        if rc_w != 0 || rc_i != 0 || rc_u != 0 {
+            return;
+        }
+        let mut diverged_paths: Vec<String> = Vec::new();
+        let mut diverged_fold: HashSet<String> = HashSet::new();
+        for buf in [&wb, &ib, &ub] {
+            for rel_b in buf.split(|&b| b == 0).filter(|b| !b.is_empty()) {
+                let rel = String::from_utf8_lossy(rel_b);
+                if cache_path_re().is_match(&rel.replace('\\', "/")) {
+                    continue;
+                }
+                let norm_p = rio::normalize_path(&Path::new(root).join(rel.as_ref()).to_string_lossy());
+                if !a_entries.contains_key(&norm_p)
+                    && is_synthetic_mt_aside(&rel, head, a_merge_head)
+                    && !Path::new(&norm_p).exists()
+                {
+                    continue;
+                }
+                if diverged_fold.insert(rio::fold_path(&norm_p)) {
+                    diverged_paths.push(norm_p);
+                }
+            }
+        }
+        changed.retain(|p| {
+            if b_entries.contains_key(p) || diverged_fold.contains(&rio::fold_path(p)) {
+                return true;
+            }
+            !a_entries
+                .get(p)
+                .and_then(Value::as_str)
+                .is_some_and(is_clean_merge_pause_entry)
+        });
+        for norm_p in diverged_paths {
+            if !b_entries.contains_key(&norm_p) {
+                changed.insert(norm_p);
+            }
+        }
+    } else if !b_merge_head.is_empty()
+        && a_merge_head.is_empty()
+        && is_pure_git_merge_abort_cmd(core_cmd)
+    {
+        let (rc_m, mo) = run_git_bytes(
+            root,
+            &["merge-tree", "--write-tree", "--name-only", "--no-messages", "-z", head, b_merge_head],
+            5.0,
+        );
+        let mut mt_recs = mo.split(|&b| b == 0);
+        let mt = String::from_utf8_lossy(mt_recs.next().unwrap_or(&[])).trim().to_string();
+        if !matches!(rc_m, 0 | 1) || mt.len() < 40 || !mt.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return;
+        }
+        let (rc_d, db) = run_git_bytes(
+            root,
+            &["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--no-renames", head, &mt],
+            4.0,
+        );
+        if rc_d != 0 {
+            return;
+        }
+        let mut merge_fold: HashSet<String> = HashSet::new();
+        let mut record_merge_rel = |rel: &str| {
+            let full = Path::new(root).join(rel);
+            merge_fold.insert(rio::fold_path(&full.to_string_lossy()));
+            // INVARIANT: Include conflicted paths from `merge-tree --name-only` (e.g. binary conflicts whose tree blob stays equal to `HEAD`), stems of virtual `~<oid>` aside paths, and parent prefixes so all merge-touched paths clean up symmetrically on `git merge --abort`.
+            if is_synthetic_mt_aside(rel, head, b_merge_head) {
+                if let Some((stem, _)) = rel.rsplit_once('~') {
+                    merge_fold.insert(rio::fold_path(&Path::new(root).join(stem).to_string_lossy()));
+                }
+            }
+            let mut cur = Path::new(rel).parent();
+            while let Some(par) = cur {
+                if par.as_os_str().is_empty() {
+                    break;
+                }
+                merge_fold.insert(rio::fold_path(&Path::new(root).join(par).to_string_lossy()));
+                cur = par.parent();
+            }
+        };
+        for rel_b in mt_recs.take_while(|r| !r.is_empty()) {
+            record_merge_rel(&String::from_utf8_lossy(rel_b));
+        }
+        for rel_b in db.split(|&b| b == 0).filter(|b| !b.is_empty()) {
+            record_merge_rel(&String::from_utf8_lossy(rel_b));
+        }
+        changed.retain(|p| {
+            if a_entries.contains_key(p) {
+                return true;
+            }
+            let fp = rio::fold_path(p);
+            if merge_fold.contains(&fp) {
+                return false;
+            }
+            if b_entries
+                .get(p)
+                .and_then(Value::as_str)
+                .is_some_and(is_unmerged_or_untracked_entry)
+                && !Path::new(p).exists()
+            {
+                if let Some((stem, _)) = p.rsplit_once('~') {
+                    if merge_fold.contains(&rio::fold_path(stem)) {
+                        return false;
+                    }
+                }
+            }
+            true
+        });
+    }
 }
 
 pub fn diff_git_snapshots_for_cmd(
@@ -2767,6 +3102,12 @@ pub fn diff_git_snapshots_for_cmd(
                     }
                 }
             }
+        }
+    } else if !a_head.is_empty() && a_head == b_head && !root.is_empty() {
+        let b_mh = b_obj.get("merge_head").and_then(|v| v.as_str()).unwrap_or("");
+        let a_mh = a_obj.get("merge_head").and_then(|v| v.as_str()).unwrap_or("");
+        if b_mh != a_mh {
+            filter_merge_pause_or_abort_changed(root, a_head, b_mh, a_mh, core_cmd, b_entries, a_entries, &mut changed);
         }
     }
 
@@ -5840,6 +6181,337 @@ mod tests {
         assert!(!unm6);
         assert!(chg6.iter().any(|p| p.ends_with("/local_only.txt")), "local commit before rebase --abort must stay attributed: {:?}", chg6);
         assert!(!chg6.iter().any(|p| p.ends_with("354_up.sql")), "aborted rebase must NOT attribute upstream 354_up.sql: {:?}", chg6);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_node_absolute_and_dotdir_validation_scripts_and_traversal_reject() {
+        let exact_task_1348 = r"node C:\Users\in\.gemini\antigravity\worktrees\wa-tg-tun-new\fix-dialogs-loading\scripts\ci\test-nomad-var-consistency.js";
+        assert_eq!(classify_shell_command(exact_task_1348), "VALIDATION");
+        assert_eq!(classify_gate_check_with_val(exact_task_1348, None).0, "VALIDATION");
+        assert_eq!(
+            classify_shell_command(r#"node "C:\Users\O'Connor\.gemini\My Repo\scripts\ci\test-nomad-var-consistency.js""#),
+            "VALIDATION"
+        );
+        assert_eq!(
+            classify_shell_command(r"node 'C:\Users\O''Connor\.gemini\My Repo\scripts\ci\nomad.spec.mjs'"),
+            "VALIDATION"
+        );
+        assert_eq!(
+            classify_shell_command("node /home/in/.gemini/worktrees/app/scripts/foo_test.cjs"),
+            "VALIDATION"
+        );
+        let abs_validate = r"node C:\Users\in\.gemini\worktrees\app\scripts\ux\validate-system.js";
+        assert_eq!(classify_shell_command(abs_validate), "UNCERTAIN");
+        assert_eq!(classify_gate_check_with_val(abs_validate, None).0, "VALIDATION");
+        assert_eq!(
+            classify_gate_check_with_val(r"node 'C:\Users\O''Connor\.gemini\scripts\schema-check.mjs'", None).0,
+            "VALIDATION"
+        );
+        for rejected in [
+            r"node ..\outside\test-foo.js",
+            r"node C:\Users\in\..\evil\test-foo.js",
+            r#"node "C:\Users\in\$env\test-foo.js""#,
+            r#"node "C:\Users\in\test-foo.js"#,
+            r"node -e 'process.exit(0)' C:\Users\in\.gemini\test-foo.js",
+            r"node C:\Users\in\.gemini\scripts\migrate.js",
+        ] {
+            assert_eq!(classify_shell_command(rejected), "UNCERTAIN", "must reject: {}", rejected);
+            assert_eq!(classify_gate_check_with_val(rejected, None).0, "UNCERTAIN", "gate check must reject: {}", rejected);
+        }
+    }
+
+    #[test]
+    fn test_merge_conflict_pause_abort_and_remote_checkout_with_local_edit() {
+        let root = std::env::temp_dir().join(format!(
+            "cwg-mark-merge-pause-{}-{}",
+            std::process::id(),
+            (now_sec() * 1000.0) as u64
+        ));
+        let upstream = root.join("upstream.git");
+        let repo = root.join("repo");
+        fs::create_dir_all(&upstream).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        let run_g = |dir: &Path, args: &[&str]| {
+            let (rc, out, err) = rio::run_git(&dir.to_string_lossy(), args, 10.0);
+            assert_eq!(rc, 0, "git {:?} failed in {:?}: {} {}", args, dir, out, err);
+        };
+        run_g(&upstream, &["init", "--bare"]);
+        run_g(&repo, &["init", "-b", "wa-tg-tun"]);
+        run_g(&repo, &["config", "user.email", "test@example.com"]);
+        run_g(&repo, &["config", "user.name", "Test"]);
+        run_g(&repo, &["remote", "add", "origin", &upstream.to_string_lossy()]);
+
+        fs::create_dir_all(repo.join(".gitlab/ci")).unwrap();
+        fs::create_dir_all(repo.join("mobile-flutter")).unwrap();
+        fs::write(repo.join(".gitlab-ci.yml"), "stages: [test]\n").unwrap();
+        fs::write(repo.join("legacy_ci.yml"), "old: true\n").unwrap();
+        fs::write(repo.join("mobile-flutter/connection_bloc.dart"), "const v = 0;\n").unwrap();
+        fs::write(repo.join("mobile-flutter/foo_test.dart"), "void main() {}\n").unwrap();
+        run_g(&repo, &["add", "."]);
+        run_g(&repo, &["commit", "-m", "base"]);
+        run_g(&repo, &["push", "-u", "origin", "wa-tg-tun"]);
+
+        run_g(&repo, &["checkout", "-b", "fix-dialogs"]);
+        fs::write(repo.join("mobile-flutter/connection_bloc.dart"), "const v = 1; // local\n").unwrap();
+        run_g(&repo, &["add", "mobile-flutter/connection_bloc.dart"]);
+        run_g(&repo, &["commit", "-m", "local dart fix"]);
+
+        run_g(&repo, &["checkout", "wa-tg-tun"]);
+        fs::write(repo.join(".gitlab-ci.yml"), "stages: [test, deploy]\n").unwrap();
+        fs::write(repo.join(".gitlab/ci/new.yml"), "job: {}\n").unwrap();
+        fs::remove_file(repo.join("legacy_ci.yml")).unwrap();
+        fs::write(repo.join("mobile-flutter/connection_bloc.dart"), "const v = 2; // upstream\n").unwrap();
+        run_g(&repo, &["add", "-A"]);
+        run_g(&repo, &["commit", "-m", "upstream ci + dart"]);
+        run_g(&repo, &["push", "origin", "wa-tg-tun"]);
+
+        let repo_s = repo.to_string_lossy().into_owned();
+        // Case 1 (anom-29ca1e77 Step 1227): conflicted `git merge origin/wa-tg-tun` must attribute ONLY the conflicted dart file, NEVER clean auto-merged CI files.
+        run_g(&repo, &["checkout", "fix-dialogs"]);
+        let b_pause = take_git_snapshot(&repo_s, "", &[], None);
+        let (rc_m, _, _) = rio::run_git(&repo_s, &["merge", "origin/wa-tg-tun", "--no-edit"], 10.0);
+        assert_ne!(rc_m, 0, "expected merge conflict on connection_bloc.dart");
+        let a_pause = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg_p, unm_p) = diff_git_snapshots_for_cmd(Some(&b_pause), Some(&a_pause), "git merge origin/wa-tg-tun --no-edit");
+        assert!(!unm_p);
+        assert!(chg_p.iter().any(|p| p.ends_with("/mobile-flutter/connection_bloc.dart")), "conflicted file must be attributed: {:?}", chg_p);
+        assert!(!chg_p.iter().any(|p| p.ends_with("/.gitlab-ci.yml")), "clean auto-merged .gitlab-ci.yml must NOT leak: {:?}", chg_p);
+        assert!(!chg_p.iter().any(|p| p.ends_with("/.gitlab/ci/new.yml")), "clean auto-merged new.yml must NOT leak: {:?}", chg_p);
+        assert!(!chg_p.iter().any(|p| p.ends_with("/legacy_ci.yml")), "clean upstream deletion must NOT leak: {:?}", chg_p);
+
+        // Case 1b (Adversarial): staged edit to auto-merged .gitlab-ci.yml + recreated deleted file + untracked file during conflict pause MUST be attributed.
+        fs::write(repo.join(".gitlab-ci.yml"), "stages: [hacked]\n").unwrap();
+        run_g(&repo, &["add", ".gitlab-ci.yml"]);
+        fs::write(repo.join("legacy_ci.yml"), "recreated\n").unwrap();
+        fs::write(repo.join("rogue.yml"), "untracked\n").unwrap();
+        let a_sneaky = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg_s, unm_s) = diff_git_snapshots_for_cmd(Some(&b_pause), Some(&a_sneaky), "git merge origin/wa-tg-tun");
+        assert!(!unm_s);
+        assert!(chg_s.iter().any(|p| p.ends_with("/.gitlab-ci.yml")), "staged edit to auto-merged .gitlab-ci.yml must be attributed: {:?}", chg_s);
+        assert!(chg_s.iter().any(|p| p.ends_with("/legacy_ci.yml")), "recreated deleted file must be attributed: {:?}", chg_s);
+        assert!(chg_s.iter().any(|p| p.ends_with("/rogue.yml")), "new untracked file must be attributed: {:?}", chg_s);
+        fs::remove_file(repo.join("legacy_ci.yml")).unwrap();
+        fs::remove_file(repo.join("rogue.yml")).unwrap();
+
+        // Case 2 (`git merge --abort`): clean abort attributes 0 files; abort + trailing edit attributes edited file.
+        let b_abort = take_git_snapshot(&repo_s, "", &[], None);
+        run_g(&repo, &["merge", "--abort"]);
+        let a_abort = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg_ab, unm_ab) = diff_git_snapshots_for_cmd(Some(&b_abort), Some(&a_abort), "git merge --abort");
+        assert!(!unm_ab);
+        assert!(chg_ab.is_empty(), "clean git merge --abort must attribute 0 files: {:?}", chg_ab);
+
+        let (rc_m2, _, _) = rio::run_git(&repo_s, &["merge", "origin/wa-tg-tun", "--no-edit"], 10.0);
+        assert_ne!(rc_m2, 0);
+        let b_abort2 = take_git_snapshot(&repo_s, "", &[], None);
+        run_g(&repo, &["merge", "--abort"]);
+        fs::write(repo.join(".gitlab-ci.yml"), "stages: [post-abort-edit]\n").unwrap();
+        let a_abort2 = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg_ab2, unm_ab2) = diff_git_snapshots_for_cmd(Some(&b_abort2), Some(&a_abort2), "git merge --abort; edit");
+        assert!(!unm_ab2);
+        assert!(chg_ab2.iter().any(|p| p.ends_with("/.gitlab-ci.yml")), "edit after merge --abort must be attributed: {:?}", chg_ab2);
+        run_g(&repo, &["checkout", "--", ".gitlab-ci.yml"]);
+
+        // Case 1c (Adversarial `--no-commit` override): `git checkout HEAD -- .gitlab-ci.yml` and `git rm -f .gitlab/ci/new.yml` during paused merge MUST be attributed.
+        run_g(&repo, &["checkout", "-b", "clean-base", "HEAD~1"]);
+        let b_nc = take_git_snapshot(&repo_s, "", &[], None);
+        run_g(&repo, &["merge", "--no-commit", "--no-ff", "origin/wa-tg-tun"]);
+        run_g(&repo, &["checkout", "HEAD", "--", ".gitlab-ci.yml"]);
+        run_g(&repo, &["rm", "-f", ".gitlab/ci/new.yml"]);
+        let a_nc = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg_nc, unm_nc) = diff_git_snapshots_for_cmd(Some(&b_nc), Some(&a_nc), "git merge --no-commit --no-ff origin/wa-tg-tun");
+        assert!(!unm_nc);
+        assert!(chg_nc.iter().any(|p| p.ends_with("/.gitlab-ci.yml")), "--ours override on auto-merged .gitlab-ci.yml must be attributed: {:?}", chg_nc);
+        assert!(chg_nc.iter().any(|p| p.ends_with("/.gitlab/ci/new.yml")), "git rm of upstream-added file must be attributed: {:?}", chg_nc);
+        run_g(&repo, &["merge", "--abort"]);
+
+        // Case 3 (anom-29ca1e77 Step 1324): `git checkout -B <branch> origin/wa-tg-tun; <local edit>` must attribute ONLY the local edit, NEVER upstream diff.
+        run_g(&repo, &["checkout", "fix-dialogs"]);
+        let b_co = take_git_snapshot(&repo_s, "", &[], None);
+        run_g(&repo, &["checkout", "-B", "in/fix-mobile-dart-format", "origin/wa-tg-tun"]);
+        fs::write(repo.join("mobile-flutter/foo_test.dart"), "void main() { /* formatted */ }\n").unwrap();
+        let a_co = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg_co, unm_co) = diff_git_snapshots_for_cmd(Some(&b_co), Some(&a_co), "git checkout -B in/fix-mobile-dart-format origin/wa-tg-tun; dart format mobile-flutter/foo_test.dart");
+        assert!(!unm_co);
+        assert_eq!(chg_co.len(), 1, "remote checkout + local edit must attribute ONLY local edit: {:?}", chg_co);
+        assert!(chg_co[0].ends_with("/mobile-flutter/foo_test.dart"), "expected foo_test.dart: {:?}", chg_co);
+
+        // Case 3b (Adversarial): checkout + local edit + commit in one span fails closed (reflog has `commit:`).
+        run_g(&repo, &["checkout", "--", "mobile-flutter/foo_test.dart"]);
+        run_g(&repo, &["checkout", "fix-dialogs"]);
+        let b_co_sneak = take_git_snapshot(&repo_s, "", &[], None);
+        run_g(&repo, &["checkout", "-B", "sneaky-branch", "origin/wa-tg-tun"]);
+        fs::write(repo.join(".gitlab-ci.yml"), "stages: [sneaky]\n").unwrap();
+        run_g(&repo, &["add", ".gitlab-ci.yml"]);
+        run_g(&repo, &["commit", "-m", "sneaky commit"]);
+        let a_co_sneak = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg_co_s, unm_co_s) = diff_git_snapshots_for_cmd(Some(&b_co_sneak), Some(&a_co_sneak), "git checkout -B sneaky-branch origin/wa-tg-tun; edit; git commit");
+        assert!(!unm_co_s);
+        assert!(chg_co_s.iter().any(|p| p.ends_with("/.gitlab-ci.yml")), "checkout + commit in one span must NOT bypass attribution: {:?}", chg_co_s);
+
+        // Case 3c (Adversarial): checkout onto unpushed local branch + edit fails closed (target not in refs/remotes/).
+        run_g(&repo, &["checkout", "wa-tg-tun"]);
+        let b_loc = take_git_snapshot(&repo_s, "", &[], None);
+        run_g(&repo, &["checkout", "-B", "from-unpushed", "fix-dialogs"]);
+        fs::write(repo.join("mobile-flutter/foo_test.dart"), "void main() { /* local */ }\n").unwrap();
+        let a_loc = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg_loc, unm_loc) = diff_git_snapshots_for_cmd(Some(&b_loc), Some(&a_loc), "git checkout -B from-unpushed fix-dialogs; edit");
+        assert!(!unm_loc);
+        assert!(chg_loc.iter().any(|p| p.ends_with("/.gitlab-ci.yml")), "checkout onto unpushed local branch mixed with non-git edit must fail closed: {:?}", chg_loc);
+        run_g(&repo, &["checkout", "--", "mobile-flutter/foo_test.dart"]);
+
+        // Case 4 (R1 #1): `git reset --hard HEAD` during paused merge wiping an uncommitted edit on a current-branch-only file (`config.yml`) MUST be attributed (never mistaken for `git merge --abort`).
+        run_g(&repo, &["checkout", "wa-tg-tun"]);
+        fs::write(repo.join("config.yml"), "v1\n").unwrap();
+        run_g(&repo, &["add", "config.yml"]);
+        run_g(&repo, &["commit", "-m", "add config.yml base"]);
+        run_g(&repo, &["checkout", "-b", "branch-f1"]);
+        fs::write(repo.join("config.yml"), "v2-local-branch\n").unwrap();
+        fs::write(repo.join("mobile-flutter/connection_bloc.dart"), "const v = 10;\n").unwrap();
+        run_g(&repo, &["add", "."]);
+        run_g(&repo, &["commit", "-m", "branch-f1 config + dart"]);
+        run_g(&repo, &["checkout", "wa-tg-tun"]);
+        fs::write(repo.join("mobile-flutter/connection_bloc.dart"), "const v = 20;\n").unwrap();
+        run_g(&repo, &["add", "mobile-flutter/connection_bloc.dart"]);
+        run_g(&repo, &["commit", "-m", "wa-tg-tun dart conflict only"]);
+        run_g(&repo, &["checkout", "branch-f1"]);
+        fs::write(repo.join("config.yml"), "v3-uncommitted-dirty\n").unwrap();
+        let (rc_f1, _, _) = rio::run_git(&repo_s, &["merge", "wa-tg-tun", "--no-edit"], 10.0);
+        assert_ne!(rc_f1, 0, "expected conflict on dart while keeping dirty config.yml");
+        let b_rst = take_git_snapshot(&repo_s, "", &[], None);
+        run_g(&repo, &["reset", "--hard", "HEAD"]);
+        let a_rst = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg_rst, unm_rst) = diff_git_snapshots_for_cmd(Some(&b_rst), Some(&a_rst), "git reset --hard HEAD");
+        assert!(!unm_rst);
+        assert!(chg_rst.iter().any(|p| p.ends_with("/config.yml")), "git reset --hard HEAD wiping dirty config.yml during merge pause MUST be attributed: {:?}", chg_rst);
+
+        // Case 5 (R1 #2 & #3): file-vs-directory conflict (`config` vs `config/settings.yml` -> `AU config~HEAD`) + clean symlink typechange (`T  linktarget.txt`).
+        run_g(&repo, &["config", "core.symlinks", "false"]);
+        run_g(&repo, &["checkout", "wa-tg-tun"]);
+        fs::write(repo.join("linktarget.txt"), "regular-file\n").unwrap();
+        run_g(&repo, &["add", "linktarget.txt"]);
+        run_g(&repo, &["commit", "-m", "add linktarget base"]);
+        run_g(&repo, &["checkout", "-b", "branch-fd-up"]);
+        fs::create_dir_all(repo.join("fd_conf")).unwrap();
+        fs::write(repo.join("fd_conf/settings.yml"), "k: v\n").unwrap();
+        let (_, blob_out, _) = rio::run_git(&repo_s, &["hash-object", "-w", "config.yml"], 5.0);
+        let blob_oid = blob_out.trim().to_string();
+        run_g(&repo, &["update-index", "--cacheinfo", &format!("120000,{},linktarget.txt", blob_oid)]);
+        run_g(&repo, &["checkout", "--", "linktarget.txt"]);
+        run_g(&repo, &["add", "fd_conf/settings.yml"]);
+        run_g(&repo, &["commit", "-m", "upstream dir + typechange"]);
+        run_g(&repo, &["checkout", "wa-tg-tun"]);
+        run_g(&repo, &["checkout", "-b", "branch-fd-local"]);
+        fs::write(repo.join("fd_conf"), "local-file\n").unwrap();
+        run_g(&repo, &["add", "fd_conf"]);
+        run_g(&repo, &["commit", "-m", "local file fd_conf"]);
+        let b_fd = take_git_snapshot(&repo_s, "", &[], None);
+        let (rc_fd, _, _) = rio::run_git(&repo_s, &["merge", "branch-fd-up", "--no-edit"], 10.0);
+        assert_ne!(rc_fd, 0, "expected file/dir conflict on fd_conf");
+        let a_fd = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg_fd, unm_fd) = diff_git_snapshots_for_cmd(Some(&b_fd), Some(&a_fd), "git merge branch-fd-up --no-edit");
+        assert!(!unm_fd);
+        assert!(chg_fd.iter().any(|p| p.ends_with("/fd_conf~HEAD")), "file/dir conflict aside path must be attributed on pause: {:?}", chg_fd);
+        assert!(!chg_fd.iter().any(|p| p.ends_with("/linktarget.txt")), "clean symlink typechange (T ) matching merge-tree must NOT leak: {:?}", chg_fd);
+        assert!(!chg_fd.iter().any(|p| p.contains("fd_conf~") && !p.ends_with("fd_conf~HEAD")), "virtual merge-tree OID aside path must NOT leak: {:?}", chg_fd);
+        let b_fd_ab = take_git_snapshot(&repo_s, "", &[], None);
+        run_g(&repo, &["merge", "--abort"]);
+        let a_fd_ab = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg_fd_ab, unm_fd_ab) = diff_git_snapshots_for_cmd(Some(&b_fd_ab), Some(&a_fd_ab), "git merge --abort");
+        assert!(!unm_fd_ab);
+        assert!(chg_fd_ab.is_empty(), "clean git merge --abort of file/dir conflict (fd_conf~HEAD) must attribute 0 files: {:?}", chg_fd_ab);
+
+        // Case 5b (R1 #3 negative): clean `--no-commit --no-ff` typechange `T ` attributes 0 files, while editing `linktarget.txt` during pause MUST attribute it.
+        run_g(&repo, &["checkout", "wa-tg-tun"]);
+        let b_tc = take_git_snapshot(&repo_s, "", &[], None);
+        run_g(&repo, &["merge", "--no-commit", "--no-ff", "branch-fd-up"]);
+        let a_tc = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg_tc, unm_tc) = diff_git_snapshots_for_cmd(Some(&b_tc), Some(&a_tc), "git merge --no-commit --no-ff branch-fd-up");
+        assert!(!unm_tc);
+        assert!(chg_tc.is_empty(), "clean --no-commit typechange (T ) must attribute 0 files: {:?}", chg_tc);
+        fs::write(repo.join("linktarget.txt"), "tampered-target\n").unwrap();
+        let a_tc_edit = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg_tc_e, unm_tc_e) = diff_git_snapshots_for_cmd(Some(&b_tc), Some(&a_tc_edit), "git merge --no-commit --no-ff branch-fd-up");
+        assert!(!unm_tc_e);
+        assert!(chg_tc_e.iter().any(|p| p.ends_with("/linktarget.txt")), "tampered typechange file must be attributed: {:?}", chg_tc_e);
+        run_g(&repo, &["reset", "--hard", "HEAD"]);
+
+        // Case 6 (R2 #1 & #2): current branch renamed `src/app.rs` -> `lib/app.rs`, incoming modified `src/app.rs` (applied to `lib/app.rs`), and abort is invoked as `$null | git merge --abort | Out-Null` -> must attribute 0 files.
+        run_g(&repo, &["checkout", "wa-tg-tun"]);
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/app.rs"), "fn a() {}\nfn b() {}\nfn c() {}\nfn d() {}\nfn e() {}\n").unwrap();
+        run_g(&repo, &["add", "src/app.rs"]);
+        run_g(&repo, &["commit", "-m", "add src/app.rs"]);
+        run_g(&repo, &["checkout", "-b", "branch-rename-local"]);
+        fs::create_dir_all(repo.join("lib")).unwrap();
+        run_g(&repo, &["mv", "src/app.rs", "lib/app.rs"]);
+        fs::write(repo.join("mobile-flutter/connection_bloc.dart"), "const v = 99;\n").unwrap();
+        run_g(&repo, &["add", "-A"]);
+        run_g(&repo, &["commit", "-m", "rename src/app.rs -> lib/app.rs"]);
+        run_g(&repo, &["checkout", "wa-tg-tun"]);
+        fs::write(repo.join("src/app.rs"), "fn a() { /* up */ }\nfn b() {}\nfn c() {}\nfn d() {}\nfn e() {}\n").unwrap();
+        fs::write(repo.join("mobile-flutter/connection_bloc.dart"), "const v = 100;\n").unwrap();
+        run_g(&repo, &["add", "-A"]);
+        run_g(&repo, &["commit", "-m", "incoming edit src/app.rs + dart conflict"]);
+        run_g(&repo, &["checkout", "branch-rename-local"]);
+        let (rc_ren, _, _) = rio::run_git(&repo_s, &["merge", "wa-tg-tun", "--no-edit"], 10.0);
+        assert_ne!(rc_ren, 0, "expected dart conflict while lib/app.rs auto-merges incoming edit");
+        let b_ren_ab = take_git_snapshot(&repo_s, "", &[], None);
+        run_g(&repo, &["merge", "--abort"]);
+        let a_ren_ab = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg_ren_ab, unm_ren_ab) = diff_git_snapshots_for_cmd(
+            Some(&b_ren_ab),
+            Some(&a_ren_ab),
+            "$null | git merge --abort | Out-Null",
+        );
+        assert!(!unm_ren_ab);
+        assert!(
+            chg_ren_ab.is_empty(),
+            "clean `$null | git merge --abort | Out-Null` restoring renamed lib/app.rs must attribute 0 files: {:?}",
+            chg_ren_ab
+        );
+
+        // Case 7 (R3 #1): binary conflict where `merge-tree` leaves `HEAD` blob in result tree (`diff-tree HEAD <mt>` omits `blob.bin`) and snapshot uses `large:` token -> clean `git merge --abort` attributes 0 files, while `git reset --hard HEAD` still attributes it.
+        run_g(&repo, &["checkout", "wa-tg-tun"]);
+        fs::write(repo.join("blob.bin"), [0u8, 1, 2, 3, 0, 4, 5]).unwrap();
+        run_g(&repo, &["add", "blob.bin"]);
+        run_g(&repo, &["commit", "-m", "add binary blob.bin"]);
+        run_g(&repo, &["checkout", "-b", "branch-bin-local"]);
+        fs::write(repo.join("blob.bin"), [0u8, 1, 2, 7, 0, 7, 7]).unwrap();
+        run_g(&repo, &["add", "blob.bin"]);
+        run_g(&repo, &["commit", "-m", "local binary change"]);
+        run_g(&repo, &["checkout", "wa-tg-tun"]);
+        fs::write(repo.join("blob.bin"), [0u8, 1, 2, 9, 0, 9, 9]).unwrap();
+        run_g(&repo, &["add", "blob.bin"]);
+        run_g(&repo, &["commit", "-m", "upstream binary change"]);
+        run_g(&repo, &["checkout", "branch-bin-local"]);
+        let (rc_bin, _, _) = rio::run_git(&repo_s, &["merge", "wa-tg-tun", "--no-edit"], 10.0);
+        assert_ne!(rc_bin, 0, "expected binary conflict on blob.bin");
+        let mut b_bin_ab = take_git_snapshot(&repo_s, "", &[], None);
+        let blob_norm = rio::normalize_path(&repo.join("blob.bin").to_string_lossy());
+        b_bin_ab
+            .get_mut("entries")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .insert(blob_norm.clone(), Value::String("UU:large:41943040:0".into()));
+        run_g(&repo, &["merge", "--abort"]);
+        let a_bin_ab = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg_bin_ab, unm_bin_ab) = diff_git_snapshots_for_cmd(Some(&b_bin_ab), Some(&a_bin_ab), "git merge --abort");
+        assert!(!unm_bin_ab);
+        assert!(
+            chg_bin_ab.is_empty(),
+            "clean `git merge --abort` of large binary conflict must attribute 0 files: {:?}",
+            chg_bin_ab
+        );
+        let (chg_bin_rst, unm_bin_rst) = diff_git_snapshots_for_cmd(Some(&b_bin_ab), Some(&a_bin_ab), "git reset --hard HEAD");
+        assert!(!unm_bin_rst);
+        assert!(
+            chg_bin_rst.iter().any(|p| p.ends_with("/blob.bin")),
+            "non-abort `git reset --hard HEAD` on large binary conflict must remain attributed: {:?}",
+            chg_bin_rst
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
