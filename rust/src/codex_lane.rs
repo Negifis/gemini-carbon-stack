@@ -1933,6 +1933,17 @@ fn cmd_dispose(args: &DisposeArgs) -> i32 {
         rio::print_cli_json(&json!({ "ok": cleared, "cleared": cleared, "session": eff_sess, "git_root": norm_root }), args.pretty);
         return if cleared { 0 } else { 2 };
     }
+    if let Some(open_sess) = find_suffixed_open_marker_session(&eff_sess, &git_root) {
+        return fail_json(
+            "review_session_mismatch",
+            &format!(
+                "Active candidate in this repository belongs to session `{}`, not `{}`; re-run with `--session \"{}\"`.",
+                open_sess, eff_sess, open_sess
+            ),
+            json!({ "expected_session": open_sess, "actual_session": eff_sess }),
+            args.pretty,
+        );
+    }
     let (finding, reason, cat) = (args.finding.trim(), args.reason.trim(), args.category.trim().to_ascii_lowercase());
     if finding.is_empty() { return fail_json("missing_finding", "Provide --finding \"<finding summary>\" (or use --list / --clear).", Value::Null, args.pretty); }
     if reason.is_empty() { return fail_json("missing_reason", "Substantive disposition requires --reason explaining why the finding conflicts with BUSINESS_INTENT, is an accepted risk with safeguards, or adds no practical value.", Value::Null, args.pretty); }
@@ -2144,6 +2155,80 @@ fn apply_timeout_continuation_delta(
     }
 }
 
+pub(crate) fn find_suffixed_open_marker_session(eff_session: &str, git_root: &str) -> Option<String> {
+    // INVARIANT: Reject suffixed (`<open_session>-audit2`) or case-mismatched `--session` variants when `<open_session>` already owns an open PERSISTENT marker for this repository/worktree so Codex packets are never written to an orphan session invisible to `cwg_stop`.
+    if eff_session.is_empty() {
+        return None;
+    }
+    if cwg_common::read_marker_with_pending(eff_session).is_some_and(|m| {
+        m.is_object() && !json_truthy(m.get("closed")) && val_to_str(m.get("session")) == eff_session
+    }) {
+        return None;
+    }
+    let eff_low = eff_session.to_ascii_lowercase();
+    let fold_root = if git_root.is_empty() { String::new() } else { rio::fold_path(git_root) };
+    let root_prefix = if fold_root.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", fold_root.trim_end_matches('/'))
+    };
+    let Ok(entries) = fs::read_dir(rio::state_dir().join("gate").join("markers")) else {
+        return None;
+    };
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut best: Option<String> = None;
+    for ent in entries.flatten() {
+        let fname = ent.file_name().to_string_lossy().into_owned();
+        let Some(stem) = fname.strip_suffix(".json").or_else(|| fname.strip_suffix(".pending.d")) else {
+            continue;
+        };
+        if stem.is_empty() || !seen.insert(stem.to_string()) {
+            continue;
+        }
+        let Some(m) = cwg_common::read_marker_with_pending(stem) else {
+            continue;
+        };
+        if !m.is_object()
+            || json_truthy(m.get("closed"))
+            || cwg_common::candidate_class(&m) != cwg_common::WORK_PERSISTENT
+        {
+            continue;
+        }
+        let open_sess = val_to_str(m.get("session"));
+        if open_sess.is_empty() {
+            continue;
+        }
+        let open_low = open_sess.to_ascii_lowercase();
+        let Some(rest) = eff_low.strip_prefix(&open_low) else {
+            continue;
+        };
+        if !(rest.is_empty() && eff_session != open_sess)
+            && !matches!(rest.chars().next(), Some('-' | '_' | ':' | '/' | '.'))
+        {
+            continue;
+        }
+        if !fold_root.is_empty() {
+            let cctx = cwg_common::resolve_candidate_context(&m, false);
+            let m_gr = rio::fold_path(&val_to_str(m.get("git_root")));
+            let m_cwd = rio::fold_path(&val_to_str(m.get("cwd")));
+            let m_rr = rio::fold_path(&val_to_str(cctx.get("review_git_root")));
+            let path_hit = m.get("paths").and_then(Value::as_array).is_some_and(|a| {
+                a.iter().any(|p| {
+                    let fp = rio::fold_path(&val_to_str(Some(p)));
+                    fp == fold_root || fp.starts_with(&root_prefix)
+                })
+            });
+            if m_gr != fold_root && m_cwd != fold_root && m_rr != fold_root && !path_hit {
+                continue;
+            }
+        }
+        if best.as_ref().is_none_or(|b| open_sess.len() > b.len()) {
+            best = Some(open_sess);
+        }
+    }
+    best
+}
+
 pub(crate) fn check_review_root_mismatch(session: &str, git_root: &str) -> Option<String> {
     if session.is_empty() || git_root.is_empty() {
         return None;
@@ -2191,7 +2276,18 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
     let eff_model = resolve_review_model(&args.model, args.xhigh);
     let phase = if args.closure || args.phase == "closure" { "closure" } else { "ordinary" };
     let review_id = if args.review_id.is_empty() { format!("cwg-{}", random_hex_12()) } else { args.review_id.clone() };
-    let eff_session = if args.session.is_empty() { infer_single_open_session(&cwd) } else { args.session.clone() };
+    let eff_session = if args.session.trim().is_empty() { infer_single_open_session(&cwd) } else { args.session.trim().to_string() };
+    if let Some(open_sess) = find_suffixed_open_marker_session(&eff_session, &git_root) {
+        return fail_json(
+            "review_session_mismatch",
+            &format!(
+                "Active candidate in this repository belongs to session `{}`, not `{}`; packets recorded under `{}` are invisible to Code Work Gate Stop. Re-run with `--session \"{}\"` (add `--new-session` if you need a fresh Codex thread).",
+                open_sess, eff_session, eff_session, open_sess
+            ),
+            json!({ "round_consumed": false, "expected_session": open_sess, "actual_session": eff_session }),
+            args.pretty,
+        );
+    }
 
     let _flight_lock = match try_acquire_review_flight_lock(&eff_session, &git_root) {
         FlightLockResult::Acquired(fh) => fh,

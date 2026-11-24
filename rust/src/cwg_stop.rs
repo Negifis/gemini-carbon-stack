@@ -5628,12 +5628,22 @@ fn validate_candidate_closure_inner(
                     ),
                 );
             }
-            if cap_v != "ESCALATE" && latest_cls_verdict == "READY" {
+            let cap_is_valid_esc = cap_v == "ESCALATE"
+                && (effective_risk != "XHIGH"
+                    || eff_cycle_ordinary
+                        .last()
+                        .is_some_and(|r| json_truthy(r.get("xhigh"))));
+            if !cap_is_valid_esc {
+                let not_esc = if cap_v == "ESCALATE" {
+                    "not `XHIGH` `ESCALATE`"
+                } else {
+                    "not `ESCALATE`"
+                };
                 return (
                     false,
                     format!(
-                        "round-{} ordinary review ended in `{}`, not `ESCALATE`; `--closure` requires round-{} `ESCALATE` + verified post-escalation research (finish finitely with `[gate] draft-blocked`)",
-                        MAX_REVIEW_ROUNDS, cap_v, MAX_REVIEW_ROUNDS
+                        "round-{} ordinary review ended in `{}`, {}; `--closure` requires round-{} `ESCALATE` + verified post-escalation research (finish finitely with `[gate] draft-blocked`)",
+                        MAX_REVIEW_ROUNDS, cap_v, not_esc, MAX_REVIEW_ROUNDS
                     ),
                 );
             }
@@ -5650,11 +5660,16 @@ fn validate_candidate_closure_inner(
             } else if let Some(err) = closing_inelig_err(&mut eval, None, true) {
                 return (false, err);
             }
+            let unavail_tail = if review_unavailable {
+                ", or finish with `[gate] draft-blocked` (review lanes unavailable)"
+            } else {
+                ""
+            };
             return (
                 false,
                 format!(
-                    "invoked adversarial review ended in `{}`, not `APPROVED` (all {} ordinary rounds used; perform one focused research pass and run `{}` for `CLOSURE_VALIDATION: READY`, or finish with `[gate] draft-blocked`)",
-                    cap_v, MAX_REVIEW_ROUNDS, CLOSURE_PHASE_FLAG
+                    "invoked adversarial review ended in `{}`, not `APPROVED` (all {} ordinary rounds used; perform one focused research pass and run `{}` for `CLOSURE_VALIDATION: READY`{})",
+                    cap_v, MAX_REVIEW_ROUNDS, CLOSURE_PHASE_FLAG, unavail_tail
                 ),
             );
         }
@@ -5842,7 +5857,7 @@ fn validate_candidate_closure_inner(
                 val_to_str(r.get("verdict")) == "ESCALATE"
                     && (effective_risk != "XHIGH" || json_truthy(r.get("xhigh")))
             });
-        if ord_cap_exhausted && !has_round_cap_esc {
+        if ord_cap_exhausted && !has_round_cap_esc && pending_reset_kind.is_empty() {
             return (true, "draft-blocked".to_string());
         }
         let after_escalate = ordinary_reviews.len() >= MAX_REVIEW_ROUNDS
@@ -5863,6 +5878,15 @@ fn validate_candidate_closure_inner(
         }
         if review_unavailable {
             return (true, "draft-blocked".to_string());
+        }
+        if has_round_cap_esc && pending_reset_kind.is_empty() {
+            return (
+                false,
+                format!(
+                    "`draft-blocked` requires `CLOSURE_VALIDATION: BLOCKED` after round-{} `ESCALATE` (perform one focused research pass and run `{}` for `CLOSURE_VALIDATION: READY|BLOCKED` first)",
+                    MAX_REVIEW_ROUNDS, CLOSURE_PHASE_FLAG
+                ),
+            );
         }
         return (
             false,
@@ -6501,20 +6525,30 @@ pub fn format_block_message(
     };
     let cs_bin = rio::normalize_path(&rio::carbon_stack_bin_path().to_string_lossy());
 
-    let guidance = if reason.contains("terminal closure cap") || reason.contains("draft-blocked") {
-        let reqs = cwg_common::receipt_requirements_summary(&floor, policy, has_tests);
+    let is_closure_cap_exhausted = reason.contains("terminal closure cap")
+        || reason.contains("exceeded MAX_CLOSURE_PASSES=")
+        || reason.contains("closure passes in this cycle are consumed");
+    let is_ordinary_cap_no_escalate = reason.contains("ordinary review ended in")
+        && (reason.contains("not `ESCALATE`") || reason.contains("not `XHIGH` `ESCALATE`"));
+    let reqs = cwg_common::receipt_requirements_summary(&floor, policy, has_tests);
+    let guidance = if is_closure_cap_exhausted {
         format!(
             "Кандидат `PERSISTENT` (риск `{}`). Обязательные условия: {}.\n- Конечный потолок гейта (`{}` раунда ревью + `{}/{}` прохода `--closure` с `BLOCKED`) исчерпан: новые циклы ревью запрещены.\n- Сохраните текущее состояние, опишите точный оставшийся блокер и завершите ответ терминальной квитанцией `[gate] draft-blocked: <точный блокер и handoff>`.",
             floor, reqs, MAX_REVIEW_ROUNDS, MAX_CLOSURE_PASSES, MAX_CLOSURE_PASSES
         )
+    } else if is_ordinary_cap_no_escalate {
+        format!(
+            "Кандидат `PERSISTENT` (риск `{}`). Обязательные условия: {}.\n- Конечный потолок обычных раундов ревью (`{}/{}` без `ESCALATE`) исчерпан: переход в `--closure` и новые циклы ревью запрещены.\n- Сохраните текущее состояние, опишите точный оставшийся блокер и завершите ответ терминальной квитанцией `[gate] draft-blocked: <точный блокер и handoff>`.",
+            floor, reqs, MAX_REVIEW_ROUNDS, MAX_REVIEW_ROUNDS
+        )
     } else {
-        let reqs = cwg_common::receipt_requirements_summary(&floor, policy, has_tests);
         let xhigh_hint = if floor == "XHIGH" {
             " с `REVIEW_TIER: XHIGH`"
         } else {
             ""
         };
-        let review_hint = if needs_review {
+        let skip_review_hint = reason.contains("`draft-blocked` conflicts with current");
+        let review_hint = if needs_review && !skip_review_hint {
             let has_cls = reason.contains(CLOSURE_PHASE_FLAG) || reason.contains("--closure");
             let phase_flag = if has_cls {
                 format!("{} ", CLOSURE_PHASE_FLAG)
@@ -6566,9 +6600,20 @@ pub fn format_block_message(
         } else {
             String::new()
         };
+        let closing_receipt_hint = if reason.contains("close with `pr-ready` or `verified`") {
+            format!(
+                "- Завершите финальный ответ строкой `[gate] pr-ready: {}; <кандидат и проверки>` или `[gate] verified: {}; <кандидат и решающие проверки>`.",
+                floor, floor
+            )
+        } else {
+            format!(
+                "- Завершите финальный ответ строкой `[gate] verified: {}; <кандидат и решающие проверки>`.",
+                floor
+            )
+        };
         format!(
-            "Кандидат `PERSISTENT` (риск `{}`). Обязательные условия: {}.\n{}- Завершите финальный ответ строкой `[gate] verified: {}; <кандидат и решающие проверки>`.",
-            floor, reqs, review_hint, floor
+            "Кандидат `PERSISTENT` (риск `{}`). Обязательные условия: {}.\n{}{}",
+            floor, reqs, review_hint, closing_receipt_hint
         )
     };
 
@@ -9624,7 +9669,7 @@ mod tests {
             })
             .collect();
         let rcp_verified = cwg_common::parse_terminal_receipt("[gate] verified: HIGH; candidate").unwrap();
-        let (ok_ver, _) = validate_candidate_closure(CandidateClosureInput {
+        let (ok_ver, why_ver) = validate_candidate_closure(CandidateClosureInput {
             receipt: Some(&rcp_verified),
             marker_in: &marker_r2,
             checks_ev: &checks_ok,
@@ -9636,6 +9681,19 @@ mod tests {
             transcript_path: Some(&tp_str),
         });
         assert!(!ok_ver, "4x REVISE must reject verified receipt");
+        assert!(
+            why_ver.contains("not `ESCALATE`") && !why_ver.contains("perform one focused research pass"),
+            "4x REVISE without ESCALATE must reject without directing to --closure: {}",
+            why_ver
+        );
+        let msg_4rev = format_block_message(&why_ver, 1, &marker_r2, sess, "n-4rev", None);
+        assert!(
+            msg_4rev.contains("Конечный потолок обычных раундов ревью")
+                && msg_4rev.contains("[gate] draft-blocked:")
+                && !msg_4rev.contains("Для независимого ревью"),
+            "Stop message for 4x REVISE must direct to terminal draft-blocked without suggesting review/--closure: {}",
+            msg_4rev
+        );
 
         let rcp_draft = cwg_common::parse_terminal_receipt(
             "[gate] draft-blocked: 4/4 ordinary rounds returned REVISE without ESCALATE",
@@ -11590,7 +11648,7 @@ mod tests {
         ]);
         assert_eq!(rc_wrong_ws, 2, "codex-lane review from parent workspace ws_parent must reject review_root_mismatch");
         let m_after_wrong = rio::read_json(&cwg_common::marker_path(sess)).unwrap();
-        assert!(m_after_wrong.get("declared_risk").is_none(), "rejected wrong-root --xhigh must fail BEFORE latching declared_risk");
+        assert_ne!(cwg_common::active_marker_declared_risk(&m_after_wrong), "XHIGH", "rejected wrong-root --xhigh must fail BEFORE latching XHIGH into cycle_declared_risk");
         assert!(m_after_wrong.get("closure_halt").is_none(), "rejected wrong-root --closure must never latch closure_halt");
 
         // Positive (anom-88074d78): APPROVED review in actual HIGH worktree (mr2_high) must close Stop cleanly even though marker.git_root is ws_parent.
@@ -11600,5 +11658,225 @@ mod tests {
             "lastAssistantMessage": "[gate] verified: HIGH; reviewed in mr2_high",
         }));
         assert!(ok_hi.is_none(), "APPROVED review in external HIGH worktree mr2_high must satisfy Stop, got: {:?}", ok_hi);
+    }
+
+    #[test]
+    fn test_format_block_message_no_self_contradiction_and_suffixed_session_guard() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let td = TempEnvDir::new("stop-anom-d9f3368d");
+        let repo = td.path.join("ai_selector");
+        let other_repo = td.path.join("other_repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(other_repo.join(".git")).unwrap();
+        let f_hi = repo.join(".gitlab-ci.yml");
+        fs::write(&f_hi, "stages: [test]\n").unwrap();
+        let repo_norm = rio::normalize_path(&repo.to_string_lossy());
+        let other_norm = rio::normalize_path(&other_repo.to_string_lossy());
+        let f_hi_norm = rio::normalize_path(&f_hi.to_string_lossy());
+
+        let base_sess = "99a35254-2f20-4deb-9cc7-ab4eebc2301f";
+        let suffixed_sess = "99a35254-2f20-4deb-9cc7-ab4eebc2301f-audit2";
+        let upper_sess = "99A35254-2F20-4DEB-9CC7-AB4EEBC2301F";
+        let fp = cwg_common::content_fingerprint(&[f_hi_norm.clone()], cwg_common::MAX_FINGERPRINT_FILE_BYTES);
+        let t_now = now_sec();
+        let marker = json!({
+            "session": base_sess, "class": cwg_common::WORK_PERSISTENT, "operational": false, "closed": false,
+            "first_ts": t_now - 60.0, "last_ts": t_now - 50.0, "last_durable_ts": t_now - 50.0, "edits": 1,
+            "cwd": repo_norm, "git_root": repo_norm, "paths": [f_hi_norm],
+            "content_marks": [{"ts": t_now - 50.0, "fp": fp, "unknown": false}],
+            "gate_max_review_rounds": 4,
+        });
+        rio::write_json(&cwg_common::marker_path(base_sess), &marker).unwrap();
+
+        // Part 1 (anom-d9f3368d): format_block_message must NEVER claim terminal ceiling exhausted when rejecting draft-blocked or when Pass 2 / --closure is still eligible.
+        let r_reject = "`draft-blocked` requires `CLOSURE_VALIDATION: BLOCKED` after round-4 ESCALATE (or 2/2 closure blocks, or 4/4 REVISE rounds without ESCALATE), or exhausted review lanes";
+        let m_reject = format_block_message(r_reject, 1, &marker, base_sess, "n1", None);
+        assert!(!m_reject.contains("Конечный потолок"), "rejected draft-blocked must NOT claim ceiling exhausted: {}", m_reject);
+        assert!(m_reject.contains("[gate] verified: HIGH;"), "rejected draft-blocked must guide toward verified receipt: {}", m_reject);
+
+        let r_ready = "`draft-blocked` conflicts with current `CLOSURE_VALIDATION: READY`; close with `pr-ready` or `verified`";
+        let m_ready = format_block_message(r_ready, 1, &marker, base_sess, "n2", None);
+        assert!(!m_ready.contains("Конечный потолок"), "READY conflict must NOT claim ceiling exhausted: {}", m_ready);
+        assert!(m_ready.contains("[gate] pr-ready: HIGH;") && !m_ready.contains("Для независимого ревью"), "READY conflict should guide pr-ready/verified without new review bullet: {}", m_ready);
+
+        let r_app = "`draft-blocked` conflicts with current fresh `VERDICT: APPROVED`; close with `verified`";
+        let m_app = format_block_message(r_app, 1, &marker, base_sess, "n3", None);
+        assert!(!m_app.contains("Конечный потолок") && !m_app.contains("Для независимого ревью"), "APPROVED conflict must guide verified without ceiling/new review bullet: {}", m_app);
+
+        let r_pass1 = "closure validation pass 1/2 returned `BLOCKED`; apply one bounded REMEDIATE/REDESIGN + tests and run final `--closure` pass 2/2, or finish finitely with `[gate] draft-blocked: <blocker>`";
+        let m_pass1 = format_block_message(r_pass1, 1, &marker, base_sess, "n4", None);
+        assert!(!m_pass1.contains("Конечный потолок"), "Pass 1/2 BLOCKED must NOT claim 2/2 exhausted: {}", m_pass1);
+        assert!(m_pass1.contains("--closure"), "Pass 1/2 BLOCKED must include --closure hint: {}", m_pass1);
+
+        // R1 #2: Round 4 ESCALATE with 0 closure passes and available review must guide toward --closure for BOTH `[gate] verified` (never offering draft-blocked prematurely) AND rejected `[gate] draft-blocked` (never suggesting exhausted ordinary review).
+        let now_esc = now_sec();
+        let checks_esc = ChecksEvidence {
+            checks_count: 1,
+            passed_count: 1,
+            latest_pass_ts: now_esc - 35.0,
+            ..Default::default()
+        };
+        let sub_esc = SubagentEvidence::default();
+        let sw_esc = SwarmEvidence::default();
+        let four_esc: Vec<Value> = (1..=4)
+            .map(|i| {
+                let lts = now_esc - 30.0 + (i as f64) * 4.0;
+                json!({
+                    "review_id": format!("cwg-4esc-{}", i),
+                    "kind": "ordinary",
+                    "verdict": if i < 4 { "REVISE" } else { "ESCALATE" },
+                    "engine": "codex",
+                    "xhigh": false,
+                    "launch_ts": lts,
+                    "verdict_ts": lts + 1.0,
+                })
+            })
+            .collect();
+        let rcp_v_esc = cwg_common::parse_terminal_receipt("[gate] verified: HIGH; after r4 escalate").unwrap();
+        let (ok_v_esc, why_v_esc) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_v_esc),
+            marker_in: &marker,
+            checks_ev: &checks_esc,
+            sub_ev: &sub_esc,
+            swarm_ev: &sw_esc,
+            codex_reviews: &four_esc,
+            ctx: None,
+            steps: None,
+            transcript_path: None,
+        });
+        assert!(!ok_v_esc);
+        assert!(
+            why_v_esc.contains(CLOSURE_PHASE_FLAG) && !why_v_esc.contains("draft-blocked"),
+            "Round 4 ESCALATE verified rejection must guide --phase closure without offering premature draft-blocked: {}",
+            why_v_esc
+        );
+        let m_v_esc = format_block_message(&why_v_esc, 1, &marker, base_sess, "n5", None);
+        assert!(!m_v_esc.contains("Конечный потолок") && m_v_esc.contains(CLOSURE_PHASE_FLAG), "Round 4 ESCALATE verified Stop message must guide closure phase: {}", m_v_esc);
+
+        let rcp_d_esc = cwg_common::parse_terminal_receipt("[gate] draft-blocked: premature after r4 escalate").unwrap();
+        let (ok_d_esc, why_d_esc) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_d_esc),
+            marker_in: &marker,
+            checks_ev: &checks_esc,
+            sub_ev: &sub_esc,
+            swarm_ev: &sw_esc,
+            codex_reviews: &four_esc,
+            ctx: None,
+            steps: None,
+            transcript_path: None,
+        });
+        assert!(!ok_d_esc);
+        assert!(why_d_esc.contains(CLOSURE_PHASE_FLAG), "Round 4 ESCALATE draft-blocked rejection must point to closure phase: {}", why_d_esc);
+        let m_d_esc = format_block_message(&why_d_esc, 1, &marker, base_sess, "n5b", None);
+        assert!(
+            !m_d_esc.contains("Конечный потолок")
+                && m_d_esc.contains(&format!("{} --summary", CLOSURE_PHASE_FLAG)),
+            "Round 4 ESCALATE draft-blocked Stop message must suggest closure phase, not exhausted ordinary review: {}",
+            m_d_esc
+        );
+
+        // R2 regression: After CLOSURE_VALIDATION: READY is invalidated by a post-READY edit (pending_reset_kind == "READY"), rejected `[gate] draft-blocked` must guide toward Round 1 ordinary review (NEVER `--phase closure` from the retired cycle).
+        let tp_rst = td.path.join("transcript-post-ready-reset.jsonl");
+        let res_ts = now_esc - 10.0;
+        let ready_ts = now_esc - 8.0;
+        let edit2_ts = now_esc - 4.0;
+        fs::write(
+            &tp_rst,
+            format!(
+                "{}\n{}\n",
+                json!({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(res_ts), "tool_calls": [{"name": "search_web", "args": {"query": "docs"}}]}),
+                json!({"step_index": 2, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(res_ts + 0.5), "content": "ok"})
+            ),
+        )
+        .unwrap();
+        let tp_rst_s = tp_rst.to_string_lossy().into_owned();
+        let fp_old = fp.clone();
+        fs::write(&f_hi, "stages: [test, deploy]\n").unwrap();
+        let fp_new = cwg_common::content_fingerprint(&[f_hi_norm.clone()], cwg_common::MAX_FINGERPRINT_FILE_BYTES);
+        let marker_post_ready = json!({
+            "session": base_sess, "class": cwg_common::WORK_PERSISTENT, "operational": false, "closed": false,
+            "first_ts": t_now - 60.0, "last_ts": edit2_ts, "last_durable_ts": edit2_ts, "edits": 2,
+            "cwd": repo_norm, "git_root": repo_norm, "paths": [f_hi_norm],
+            "content_marks": [
+                {"ts": t_now - 50.0, "fp": fp_old, "unknown": false},
+                {"ts": edit2_ts, "fp": fp_new, "unknown": false}
+            ],
+            "gate_max_review_rounds": 4,
+        });
+        let mut revs_post_ready = four_esc.clone();
+        revs_post_ready.push(json!({
+            "review_id": "cwg-cls-ready-1", "kind": "closure", "verdict": "READY",
+            "engine": "codex", "xhigh": false, "launch_ts": ready_ts - 1.0, "verdict_ts": ready_ts,
+        }));
+        let checks_post_ready = ChecksEvidence {
+            checks_count: 1,
+            passed_count: 1,
+            latest_pass_ts: edit2_ts + 1.0,
+            ..Default::default()
+        };
+        let (ok_d_rst, why_d_rst) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_d_esc),
+            marker_in: &marker_post_ready,
+            checks_ev: &checks_post_ready,
+            sub_ev: &sub_esc,
+            swarm_ev: &sw_esc,
+            codex_reviews: &revs_post_ready,
+            ctx: None,
+            steps: None,
+            transcript_path: Some(&tp_rst_s),
+        });
+        assert!(!ok_d_rst);
+        assert!(
+            !why_d_rst.contains(CLOSURE_PHASE_FLAG),
+            "post-READY edit draft-blocked rejection must NOT point to retired --phase closure: {}",
+            why_d_rst
+        );
+        let m_d_rst = format_block_message(&why_d_rst, 1, &marker_post_ready, base_sess, "n5c", None);
+        assert!(
+            !m_d_rst.contains("Конечный потолок")
+                && m_d_rst.contains("codex-lane review --session")
+                && !m_d_rst.contains(CLOSURE_PHASE_FLAG),
+            "post-READY edit draft-blocked Stop message must direct to ordinary Round 1 review, not --phase closure: {}",
+            m_d_rst
+        );
+
+        let r_cap = "closure validation reached 2/2 `BLOCKED` verdicts (terminal closure cap); do NOT restart review — finish finitely with `[gate] draft-blocked: <exact blocker and handoff>`";
+        let m_cap = format_block_message(r_cap, 1, &marker, base_sess, "n6", None);
+        assert!(m_cap.contains("Конечный потолок гейта") && m_cap.contains("[gate] draft-blocked:"), "2/2 BLOCKED cap must emit ceiling guidance: {}", m_cap);
+
+        let r_ord4 = "round-4 ordinary review ended in `REVISE`, not `ESCALATE`; `--closure` requires round-4 `ESCALATE` + verified post-escalation research (finish finitely with `[gate] draft-blocked`)";
+        let m_ord4 = format_block_message(r_ord4, 1, &marker, base_sess, "n7", None);
+        assert!(m_ord4.contains("Конечный потолок обычных раундов ревью") && m_ord4.contains("[gate] draft-blocked:"), "4/4 REVISE without ESCALATE must emit ordinary-cap guidance: {}", m_ord4);
+
+        // Part 2 (anom-d9f3368d): codex-lane review/dispose must fail fast on suffixed/case-mismatched --session variants for an open marker in the same repo.
+        assert_eq!(codex_lane::find_suffixed_open_marker_session(suffixed_sess, &repo_norm).as_deref(), Some(base_sess));
+        assert_eq!(codex_lane::find_suffixed_open_marker_session(upper_sess, &repo_norm).as_deref(), Some(base_sess));
+        assert!(codex_lane::find_suffixed_open_marker_session(base_sess, &repo_norm).is_none());
+        assert!(codex_lane::find_suffixed_open_marker_session("other-unrelated-session", &repo_norm).is_none());
+        assert!(codex_lane::find_suffixed_open_marker_session(suffixed_sess, &other_norm).is_none());
+        assert_eq!(
+            codex_lane::run_cli(&[
+                "review".into(), "--cwd".into(), repo_norm.clone(), "--session".into(), suffixed_sess.into(),
+                "--xhigh".into(), "--summary".into(), "suffixed review".into(),
+            ]),
+            2,
+            "codex-lane review with suffixed --session must fail fast with review_session_mismatch"
+        );
+        assert_eq!(
+            codex_lane::run_cli(&[
+                "dispose".into(), "--cwd".into(), repo_norm.clone(), "--session".into(), suffixed_sess.into(),
+                "--finding".into(), "f1".into(), "--category".into(), "accepted-risk".into(), "--reason".into(), "r1".into(),
+            ]),
+            2,
+            "codex-lane dispose with suffixed --session must fail fast with review_session_mismatch"
+        );
+        let m_after = rio::read_json(&cwg_common::marker_path(base_sess)).unwrap();
+        assert!(cwg_common::active_marker_declared_risk(&m_after).is_empty(), "rejected suffixed review must not latch risk onto open marker");
+
+        // Closed base marker must NOT block later manual sessions.
+        let mut closed_m = marker.clone();
+        closed_m["closed"] = json!(true);
+        rio::write_json(&cwg_common::marker_path(base_sess), &closed_m).unwrap();
+        assert!(codex_lane::find_suffixed_open_marker_session(suffixed_sess, &repo_norm).is_none());
     }
 }
