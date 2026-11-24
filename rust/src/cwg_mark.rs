@@ -2479,28 +2479,27 @@ fn git_entry_unchanged_on_disk(path: &str, b_tok: &str, a_tok: Option<&str>) -> 
     file_entry_token(p, "", Some(&st)) == b_ctok
 }
 
-fn is_clean_upstream_reflog_transition(
+fn is_merge_or_pull_reflog_prefix(subj: &str) -> bool {
+    subj.starts_with("merge ")
+        || subj.starts_with("merge:")
+        || subj.starts_with("pull ")
+        || subj.starts_with("pull:")
+}
+
+fn clean_upstream_reflog_rel_paths(
     root: &str,
     bh: &str,
     ah: &str,
     b_reflog_len: usize,
     a_reflog_len: usize,
-) -> bool {
-    // INVARIANT: Prove a clean fast-forward or branch switch onto an existing remote-tracking commit by inspecting EVERY reflog entry added during `[b_reflog_len..a_reflog_len]` plus `refs/remotes/` (and ancestry for fast-forwards), BEFORE `merge-tree` reconstruction.
+) -> Option<HashSet<String>> {
+    // INVARIANT: Prove a clean fast-forward or remote-tracking branch switch (`checkout -B`/`switch -C` onto `refs/remotes/`) optionally followed by local `cherry-pick`/`commit` entries by inspecting EVERY reflog entry in `[b_reflog_len..a_reflog_len]`, returning ONLY `diff-tree(remote_base, ah)` so unrelated upstream files in `bh..remote_base` never leak while all local/cherry-picked edits (including reverts back to `bh`) stay attributed.
     if bh.is_empty() || ah.is_empty() || bh == ah || b_reflog_len == 0 || a_reflog_len <= b_reflog_len {
-        return false;
+        return None;
     }
     let delta = a_reflog_len - b_reflog_len;
-    if delta == 0 || delta > 20 {
-        return false;
-    }
-    let (rc_ref, ref_out, _) = rio::run_git(
-        root,
-        &["for-each-ref", &format!("--contains={}", ah), "refs/remotes/"],
-        3.0,
-    );
-    if rc_ref != 0 || ref_out.trim().is_empty() {
-        return false;
+    if delta == 0 || delta > 64 {
+        return None;
     }
     let count_arg = (delta + 1).to_string();
     let (rc_rl, rl_out, _) = rio::run_git(
@@ -2509,32 +2508,71 @@ fn is_clean_upstream_reflog_transition(
         3.0,
     );
     if rc_rl != 0 {
-        return false;
+        return None;
     }
     let entries: Vec<(&str, &str)> = rl_out.lines().filter_map(|l| l.split_once(' ')).collect();
     if entries.len() != delta + 1 || entries[0].0 != ah || entries[delta].0 != bh {
-        return false;
+        return None;
     }
+    let base_idx = entries[..delta]
+        .iter()
+        .position(|&(_, s)| {
+            !s.starts_with("cherry-pick: ")
+                && !s.starts_with("commit: ")
+                && !s.starts_with("commit (amend): ")
+        })?;
     let mut saw_ff = false;
     let mut saw_move = false;
-    for &(_, subj) in &entries[..delta] {
-        let is_ff = (subj.starts_with("merge ") || subj.starts_with("pull "))
-            && subj.contains(": Fast-forward")
+    for idx in base_idx..delta {
+        let (oid, subj) = entries[idx];
+        let is_ff = (is_merge_or_pull_reflog_prefix(subj) && subj.contains(": Fast-forward"))
             || (subj.starts_with("rebase")
                 && (subj.contains(": Fast-forward") || subj.contains("Fast-forwarded")));
         let is_move = subj.starts_with("checkout: moving from ");
+        let is_paired_branch_reset = subj.starts_with("branch: Reset to ")
+            && idx > base_idx
+            && entries[idx - 1].0 == oid
+            && entries[idx - 1].1.starts_with("checkout: moving from ");
         if is_ff {
             saw_ff = true;
         } else if is_move {
             saw_move = true;
-        } else {
-            return false;
+        } else if !is_paired_branch_reset {
+            return None;
         }
     }
-    if saw_ff {
-        return rio::run_git(root, &["merge-base", "--is-ancestor", bh, ah], 3.0).0 == 0;
+    if !saw_ff && !saw_move {
+        return None;
     }
-    saw_move
+    let base_oid = entries[base_idx].0;
+    if saw_ff && rio::run_git(root, &["merge-base", "--is-ancestor", bh, base_oid], 3.0).0 != 0 {
+        return None;
+    }
+    let (rc_ref, ref_out, _) = rio::run_git(
+        root,
+        &["for-each-ref", &format!("--contains={}", base_oid), "refs/remotes/"],
+        3.0,
+    );
+    if rc_ref != 0 || ref_out.trim().is_empty() {
+        return None;
+    }
+    if base_oid == ah {
+        return Some(HashSet::new());
+    }
+    let (rc_d, db) = run_git_bytes(
+        root,
+        &["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--no-renames", base_oid, ah],
+        4.0,
+    );
+    if rc_d != 0 {
+        return None;
+    }
+    Some(
+        db.split(|&b| b == 0)
+            .filter(|b| !b.is_empty())
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .collect(),
+    )
 }
 
 fn merge_tree_diff_rel_paths(
@@ -2652,6 +2690,62 @@ fn clean_rebase_rel_paths(
     Some(local_rel)
 }
 
+fn is_direct_merge_reflog_commit(
+    root: &str,
+    bh: &str,
+    ah: &str,
+    b_reflog_len: usize,
+    a_reflog_len: usize,
+) -> bool {
+    // INVARIANT: Allow optional same-OID branch-switch reflog entries immediately before a single confirmed non-FF merge-creation step (`merge`/`pull` merge commit or `commit (merge):`) from `bh` to `ah`, while failing closed on `reset`, OID-changing switches, or rebase finishes.
+    if bh.is_empty()
+        || ah.is_empty()
+        || bh == ah
+        || b_reflog_len == 0
+        || a_reflog_len <= b_reflog_len
+    {
+        return false;
+    }
+    let delta = a_reflog_len - b_reflog_len;
+    if delta == 0 || delta > 16 {
+        return false;
+    }
+    let count_arg = (delta + 1).to_string();
+    let (rc_rl, rl_out, _) = rio::run_git(
+        root,
+        &["reflog", "show", "-n", &count_arg, "--format=%H %gs", "HEAD"],
+        3.0,
+    );
+    if rc_rl != 0 {
+        return false;
+    }
+    let entries: Vec<(&str, &str)> = rl_out.lines().filter_map(|l| l.split_once(' ')).collect();
+    if entries.len() != delta + 1 || entries[0].0 != ah || entries[delta].0 != bh {
+        return false;
+    }
+    let subj = entries[0].1;
+    let is_merge_creation = (is_merge_or_pull_reflog_prefix(subj)
+        && (subj.contains(": Merge made by ") || subj.contains(": In-index merge")))
+        || subj.starts_with("commit (merge): ");
+    if !is_merge_creation {
+        return false;
+    }
+    for idx in 1..delta {
+        let (oid, step_subj) = entries[idx];
+        if oid != bh {
+            return false;
+        }
+        let is_move = step_subj.starts_with("checkout: moving from ");
+        let is_paired_branch_reset = step_subj.starts_with("branch: Reset to ")
+            && entries[idx - 1].0 == bh
+            && entries[idx - 1].1.starts_with("checkout: moving from ");
+        if !is_move && !is_paired_branch_reset {
+            return false;
+        }
+    }
+    true
+}
+
 fn clean_integration_rel_paths(
     root: &str,
     bh: &str,
@@ -2661,13 +2755,15 @@ fn clean_integration_rel_paths(
     cmd: &str,
     no_dirty: bool,
 ) -> Option<HashSet<String>> {
-    if no_dirty && is_clean_upstream_reflog_transition(root, bh, ah, b_reflog_len, a_reflog_len) {
-        return Some(HashSet::new());
+    if let Some(up_rel) = clean_upstream_reflog_rel_paths(root, bh, ah, b_reflog_len, a_reflog_len) {
+        return Some(up_rel);
     }
-    if let (0, po, _) = rio::run_git(root, &["rev-list", "--parents", "-n", "1", ah], 3.0) {
-        let oids: Vec<&str> = po.split_whitespace().collect();
-        if oids.len() >= 3 && oids[1] == bh {
-            return merge_tree_diff_rel_paths(root, bh, oids[2], ah);
+    if is_direct_merge_reflog_commit(root, bh, ah, b_reflog_len, a_reflog_len) {
+        if let (0, po, _) = rio::run_git(root, &["rev-list", "--parents", "-n", "1", ah], 3.0) {
+            let oids: Vec<&str> = po.split_whitespace().collect();
+            if oids.len() >= 3 && oids[1] == bh {
+                return merge_tree_diff_rel_paths(root, bh, oids[2], ah);
+            }
         }
     }
     if let Some(rebase_rel) = clean_rebase_rel_paths(root, bh, ah, b_reflog_len, a_reflog_len) {
@@ -6512,6 +6608,225 @@ mod tests {
             "non-abort `git reset --hard HEAD` on large binary conflict must remain attributed: {:?}",
             chg_bin_rst
         );
+
+        // Case 8 (anom-c5bec0c4 Steps 3791 & 3947): `git checkout -B <same-branch> origin/wa-tg-tun; git cherry-pick <c1> <c2>` must attribute ONLY the cherry-picked files, NEVER upstream migrations/CI files in `bh..origin/wa-tg-tun`.
+        run_g(&repo, &["checkout", "wa-tg-tun"]);
+        run_g(&repo, &["checkout", "-b", "slice-src"]);
+        fs::write(repo.join("mobile-flutter/foo_test.dart"), "void main() { /* cherry1 */ }\n").unwrap();
+        run_g(&repo, &["add", "mobile-flutter/foo_test.dart"]);
+        run_g(&repo, &["commit", "-m", "cherry slice 1"]);
+        let c1_oid = rio::git_head_oid(&repo_s);
+        fs::write(repo.join("mobile-flutter/connection_bloc.dart"), "const v = 777;\n").unwrap();
+        run_g(&repo, &["add", "mobile-flutter/connection_bloc.dart"]);
+        run_g(&repo, &["commit", "-m", "cherry slice 2"]);
+        let c2_oid = rio::git_head_oid(&repo_s);
+
+        run_g(&repo, &["checkout", "wa-tg-tun"]);
+        fs::create_dir_all(repo.join("backend/migrations")).unwrap();
+        fs::write(repo.join("backend/migrations/353_upstream.sql"), "CREATE TABLE up (id int);\n").unwrap();
+        fs::write(repo.join(".gitlab-ci.yml"), "stages: [test, deploy, release]\n").unwrap();
+        run_g(&repo, &["add", "-A"]);
+        run_g(&repo, &["commit", "-m", "upstream migration + ci"]);
+        run_g(&repo, &["push", "origin", "wa-tg-tun"]);
+
+        // Start on a branch that does NOT have 353_upstream.sql (same branch name reset via `checkout -B`), then reset to `origin/wa-tg-tun` and cherry-pick c1 + c2.
+        run_g(&repo, &["checkout", "-B", "fix/qa-round2", "HEAD~1"]);
+        let b_cp = take_git_snapshot(&repo_s, "", &[], None);
+        run_g(&repo, &["checkout", "-B", "fix/qa-round2", "origin/wa-tg-tun"]);
+        run_g(&repo, &["cherry-pick", &c1_oid, &c2_oid]);
+        let a_cp = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg_cp, unm_cp) = diff_git_snapshots_for_cmd(
+            Some(&b_cp),
+            Some(&a_cp),
+            "git checkout -B fix/qa-round2 origin/wa-tg-tun; git cherry-pick c1 c2",
+        );
+        assert!(!unm_cp);
+        assert!(chg_cp.iter().any(|p| p.ends_with("/mobile-flutter/foo_test.dart")), "cherry-pick c1 must be attributed: {:?}", chg_cp);
+        assert!(chg_cp.iter().any(|p| p.ends_with("/mobile-flutter/connection_bloc.dart")), "cherry-pick c2 must be attributed: {:?}", chg_cp);
+        assert!(!chg_cp.iter().any(|p| p.ends_with("/backend/migrations/353_upstream.sql")), "upstream SQL migration from bh..origin/wa-tg-tun must NOT leak into cherry-pick: {:?}", chg_cp);
+        assert!(!chg_cp.iter().any(|p| p.ends_with("/.gitlab-ci.yml")), "upstream .gitlab-ci.yml from bh..origin/wa-tg-tun must NOT leak into cherry-pick: {:?}", chg_cp);
+
+        // Case 8b (Adversarial revert-to-bh): cherry-pick reverting `.gitlab-ci.yml` back to `bh` content MUST still be attributed even though `diff-tree(bh, ah)` omits it.
+        run_g(&repo, &["checkout", "-b", "slice-revert", "origin/wa-tg-tun"]);
+        fs::write(repo.join(".gitlab-ci.yml"), "stages: [test, deploy]\n").unwrap();
+        run_g(&repo, &["add", ".gitlab-ci.yml"]);
+        run_g(&repo, &["commit", "-m", "revert ci back to bh"]);
+        let c_rev_oid = rio::git_head_oid(&repo_s);
+        run_g(&repo, &["checkout", "-B", "fix/qa-round2", "origin/wa-tg-tun~1"]);
+        let b_rev = take_git_snapshot(&repo_s, "", &[], None);
+        run_g(&repo, &["checkout", "-B", "fix/qa-round2", "origin/wa-tg-tun"]);
+        run_g(&repo, &["cherry-pick", &c_rev_oid]);
+        let a_rev = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg_rev, unm_rev) = diff_git_snapshots_for_cmd(
+            Some(&b_rev),
+            Some(&a_rev),
+            "git checkout -B fix/qa-round2 origin/wa-tg-tun; git cherry-pick revert",
+        );
+        assert!(!unm_rev);
+        assert!(chg_rev.iter().any(|p| p.ends_with("/.gitlab-ci.yml")), "cherry-pick reverting .gitlab-ci.yml back to bh MUST stay attributed: {:?}", chg_rev);
+        assert!(!chg_rev.iter().any(|p| p.ends_with("/backend/migrations/353_upstream.sql")), "upstream migration must still NOT leak: {:?}", chg_rev);
+
+        // Case 8b-dirty (R1 #1): pre-staged file committed in the same span (`unchanged_clean` non-empty) + `checkout -B` onto remote + cherry-pick reverting `.gitlab-ci.yml` to `bh` MUST still attribute `.gitlab-ci.yml` and MUST NOT leak upstream migration `353_upstream.sql`.
+        run_g(&repo, &["checkout", "-B", "fix/qa-round2", "origin/wa-tg-tun~1"]);
+        fs::write(repo.join("pre_staged.txt"), "staged before span\n").unwrap();
+        run_g(&repo, &["add", "pre_staged.txt"]);
+        let b_rev_dirty = take_git_snapshot(&repo_s, "", &[], None);
+        run_g(&repo, &["checkout", "-B", "fix/qa-round2", "origin/wa-tg-tun"]);
+        run_g(&repo, &["commit", "-m", "commit pre-staged file"]);
+        run_g(&repo, &["cherry-pick", &c_rev_oid]);
+        let a_rev_dirty = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg_rd, unm_rd) = diff_git_snapshots_for_cmd(
+            Some(&b_rev_dirty),
+            Some(&a_rev_dirty),
+            "git checkout -B fix/qa-round2 origin/wa-tg-tun; git commit; git cherry-pick revert",
+        );
+        assert!(!unm_rd);
+        assert!(chg_rd.iter().any(|p| p.ends_with("/.gitlab-ci.yml")), "revert-to-bh cherry-pick with pre-staged commit MUST stay attributed: {:?}", chg_rd);
+        assert!(!chg_rd.iter().any(|p| p.ends_with("/backend/migrations/353_upstream.sql")), "upstream migration must NOT leak when pre-staged file is committed: {:?}", chg_rd);
+        assert!(!chg_rd.iter().any(|p| p.ends_with("/pre_staged.txt")), "already-tracked pre-staged file committed unchanged on disk must stay excluded per-path: {:?}", chg_rd);
+
+        // Case 8c: `git checkout -B <same-branch> origin/wa-tg-tun` (paired `branch: Reset to` + `checkout: moving from`) + working-tree edit attributes ONLY the working-tree edit.
+        run_g(&repo, &["checkout", "-B", "fix/qa-round2", "origin/wa-tg-tun~1"]);
+        let b_same = take_git_snapshot(&repo_s, "", &[], None);
+        run_g(&repo, &["checkout", "-B", "fix/qa-round2", "origin/wa-tg-tun"]);
+        fs::write(repo.join("mobile-flutter/foo_test.dart"), "void main() { /* same-br */ }\n").unwrap();
+        let a_same = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg_same, unm_same) = diff_git_snapshots_for_cmd(
+            Some(&b_same),
+            Some(&a_same),
+            "git checkout -B fix/qa-round2 origin/wa-tg-tun; dart format mobile-flutter/foo_test.dart",
+        );
+        assert!(!unm_same);
+        assert_eq!(chg_same.len(), 1, "same-branch checkout -B + local edit must attribute ONLY local edit: {:?}", chg_same);
+        assert!(chg_same[0].ends_with("/mobile-flutter/foo_test.dart"));
+        run_g(&repo, &["checkout", "--", "mobile-flutter/foo_test.dart"]);
+
+        // Case 8d (Adversarial): `git checkout -B <branch> origin/wa-tg-tun; git reset --hard HEAD~1` fails closed (`reset:` in reflog).
+        run_g(&repo, &["checkout", "-B", "fix/qa-round2", "origin/wa-tg-tun~1"]);
+        let b_rfail = take_git_snapshot(&repo_s, "", &[], None);
+        run_g(&repo, &["checkout", "-B", "fix/qa-round2", "origin/wa-tg-tun"]);
+        run_g(&repo, &["cherry-pick", &c1_oid]);
+        run_g(&repo, &["reset", "--hard", "HEAD~1"]);
+        let a_rfail = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg_rf, unm_rf) = diff_git_snapshots_for_cmd(
+            Some(&b_rfail),
+            Some(&a_rfail),
+            "git checkout -B fix/qa-round2 origin/wa-tg-tun; git cherry-pick c1; git reset --hard HEAD~1",
+        );
+        assert!(!unm_rf);
+        assert!(chg_rf.iter().any(|p| p.ends_with("/backend/migrations/353_upstream.sql")), "reset --hard in reflog must fail closed and attribute full bh..ah diff: {:?}", chg_rf);
+
+        // Case 8e (R1 #2): When the target is a clean 2-parent merge commit whose first parent is `bh`, BOTH `checkout -B → cherry-pick → reset --hard HEAD~1` AND mixed `checkout -B` onto an unpushed local merge commit MUST fail closed (never bypassed by merge-tree reconstruction).
+        run_g(&repo, &["checkout", "wa-tg-tun"]);
+        run_g(&repo, &["checkout", "-b", "merge-side"]);
+        fs::write(repo.join("backend/migrations/355_merge_tip.sql"), "CREATE TABLE mtip (id int);\n").unwrap();
+        run_g(&repo, &["add", "backend/migrations/355_merge_tip.sql"]);
+        run_g(&repo, &["commit", "-m", "side migration 355"]);
+        run_g(&repo, &["checkout", "wa-tg-tun"]);
+        let pre_merge_base = rio::git_head_oid(&repo_s);
+        run_g(&repo, &["merge", "--no-ff", "--no-edit", "merge-side"]);
+        run_g(&repo, &["branch", "unpushed-merge-tip"]);
+        run_g(&repo, &["push", "origin", "wa-tg-tun"]);
+
+        run_g(&repo, &["checkout", "-B", "fix/qa-round2", &pre_merge_base]);
+        let b_mreset = take_git_snapshot(&repo_s, "", &[], None);
+        run_g(&repo, &["checkout", "-B", "fix/qa-round2", "origin/wa-tg-tun"]);
+        run_g(&repo, &["cherry-pick", &c1_oid]);
+        run_g(&repo, &["reset", "--hard", "HEAD~1"]);
+        let a_mreset = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg_mr, unm_mr) = diff_git_snapshots_for_cmd(
+            Some(&b_mreset),
+            Some(&a_mreset),
+            "git checkout -B fix/qa-round2 origin/wa-tg-tun; git cherry-pick c1; git reset --hard HEAD~1",
+        );
+        assert!(!unm_mr);
+        assert!(chg_mr.iter().any(|p| p.ends_with("/backend/migrations/355_merge_tip.sql")), "reset --hard landing on remote merge commit (first-parent==bh) must fail closed: {:?}", chg_mr);
+
+        run_g(&repo, &["checkout", "-B", "unpushed-side", &pre_merge_base]);
+        fs::write(repo.join("backend/migrations/356_local_merge.sql"), "CREATE TABLE lmtip (id int);\n").unwrap();
+        run_g(&repo, &["add", "backend/migrations/356_local_merge.sql"]);
+        run_g(&repo, &["commit", "-m", "local side 356"]);
+        run_g(&repo, &["checkout", "-B", "unpushed-local-merge", &pre_merge_base]);
+        run_g(&repo, &["merge", "--no-ff", "--no-edit", "unpushed-side"]);
+        run_g(&repo, &["checkout", "-B", "fix/qa-round2", &pre_merge_base]);
+        let b_ulm = take_git_snapshot(&repo_s, "", &[], None);
+        run_g(&repo, &["checkout", "-B", "from-unpushed-merge", "unpushed-local-merge"]);
+        fs::write(repo.join("mobile-flutter/foo_test.dart"), "void main() { /* ulm */ }\n").unwrap();
+        let a_ulm = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg_ulm, unm_ulm) = diff_git_snapshots_for_cmd(
+            Some(&b_ulm),
+            Some(&a_ulm),
+            "git checkout -B from-unpushed-merge unpushed-local-merge; edit",
+        );
+        assert!(!unm_ulm);
+        assert!(chg_ulm.iter().any(|p| p.ends_with("/backend/migrations/356_local_merge.sql")), "mixed checkout onto unpushed local merge commit (first-parent==bh) must fail closed: {:?}", chg_ulm);
+        run_g(&repo, &["checkout", "--", "mobile-flutter/foo_test.dart"]);
+
+        run_g(&repo, &["checkout", "wa-tg-tun"]);
+        let pre_pull_tip = rio::git_head_oid(&repo_s);
+        fs::write(repo.join("backend/migrations/357_pull_merge.sql"), "CREATE TABLE pm (id int);\n").unwrap();
+        run_g(&repo, &["add", "backend/migrations/357_pull_merge.sql"]);
+        run_g(&repo, &["commit", "-m", "upstream migration 357"]);
+        run_g(&repo, &["push", "origin", "wa-tg-tun"]);
+
+        run_g(&repo, &["checkout", "-B", "track-pull", &pre_pull_tip]);
+        run_g(&repo, &["branch", "--set-upstream-to=origin/wa-tg-tun", "track-pull"]);
+        fs::write(repo.join("local_div.txt"), "local diverged commit\n").unwrap();
+        run_g(&repo, &["add", "local_div.txt"]);
+        run_g(&repo, &["commit", "-m", "local diverged commit"]);
+        let div_commit = rio::git_head_oid(&repo_s);
+        run_g(&repo, &["config", "pull.rebase", "false"]);
+
+        let b_pull = take_git_snapshot(&repo_s, "", &[], None);
+        run_g(&repo, &["pull"]);
+        let a_pull = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg_pull, unm_pull) = diff_git_snapshots_for_cmd(
+            Some(&b_pull),
+            Some(&a_pull),
+            "git pull; cargo test",
+        );
+        assert!(!unm_pull);
+        assert!(chg_pull.is_empty(), "bare git pull non-FF merge + cargo test must not leak upstream migration: {:?}", chg_pull);
+
+        run_g(&repo, &["checkout", "-B", "div-base", &div_commit]);
+        let b_sw = take_git_snapshot(&repo_s, "", &[], None);
+        run_g(&repo, &["switch", "-c", "integration-check"]);
+        run_g(&repo, &["merge", "--no-ff", "--no-edit", "origin/wa-tg-tun"]);
+        let a_sw = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg_sw, unm_sw) = diff_git_snapshots_for_cmd(
+            Some(&b_sw),
+            Some(&a_sw),
+            "git switch -c integration-check; git merge --no-ff --no-edit origin/wa-tg-tun; cargo test",
+        );
+        assert!(!unm_sw);
+        assert!(chg_sw.is_empty(), "same-OID git switch -c + git merge --no-ff + cargo test must not leak upstream migration: {:?}", chg_sw);
+
+        run_g(&repo, &["checkout", "-B", "div-reset", &div_commit]);
+        let b_rst = take_git_snapshot(&repo_s, "", &[], None);
+        run_g(&repo, &["reset", "--soft", "HEAD"]);
+        run_g(&repo, &["merge", "--no-ff", "--no-edit", "origin/wa-tg-tun"]);
+        let a_rst = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg_rst, unm_rst) = diff_git_snapshots_for_cmd(
+            Some(&b_rst),
+            Some(&a_rst),
+            "git reset --soft HEAD; git merge --no-ff --no-edit origin/wa-tg-tun; cargo test",
+        );
+        assert!(!unm_rst);
+        assert!(chg_rst.iter().any(|p| p.ends_with("/backend/migrations/357_pull_merge.sql")), "reset before merge must fail closed: {:?}", chg_rst);
+
+        run_g(&repo, &["checkout", "-B", "div-detour", &div_commit]);
+        let b_det = take_git_snapshot(&repo_s, "", &[], None);
+        run_g(&repo, &["switch", "-c", "detour-other-oid", &pre_pull_tip]);
+        run_g(&repo, &["switch", "div-detour"]);
+        run_g(&repo, &["merge", "--no-ff", "--no-edit", "origin/wa-tg-tun"]);
+        let a_det = take_git_snapshot(&repo_s, "", &[], None);
+        let (chg_det, unm_det) = diff_git_snapshots_for_cmd(
+            Some(&b_det),
+            Some(&a_det),
+            "git switch -c detour-other-oid pre; git switch div-detour; git merge --no-ff --no-edit origin/wa-tg-tun; cargo test",
+        );
+        assert!(!unm_det);
+        assert!(chg_det.iter().any(|p| p.ends_with("/backend/migrations/357_pull_merge.sql")), "OID-changing switch before merge must fail closed: {:?}", chg_det);
 
         let _ = fs::remove_dir_all(&root);
     }
