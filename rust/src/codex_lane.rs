@@ -1308,7 +1308,10 @@ fn active_cycle_closure_summary_with_risk(session: &str, git_root: &str, tp: &st
     let (Some(marker), _) = cwg_common::apply_pending_marker_deltas(&skey, raw.as_ref()) else { return ClosureCycleSummary::default(); };
     let sum = crate::cwg_stop::evaluate_closure_cycle_for_marker(&marker, session, git_root, tp, min_risk);
     if sum.live_blocked_count >= cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE {
-        cwg_common::latch_marker_closure_halt_for_marker(session, &marker, sum.live_blocked_count, sum.last_blocked_ts, &sum.blocked_ids);
+        let exp_rr = val_to_str(cwg_common::resolve_candidate_context(&marker, false).get("review_git_root"));
+        if exp_rr.is_empty() || git_root.is_empty() || rio::fold_path(git_root) == rio::fold_path(&exp_rr) {
+            cwg_common::latch_marker_closure_halt_for_marker(session, &marker, sum.live_blocked_count, sum.last_blocked_ts, &sum.blocked_ids);
+        }
     }
     sum
 }
@@ -2141,6 +2144,22 @@ fn apply_timeout_continuation_delta(
     }
 }
 
+pub(crate) fn check_review_root_mismatch(session: &str, git_root: &str) -> Option<String> {
+    if session.is_empty() || git_root.is_empty() {
+        return None;
+    }
+    let m = cwg_common::read_marker_with_pending(session)?;
+    if !m.is_object() || json_truthy(m.get("closed")) || cwg_common::candidate_class(&m) != cwg_common::WORK_PERSISTENT {
+        return None;
+    }
+    let exp_rr = val_to_str(cwg_common::resolve_candidate_context(&m, false).get("review_git_root"));
+    if !exp_rr.is_empty() && rio::fold_path(git_root) != rio::fold_path(&exp_rr) {
+        Some(exp_rr)
+    } else {
+        None
+    }
+}
+
 fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
     if !args.review_id.is_empty() {
         if !aborted_rid_re().is_match(&args.review_id) {
@@ -2181,6 +2200,20 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
     };
     if let Err(e) = sync_marker_before_review(&eff_session) {
         return fail_json(e, "Failed to synchronize candidate marker fingerprint before review; retry `carbon-stack codex-lane review` once marker lock/storage is available.", json!({ "round_consumed": false }), args.pretty);
+    }
+    // INVARIANT: Reject mismatched worktree/repo `--cwd` before latching XHIGH, mutating closure_halt, or spawning Codex so a sibling STANDARD worktree can never burn rounds or poison closure state for the active HIGH worktree.
+    if let Some(exp_rr) = check_review_root_mismatch(&eff_session, &git_root) {
+        return fail_json(
+            "review_root_mismatch",
+            &format!(
+                "Active candidate requires review in `{}`, not `{}`; re-run `carbon-stack codex-lane review --cwd {}`.",
+                exp_rr,
+                rio::normalize_path(&git_root),
+                rio::quote_ps_literal(&exp_rr),
+            ),
+            json!({ "round_consumed": false, "expected_review_root": exp_rr, "actual_git_root": rio::normalize_path(&git_root) }),
+            args.pretty,
+        );
     }
     let req_risk = if args.xhigh { "XHIGH" } else { "" };
     // SAFETY: Latch `XHIGH` BEFORE `check_health()` so fallback paths preserve escalated cycle risk in `Stop`.

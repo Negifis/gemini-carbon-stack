@@ -5027,7 +5027,14 @@ fn validate_candidate_closure_inner(
         all_reviews.push(r.clone());
     }
     // INVARIANT: Hydrate candidate-scoped saved-thread Round-4 `ESCALATE` proof once here so CLI `--closure` admission and `Stop` `READY` verification share one source of truth when older rollouts leave the scan window; ignore retired pre-reset evidence once a confirmed cycle reset boundary is persisted.
-    let eff_root = if !git_root.is_empty() { git_root.as_str() } else { cwd.as_str() };
+    let cctx_review_root = val_to_str(cctx.get("review_git_root"));
+    let eff_root = if !cctx_review_root.is_empty() {
+        cctx_review_root.as_str()
+    } else if !git_root.is_empty() {
+        git_root.as_str()
+    } else {
+        cwd.as_str()
+    };
     let marker_sess_saved = val_to_str(marker.get("session"));
     let saved_cycle_reset_ts = codex_lane::saved_thread_cycle_reset_ts(&marker_sess_saved, eff_root, first_ts_val);
     if let Some((_, esc_ts, is_xh)) = codex_lane::saved_thread_escalate_evidence(&marker_sess_saved, eff_root, first_ts_val, effective_risk == "XHIGH")
@@ -6178,7 +6185,15 @@ pub fn evaluate_closure_cycle_for_marker(
         String::new()
     };
 
-    let codex_reviews = codex_lane::scan_verified_codex_reviews(first_ts_val, session, git_root);
+    let eff_review_root = if !git_root.is_empty() {
+        if let Some(cobj) = cctx.as_object_mut() {
+            cobj.insert("review_git_root".to_string(), Value::String(git_root.to_string()));
+        }
+        git_root.to_string()
+    } else {
+        val_to_str(cctx.get("review_git_root"))
+    };
+    let codex_reviews = codex_lane::scan_verified_codex_reviews(first_ts_val, session, &eff_review_root);
     let synthetic_checks = ChecksEvidence {
         checks_count: 1,
         passed_count: 1,
@@ -6526,10 +6541,19 @@ pub fn format_block_message(
                     cwg_common::CARBON_HIGH_MODEL
                 )
             };
+            let review_root = val_to_str(cctx.get("review_git_root"));
+            let cwd_flag = if !review_root.is_empty()
+                && rio::fold_path(&review_root) != rio::fold_path(&git_root)
+            {
+                format!("--cwd {} ", rio::quote_ps_literal(&review_root))
+            } else {
+                String::new()
+            };
             format!(
-                "- Для независимого ревью сначала проверьте `& \"{}\" codex-lane check`; если доступно — запустите `& \"{}\" codex-lane review --session \"{}\" {}{}--summary \"...\"`{} (при недоступности Codex запустите внутреннее ревью{} на `{}`{} через `swarm`, с эскалацией на {} при ошибке/квоте Opus).\n",
+                "- Для независимого ревью сначала проверьте `& \"{}\" codex-lane check`; если доступно — запустите `& \"{}\" codex-lane review {}--session \"{}\" {}{}--summary \"...\"`{} (при недоступности Codex запустите внутреннее ревью{} на `{}`{} через `swarm`, с эскалацией на {} при ошибке/квоте Opus).\n",
                 cs_bin,
                 cs_bin,
+                cwd_flag,
                 session,
                 phase_flag,
                 xhigh_flag,
@@ -6795,12 +6819,20 @@ pub fn decide_stop(payload: &Value) -> Option<String> {
             marker: Some(&marker),
         });
         merge_sticky_outage_state(&mut state, &mut swarm_ev);
+        cctx = cwg_common::resolve_candidate_context(&marker, true);
+        let review_root = {
+            let rr = val_to_str(cctx.get("review_git_root"));
+            if !rr.is_empty() {
+                rr
+            } else {
+                val_to_str(marker.get("git_root"))
+            }
+        };
         let codex_revs = codex_lane::scan_verified_codex_reviews(
             first_ts,
             &session,
-            &val_to_str(marker.get("git_root")),
+            &review_root,
         );
-        cctx = cwg_common::resolve_candidate_context(&marker, true);
         let (valid, val_reason) = validate_candidate_closure(CandidateClosureInput {
             receipt: receipt.as_ref(),
             marker_in: &marker,
@@ -6935,10 +6967,18 @@ pub fn decide_stop(payload: &Value) -> Option<String> {
         cobj.insert("effective_risk".to_string(), Value::String(eff_block_risk.clone()));
     }
 
+    let stop_review_root = {
+        let rr = val_to_str(cctx.get("review_git_root"));
+        if !rr.is_empty() {
+            rr
+        } else {
+            val_to_str(cctx.get("git_root"))
+        }
+    };
     let cls_summary = codex_lane::active_cycle_closure_summary_for_marker(
         &marker,
         &session,
-        &val_to_str(cctx.get("git_root")),
+        &stop_review_root,
         &tp_str,
     );
     // SAFETY: Promote to v2 latched closure halt ONLY from live-confirmed `BLOCKED` passes in this cycle (never re-latch a pre-existing legacy v0 halt as v2 when live passes are missing/evicted).
@@ -11399,5 +11439,166 @@ mod tests {
             "lastAssistantMessage": "Done without receipt",
         }));
         assert!(blk.is_some(), "after one-shot schedule timer fires, Stop must enforce terminal receipt");
+    }
+
+    #[test]
+    fn test_external_high_worktree_codex_review_recognized_and_standard_worktree_rejected() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let td = TempEnvDir::new("stop-ext-wt-review");
+        let sd = td.path.join("codex_sessions");
+        fs::create_dir_all(&sd).unwrap();
+        struct ScopedEnv(&'static str, Option<String>);
+        impl Drop for ScopedEnv {
+            fn drop(&mut self) {
+                match &self.1 {
+                    Some(v) => unsafe { std::env::set_var(self.0, v) },
+                    None => unsafe { std::env::remove_var(self.0) },
+                }
+            }
+        }
+        let prev_sd = std::env::var("CARBON_CODEX_SESSIONS_DIR").ok();
+        unsafe { std::env::set_var("CARBON_CODEX_SESSIONS_DIR", &sd) };
+        let _codex_env = ScopedEnv("CARBON_CODEX_SESSIONS_DIR", prev_sd);
+
+        let ws_parent = td.path.join("cicd_audit");
+        let mr1_std = td.path.join("mr1_std");
+        let mr2_high = td.path.join("O'Connor").join("mr2_high");
+        for d in [&ws_parent, &mr1_std, &mr2_high] {
+            fs::create_dir_all(d.join(".git")).unwrap();
+        }
+        fs::create_dir_all(mr1_std.join("scripts/ci")).unwrap();
+        let p_std = mr1_std.join("scripts/ci/helper.js");
+        let p_hi = mr2_high.join(".gitlab-ci.yml");
+        fs::write(&p_std, "module.exports = 1;\n").unwrap();
+        fs::write(&p_hi, "stages: [test]\n").unwrap();
+
+        let ws_norm = rio::normalize_path(&ws_parent.to_string_lossy());
+        let mr1_norm = rio::normalize_path(&mr1_std.to_string_lossy());
+        let mr2_norm = rio::normalize_path(&mr2_high.to_string_lossy());
+        let p_std_norm = rio::normalize_path(&p_std.to_string_lossy());
+        let p_hi_norm = rio::normalize_path(&p_hi.to_string_lossy());
+        let paths = vec![p_std_norm.clone(), p_hi_norm.clone()];
+        let fp = cwg_common::content_fingerprint(&paths, cwg_common::MAX_FINGERPRINT_FILE_BYTES);
+
+        let sess = "sess-ext-wt-high-01";
+        let now = now_sec();
+        let first_ts = now - 60.0;
+        let check_ts = now - 20.0;
+        let tp = td.path.join("transcript.jsonl");
+        fs::write(
+            &tp,
+            format!(
+                "{}\n",
+                json!({
+                    "step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE",
+                    "created_at": crate::win32_sqlite::format_iso_utc(check_ts),
+                    "tool_calls": [{"name": "run_command", "args": {"CommandLine": "npm test"}}]
+                })
+            ),
+        )
+        .unwrap();
+        let chk_p = cwg_common::checks_ledger_path(sess);
+        fs::create_dir_all(chk_p.parent().unwrap()).unwrap();
+        fs::write(
+            &chk_p,
+            format!(
+                "{}\n",
+                json!({
+                    "ts": check_ts, "start_ts": check_ts - 1.0, "cmd": "npm test",
+                    "cwd": mr2_norm, "passed": true, "kind": "check", "step_idx": 1
+                })
+            ),
+        )
+        .unwrap();
+        let marker = json!({
+            "session": sess, "class": cwg_common::WORK_PERSISTENT, "operational": false, "closed": false,
+            "first_ts": first_ts, "last_ts": first_ts + 5.0, "last_durable_ts": first_ts + 5.0, "edits": 2,
+            "cwd": ws_norm, "git_root": ws_norm, "paths": paths,
+            "content_marks": [{"ts": first_ts + 5.0, "fp": fp, "unknown": false}],
+        });
+        rio::write_json(&cwg_common::marker_path(sess), &marker).unwrap();
+
+        let cctx = cwg_common::resolve_candidate_context(&marker, false);
+        assert_eq!(rio::fold_path(&val_to_str(cctx.get("review_git_root"))), rio::fold_path(&mr2_norm));
+
+        let write_rev = |rid: &str, nonce: &str, cwd_s: &str, ts: f64| {
+            let ptxt = format!("REVIEW_ID: {}\nPACKET_NONCE: {}\n", rid, nonce);
+            rio::write_json(
+                &cwg_common::marker_path(sess).parent().unwrap().parent().unwrap().join("packets").join(format!("{}.json", rid)),
+                &json!({
+                    "review_id": rid, "packet_nonce": nonce, "cwd": cwd_s, "effort": "medium",
+                    "phase": "ordinary", "session": sess, "created_ts": ts - 2.0, "committed": true,
+                }),
+            )
+            .unwrap();
+            let iso = crate::win32_sqlite::format_iso_utc(ts);
+            fs::write(
+                sd.join(format!("rollout-{}.jsonl", rid)),
+                [
+                    json!({"type": "session_meta", "timestamp": iso, "payload": {"id": format!("sid-{}", rid), "source": "exec"}}),
+                    json!({"type": "turn_context", "timestamp": iso, "payload": {"model": "gpt-6.2-sol", "effort": "medium"}}),
+                    json!({"type": "response_item", "timestamp": iso, "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": ptxt}]}}),
+                    json!({"type": "event_msg", "timestamp": iso, "payload": {"type": "task_complete", "last_agent_message": "VERDICT: APPROVED"}}),
+                ]
+                .into_iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+                    + "\n",
+            )
+            .unwrap();
+        };
+
+        // Security: APPROVED review in sibling STANDARD worktree (mr1_std) must NOT satisfy HIGH worktree (mr2_high).
+        write_rev("cwg-mr1std000001", "aa11bb22cc33", &mr1_norm, now - 10.0);
+        let blk_std = decide_stop(&json!({
+            "conversationId": sess, "transcriptPath": tp.to_string_lossy(), "fullyIdle": true,
+            "lastAssistantMessage": "[gate] verified: HIGH; reviewed in mr1_std",
+        }))
+        .expect("review in STANDARD worktree mr1_std must NOT approve HIGH worktree mr2_high");
+        assert!(
+            blk_std.contains("lacks an independent `VERDICT: APPROVED`"),
+            "expected review-missing block for mr1_std review, got: {}",
+            blk_std
+        );
+        let expected_cwd_arg = format!("--cwd {}", rio::quote_ps_literal(&mr2_norm));
+        assert!(expected_cwd_arg.contains("O''Connor/mr2_high"), "quote_ps_literal must escape apostrophe by doubling: {}", expected_cwd_arg);
+        assert_eq!(rio::quote_ps_literal("C:/Work/O'Connor/$prod/a`b"), "'C:/Work/O''Connor/$prod/a`b'");
+        assert!(
+            blk_std.contains(&expected_cwd_arg),
+            "Stop hint must pass literal PowerShell --cwd preserving apostrophe, got: {}",
+            blk_std
+        );
+        // R1 #1: CLI review / --closure invoked from wrong worktree (mr1_std or ws_parent) must fail closed before latching XHIGH/closure_halt or spawning Codex.
+        assert_eq!(
+            codex_lane::check_review_root_mismatch(sess, &mr1_norm).map(|s| rio::fold_path(&s)),
+            Some(rio::fold_path(&mr2_norm))
+        );
+        assert_eq!(
+            codex_lane::check_review_root_mismatch(sess, &ws_norm).map(|s| rio::fold_path(&s)),
+            Some(rio::fold_path(&mr2_norm))
+        );
+        assert!(codex_lane::check_review_root_mismatch(sess, &mr2_norm).is_none());
+        let rc_wrong_cls = codex_lane::run_cli(&[
+            "review".into(), "--cwd".into(), mr1_norm.clone(), "--session".into(), sess.into(),
+            "--xhigh".into(), "--closure".into(), "--summary".into(), "wrong root closure".into(),
+        ]);
+        assert_eq!(rc_wrong_cls, 2, "codex-lane --xhigh --closure from STANDARD worktree mr1_std must reject review_root_mismatch");
+        let rc_wrong_ws = codex_lane::run_cli(&[
+            "review".into(), "--cwd".into(), ws_norm.clone(), "--session".into(), sess.into(),
+            "--xhigh".into(), "--summary".into(), "wrong parent ws".into(),
+        ]);
+        assert_eq!(rc_wrong_ws, 2, "codex-lane review from parent workspace ws_parent must reject review_root_mismatch");
+        let m_after_wrong = rio::read_json(&cwg_common::marker_path(sess)).unwrap();
+        assert!(m_after_wrong.get("declared_risk").is_none(), "rejected wrong-root --xhigh must fail BEFORE latching declared_risk");
+        assert!(m_after_wrong.get("closure_halt").is_none(), "rejected wrong-root --closure must never latch closure_halt");
+
+        // Positive (anom-88074d78): APPROVED review in actual HIGH worktree (mr2_high) must close Stop cleanly even though marker.git_root is ws_parent.
+        write_rev("cwg-mr2hi0000001", "dd44ee55ff66", &mr2_norm, now - 5.0);
+        let ok_hi = decide_stop(&json!({
+            "conversationId": sess, "transcriptPath": tp.to_string_lossy(), "fullyIdle": true,
+            "lastAssistantMessage": "[gate] verified: HIGH; reviewed in mr2_high",
+        }));
+        assert!(ok_hi.is_none(), "APPROVED review in external HIGH worktree mr2_high must satisfy Stop, got: {:?}", ok_hi);
     }
 }

@@ -463,6 +463,19 @@ pub fn fold_path(path: &str) -> String {
     }
 }
 
+pub fn quote_ps_literal(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 2);
+    out.push('\'');
+    for ch in raw.chars() {
+        if matches!(ch, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            out.push(ch);
+        }
+        out.push(ch);
+    }
+    out.push('\'');
+    out
+}
+
 pub fn safe_key(value: &str, fallback: &str) -> String {
     let raw = value.trim();
     if raw.is_empty() {

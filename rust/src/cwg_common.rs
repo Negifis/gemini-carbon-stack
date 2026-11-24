@@ -4515,6 +4515,22 @@ pub fn requires_tests(
     requires_tests_impl(risk, cwd, paths, policy, git_root_opt, None)
 }
 
+fn find_enclosing_git_root(path: &str) -> Option<String> {
+    let mut cur = Path::new(path);
+    if !cur.is_dir() {
+        cur = cur.parent()?;
+    }
+    for anc in cur.ancestors() {
+        if anc.join(".git").exists() {
+            let norm = rio::normalize_path(&anc.to_string_lossy());
+            if !rio::is_unapproved_home_git_root(path, &norm) {
+                return Some(norm);
+            }
+        }
+    }
+    None
+}
+
 pub fn resolve_candidate_context(marker: &Value, include_tests: bool) -> Value {
     let cwd = val_to_str(marker.get("cwd"));
     let dpaths = durable_paths_from_val(marker.get("paths"));
@@ -4564,6 +4580,34 @@ pub fn resolve_candidate_context(marker: &Value, include_tests: bool) -> Value {
     } else {
         Value::Null
     };
+    // INVARIANT: Bind Codex review lookup to the unique review-requiring edited worktree root (or unique edited root) so edits made in an external worktree under a sibling parent workspace recognize `--cwd <edited-worktree>` reviews without letting a STANDARD worktree approve a HIGH one.
+    let mut root_cache: HashMap<String, Option<String>> = HashMap::new();
+    let mut review_roots: HashMap<String, String> = HashMap::new();
+    let mut all_edited_roots: HashMap<String, String> = HashMap::new();
+    for (abs_p, p_pol, p_risk) in &items {
+        let pdir = Path::new(abs_p)
+            .parent()
+            .map(|p| rio::fold_path(&p.to_string_lossy()))
+            .unwrap_or_default();
+        let gr_opt = root_cache
+            .entry(pdir)
+            .or_insert_with(|| find_enclosing_git_root(abs_p))
+            .clone();
+        if let Some(gr) = gr_opt {
+            let fgr = rio::fold_path(&gr);
+            all_edited_roots.entry(fgr.clone()).or_insert_with(|| gr.clone());
+            if requires_review(p_risk, Some(p_pol)) {
+                review_roots.entry(fgr).or_insert(gr);
+            }
+        }
+    }
+    let review_git_root = if review_roots.len() == 1 {
+        review_roots.into_values().next().unwrap_or_default()
+    } else if review_roots.is_empty() && all_edited_roots.len() == 1 {
+        all_edited_roots.into_values().next().unwrap_or_default()
+    } else {
+        git_root_opt.clone().unwrap_or_default()
+    };
     let git_root_val = match git_root_opt {
         Some(gr) => Value::String(gr),
         None => Value::Null,
@@ -4572,6 +4616,7 @@ pub fn resolve_candidate_context(marker: &Value, include_tests: bool) -> Value {
     json!({
         "cwd": cwd,
         "git_root": git_root_val,
+        "review_git_root": review_git_root,
         "dpaths": dpaths,
         "policy": policy,
         "floor": floor,
