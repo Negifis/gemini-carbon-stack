@@ -1,11 +1,11 @@
 ---
 name: swarm-orchestration
-description: "Swarm 2.0 multi-worker orchestration for parallel exploration, disjoint worktrees, and advisory polish."
+description: "Swarm 2.0 multi-worker orchestration for parallel exploration, disjoint worktrees, and specialist building/review."
 ---
 
 # Swarm 2.0 Orchestration Playbook
 
-Three-phase orchestration for parallel discovery, isolated disjoint building, and advisory review/polish.
+Three-phase orchestration for parallel discovery, isolated disjoint building, and fallback review.
 
 ## 1. Core Invariants
 
@@ -23,7 +23,7 @@ Three-phase orchestration for parallel discovery, isolated disjoint building, an
 | Coordinator (Planning / Routine) | `Orchestrator (Neon)` / `Gemini 4 Carbon` | Planning, task slicing, routine edits (`Orchestrator (Neon)` Execution Mode uses `gemini-flash-worker-agy`) |
 | Fast Scouts & Mechanical Builders | `gemini-4-hydrogen-medium` / `-high` | Multi-subsystem exploration (`3+` areas), `browser` QA, `translator`, straightforward edits |
 | Architecture, Debugging, UI, Tests | `gemini-4-neon-medium`..`-xhigh` | Call graphs/contracts, race/flakiness debugging, complex UI-to-code, unit/E2E tests |
-| Advisory Simplify (once before review) | `claude-sonnet-5-5-high` (fallback `gemini-4-neon-xhigh`, then `gemini-4-hydrogen-xhigh`) | Combined `simplify-reviewer` (`<=2` files / `<=30` LOC) or 3 parallel lenses |
+| Mandatory Simplify (fixed Claude lenses) | `invoke_subagent(..., Model="inherit")` (not ad-hoc `swarm` briefs) | `STANDARD`: 1× `simplify-reviewer`; `HIGH`/`XHIGH`: 3 parallel lenses (`simplify-{reuse,quality,efficiency}-reviewer`) before review |
 | Logic Review Escalation | `claude-opus-5-5-high` → `gemini-4-neon-xhigh` (`HIGH`) / `gemini-4-carbon-high` (`XHIGH`) | Only after verified `codex-lane` outage |
 
 ## 3. Disjoint Building & Worktree Isolation
@@ -39,7 +39,7 @@ $null | carbon-stack swarm-ctl ownership verify-git-diff --strict --cwd "<repo>"
 $null | carbon-stack swarm-ctl worktree cleanup --cwd "<repo>"
 ```
 
-Kill completed workers cleanly via `swarm(action="kill", ...)` before moving from simplify/building to final review or closure.
+Kill completed workers cleanly via `swarm(action="kill", ...)` before moving from building to mandatory simplify, final review, or closure.
 
 ## 4. Inline Specialist Swarm Briefs
 

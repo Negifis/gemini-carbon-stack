@@ -1,37 +1,33 @@
 ---
 name: simplify
-description: "Advisory single-pass code simplification (Reuse, Quality, Efficiency) before review via Sonnet or Neon."
+description: "Mandatory single-pass code simplification using fixed Claude lens agents: 1x simplify-reviewer on STANDARD, 3 parallel lenses on HIGH/XHIGH before review."
 ---
 
-# Advisory Code Simplification (`/simplify`)
+# Mandatory Code Simplification (`/simplify`)
 
-Advisory single-pass polish run **after local tests pass and BEFORE Round 1 independent review** on `HIGH`/`XHIGH` work (or complex `STANDARD` changes). Simplification does not hard-block `Stop` and never runs again after `APPROVED` or during review remediation.
+A bounded, behavior-preserving polish pass over the changed scope: clearer, more maintainable code that fits the repository. Enforced by `Code Work Gate` on `Stop` and before Round 1 `carbon-stack codex-lane review`.
 
-## 1. Execution Modes
+## 1. Mandatory Passes by Risk
 
-- **Compact diff (`<= 2` files & `<= 30` changed lines):** spawn 1 combined read-only worker (`simplify-reviewer`) on `claude-sonnet-5-5-high` (fallback `gemini-4-neon-xhigh`, secondary `gemini-4-hydrogen-xhigh`, never Carbon) covering Reuse, Quality, and Efficiency together.
-- **Larger candidate (`> 2` files or `> 30` changed lines):** spawn 3 parallel read-only workers via `swarm` (`claude-sonnet-5-5-high`, fallback `gemini-4-neon-xhigh`):
-  1. `simplify-reuse` — duplicated helpers, literals, validation/query shapes, reinvented repo/stdlib utilities.
-  2. `simplify-quality` — deep nesting, dead branches/imports, sloppy comments, error/validation boundaries (`explicit` > `clever`).
-  3. `simplify-efficiency` — redundant loops/I-O/stat/subprocesses, repeated parsing, missing cleanup, quadratic scans.
+- **`LOW`:** never required (docs, comments, tests-only, static assets).
+- **`STANDARD`:** **1 mandatory pass in 1 combined lens** via `invoke_subagent`:
+  - `invoke_subagent(TypeName="simplify-reviewer", Role="Simplify Reviewer", Model="inherit", Prompt="<scope packet>")`
+- **`HIGH` and `XHIGH`:** **1 mandatory pass in 3 parallel lenses BEFORE Round 1 `codex-lane review`** via `invoke_subagent` (launched together in one turn):
+  1. `invoke_subagent(TypeName="simplify-reuse-reviewer", Role="Simplify Reuse Lens", Model="inherit", Prompt="<scope packet>")`
+  2. `invoke_subagent(TypeName="simplify-quality-reviewer", Role="Simplify Quality Lens", Model="inherit", Prompt="<scope packet>")`
+  3. `invoke_subagent(TypeName="simplify-efficiency-reviewer", Role="Simplify Efficiency Lens", Model="inherit", Prompt="<scope packet>")`
 
-Prepare diff context before spawning:
-```powershell
-$null | carbon-stack swarm-cache prepare --session "<conversation-id>" --cwd "<repo_path>" --label simplify
-```
+## 2. Fixed Prompts Only (No Custom Lens Prompts)
 
-## 2. Lens Worker Brief Template
+- The lens instructions are **fixed** in `plugin/agents/simplify-*.md` (ported from `claude-code-stack`). **Never** invent arbitrary lens instructions or substitute ad-hoc `swarm` briefs.
+- Pass **only the bounded candidate packet** in `Prompt`:
+  - repository / working directory (`cwd`) and changed files / `git diff` range;
+  - core invariants that must hold (`BUSINESS_INTENT`, public contracts, nearby helpers worth knowing);
+  - never tell a lens what to find or how its report should turn out.
 
-Use this concise brief template for each lens worker (no separate `.md` agent needed):
+## 3. Apply, Verify & Finite Failure Rule
 
-```text
-Strictly read-only <REUSE|QUALITY|EFFICIENCY> simplification review of <repo_path> (diff: <diff_path>, files: <paths>).
-Preserve `BUSINESS_INTENT`: <goal>. Do not propose removing requested features or rewriting unrelated modules.
-Report up to 5 concrete findings under `### <Lens>`. Each finding MUST state: `file:line`, defect, exact behavior-preserving edit shape, **why behavior is preserved**, and verification needed (or `No actionable <lens> simplifications.`).
-Save long notes to `.swarm/artifacts/<worker>-1.md` and end board summary with `SIMPLIFY_VERDICT: CLEAN|ACTIONABLE_FIXES`.
-```
-
-## 3. Apply & Cleanup
-
-1. Review returned findings critically (reject speculative rewrites or risky edge-case changes).
-2. Apply accepted edits cleanly, rerun affected tests, and kill all `waiting` simplify workers via `swarm(action="kill", ...)` before starting `codex-lane review`.
+1. Run **once** after local tests pass (and **before** Round 1 independent review on `HIGH`/`XHIGH`). Never repeat after review approval or during `REVISE` / `--closure` rounds.
+2. Review returned findings critically; apply only concrete, behavior-preserving improvements (reject aesthetic churn, speculative abstractions, semantic changes, or test weakening).
+3. If edits were applied, rerun affected tests/checks so final bytes are verified before closing (`STANDARD`) or launching `codex-lane review` (`HIGH`/`XHIGH`).
+4. If a required simplify subagent fails, retry it once. After 2 failures on a required lens, record `SIMPLIFY_UNAVAILABLE` and finish finitely with `[gate] draft-blocked`.

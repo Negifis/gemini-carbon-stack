@@ -5,7 +5,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use crate::codex_lane;
 use crate::cwg_common;
+use crate::cwg_stop;
 use crate::rio::{self, json_truthy, resolve_command_cwd, val_to_i64, val_to_str};
 
 fn hydrogen_policy_msg() -> String {
@@ -121,7 +123,7 @@ pub fn guard_shell_command(cmd: &str, cwd: &str) -> (String, Option<String>) {
 
 pub fn guard_swarm_invocation_with_payload(
     args: &Value,
-    _payload: Option<&Value>,
+    payload: Option<&Value>,
 ) -> (String, Option<String>) {
     let action = val_to_str(args.get("action")).trim().to_lowercase();
     if action != "add" && action != "model" {
@@ -130,6 +132,30 @@ pub fn guard_swarm_invocation_with_payload(
     let model = val_to_str(args.get("model")).trim().to_string();
     if !model.is_empty() && cwg_common::is_flash_model(&model) {
         return ("deny".to_string(), Some(hydrogen_policy_msg()));
+    }
+    if action == "add" {
+        if let Some(p) = payload {
+            let wname = val_to_str(args.get("name"));
+            let brief = val_to_str(args.get("brief"));
+            if cwg_common::is_review_swarm_worker_with_brief(&wname, Some(args), &brief) {
+                let sess = rio::session_key(p);
+                let tp = p
+                    .get("transcriptPath")
+                    .or_else(|| p.get("transcript_path"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let min_risk = if wname.to_ascii_lowercase().contains("xhigh")
+                    || cwg_common::is_review_tier_xhigh(&brief)
+                {
+                    "XHIGH"
+                } else {
+                    ""
+                };
+                if let Some(err) = cwg_stop::pre_review_simplify_block_for_session(&sess, tp, min_risk) {
+                    return ("deny".to_string(), Some(format!("[Code Work Gate] {}", err)));
+                }
+            }
+        }
     }
     ("allow".to_string(), None)
 }
@@ -202,6 +228,24 @@ pub fn guard_subagent_invocation_with_payload(
             ),
             None,
         );
+    }
+
+    if codex_lane::NATIVE_REVIEWERS.contains(&base_sub_type) {
+        let sess = rio::session_key(payload);
+        let min_risk = if base_sub_type == codex_lane::XHIGH_NATIVE_REVIEWER {
+            "XHIGH"
+        } else {
+            ""
+        };
+        if let Some(err) =
+            cwg_stop::pre_review_simplify_block_for_session(&sess, transcript_path, min_risk)
+        {
+            return (
+                "deny".to_string(),
+                Some(format!("[Code Work Gate] {}", err)),
+                None,
+            );
+        }
     }
 
     if !prompt.contains("[Canonical Constraints]") {

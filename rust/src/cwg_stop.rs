@@ -25,6 +25,7 @@ pub const MAX_RAW_ORDINARY_ROUNDS: usize = MAX_REVIEW_ROUNDS * 2;
 pub const MAX_CLOSURE_PASSES: usize = cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE;
 pub const MAX_WORKER_POST_REMINDERS: i64 = 2;
 const CLOSURE_PHASE_FLAG: &str = "--phase closure";
+const SIMPLIFY_BLOCK_PREFIX: &str = "mandatory simplify incomplete";
 use crate::cwg_common::TS_EPS;
 
 static NONCE_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -3551,7 +3552,39 @@ pub fn scan_swarm_activity(input: SwarmScanInput<'_>) -> SwarmEvidence {
 pub struct SubagentEvidence {
     pub reviews: Vec<Value>,
     pub review_failures: Vec<f64>,
+    pub simplify_successes: HashMap<String, Vec<f64>>,
+    pub simplify_failures: HashMap<String, Vec<f64>>,
+    pub in_flight_simplify_lenses: Vec<String>,
     pub in_flight_subagents: Vec<String>,
+}
+
+impl SubagentEvidence {
+    pub fn simplify_completed_count(&self) -> usize {
+        self.simplify_successes.values().map(Vec::len).sum()
+    }
+}
+
+fn is_subagent_runtime_failure(body: &str) -> bool {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if trimmed.len() >= 400 {
+        return false;
+    }
+    const PREFIXES: &[&[u8]] = &[
+        b"subagent failed",
+        b"error:",
+        b"task cancelled",
+        b"task canceled",
+        b"subagent terminated",
+        b"subagent aborted",
+        b"subagent error",
+    ];
+    let bytes = trimmed.as_bytes();
+    PREFIXES
+        .iter()
+        .any(|p| bytes.get(..p.len()).is_some_and(|h| h.eq_ignore_ascii_case(p)))
 }
 
 pub fn scan_native_subagents(
@@ -3655,6 +3688,9 @@ pub fn scan_native_subagents(
                 .map(|v| val_to_str(Some(v)).trim().to_string())
                 .unwrap_or_default();
             let base_tname = tname.rsplit(':').next().unwrap_or("");
+            let base_tname_low = base_tname.to_ascii_lowercase();
+            let is_simplify_lane =
+                cwg_common::SIMPLIFY_REVIEWERS.contains(&base_tname_low.as_str());
             let model_arg = args
                 .and_then(|m| m.get("Model"))
                 .map(|v| val_to_str(Some(v)).trim().to_string())
@@ -3668,18 +3704,56 @@ pub fn scan_native_subagents(
             };
             let Some(sm) = subagent_uri_re().captures(blob) else {
                 let blob_low = blob.to_lowercase();
-                if (g_status == "ERROR"
+                if g_status == "ERROR"
                     || blob_low.contains("error")
-                    || blob_low.contains("failed"))
-                    && NATIVE_REVIEWERS.contains(&base_tname)
+                    || blob_low.contains("failed")
                 {
-                    ev.review_failures
-                        .push(if call_ts > 0.0 { call_ts } else { now_sec() });
+                    let err_ts = if call_ts > 0.0 { call_ts } else { now_sec() };
+                    if NATIVE_REVIEWERS.contains(&base_tname) {
+                        ev.review_failures.push(err_ts);
+                    } else if is_simplify_lane {
+                        ev.simplify_failures
+                            .entry(base_tname_low)
+                            .or_default()
+                            .push(err_ts);
+                    }
                 }
                 continue;
             };
 
             let cid = sm.name("cid").map_or("", |m| m.as_str());
+            let is_native_reviewer = NATIVE_REVIEWERS.contains(&base_tname);
+            let delivered = delivered_by_sender
+                .get(cid)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+
+            if !is_native_reviewer && !is_simplify_lane && !delivered.is_empty() {
+                continue;
+            }
+            if is_simplify_lane && !delivered.is_empty() {
+                let delivered_max_ts = delivered
+                    .iter()
+                    .map(|(ts, _)| *ts)
+                    .reduce(f64::max)
+                    .unwrap_or(0.0);
+                let has_delivered_ok = delivered
+                    .iter()
+                    .any(|(_, b)| !b.trim().is_empty() && !is_subagent_runtime_failure(b));
+                if has_delivered_ok && (delivered_max_ts > 0.0 || call_ts > 0.0) {
+                    let eff_launch_ts = if call_ts > 0.0 {
+                        call_ts
+                    } else {
+                        delivered_max_ts
+                    };
+                    ev.simplify_successes
+                        .entry(base_tname_low)
+                        .or_default()
+                        .push(eff_launch_ts.max(delivered_max_ts));
+                    continue;
+                }
+            }
+
             let mut sub_tp = sm
                 .name("uri")
                 .map(|m| uri_to_path(m.as_str()))
@@ -3700,10 +3774,6 @@ pub fn scan_native_subagents(
             };
             let (sub_chunks, sub_last_ts, mut sub_done) =
                 extract_subagent_timed_chunks(sub_tp_opt, &parent_cid);
-            let delivered = delivered_by_sender
-                .get(cid)
-                .map(|v| v.as_slice())
-                .unwrap_or(&[]);
             if !delivered.is_empty() {
                 sub_done = true;
             }
@@ -3711,26 +3781,33 @@ pub fn scan_native_subagents(
                 let short_cid: String = cid.chars().take(8).collect();
                 ev.in_flight_subagents
                     .push(format!("{}:{}", tname, short_cid));
+                if is_simplify_lane && !ev.in_flight_simplify_lenses.contains(&base_tname_low) {
+                    ev.in_flight_simplify_lenses.push(base_tname_low);
+                }
+                continue;
+            }
+            if !is_native_reviewer && !is_simplify_lane {
                 continue;
             }
 
-            // INVARIANT: Bind each review verdict strictly to the timestamp of the message chunk that produced it; coalesce only an immediate post-`send_message` sign-off repeating the identical decision.
-            let merged_chunks = merge_subagent_chunks(&sub_chunks, delivered);
-            let last_chunk_ts = merged_chunks.iter().map(|c| c.ts).reduce(f64::max).unwrap_or(0.0);
-            let fallback_end_ts = if last_chunk_ts > 0.0 {
-                last_chunk_ts
-            } else {
-                sub_last_ts
-            };
-            let eff_launch_ts = if call_ts > 0.0 {
-                call_ts
-            } else if fallback_end_ts > 0.0 {
-                fallback_end_ts
-            } else {
-                now_sec()
-            };
+            if is_native_reviewer {
+                // INVARIANT: Bind each review verdict strictly to the timestamp of the message chunk that produced it; coalesce only an immediate post-`send_message` sign-off repeating the identical decision.
+                let merged_chunks = merge_subagent_chunks(&sub_chunks, delivered);
+                let last_chunk_ts = merged_chunks.iter().map(|c| c.ts).reduce(f64::max).unwrap_or(0.0);
+                let fallback_end_ts = if last_chunk_ts > 0.0 {
+                    last_chunk_ts
+                } else {
+                    sub_last_ts
+                };
+                let eff_launch_ts = if call_ts > 0.0 {
+                    call_ts
+                } else if fallback_end_ts > 0.0 {
+                    fallback_end_ts
+                } else {
+                    now_sec()
+                };
+                let eff_end_ts = eff_launch_ts.max(fallback_end_ts);
 
-            if NATIVE_REVIEWERS.contains(&base_tname) {
                 let mut r_kind: Option<String> = None;
                 let mut r_verdict: Option<String> = None;
                 let mut r_ts = 0.0f64;
@@ -3751,14 +3828,11 @@ pub fn scan_native_subagents(
                 }
 
                 if let (Some(rk), Some(rv)) = (r_kind, r_verdict) {
-                    let end_cand = if r_ts > 0.0 {
-                        r_ts
-                    } else if fallback_end_ts > 0.0 {
-                        fallback_end_ts
+                    let eff_verdict_ts = if r_ts > 0.0 {
+                        eff_launch_ts.max(r_ts)
                     } else {
-                        eff_launch_ts
+                        eff_end_ts
                     };
-                    let eff_verdict_ts = eff_launch_ts.max(end_cand);
                     ev.reviews.push(json!({
                         "engine": "native",
                         "reviewer": base_tname,
@@ -3772,17 +3846,207 @@ pub fn scan_native_subagents(
                         "step_idx": idx,
                     }));
                 } else {
-                    let fail_cand = if fallback_end_ts > 0.0 {
-                        fallback_end_ts
-                    } else {
-                        eff_launch_ts
-                    };
-                    ev.review_failures.push(eff_launch_ts.max(fail_cand));
+                    ev.review_failures.push(eff_end_ts);
+                }
+            } else {
+                let last_chunk_ts = sub_chunks
+                    .iter()
+                    .map(|c| c.ts)
+                    .chain(delivered.iter().map(|(ts, _)| *ts))
+                    .reduce(f64::max)
+                    .unwrap_or(0.0);
+                let fallback_end_ts = if last_chunk_ts > 0.0 {
+                    last_chunk_ts
+                } else {
+                    sub_last_ts
+                };
+                let eff_launch_ts = if call_ts > 0.0 {
+                    call_ts
+                } else if fallback_end_ts > 0.0 {
+                    fallback_end_ts
+                } else {
+                    now_sec()
+                };
+                let eff_end_ts = eff_launch_ts.max(fallback_end_ts);
+                let has_output = sub_chunks.iter().any(|c| !c.text.trim().is_empty())
+                    || delivered.iter().any(|(_, b)| !b.trim().is_empty());
+                let runtime_abort_only = sub_chunks.is_empty()
+                    && !delivered.is_empty()
+                    && delivered.iter().all(|(_, b)| is_subagent_runtime_failure(b));
+                if has_output && !runtime_abort_only {
+                    ev.simplify_successes
+                        .entry(base_tname_low)
+                        .or_default()
+                        .push(eff_end_ts);
+                } else {
+                    ev.simplify_failures
+                        .entry(base_tname_low)
+                        .or_default()
+                        .push(eff_end_ts);
                 }
             }
         }
     }
     ev
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SimplifyLaneState {
+    Missing,
+    Current,
+    Failed,
+    Exhausted,
+}
+
+fn evaluate_simplify_states(
+    sub_ev: &SubagentEvidence,
+    durable_ts: f64,
+) -> HashMap<&'static str, SimplifyLaneState> {
+    // INVARIANT: Simplify completions are candidate-bound (`>= first_ts`) so applying simplify's own edits never triggers an infinite re-simplify loop; 2+ failures at/after the latest success with the latest failure at/after `durable_ts` mark a lane `Exhausted` for finite `draft-blocked` escape.
+    let mut out = HashMap::new();
+    for &lane in cwg_common::SIMPLIFY_REVIEWERS {
+        let successes = sub_ev
+            .simplify_successes
+            .get(lane)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let failures = sub_ev
+            .simplify_failures
+            .get(lane)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let latest_success = successes.iter().copied().reduce(f64::max).unwrap_or(0.0);
+        let latest_fail = failures
+            .iter()
+            .copied()
+            .max_by(f64::total_cmp)
+            .unwrap_or(0.0);
+        if latest_success > 0.0 && latest_success > latest_fail {
+            out.insert(lane, SimplifyLaneState::Current);
+            continue;
+        }
+        let mut retry_count = 0usize;
+        let mut latest_retry: Option<f64> = None;
+        for &ts in failures {
+            if ts > latest_success || (latest_success > 0.0 && ts == latest_success) {
+                retry_count += 1;
+                latest_retry = Some(match latest_retry {
+                    Some(cur) if cur.total_cmp(&ts).is_ge() => cur,
+                    _ => ts,
+                });
+            }
+        }
+        if retry_count >= 2 && latest_retry.unwrap_or(0.0) >= durable_ts - TS_EPS {
+            out.insert(lane, SimplifyLaneState::Exhausted);
+        } else if retry_count > 0 {
+            out.insert(lane, SimplifyLaneState::Failed);
+        } else {
+            out.insert(lane, SimplifyLaneState::Missing);
+        }
+    }
+    out
+}
+
+fn missing_simplify_lenses(
+    effective_risk: &str,
+    states: &HashMap<&'static str, SimplifyLaneState>,
+) -> Vec<&'static str> {
+    let is_current = |lane: &str| states.get(lane) == Some(&SimplifyLaneState::Current);
+    match effective_risk {
+        "HIGH" | "XHIGH" => cwg_common::SIMPLIFY_LENSES
+            .iter()
+            .copied()
+            .filter(|&l| !is_current(l))
+            .collect(),
+        "STANDARD" => {
+            if is_current(cwg_common::SIMPLIFY_LANE) {
+                Vec::new()
+            } else {
+                vec![cwg_common::SIMPLIFY_LANE]
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn simplify_completed_ts(
+    effective_risk: &str,
+    sub_ev: &SubagentEvidence,
+    missing_simplify: &[&str],
+) -> f64 {
+    if !missing_simplify.is_empty() {
+        return 0.0;
+    }
+    let required: &[&str] = match effective_risk {
+        "HIGH" | "XHIGH" => cwg_common::SIMPLIFY_LENSES,
+        "STANDARD" => &[cwg_common::SIMPLIFY_LANE],
+        _ => return 0.0,
+    };
+    let mut ready_ts = 0.0_f64;
+    for &lane in required {
+        // INVARIANT: Anchor each lens to its earliest valid candidate completion (`min`) so later retries cannot advance the cutoff and launder counted post-simplify rounds.
+        let first_ok = sub_ev
+            .simplify_successes
+            .get(lane)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+            .copied()
+            .filter(|&ts| ts > 0.0)
+            .reduce(f64::min)
+            .unwrap_or(0.0);
+        if first_ok <= 0.0 {
+            return 0.0;
+        }
+        ready_ts = ready_ts.max(first_ok);
+    }
+    ready_ts
+}
+
+fn format_simplify_block_reason(
+    effective_risk: &str,
+    missing: &[&str],
+    states: &HashMap<&'static str, SimplifyLaneState>,
+) -> String {
+    let lenses = cwg_common::SIMPLIFY_LENSES.join(", ");
+    let needed = match effective_risk {
+        "HIGH" | "XHIGH" => format!("one completed pass from each of the 3 lenses ({})", lenses),
+        _ => format!("one completed `{}` pass", cwg_common::SIMPLIFY_LANE),
+    };
+    let failed: Vec<&str> = missing
+        .iter()
+        .copied()
+        .filter(|&l| {
+            matches!(
+                states.get(l),
+                Some(SimplifyLaneState::Failed | SimplifyLaneState::Exhausted)
+            )
+        })
+        .collect();
+    let exhausted: Vec<&str> = missing
+        .iter()
+        .copied()
+        .filter(|&l| states.get(l) == Some(&SimplifyLaneState::Exhausted))
+        .collect();
+    let fail_tail = if failed.is_empty() {
+        String::new()
+    } else if exhausted.is_empty() {
+        format!(" (last attempt failed: {})", failed.join(", "))
+    } else {
+        format!(
+            " (last attempt failed: {}; exhausted: {} — finite `[gate] draft-blocked` is permitted)",
+            failed.join(", "),
+            exhausted.join(", ")
+        )
+    };
+    format!(
+        "{}: a `{}` candidate requires {} via `invoke_subagent` before review/closure (missing: {}){}",
+        SIMPLIFY_BLOCK_PREFIX,
+        effective_risk,
+        needed,
+        missing.join(", "),
+        fail_tail
+    )
 }
 
 fn mark_fp(m: &Map<String, Value>) -> Option<&str> {
@@ -4921,22 +5185,27 @@ fn validate_candidate_closure_inner(
         cwg_common::requires_tests(&effective_risk, &cwd, &dpaths, policy, &git_root)
     };
 
+    let durable_ts = {
+        let ld = val_to_f64(marker.get("last_durable_ts"));
+        if ld > 0.0 {
+            ld
+        } else {
+            first_ts_for_risk
+        }
+    };
+    let mut standalone_doc_cache: Option<bool> = None;
+    let mut is_standalone_doc = || -> bool {
+        *standalone_doc_cache.get_or_insert_with(|| {
+            effective_risk == "HIGH"
+                && is_standalone_non_repo_doc_candidate(marker, &dpaths, policy)
+        })
+    };
+
     if require_checks && (rkind == "verified" || rkind == "pr-ready") {
-        let last_durable = {
-            let ld = val_to_f64(marker.get("last_durable_ts"));
-            if ld > 0.0 {
-                ld
-            } else {
-                val_to_f64(marker.get("first_ts"))
-            }
-        };
         let checks_missing = checks_ev.checks_count == 0;
         let checks_stale =
-            !checks_missing && (checks_ev.passed_count == 0 || checks_ev.latest_pass_ts + TS_EPS < last_durable);
-        if (checks_missing || checks_stale)
-            && !(effective_risk == "HIGH"
-                && is_standalone_non_repo_doc_candidate(marker, &dpaths, policy))
-        {
+            !checks_missing && (checks_ev.passed_count == 0 || checks_ev.latest_pass_ts + TS_EPS < durable_ts);
+        if (checks_missing || checks_stale) && !is_standalone_doc() {
             if checks_missing {
                 if checks_ev.saw_uncertain_pass {
                     return (
@@ -4955,7 +5224,7 @@ fn validate_candidate_closure_inner(
                     ),
                 );
             }
-            if checks_ev.latest_uncertain_pass_ts + TS_EPS >= last_durable {
+            if checks_ev.latest_uncertain_pass_ts + TS_EPS >= durable_ts {
                 return (
                     false,
                     "last standalone passing test/verification command ran BEFORE the latest file edit (subsequent chained/non-standalone check run(s) were ignored because ';', '||', PowerShell 'if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }', trailing segments, or pipes can mask exit codes); re-verify current bytes with a standalone test command (single runner, no '; cmd' or trailing pipes)"
@@ -4969,6 +5238,25 @@ fn validate_candidate_closure_inner(
             );
         }
     }
+
+    let (simplify_states, missing_simplify, simplify_unavailable) = if effective_risk == "LOW" {
+        (HashMap::new(), Vec::new(), false)
+    } else {
+        let states = evaluate_simplify_states(sub_ev, durable_ts);
+        let mut missing = missing_simplify_lenses(&effective_risk, &states);
+        if !missing.is_empty() && is_standalone_doc() {
+            missing.clear();
+        }
+        let unavailable = !missing.is_empty()
+            && missing
+                .iter()
+                .any(|&l| states.get(l) == Some(&SimplifyLaneState::Exhausted));
+        (states, missing, unavailable)
+    };
+    let simplify_ready_ts = simplify_completed_ts(&effective_risk, sub_ev, &missing_simplify);
+    let review_ran_after_simplify = |r: &Value| -> bool {
+        simplify_ready_ts <= 0.0 || val_to_f64(r.get("launch_ts")) + TS_EPS >= simplify_ready_ts
+    };
 
     let candidate_marks: Vec<&Map<String, Value>> = marker
         .get("content_marks")
@@ -5037,13 +5325,27 @@ fn validate_candidate_closure_inner(
     };
     let marker_sess_saved = val_to_str(marker.get("session"));
     let saved_cycle_reset_ts = codex_lane::saved_thread_cycle_reset_ts(&marker_sess_saved, eff_root, first_ts_val);
-    if let Some((_, esc_ts, is_xh)) = codex_lane::saved_thread_escalate_evidence(&marker_sess_saved, eff_root, first_ts_val, effective_risk == "XHIGH")
-        .filter(|&(_, esc_ts, _)| saved_cycle_reset_ts <= 0.0 || esc_ts >= saved_cycle_reset_ts)
+    let simplify_cutoff_ts = (simplify_ready_ts > 0.0)
+        .then(|| (simplify_ready_ts - TS_EPS).max(0.0))
+        .unwrap_or(0.0);
+    let saved_esc_cutoff_ts = saved_cycle_reset_ts.max(simplify_cutoff_ts);
+    if let Some((_, esc_launch_ts, esc_ts, is_xh)) = codex_lane::saved_thread_escalate_evidence(&marker_sess_saved, eff_root, first_ts_val, effective_risk == "XHIGH")
+        .filter(|&(_, esc_launch_ts, esc_ts, _)| {
+            let cutoff_ok = saved_esc_cutoff_ts <= 0.0 || esc_launch_ts >= saved_esc_cutoff_ts;
+            let pre_cutoff_live_esc = saved_esc_cutoff_ts > 0.0
+                && all_reviews.iter().any(|r| {
+                    val_to_str(r.get("kind")) == "ordinary"
+                        && val_to_str(r.get("verdict")) == "ESCALATE"
+                        && val_to_f64(r.get("launch_ts")) < saved_esc_cutoff_ts
+                        && (val_to_f64(r.get("verdict_ts")).max(val_to_f64(r.get("launch_ts"))) - esc_ts).abs() <= 5.0
+                });
+            cutoff_ok && !pre_cutoff_live_esc
+        })
     {
         let mut is_ok_ord = |r: &Value| {
             val_to_str(r.get("kind")) == "ordinary"
                 && eval.is_acceptable_engine(r)
-                && (saved_cycle_reset_ts <= 0.0 || val_to_f64(r.get("launch_ts")) >= saved_cycle_reset_ts)
+                && (saved_esc_cutoff_ts <= 0.0 || val_to_f64(r.get("launch_ts")) >= saved_esc_cutoff_ts)
         };
         let live_esc_ts = all_reviews.iter()
             .filter(|r| is_ok_ord(r) && val_to_str(r.get("verdict")) == "ESCALATE" && (val_to_f64(r.get("verdict_ts")).max(val_to_f64(r.get("launch_ts"))) - esc_ts).abs() <= 5.0)
@@ -5059,8 +5361,18 @@ fn validate_candidate_closure_inner(
             let missing = MAX_REVIEW_ROUNDS - live_n;
             for i in 0..missing {
                 let is_esc = live_esc_ts.is_none() && i + 1 == missing;
-                let ts = if is_esc { anchor_ts } else { (rev_anchor - ((missing - i - usize::from(live_esc_ts.is_none())) as f64) * 0.001).max(saved_cycle_reset_ts) };
-                all_reviews.push(json!({ "engine": "codex", "kind": "ordinary", "verdict": if is_esc { "ESCALATE" } else { "REVISE" }, "launch_ts": ts, "verdict_ts": ts, "xhigh": is_xh }));
+                let (lts, vts) = if is_esc {
+                    (esc_launch_ts.min(anchor_ts).max(saved_esc_cutoff_ts), anchor_ts)
+                } else {
+                    let ts = (rev_anchor - ((missing - i - usize::from(live_esc_ts.is_none())) as f64) * 0.001).max(saved_esc_cutoff_ts);
+                    let lts = if i == 0 && esc_launch_ts > 0.0 {
+                        esc_launch_ts.min(ts).max(saved_esc_cutoff_ts)
+                    } else {
+                        ts
+                    };
+                    (lts, ts)
+                };
+                all_reviews.push(json!({ "engine": "codex", "kind": "ordinary", "verdict": if is_esc { "ESCALATE" } else { "REVISE" }, "launch_ts": lts, "verdict_ts": vts, "xhigh": is_xh }));
             }
         }
     }
@@ -5119,7 +5431,7 @@ fn validate_candidate_closure_inner(
 
     for rev in &raw_eligible_reviews {
         let rev_lts = val_to_f64(rev.get("launch_ts"));
-        if cycle_cutoff_ts > 0.0 && rev_lts < cycle_cutoff_ts {
+        if (cycle_cutoff_ts > 0.0 && rev_lts < cycle_cutoff_ts) || !review_ran_after_simplify(rev) {
             continue;
         }
         if let Some(p_ts) = pending_reset_ts {
@@ -5213,25 +5525,23 @@ fn validate_candidate_closure_inner(
         }
     }
 
-    let cycle_ineligible_ordinary: Vec<Value> = if cycle_cutoff_ts > 0.0 {
-        ineligible_ordinary_reviews
-            .iter()
-            .filter(|r| val_to_f64(r.get("launch_ts")) >= cycle_cutoff_ts)
-            .cloned()
-            .collect()
-    } else {
-        ineligible_ordinary_reviews.clone()
-    };
+    let cycle_ineligible_ordinary: Vec<Value> = ineligible_ordinary_reviews
+        .iter()
+        .filter(|r| {
+            (cycle_cutoff_ts <= 0.0 || val_to_f64(r.get("launch_ts")) >= cycle_cutoff_ts)
+                && review_ran_after_simplify(r)
+        })
+        .cloned()
+        .collect();
 
-    let cycle_ineligible_closure: Vec<&Value> = if cycle_cutoff_ts > 0.0 {
-        ineligible_closure_reviews
-            .iter()
-            .copied()
-            .filter(|r| val_to_f64(r.get("launch_ts")) >= cycle_cutoff_ts)
-            .collect()
-    } else {
-        ineligible_closure_reviews.clone()
-    };
+    let cycle_ineligible_closure: Vec<&Value> = ineligible_closure_reviews
+        .iter()
+        .copied()
+        .filter(|r| {
+            (cycle_cutoff_ts <= 0.0 || val_to_f64(r.get("launch_ts")) >= cycle_cutoff_ts)
+                && review_ran_after_simplify(r)
+        })
+        .collect();
 
     let ordinary_reviews: Vec<Value> = cycle_raw_ordinary.clone();
     let closure_reviews: Vec<Value> = cycle_raw_closure.clone();
@@ -5305,6 +5615,7 @@ fn validate_candidate_closure_inner(
         for (earlier_rev, earlier_v) in &norm_ordinary[..norm_ordinary.len() - 1] {
             if earlier_v == "APPROVED"
                 && is_review_fresh(earlier_rev, marker)
+                && review_ran_after_simplify(earlier_rev)
                 && (effective_risk != "XHIGH" || json_truthy(earlier_rev.get("xhigh")))
             {
                 if probing {
@@ -5366,6 +5677,7 @@ fn validate_candidate_closure_inner(
     {
         latest_eff_cls_rev.filter(|&cls_rev| {
             is_review_fresh(cls_rev, marker)
+                && review_ran_after_simplify(cls_rev)
                 && (eval.is_valid_cycle_closure_ready(
                     eff_cycle_ordinary,
                     &effective_cycle_closure,
@@ -5379,6 +5691,7 @@ fn validate_candidate_closure_inner(
     let is_fresh_tier_approved = |r: &Value, v: &str| -> bool {
         if v != "APPROVED"
             || !is_review_fresh(r, marker)
+            || !review_ran_after_simplify(r)
             || (effective_risk == "XHIGH" && !json_truthy(r.get("xhigh")))
         {
             return false;
@@ -5394,11 +5707,19 @@ fn validate_candidate_closure_inner(
                 .last()
                 .is_some_and(|r| is_fresh_tier_approved(r, &val_to_str(r.get("verdict")))));
 
+    let probe_missing_simplify: Vec<String> =
+        missing_simplify.iter().map(|s| (*s).to_string()).collect();
+    let probe_has_transcript = transcript_path
+        .is_some_and(|p| rio::resolve_transcript_path(p.trim()).is_some());
     if probing {
         if let Some(p_ts) = pending_reset_ts.filter(|&p_ts| now_sec() >= p_ts) {
             if let Some(probe) = cycle_probe {
                 *probe = codex_lane::ClosureCycleSummary {
                     cycle_reset_ts: p_ts,
+                    simplify_completed_ts: simplify_ready_ts,
+                    missing_simplify_lenses: probe_missing_simplify,
+                    in_flight_simplify_lenses: sub_ev.in_flight_simplify_lenses.clone(),
+                    has_transcript: probe_has_transcript,
                     ..Default::default()
                 };
             }
@@ -5440,6 +5761,12 @@ fn validate_candidate_closure_inner(
         probe.last_closure_ts = last_cls_ts;
         probe.counted_ordinary_rounds = cycle_counted_ordinary_n;
         probe.raw_ordinary_rounds = cycle_raw_ordinary.len();
+        probe.first_ordinary_launch_ts = cycle_raw_ordinary
+            .iter()
+            .map(|r| val_to_f64(r.get("launch_ts")))
+            .filter(|&t| t > 0.0)
+            .reduce(f64::min)
+            .unwrap_or(0.0);
         probe.legacy_three_round_closure_active = legacy_three_round_closure;
         let hyp_ord_ts = now_sec().max(last_cls_ts + 0.001);
         let hyp_ord = json!({
@@ -5479,6 +5806,10 @@ fn validate_candidate_closure_inner(
         }
         // INVARIANT: Report `has_fresh_ordinary_approved` as `true` only when no subsequent closure pass superseded `APPROVED`, avoiding deadlock on legacy `APPROVED -> closure BLOCKED` cycles.
         probe.has_fresh_ordinary_approved = !probe_early_reject && has_fresh_valid_app;
+        probe.simplify_completed_ts = simplify_ready_ts;
+        probe.missing_simplify_lenses = probe_missing_simplify;
+        probe.in_flight_simplify_lenses = sub_ev.in_flight_simplify_lenses.clone();
+        probe.has_transcript = probe_has_transcript;
     }
 
     let is_closing_kind = rkind == "verified" || rkind == "pr-ready";
@@ -5514,6 +5845,12 @@ fn validate_candidate_closure_inner(
         if is_closing_kind && blocked_closure_count >= MAX_CLOSURE_PASSES {
             return (false, closure_blocked_halt_msg(blocked_closure_count));
         }
+        if !probing && is_closing_kind && !missing_simplify.is_empty() {
+            return (
+                false,
+                format_simplify_block_reason(&effective_risk, &missing_simplify, &simplify_states),
+            );
+        }
 
     let closing_inelig_err =
         |ctx_eval: &mut ClosureEvalCtx, min_launch_ts: Option<f64>, check_after_cls: bool|
@@ -5532,6 +5869,19 @@ fn validate_candidate_closure_inner(
     if rkind == "verified" {
         if closure_ready_rev.is_some() {
             return (true, "verified".to_string());
+        }
+        if latest_eff_cls_rev.is_some_and(|r| {
+            val_to_str(r.get("verdict")) == "READY"
+                && is_review_fresh(r, marker)
+                && !review_ran_after_simplify(r)
+        }) {
+            return (
+                false,
+                format!(
+                    "{} candidate's `CLOSURE_VALIDATION: READY` ran BEFORE mandatory simplify completed; run a fresh review after simplify finishes",
+                    effective_risk
+                ),
+            );
         }
         if effective_cycle_closure.len() == 1
             && val_to_str(effective_cycle_closure[0].get("verdict")) == "BLOCKED"
@@ -5720,17 +6070,39 @@ fn validate_candidate_closure_inner(
                     }
                 }
                 if let Some(last_raw) = raw_ordinary_reviews.last() {
-                    if val_to_str(last_raw.get("verdict")) == "APPROVED"
-                        && !is_review_fresh(last_raw, marker)
-                    {
-                        return (
-                            false,
-                            format!(
-                                "{} candidate's `APPROVED` verdict is stale: durable candidate content changed after review",
-                                effective_risk
-                            ),
-                        );
+                    if val_to_str(last_raw.get("verdict")) == "APPROVED" {
+                        if !is_review_fresh(last_raw, marker) {
+                            return (
+                                false,
+                                format!(
+                                    "{} candidate's `APPROVED` verdict is stale: durable candidate content changed after review",
+                                    effective_risk
+                                ),
+                            );
+                        }
+                        if !review_ran_after_simplify(last_raw) {
+                            return (
+                                false,
+                                format!(
+                                    "{} candidate's `VERDICT: APPROVED` ran BEFORE mandatory simplify completed; run a fresh independent review after simplify finishes",
+                                    effective_risk
+                                ),
+                            );
+                        }
                     }
+                }
+                if raw_closure_reviews.last().is_some_and(|r| {
+                    val_to_str(r.get("verdict")) == "READY"
+                        && is_review_fresh(r, marker)
+                        && !review_ran_after_simplify(r)
+                }) {
+                    return (
+                        false,
+                        format!(
+                            "{} candidate's `CLOSURE_VALIDATION: READY` ran BEFORE mandatory simplify completed; run a fresh independent review after simplify finishes",
+                            effective_risk
+                        ),
+                    );
                 }
                 let esc_chain = cwg_common::review_escalation_chain(&effective_risk);
                 return (
@@ -5747,6 +6119,15 @@ fn validate_candidate_closure_inner(
                     false,
                     format!(
                         "{} candidate's `APPROVED` verdict is stale: durable candidate content changed after review",
+                        effective_risk
+                    ),
+                );
+            }
+            if !review_ran_after_simplify(ord_rev) {
+                return (
+                    false,
+                    format!(
+                        "{} candidate's `VERDICT: APPROVED` ran BEFORE mandatory simplify completed; run a fresh independent review after simplify finishes",
                         effective_risk
                     ),
                 );
@@ -5781,6 +6162,22 @@ fn validate_candidate_closure_inner(
     if rkind == "pr-ready" {
         if closure_ready_rev.is_some() {
             return (true, "pr-ready".to_string());
+        }
+        if latest_eff_cls_rev
+            .or_else(|| raw_closure_reviews.last())
+            .is_some_and(|r| {
+                val_to_str(r.get("verdict")) == "READY"
+                    && is_review_fresh(r, marker)
+                    && !review_ran_after_simplify(r)
+            })
+        {
+            return (
+                false,
+                format!(
+                    "{} candidate's `CLOSURE_VALIDATION: READY` ran BEFORE mandatory simplify completed; run a fresh review after simplify finishes",
+                    effective_risk
+                ),
+            );
         }
         let pr_cap_met = ordinary_reviews.len() == MAX_REVIEW_ROUNDS
             || (ordinary_reviews.is_empty() && cycle_counted_ordinary_n == MAX_REVIEW_ROUNDS);
@@ -5822,14 +6219,14 @@ fn validate_candidate_closure_inner(
     }
 
     if rkind == "draft-blocked" {
-        if closure_ready_rev.is_some() {
+        if closure_ready_rev.is_some() && missing_simplify.is_empty() {
             return (
                 false,
                 "`draft-blocked` conflicts with current `CLOSURE_VALIDATION: READY`; close with `pr-ready` or `verified`"
                     .to_string(),
             );
         }
-        if has_fresh_valid_app {
+        if has_fresh_valid_app && missing_simplify.is_empty() {
             return (
                 false,
                 "`draft-blocked` conflicts with current fresh `VERDICT: APPROVED`; close with `verified`"
@@ -5876,7 +6273,7 @@ fn validate_candidate_closure_inner(
         {
             return (true, "draft-blocked".to_string());
         }
-        if review_unavailable {
+        if review_unavailable || simplify_unavailable {
             return (true, "draft-blocked".to_string());
         }
         if has_round_cap_esc && pending_reset_kind.is_empty() {
@@ -5891,7 +6288,7 @@ fn validate_candidate_closure_inner(
         return (
             false,
             format!(
-                "`draft-blocked` requires `CLOSURE_VALIDATION: BLOCKED` after round-{} ESCALATE (or {}/{} closure blocks, or {}/{} REVISE rounds without ESCALATE), or exhausted review lanes",
+                "`draft-blocked` requires `CLOSURE_VALIDATION: BLOCKED` after round-{} ESCALATE (or {}/{} closure blocks, or {}/{} REVISE rounds without ESCALATE), or exhausted review/simplify lanes",
                 MAX_REVIEW_ROUNDS, MAX_CLOSURE_PASSES, MAX_CLOSURE_PASSES, MAX_REVIEW_ROUNDS, MAX_REVIEW_ROUNDS
             ),
         );
@@ -6135,6 +6532,21 @@ fn max_cycle_declared_receipt_risk(steps: &[Value], min_ts: f64) -> String {
     } else {
         cwg_common::max_risk(&found)
     }
+}
+
+pub fn pre_review_simplify_block_for_session(
+    session: &str,
+    transcript_path: &str,
+    min_risk_override: &str,
+) -> Option<String> {
+    let sess = session.trim();
+    if sess.is_empty() || sess == "unknown" {
+        return None;
+    }
+    let marker = cwg_common::read_active_marker_with_pending(sess)
+        .filter(|m| cwg_common::candidate_class(m) == cwg_common::WORK_PERSISTENT)?;
+    let sum = evaluate_closure_cycle_for_marker(&marker, sess, "", transcript_path, min_risk_override);
+    codex_lane::pre_review_simplify_error(&sum, "ordinary")
 }
 
 pub fn evaluate_closure_cycle_for_marker(
@@ -6547,7 +6959,25 @@ pub fn format_block_message(
         } else {
             ""
         };
-        let skip_review_hint = reason.contains("`draft-blocked` conflicts with current");
+        let is_simplify_block = reason.starts_with(SIMPLIFY_BLOCK_PREFIX);
+        let simplify_hint = if is_simplify_block {
+            if floor == "HIGH" || floor == "XHIGH" {
+                format!(
+                    "- Для обязательного упрощения (`{}`) вызовите параллельно 3 фиксированные линзы через `invoke_subagent(..., Model=\"inherit\")` ДО ревью: `{}` (передайте только пакет изменений: diff/файлы/инварианты, без произвольных инструкций линз); примените принятые правки, перепрогоните тесты и затем запустите ревью.\n",
+                    floor,
+                    cwg_common::SIMPLIFY_LENSES.join("`, `")
+                )
+            } else {
+                format!(
+                    "- Для обязательного упрощения (`STANDARD`) вызовите один раз `invoke_subagent(TypeName=\"{}\", Model=\"inherit\", ...)` с пакетом изменений (diff/файлы/инварианты, без произвольного промпта); после принятых правок перепрогоните тесты.\n",
+                    cwg_common::SIMPLIFY_LANE
+                )
+            }
+        } else {
+            String::new()
+        };
+        let skip_review_hint =
+            is_simplify_block || reason.contains("`draft-blocked` conflicts with current");
         let review_hint = if needs_review && !skip_review_hint {
             let has_cls = reason.contains(CLOSURE_PHASE_FLAG) || reason.contains("--closure");
             let phase_flag = if has_cls {
@@ -6612,8 +7042,8 @@ pub fn format_block_message(
             )
         };
         format!(
-            "Кандидат `PERSISTENT` (риск `{}`). Обязательные условия: {}.\n{}{}",
-            floor, reqs, review_hint, closing_receipt_hint
+            "Кандидат `PERSISTENT` (риск `{}`). Обязательные условия: {}.\n{}{}{}",
+            floor, reqs, simplify_hint, review_hint, closing_receipt_hint
         )
     };
 
@@ -6955,9 +7385,10 @@ pub fn decide_stop(payload: &Value) -> Option<String> {
                 && swarm_ev.passive_bg_tasks.is_empty();
             in_flight.sort();
             let progress_sig = format!(
-                "{}:{}:{}",
+                "{}:{}:{}:{}",
                 swarm_ev.worker_activity_count.unwrap_or(0),
                 sub_ev.reviews.len(),
+                sub_ev.simplify_completed_count(),
                 in_flight.join(",")
             );
             let waits = if val_to_str(state.get("last_wait_progress")) != progress_sig {
@@ -7181,6 +7612,84 @@ mod tests {
         }
     }
 
+    fn completed_simplify_ev(lenses: &[&str], ts: f64) -> SubagentEvidence {
+        let mut ev = SubagentEvidence::default();
+        for &lane in lenses {
+            ev.simplify_successes
+                .entry(lane.to_string())
+                .or_default()
+                .push(ts);
+        }
+        ev
+    }
+
+    fn simplify_transcript_lines(
+        lenses: &[&str],
+        launch_ts: f64,
+        done_ts: Option<f64>,
+        step_base: usize,
+        id_prefix: &str,
+    ) -> String {
+        let launch_iso = crate::win32_sqlite::format_iso_utc(launch_ts);
+        let tcs: Vec<Value> = lenses
+            .iter()
+            .map(|&l| {
+                json!({
+                    "name": "invoke_subagent",
+                    "args": {"TypeName": l, "Role": format!("Simplify {}", l), "Model": "inherit", "Prompt": "Bounded diff packet"}
+                })
+            })
+            .collect();
+        let mut lines = vec![json!({
+            "step_index": step_base,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": launch_iso,
+            "tool_calls": tcs,
+        })
+        .to_string()];
+        for (i, &l) in lenses.iter().enumerate() {
+            let cid = format!("{}-{}", id_prefix, i);
+            lines.push(
+                json!({
+                    "step_index": step_base + 1 + i,
+                    "source": "SYSTEM",
+                    "type": "GENERIC",
+                    "status": "DONE",
+                    "created_at": launch_iso,
+                    "content": format!(
+                        "{{\"conversationId\": \"{}\", \"logAbsoluteUri\": \"file:///C:/nonexistent/{}.jsonl\"}}",
+                        cid, cid
+                    ),
+                })
+                .to_string(),
+            );
+            let _ = l;
+        }
+        if let Some(dts) = done_ts {
+            let done_iso = crate::win32_sqlite::format_iso_utc(dts);
+            for (i, &l) in lenses.iter().enumerate() {
+                let cid = format!("{}-{}", id_prefix, i);
+                lines.push(
+                    json!({
+                        "step_index": step_base + 1 + lenses.len() + i,
+                        "source": "SYSTEM",
+                        "type": "SYSTEM_MESSAGE",
+                        "status": "DONE",
+                        "created_at": done_iso,
+                        "content": format!(
+                            "<SYSTEM_MESSAGE>\n[Message] timestamp={} sender={} priority=MESSAGE_PRIORITY_HIGH content=No actionable {} simplifications.\n</SYSTEM_MESSAGE>",
+                            done_iso, cid, l
+                        ),
+                    })
+                    .to_string(),
+                );
+            }
+        }
+        lines.join("\n") + "\n"
+    }
+
     #[test]
     fn test_all_regexes_compile() {
         assert!(subagent_uri_re().is_match(
@@ -7358,7 +7867,7 @@ mod tests {
             latest_fail_ts: 0.0,
             ..Default::default()
         };
-        let sub_ev = SubagentEvidence::default();
+        let sub_ev = completed_simplify_ev(cwg_common::SIMPLIFY_LENSES, 116.0);
 
         // INVARIANT: Missing independent review must reject HIGH closure.
         let swarm_empty = SwarmEvidence::default();
@@ -7601,7 +8110,7 @@ mod tests {
             latest_fail_ts: 0.0,
             ..Default::default()
         };
-        let sub_ev = SubagentEvidence::default();
+        let sub_ev = completed_simplify_ev(cwg_common::SIMPLIFY_LENSES, t0 + 0.05);
 
         let sw_pass1 = SwarmEvidence::default();
 
@@ -9327,11 +9836,12 @@ mod tests {
             "standalone background `npx --workspace backend jest` must be credited as passing verification: {:?}",
             ev_standalone
         );
+        let std_simp_ev = completed_simplify_ev(&[cwg_common::SIMPLIFY_LANE], first_ts + 50.0);
         let (ok_pass, why_pass) = validate_candidate_closure(CandidateClosureInput {
             receipt: Some(&rcp_std),
             marker_in: &marker,
             checks_ev: &ev_standalone,
-            sub_ev: &SubagentEvidence::default(),
+            sub_ev: &std_simp_ev,
             swarm_ev: &SwarmEvidence::default(),
             codex_reviews: &[],
             ctx: None,
@@ -9645,7 +10155,7 @@ mod tests {
             latest_pass_ts: t_edit2 + 10.0,
             ..Default::default()
         };
-        let sub_empty = SubagentEvidence::default();
+        let sub_empty = completed_simplify_ev(cwg_common::SIMPLIFY_LENSES, t_edit2 + 15.0);
         let sw_ev = scan_swarm_activity(SwarmScanInput {
             steps: &[],
             transcript_path: Some(&tp_str),
@@ -9730,6 +10240,7 @@ mod tests {
                 {"ts": 1050.0, "fp": "fp-v2", "unknown": false},
             ]);
             m_r6["current_diff_hash"] = json!("fp-v2");
+            let sub_empty = completed_simplify_ev(cwg_common::SIMPLIFY_LENSES, 1005.0);
             let sw_r6 = SwarmEvidence::default();
             let r6_reviews = vec![
                 json!({"review_id": "r6-1", "kind": "ordinary", "verdict": "REVISE", "engine": "codex", "xhigh": false, "launch_ts": 1010.0, "verdict_ts": 1012.0}),
@@ -10959,7 +11470,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stage2_high_closes_verified_without_simplify_or_design_gate() {
+    fn test_stage2_high_requires_three_lens_simplify_and_closes_without_design_gate() {
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = TempEnvDir::new("stage2-high-ui");
         let ui_file = tmp.path.join("src").join("App.tsx");
@@ -10995,7 +11506,7 @@ mod tests {
         let receipt =
             cwg_common::parse_terminal_receipt("[gate] verified: HIGH; App.tsx updated and checks passed")
                 .unwrap();
-        let (ok, res) = validate_candidate_closure(CandidateClosureInput {
+        let (ok_missing, why_missing) = validate_candidate_closure(CandidateClosureInput {
             receipt: Some(&receipt),
             marker_in: &marker,
             checks_ev: &checks_ev,
@@ -11006,7 +11517,22 @@ mod tests {
             steps: None,
             transcript_path: None,
         });
-        assert!(ok, "HIGH visual candidate must close without simplify or Design Gate: {}", res);
+        assert!(!ok_missing, "HIGH candidate without 3-lens simplify must block");
+        assert!(why_missing.contains("mandatory simplify incomplete"), "got: {}", why_missing);
+
+        let high_simp_ev = completed_simplify_ev(cwg_common::SIMPLIFY_LENSES, 116.0);
+        let (ok, res) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&receipt),
+            marker_in: &marker,
+            checks_ev: &checks_ev,
+            sub_ev: &high_simp_ev,
+            swarm_ev: &SwarmEvidence::default(),
+            codex_reviews: &codex_reviews,
+            ctx: None,
+            steps: None,
+            transcript_path: None,
+        });
+        assert!(ok, "HIGH visual candidate with 3-lens simplify must close without Design Gate: {}", res);
         assert_eq!(res, "verified");
 
         let mut m_helper = marker.clone();
@@ -11054,7 +11580,7 @@ mod tests {
             receipt: Some(&receipt),
             marker_in: &m_helper,
             checks_ev: &checks_ev,
-            sub_ev: &SubagentEvidence::default(),
+            sub_ev: &high_simp_ev,
             swarm_ev: &SwarmEvidence::default(),
             codex_reviews: &codex_reviews,
             ctx: None,
@@ -11543,15 +12069,23 @@ mod tests {
         let first_ts = now - 60.0;
         let check_ts = now - 20.0;
         let tp = td.path.join("transcript.jsonl");
+        let simp_lines = simplify_transcript_lines(
+            cwg_common::SIMPLIFY_LENSES,
+            first_ts + 10.0,
+            Some(first_ts + 15.0),
+            2,
+            "cid-ext-simp",
+        );
         fs::write(
             &tp,
             format!(
-                "{}\n",
+                "{}\n{}",
                 json!({
                     "step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE",
                     "created_at": crate::win32_sqlite::format_iso_utc(check_ts),
                     "tool_calls": [{"name": "run_command", "args": {"CommandLine": "npm test"}}]
-                })
+                }),
+                simp_lines
             ),
         )
         .unwrap();
@@ -11716,7 +12250,7 @@ mod tests {
             latest_pass_ts: now_esc - 35.0,
             ..Default::default()
         };
-        let sub_esc = SubagentEvidence::default();
+        let sub_esc = completed_simplify_ev(cwg_common::SIMPLIFY_LENSES, now_esc - 32.0);
         let sw_esc = SwarmEvidence::default();
         let four_esc: Vec<Value> = (1..=4)
             .map(|i| {
@@ -11878,5 +12412,428 @@ mod tests {
         closed_m["closed"] = json!(true);
         rio::write_json(&cwg_common::marker_path(base_sess), &closed_m).unwrap();
         assert!(codex_lane::find_suffixed_open_marker_session(suffixed_sess, &repo_norm).is_none());
+    }
+
+    #[test]
+    fn test_mandatory_simplify_standard_high_xhigh_and_codex_pre_review_guard() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let td = TempEnvDir::new("mandatory-simplify");
+        let repo = td.path.join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let doc_file = repo.join("README.md");
+        let std_file = repo.join("src").join("util.rs");
+        let hi_file = repo.join(".gitlab-ci.yml");
+        fs::create_dir_all(std_file.parent().unwrap()).unwrap();
+        fs::write(&doc_file, "# Docs\n").unwrap();
+        fs::write(&std_file, "pub fn add(a: i32, b: i32) -> i32 { a + b }\n").unwrap();
+        fs::write(&hi_file, "stages: [test]\n").unwrap();
+        let repo_norm = rio::normalize_path(&repo.to_string_lossy());
+        let doc_norm = rio::normalize_path(&doc_file.to_string_lossy());
+        let std_norm = rio::normalize_path(&std_file.to_string_lossy());
+        let hi_norm = rio::normalize_path(&hi_file.to_string_lossy());
+        let fp_doc = cwg_common::content_fingerprint(std::slice::from_ref(&doc_norm), 4_000_000);
+        let fp_std = cwg_common::content_fingerprint(std::slice::from_ref(&std_norm), 4_000_000);
+        let fp_hi = cwg_common::content_fingerprint(std::slice::from_ref(&hi_norm), 4_000_000);
+
+        let now = now_sec();
+        let first_ts = now - 100.0;
+        let checks_ok = ChecksEvidence {
+            checks_count: 1,
+            passed_count: 1,
+            latest_pass_ts: first_ts + 40.0,
+            ..Default::default()
+        };
+
+        // 1. LOW candidate closes WITHOUT simplify.
+        let m_low = json!({
+            "session": "sess-simp-low", "class": cwg_common::WORK_PERSISTENT, "closed": false,
+            "first_ts": first_ts, "last_ts": first_ts + 10.0, "last_durable_ts": first_ts + 10.0,
+            "cwd": repo_norm, "git_root": repo_norm, "paths": [doc_norm],
+            "content_marks": [{"ts": first_ts + 10.0, "fp": fp_doc}],
+        });
+        let rcp_low = cwg_common::parse_terminal_receipt("[gate] verified: LOW; docs checked").unwrap();
+        let (ok_low, res_low) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_low), marker_in: &m_low, checks_ev: &checks_ok,
+            sub_ev: &SubagentEvidence::default(), swarm_ev: &SwarmEvidence::default(),
+            codex_reviews: &[], ctx: None, steps: None, transcript_path: None,
+        });
+        assert!(ok_low && res_low == "verified", "LOW must close without simplify: {}", res_low);
+
+        // 2. STANDARD candidate blocks without simplify-reviewer, passes with 1x simplify-reviewer (even after applying simplify's edit + re-testing), and passes with all 3 lenses (but NOT 2/3 lenses).
+        let m_std = json!({
+            "session": "sess-simp-std", "class": cwg_common::WORK_PERSISTENT, "closed": false,
+            "first_ts": first_ts, "last_ts": first_ts + 35.0, "last_durable_ts": first_ts + 35.0,
+            "cwd": repo_norm, "git_root": repo_norm, "paths": [std_norm],
+            "content_marks": [
+                {"ts": first_ts + 10.0, "fp": "pre_simp_fp"},
+                {"ts": first_ts + 35.0, "fp": fp_std},
+            ],
+        });
+        let rcp_std = cwg_common::parse_terminal_receipt("[gate] verified: STANDARD; util.rs tested").unwrap();
+        let (ok_std_miss, why_std_miss) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_std), marker_in: &m_std, checks_ev: &checks_ok,
+            sub_ev: &SubagentEvidence::default(), swarm_ev: &SwarmEvidence::default(),
+            codex_reviews: &[], ctx: None, steps: None, transcript_path: None,
+        });
+        assert!(!ok_std_miss && why_std_miss.contains("missing: simplify-reviewer"), "got: {}", why_std_miss);
+        let blk_std_msg = format_block_message(&why_std_miss, 1, &m_std, "sess-simp-std", "n-std", None);
+        assert!(blk_std_msg.contains("TypeName=\"simplify-reviewer\""), "got: {}", blk_std_msg);
+
+        // Scan real JSONL transcript (launched at first_ts + 20 < post-simplify edit at first_ts + 35): candidate-bound so applying simplify edits never loops.
+        let std_tp = td.path.join("std-transcript.jsonl");
+        fs::write(&std_tp, simplify_transcript_lines(&["gemini-carbon-stack:simplify-reviewer"], first_ts + 20.0, Some(first_ts + 25.0), 1, "cid-std")).unwrap();
+        let std_steps = rio::read_transcript_steps(&std_tp.to_string_lossy(), 200);
+        let std_sub_ev = scan_native_subagents(&std_steps, Some(&std_tp.to_string_lossy()), first_ts);
+        let (ok_std_ok, res_std_ok) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_std), marker_in: &m_std, checks_ev: &checks_ok,
+            sub_ev: &std_sub_ev, swarm_ev: &SwarmEvidence::default(),
+            codex_reviews: &[], ctx: None, steps: Some(&std_steps), transcript_path: None,
+        });
+        assert!(ok_std_ok && res_std_ok == "verified", "STANDARD with 1x simplify-reviewer must pass after post-simplify edit: {}", res_std_ok);
+
+        let two_lenses = completed_simplify_ev(&["simplify-reuse-reviewer", "simplify-quality-reviewer"], first_ts + 20.0);
+        assert!(!validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_std), marker_in: &m_std, checks_ev: &checks_ok,
+            sub_ev: &two_lenses, swarm_ev: &SwarmEvidence::default(),
+            codex_reviews: &[], ctx: None, steps: None, transcript_path: None,
+        }).0);
+        let three_lenses = completed_simplify_ev(cwg_common::SIMPLIFY_LENSES, first_ts + 20.0);
+        let (ok_std_3, why_std_3) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_std), marker_in: &m_std, checks_ev: &checks_ok,
+            sub_ev: &three_lenses, swarm_ev: &SwarmEvidence::default(),
+            codex_reviews: &[], ctx: None, steps: None, transcript_path: None,
+        });
+        assert!(
+            !ok_std_3 && why_std_3.contains("missing: simplify-reviewer"),
+            "STANDARD must strictly require 1-lens simplify-reviewer, got: {}",
+            why_std_3
+        );
+
+        // 3. HIGH and XHIGH reject combined simplify-reviewer or 2/3 lenses, accept 3/3 lenses, and reject pre-candidate stale simplify calls.
+        let m_hi = json!({
+            "session": "sess-simp-hi", "class": cwg_common::WORK_PERSISTENT, "closed": false,
+            "first_ts": first_ts, "last_ts": first_ts + 10.0, "last_durable_ts": first_ts + 10.0,
+            "cwd": repo_norm, "git_root": repo_norm, "paths": [hi_norm],
+            "content_marks": [{"ts": first_ts + 10.0, "fp": fp_hi}],
+        });
+        let rcp_hi = cwg_common::parse_terminal_receipt("[gate] verified: HIGH; ci updated").unwrap();
+        let rcp_xhi = cwg_common::parse_terminal_receipt("[gate] verified: XHIGH; ci updated").unwrap();
+        let rev_hi = vec![json!({"engine": "codex", "kind": "ordinary", "verdict": "APPROVED", "launch_ts": first_ts + 50.0, "verdict_ts": first_ts + 55.0, "xhigh": false})];
+        let rev_xhi = vec![json!({"engine": "codex", "kind": "ordinary", "verdict": "APPROVED", "launch_ts": first_ts + 50.0, "verdict_ts": first_ts + 55.0, "xhigh": true})];
+
+        let (ok_hi_comb, why_hi_comb) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_hi), marker_in: &m_hi, checks_ev: &checks_ok,
+            sub_ev: &std_sub_ev, swarm_ev: &SwarmEvidence::default(),
+            codex_reviews: &rev_hi, ctx: None, steps: None, transcript_path: None,
+        });
+        assert!(!ok_hi_comb && why_hi_comb.contains("simplify-reuse-reviewer"), "combined simplify-reviewer must NOT satisfy HIGH: {}", why_hi_comb);
+        let blk_hi_msg = format_block_message(&why_hi_comb, 1, &m_hi, "sess-simp-hi", "n-hi", None);
+        assert!(
+            blk_hi_msg.contains("simplify-reuse-reviewer")
+                && blk_hi_msg.contains("simplify-quality-reviewer")
+                && blk_hi_msg.contains("simplify-efficiency-reviewer")
+                && !blk_hi_msg.contains("Для независимого ревью"),
+            "HIGH simplify block must guide 3 fixed lenses first without jumping to review hint: {}",
+            blk_hi_msg
+        );
+
+        let (ok_hi_2, why_hi_2) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_hi), marker_in: &m_hi, checks_ev: &checks_ok,
+            sub_ev: &two_lenses, swarm_ev: &SwarmEvidence::default(),
+            codex_reviews: &rev_hi, ctx: None, steps: None, transcript_path: None,
+        });
+        assert!(!ok_hi_2 && why_hi_2.contains("missing: simplify-efficiency-reviewer"), "got: {}", why_hi_2);
+
+        assert!(validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_hi), marker_in: &m_hi, checks_ev: &checks_ok,
+            sub_ev: &three_lenses, swarm_ev: &SwarmEvidence::default(),
+            codex_reviews: &rev_hi, ctx: None, steps: None, transcript_path: None,
+        }).0);
+        assert!(validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_xhi), marker_in: &m_hi, checks_ev: &checks_ok,
+            sub_ev: &three_lenses, swarm_ev: &SwarmEvidence::default(),
+            codex_reviews: &rev_xhi, ctx: None, steps: None, transcript_path: None,
+        }).0);
+
+        // R1 #1: Review launched BEFORE simplify completed must NOT close verified/pr-ready AND must NOT trigger already_ordinary_approved or duplicate-APPROVED deadlocks when followed by a post-simplify APPROVED.
+        let pre_simp_approved = vec![json!({
+            "engine": "codex", "kind": "ordinary", "verdict": "APPROVED",
+            "launch_ts": first_ts + 15.0, "verdict_ts": first_ts + 17.0, "xhigh": false,
+        })];
+        let (ok_pre_rev, why_pre_rev) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_hi), marker_in: &m_hi, checks_ev: &checks_ok,
+            sub_ev: &three_lenses, swarm_ev: &SwarmEvidence::default(),
+            codex_reviews: &pre_simp_approved, ctx: None, steps: None, transcript_path: None,
+        });
+        assert!(!ok_pre_rev && why_pre_rev.contains("BEFORE mandatory simplify"), "got: {}", why_pre_rev);
+        let mut pre_probe = codex_lane::ClosureCycleSummary::default();
+        let _ = validate_candidate_closure_inner(
+            CandidateClosureInput {
+                receipt: Some(&rcp_hi), marker_in: &m_hi, checks_ev: &checks_ok,
+                sub_ev: &three_lenses, swarm_ev: &SwarmEvidence::default(),
+                codex_reviews: &pre_simp_approved, ctx: None, steps: None, transcript_path: None,
+            },
+            Some(&mut pre_probe),
+        );
+        assert!(!pre_probe.has_fresh_ordinary_approved, "pre-simplify APPROVED must not block post-simplify re-review via already_ordinary_approved");
+        let recovered_after_pre = vec![pre_simp_approved[0].clone(), rev_hi[0].clone()];
+        let (ok_rec_post, res_rec_post) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_hi), marker_in: &m_hi, checks_ev: &checks_ok,
+            sub_ev: &three_lenses, swarm_ev: &SwarmEvidence::default(),
+            codex_reviews: &recovered_after_pre, ctx: None, steps: None, transcript_path: None,
+        });
+        assert!(ok_rec_post && res_rec_post == "verified", "post-simplify APPROVED after premature pre-simplify APPROVED must close cleanly: {}", res_rec_post);
+
+        // Pre-simplify CLOSURE_VALIDATION: READY must also be rejected on verified and pr-ready.
+        let pre_cls_revs = vec![
+            json!({"engine": "codex", "kind": "ordinary", "verdict": "REVISE", "launch_ts": first_ts + 11.0, "verdict_ts": first_ts + 11.5, "xhigh": false}),
+            json!({"engine": "codex", "kind": "ordinary", "verdict": "REVISE", "launch_ts": first_ts + 12.0, "verdict_ts": first_ts + 12.5, "xhigh": false}),
+            json!({"engine": "codex", "kind": "ordinary", "verdict": "REVISE", "launch_ts": first_ts + 13.0, "verdict_ts": first_ts + 13.5, "xhigh": false}),
+            json!({"engine": "codex", "kind": "ordinary", "verdict": "ESCALATE", "launch_ts": first_ts + 14.0, "verdict_ts": first_ts + 14.5, "xhigh": false}),
+            json!({"engine": "codex", "kind": "closure", "verdict": "READY", "launch_ts": first_ts + 16.0, "verdict_ts": first_ts + 16.5, "xhigh": false}),
+        ];
+        let pre_res_steps = vec![
+            json!({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(first_ts + 15.0), "tool_calls": [{"name": "search_web", "args": {"query": "docs"}}]}),
+            json!({"step_index": 2, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(first_ts + 15.2), "content": "ok"}),
+        ];
+        let rcp_pr = cwg_common::parse_terminal_receipt("[gate] pr-ready: HIGH; closure ready").unwrap();
+        let (ok_pre_pr, why_pre_pr) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_pr), marker_in: &m_hi, checks_ev: &checks_ok,
+            sub_ev: &three_lenses, swarm_ev: &SwarmEvidence::default(),
+            codex_reviews: &pre_cls_revs, ctx: None, steps: Some(&pre_res_steps), transcript_path: None,
+        });
+        assert!(!ok_pre_pr && why_pre_pr.contains("BEFORE mandatory simplify"), "got: {}", why_pre_pr);
+
+        // Pre-candidate stale simplify calls (launched before first_ts - 2) must NOT carry over.
+        let stale_tp = td.path.join("stale-simp.jsonl");
+        fs::write(&stale_tp, simplify_transcript_lines(cwg_common::SIMPLIFY_LENSES, first_ts - 30.0, Some(first_ts - 20.0), 1, "cid-stale")).unwrap();
+        let stale_steps = rio::read_transcript_steps(&stale_tp.to_string_lossy(), 200);
+        let stale_sub_ev = scan_native_subagents(&stale_steps, Some(&stale_tp.to_string_lossy()), first_ts);
+        assert!(stale_sub_ev.simplify_successes.is_empty(), "pre-candidate simplify must not leak into new candidate");
+
+        // 4. Failure retry vs 2-failure Exhausted -> allows terminal draft-blocked.
+        let mut fail1_ev = completed_simplify_ev(&["simplify-reuse-reviewer", "simplify-quality-reviewer"], first_ts + 20.0);
+        fail1_ev.simplify_failures.insert("simplify-efficiency-reviewer".to_string(), vec![first_ts + 22.0]);
+        let rcp_draft = cwg_common::parse_terminal_receipt("[gate] draft-blocked: SIMPLIFY_UNAVAILABLE").unwrap();
+        assert!(!validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_draft), marker_in: &m_hi, checks_ev: &checks_ok,
+            sub_ev: &fail1_ev, swarm_ev: &SwarmEvidence::default(),
+            codex_reviews: &[], ctx: None, steps: None, transcript_path: None,
+        }).0, "single simplify failure must require retry before draft-blocked");
+        fail1_ev.simplify_failures.get_mut("simplify-efficiency-reviewer").unwrap().push(first_ts + 26.0);
+        let (ok_exh_v, why_exh_v) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_hi), marker_in: &m_hi, checks_ev: &checks_ok,
+            sub_ev: &fail1_ev, swarm_ev: &SwarmEvidence::default(),
+            codex_reviews: &[], ctx: None, steps: None, transcript_path: None,
+        });
+        assert!(!ok_exh_v && why_exh_v.contains("draft-blocked"), "exhausted lane block must surface draft-blocked escape: {}", why_exh_v);
+        assert!(validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_draft), marker_in: &m_hi, checks_ev: &checks_ok,
+            sub_ev: &fail1_ev, swarm_ev: &SwarmEvidence::default(),
+            codex_reviews: &[], ctx: None, steps: None, transcript_path: None,
+        }).0, "2 simplify failures after durable edit must allow terminal draft-blocked");
+
+        // 5. codex-lane review Round 1 pre-review guard blocks missing OR in-flight simplify lenses when transcript exists, and clears once all 3 lenses complete.
+        let cli_sess = "sess-codex-pre-simp";
+        let m_cli = json!({
+            "session": cli_sess, "class": cwg_common::WORK_PERSISTENT, "closed": false,
+            "first_ts": first_ts, "last_ts": first_ts + 10.0, "last_durable_ts": first_ts + 10.0,
+            "cwd": repo_norm, "git_root": repo_norm, "paths": [hi_norm],
+            "content_marks": [{"ts": first_ts + 10.0, "fp": fp_hi}],
+        });
+        rio::write_json(&cwg_common::marker_path(cli_sess), &m_cli).unwrap();
+        let cli_tp = td.path.join("cli-simp.jsonl");
+        fs::write(&cli_tp, format!("{}\n", json!({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "fix ci"}))).unwrap();
+        let cli_tp_s = cli_tp.to_string_lossy().into_owned();
+
+        let sum_miss = evaluate_closure_cycle_for_marker(&m_cli, cli_sess, &repo_norm, &cli_tp_s, "");
+        assert!(sum_miss.has_transcript && sum_miss.missing_simplify_lenses.len() == 3);
+        assert!(codex_lane::pre_review_simplify_error(&sum_miss, "ordinary").is_some_and(|m| m.contains("simplify-reuse-reviewer")));
+
+        // Write in-flight (not yet delivered) 3 lenses: still blocked.
+        fs::write(&cli_tp, simplify_transcript_lines(cwg_common::SIMPLIFY_LENSES, first_ts + 20.0, None, 1, "cid-inf")).unwrap();
+        let sum_inf = evaluate_closure_cycle_for_marker(&m_cli, cli_sess, &repo_norm, &cli_tp_s, "");
+        assert!(sum_inf.has_transcript && sum_inf.missing_simplify_lenses.len() == 3 && sum_inf.in_flight_simplify_lenses.len() == 3);
+        assert!(codex_lane::pre_review_simplify_error(&sum_inf, "ordinary").is_some_and(|m| m.contains("in_flight:")));
+
+        // Write completed 3 lenses: pre-review guard clears!
+        fs::write(&cli_tp, simplify_transcript_lines(cwg_common::SIMPLIFY_LENSES, first_ts + 20.0, Some(first_ts + 25.0), 1, "cid-ok")).unwrap();
+        let sum_ok = evaluate_closure_cycle_for_marker(&m_cli, cli_sess, &repo_norm, &cli_tp_s, "");
+        assert!(sum_ok.has_transcript && sum_ok.missing_simplify_lenses.is_empty() && sum_ok.in_flight_simplify_lenses.is_empty());
+        assert!(codex_lane::pre_review_simplify_error(&sum_ok, "ordinary").is_none());
+
+        // Sibling transcript_full.jsonl without transcript.jsonl must still set has_transcript = true.
+        let full_only_dir = td.path.join("full_only_logs");
+        fs::create_dir_all(&full_only_dir).unwrap();
+        let full_only_tp = full_only_dir.join("transcript_full.jsonl");
+        fs::write(&full_only_tp, format!("{}\n", json!({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "fix ci"}))).unwrap();
+        let missing_compact_tp = full_only_dir.join("transcript.jsonl").to_string_lossy().into_owned();
+        let sum_full_only = evaluate_closure_cycle_for_marker(&m_cli, cli_sess, &repo_norm, &missing_compact_tp, "");
+        assert!(sum_full_only.has_transcript && sum_full_only.missing_simplify_lenses.len() == 3);
+
+        // Test live CLI rejection via codex_lane::run_cli when transcript under brain_root has missing simplify.
+        let brain_dir = td.path.join("brain_cli");
+        let brain_tp = rio::member_transcript_path(&brain_dir, cli_sess);
+        fs::create_dir_all(brain_tp.parent().unwrap()).unwrap();
+        fs::write(&brain_tp, format!("{}\n", json!({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "fix ci"}))).unwrap();
+        let prev_br = std::env::var("ANTIGRAVITY_BRAIN_ROOT").ok();
+        unsafe { std::env::set_var("ANTIGRAVITY_BRAIN_ROOT", &brain_dir) };
+        let rc_pre = codex_lane::run_cli(&[
+            "review".into(), "--cwd".into(), repo_norm.clone(), "--session".into(), cli_sess.into(),
+            "--summary".into(), "round 1 without simplify".into(),
+        ]);
+        unsafe {
+            match prev_br {
+                Some(v) => std::env::set_var("ANTIGRAVITY_BRAIN_ROOT", v),
+                None => std::env::remove_var("ANTIGRAVITY_BRAIN_ROOT"),
+            }
+        }
+        assert_eq!(rc_pre, 2, "codex-lane review Round 1 must reject missing_pre_review_simplify when 3 lenses have not completed");
+
+        // R1 #1: Internal fallback review routes (`invoke_subagent(adversarial-reviewer*)` and `swarm(add, internal-reviewer)`) must ALSO deny before simplify and allow once all 3 lenses complete.
+        let guard_payload_miss = json!({
+            "conversationId": cli_sess,
+            "transcriptPath": brain_tp.to_string_lossy(),
+        });
+        let (sub_dec_miss, sub_why_miss, _) = crate::safety_guards::guard_subagent_invocation_with_payload(
+            &guard_payload_miss,
+            &json!({"TypeName": "adversarial-reviewer", "Model": "inherit", "Prompt": "Review this HIGH candidate thoroughly."}),
+        );
+        assert_eq!(sub_dec_miss, "deny");
+        assert!(sub_why_miss.as_deref().unwrap_or("").contains("simplify-reuse-reviewer"));
+
+        let (sw_dec_miss, sw_why_miss) = crate::safety_guards::guard_swarm_invocation_with_payload(
+            &json!({"action": "add", "name": "internal-reviewer", "model": cwg_common::OPUS_HIGH_MODEL, "brief": "Adversarial review of candidate"}),
+            Some(&guard_payload_miss),
+        );
+        assert_eq!(sw_dec_miss, "deny");
+        assert!(sw_why_miss.as_deref().unwrap_or("").contains("simplify-reuse-reviewer"));
+
+        let (sw_scout_ok, _) = crate::safety_guards::guard_swarm_invocation_with_payload(
+            &json!({"action": "add", "name": "scout-1", "model": cwg_common::NEON_HIGH_MODEL, "brief": "Map repository files"}),
+            Some(&guard_payload_miss),
+        );
+        assert_eq!(sw_scout_ok, "allow", "non-review swarm worker must remain allowed before simplify");
+
+        fs::write(&brain_tp, simplify_transcript_lines(cwg_common::SIMPLIFY_LENSES, first_ts + 20.0, Some(first_ts + 25.0), 1, "cid-guard-ok")).unwrap();
+        let (sub_dec_ok, _, _) = crate::safety_guards::guard_subagent_invocation_with_payload(
+            &guard_payload_miss,
+            &json!({"TypeName": "adversarial-reviewer", "Model": "inherit", "Prompt": "Review this HIGH candidate thoroughly."}),
+        );
+        assert_eq!(sub_dec_ok, "allow");
+        let (sw_dec_ok, _) = crate::safety_guards::guard_swarm_invocation_with_payload(
+            &json!({"action": "add", "name": "internal-reviewer", "model": cwg_common::OPUS_HIGH_MODEL, "brief": "Adversarial review of candidate"}),
+            Some(&guard_payload_miss),
+        );
+        assert_eq!(sw_dec_ok, "allow");
+
+        // R2 #1: Cycle reset (STANDARD with require_review_on_standard gets APPROVED, then CI edit elevates risk to HIGH and sets pending_reset_ts) must preserve transcript & missing 3 HIGH simplify lenses in BOTH codex-lane and internal fallback guards.
+        let esc_sess = "sess-r2-reset-std-to-high";
+        let esc_tp = td.path.join("r2-reset-std-to-high.jsonl");
+        let esc_tp_s = esc_tp.to_string_lossy().into_owned();
+        fs::write(&esc_tp, simplify_transcript_lines(&[cwg_common::SIMPLIFY_LANE], first_ts + 5.0, Some(first_ts + 8.0), 1, "cid-std-1")).unwrap();
+        let m_std_esc = json!({
+            "session": esc_sess, "class": cwg_common::WORK_PERSISTENT, "closed": false,
+            "first_ts": first_ts, "last_ts": first_ts + 30.0, "last_durable_ts": first_ts + 30.0,
+            "cwd": repo_norm, "git_root": repo_norm, "paths": [std_norm, hi_norm],
+            "content_marks": [
+                {"ts": first_ts + 4.0, "fp": fp_std},
+                {"ts": first_ts + 30.0, "fp": fp_hi}
+            ],
+        });
+        rio::write_json(&cwg_common::marker_path(esc_sess), &m_std_esc).unwrap();
+        let std_app_rev = vec![json!({
+            "engine": "codex", "kind": "ordinary", "verdict": "APPROVED",
+            "launch_ts": first_ts + 12.0, "verdict_ts": first_ts + 15.0, "xhigh": false,
+        })];
+        let esc_steps = rio::read_transcript_steps(&esc_tp_s, 200);
+        let esc_sub_ev = scan_native_subagents(&esc_steps, Some(&esc_tp_s), first_ts);
+        let mut reset_probe = codex_lane::ClosureCycleSummary::default();
+        let _ = validate_candidate_closure_inner(
+            CandidateClosureInput {
+                receipt: Some(&rcp_hi), marker_in: &m_std_esc, checks_ev: &checks_ok,
+                sub_ev: &esc_sub_ev, swarm_ev: &SwarmEvidence::default(),
+                codex_reviews: &std_app_rev, ctx: None, steps: Some(&esc_steps), transcript_path: Some(&esc_tp_s),
+            },
+            Some(&mut reset_probe),
+        );
+        assert!(reset_probe.cycle_reset_ts > first_ts + 25.0, "expected cycle reset after CI edit");
+        assert!(reset_probe.has_transcript && reset_probe.missing_simplify_lenses.len() == 3, "cycle reset probe must keep transcript & 3 missing HIGH simplify lenses: {:?}", reset_probe);
+        assert!(codex_lane::pre_review_simplify_error(&reset_probe, "ordinary").is_some_and(|m| m.contains("simplify-reuse-reviewer")));
+
+        // R2 #1b: Non-reset escalation (STANDARD Round 1 REVISE -> CI edit raises to HIGH) must ALSO block Round 2 until all 3 HIGH lenses complete.
+        let std_revise_rev = vec![json!({
+            "engine": "codex", "kind": "ordinary", "verdict": "REVISE",
+            "launch_ts": first_ts + 12.0, "verdict_ts": first_ts + 15.0, "xhigh": false,
+        })];
+        let mut nonreset_probe = codex_lane::ClosureCycleSummary::default();
+        let _ = validate_candidate_closure_inner(
+            CandidateClosureInput {
+                receipt: Some(&rcp_hi), marker_in: &m_std_esc, checks_ev: &checks_ok,
+                sub_ev: &esc_sub_ev, swarm_ev: &SwarmEvidence::default(),
+                codex_reviews: &std_revise_rev, ctx: None, steps: Some(&esc_steps), transcript_path: Some(&esc_tp_s),
+            },
+            Some(&mut nonreset_probe),
+        );
+        assert_eq!(nonreset_probe.counted_ordinary_rounds, 1);
+        assert!(codex_lane::pre_review_simplify_error(&nonreset_probe, "ordinary").is_some_and(|m| m.contains("simplify-reuse-reviewer")));
+
+        // R2 #2: 4 pre-simplify ordinary rounds ending in APPROVED followed by mandatory 3-lens simplify must reject Stop closure with BEFORE mandatory simplify AND keep post-simplify ordinary round budget at 0/4 (no deadlock / forced draft-blocked).
+        let four_pre_simp = vec![
+            json!({"engine": "codex", "kind": "ordinary", "verdict": "REVISE", "launch_ts": first_ts + 11.0, "verdict_ts": first_ts + 11.5, "xhigh": false}),
+            json!({"engine": "codex", "kind": "ordinary", "verdict": "REVISE", "launch_ts": first_ts + 12.0, "verdict_ts": first_ts + 12.5, "xhigh": false}),
+            json!({"engine": "codex", "kind": "ordinary", "verdict": "REVISE", "launch_ts": first_ts + 13.0, "verdict_ts": first_ts + 13.5, "xhigh": false}),
+            json!({"engine": "codex", "kind": "ordinary", "verdict": "APPROVED", "launch_ts": first_ts + 14.0, "verdict_ts": first_ts + 14.5, "xhigh": false}),
+        ];
+        let (ok_4pre, why_4pre) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_hi), marker_in: &m_hi, checks_ev: &checks_ok,
+            sub_ev: &three_lenses, swarm_ev: &SwarmEvidence::default(),
+            codex_reviews: &four_pre_simp, ctx: None, steps: None, transcript_path: None,
+        });
+        assert!(!ok_4pre && why_4pre.contains("BEFORE mandatory simplify"), "got: {}", why_4pre);
+        let mut probe_4pre = codex_lane::ClosureCycleSummary::default();
+        let _ = validate_candidate_closure_inner(
+            CandidateClosureInput {
+                receipt: Some(&rcp_hi), marker_in: &m_hi, checks_ev: &checks_ok,
+                sub_ev: &three_lenses, swarm_ev: &SwarmEvidence::default(),
+                codex_reviews: &four_pre_simp, ctx: None, steps: None, transcript_path: None,
+            },
+            Some(&mut probe_4pre),
+        );
+        assert_eq!(probe_4pre.counted_ordinary_rounds, 0, "pre-simplify rounds must not consume post-simplify budget");
+        assert_eq!(probe_4pre.raw_ordinary_rounds, 0);
+        assert!(!probe_4pre.ordinary_cap_reached && !probe_4pre.has_fresh_ordinary_approved);
+        assert!((probe_4pre.simplify_completed_ts - (first_ts + 20.0)).abs() < 0.01);
+        let mut after_4pre_recovered = four_pre_simp.clone();
+        after_4pre_recovered.push(rev_hi[0].clone());
+        let (ok_4pre_rec, res_4pre_rec) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_hi), marker_in: &m_hi, checks_ev: &checks_ok,
+            sub_ev: &three_lenses, swarm_ev: &SwarmEvidence::default(),
+            codex_reviews: &after_4pre_recovered, ctx: None, steps: None, transcript_path: None,
+        });
+        assert!(ok_4pre_rec && res_4pre_rec == "verified", "post-simplify APPROVED after 4 pre-simplify rounds must close verified: {}", res_4pre_rec);
+
+        // Anti-laundering: A later simplify failure + retry after 4 post-simplify REVISE rounds must NOT advance simplify_completed_ts or clear counted post-simplify rounds.
+        let mut launder_ev = three_lenses.clone();
+        launder_ev.simplify_failures.insert("simplify-reuse-reviewer".to_string(), vec![first_ts + 80.0]);
+        launder_ev.simplify_successes.get_mut("simplify-reuse-reviewer").unwrap().push(first_ts + 85.0);
+        let four_post_revise = vec![
+            json!({"engine": "codex", "kind": "ordinary", "verdict": "REVISE", "launch_ts": first_ts + 30.0, "verdict_ts": first_ts + 31.0, "xhigh": false}),
+            json!({"engine": "codex", "kind": "ordinary", "verdict": "REVISE", "launch_ts": first_ts + 40.0, "verdict_ts": first_ts + 41.0, "xhigh": false}),
+            json!({"engine": "codex", "kind": "ordinary", "verdict": "REVISE", "launch_ts": first_ts + 50.0, "verdict_ts": first_ts + 51.0, "xhigh": false}),
+            json!({"engine": "codex", "kind": "ordinary", "verdict": "REVISE", "launch_ts": first_ts + 60.0, "verdict_ts": first_ts + 61.0, "xhigh": false}),
+        ];
+        let mut launder_probe = codex_lane::ClosureCycleSummary::default();
+        let _ = validate_candidate_closure_inner(
+            CandidateClosureInput {
+                receipt: Some(&rcp_hi), marker_in: &m_hi, checks_ev: &checks_ok,
+                sub_ev: &launder_ev, swarm_ev: &SwarmEvidence::default(),
+                codex_reviews: &four_post_revise, ctx: None, steps: None, transcript_path: None,
+            },
+            Some(&mut launder_probe),
+        );
+        assert_eq!(launder_probe.counted_ordinary_rounds, 4, "later simplify retry must never launder 4 counted post-simplify rounds");
+        assert!(launder_probe.ordinary_cap_reached);
+        assert!((launder_probe.simplify_completed_ts - (first_ts + 20.0)).abs() < 0.01);
     }
 }

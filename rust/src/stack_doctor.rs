@@ -1417,6 +1417,12 @@ pub(crate) fn collect_doctor_report_for_os(
         hydrogen_levels.insert("xhigh", cwg_common::HYDROGEN_XHIGH_MODEL);
         let max_rounds = cwg_common::MAX_ORDINARY_REVIEW_ROUNDS;
         let max_closure = cwg_common::MAX_CLOSURE_PASSES_PER_CYCLE;
+        let plugin_agents: BTreeSet<&str> = codex_lane::NATIVE_REVIEWERS
+            .iter()
+            .copied()
+            .chain(cwg_common::SIMPLIFY_REVIEWERS.iter().copied())
+            .chain(["code-explorer", "translator"])
+            .collect();
         report.insert(
             "model_routing".to_string(),
             json!({
@@ -1430,23 +1436,16 @@ pub(crate) fn collect_doctor_report_for_os(
                     "planning_and_routine": cwg_common::ORCHESTRATOR_NEON_MODEL,
                 },
                 "pipeline_order": format!(
-                    "unittest -> optional advisory simplify -> primary review (1..{}) -> APPROVED | (Round {} ESCALATE -> mandatory research -> fix + re-test -> <={} --closure passes -> pr-ready/draft-blocked)",
-                    max_rounds, max_rounds, max_closure
+                    "unittest -> mandatory simplify (STANDARD: 1x {}; HIGH/XHIGH: 3 parallel fixed lenses before review) -> primary review (1..{}) -> APPROVED | (Round {} ESCALATE -> mandatory research -> fix + re-test -> <={} --closure passes -> pr-ready/draft-blocked)",
+                    cwg_common::SIMPLIFY_LANE, max_rounds, max_rounds, max_closure
                 ),
-                "advisory_simplify": {
-                    "mode": "optional single advisory pass (simplify-reviewer) before primary review",
-                    "primary_model": cwg_common::SONNET_HIGH_MODEL,
-                    "fallback_model": cwg_common::NEON_XHIGH_MODEL,
-                    "secondary_fallback_model": cwg_common::HYDROGEN_XHIGH_MODEL,
-                    "prompt_cache_ttl_seconds": cwg_common::SWARM_CACHE_SAFE_TTL_SECONDS,
+                "mandatory_simplify": {
+                    "enforcement": "hard Stop gate + Round 1 codex-lane pre-review guard",
+                    "standard": cwg_common::SIMPLIFY_LANE,
+                    "high_and_xhigh": cwg_common::SIMPLIFY_LENSES,
+                    "invocation": "invoke_subagent(TypeName=<fixed-agent>, Model='inherit') using fixed Claude prompts from plugin/agents/simplify-*.md",
                 },
-                "plugin_agents": [
-                    "adversarial-reviewer",
-                    "adversarial-reviewer-xhigh",
-                    "code-explorer",
-                    "simplify-reviewer",
-                    "translator",
-                ],
+                "plugin_agents": plugin_agents,
                 "external_review": format!(
                     "codex-cli (HIGH: {} medium, XHIGH: {} ultra; 1..{} rounds in one session; after Round {} ESCALATE: mandatory research -> fix + re-test -> <={} --closure passes -> pr-ready/draft-blocked)",
                     cwg_common::CODEX_SOL_MODEL, cwg_common::CODEX_ASTRA_MODEL, max_rounds, max_rounds, max_closure
@@ -1466,7 +1465,6 @@ pub(crate) fn collect_doctor_report_for_os(
                         "infra-sre-diagnostician",
                         "test-author",
                         "complex_disjoint_builder",
-                        "simplify_fallback",
                         "high_review_escalation",
                     ],
                 },
@@ -1479,7 +1477,6 @@ pub(crate) fn collect_doctor_report_for_os(
                         "gitlab-delivery-analyst",
                         "scout_swarm",
                         "simple_disjoint_builder",
-                        "simplify_secondary_fallback",
                     ],
                 },
             }),
@@ -1788,14 +1785,13 @@ mod tests {
             report["model_routing"]["coordinator"],
             cwg_common::ORCHESTRATOR_NEON_MODEL
         );
-        assert!(report["model_routing"].get("simplify_lenses").is_none());
         assert_eq!(
-            report["model_routing"]["advisory_simplify"]["fallback_model"],
-            cwg_common::NEON_XHIGH_MODEL
+            report["model_routing"]["mandatory_simplify"]["standard"],
+            cwg_common::SIMPLIFY_LANE
         );
         assert_eq!(
-            report["model_routing"]["advisory_simplify"]["secondary_fallback_model"],
-            cwg_common::HYDROGEN_XHIGH_MODEL
+            report["model_routing"]["mandatory_simplify"]["high_and_xhigh"],
+            json!(cwg_common::SIMPLIFY_LENSES)
         );
         assert_eq!(
             report["model_routing"]["direct_engineering"]["architecture_and_review_fixes"],
@@ -1807,6 +1803,9 @@ mod tests {
                 "adversarial-reviewer",
                 "adversarial-reviewer-xhigh",
                 "code-explorer",
+                "simplify-efficiency-reviewer",
+                "simplify-quality-reviewer",
+                "simplify-reuse-reviewer",
                 "simplify-reviewer",
                 "translator",
             ])
@@ -1846,7 +1845,7 @@ mod tests {
             .as_str()
             .unwrap_or("");
         assert!(pipeline.starts_with(
-            "unittest -> optional advisory simplify -> primary review (1..4) -> APPROVED"
+            "unittest -> mandatory simplify (STANDARD: 1x simplify-reviewer; HIGH/XHIGH: 3 parallel fixed lenses before review) -> primary review (1..4) -> APPROVED"
         ));
         assert!(pipeline.contains(
             "mandatory research -> fix + re-test -> <=2 --closure passes -> pr-ready/draft-blocked"

@@ -17,14 +17,14 @@
   - `bin/carbon-stack.exe` — релизный Rust-бинарник гейта (`cwg_*`), независимого ревью (`codex-lane`), `continuity`, защитных хуков (`safety_guards`, `comment_density_guard`), локальной FTS5-памяти (`carbon-memory`), импортера сессий Claude Code (`claude-chat-importer`), оркестратора worktree-задач (`chip-handoff`), поиска (`code-search`), кэша роя (`swarm-cache`), безопасного управления worktrees (`worktree-guard`), самодиагностики (`stack-doctor`) и установщика (`install`).
   - `tools/` — `file-holders.ps1` и `vectorize.mjs`.
   - `rules/` — компактная конституция `AGENTS.md` и селективные правила (`high-risk-verification.md` `glob`, `multi-agent-routing.md` `model_decision`, `engineering-tool-routing.md` `model_decision`, `deep-audit.md` `manual`).
-  - `agents/` — `5` профильных субагентов (`adversarial-reviewer`, `adversarial-reviewer-xhigh`, `simplify-reviewer`, `code-explorer`, `translator`).
+  - `agents/` — `8` профильных субагентов (`adversarial-reviewer`, `adversarial-reviewer-xhigh`, `simplify-reviewer`, `simplify-reuse-reviewer`, `simplify-quality-reviewer`, `simplify-efficiency-reviewer`, `code-explorer`, `translator`).
   - `skills/` — `25` прогрессивных навыков и slash-команд с компактными описаниями (`Turn-0 <= 6,500 tok`).
 - `rules/uiux-design.md` — контекстное правило фронтенда (`trigger: model_decision`).
 
 ## Finite Verification & Swarm Architecture
 
 - **Линейный конечный контур (`HIGH` / `XHIGH`):**
-  1. Детерминированные проверки/тесты -> опциональный однократный консультативный проход `simplify` (никогда не блокирует `Stop`).
+  1. Детерминированные проверки/тесты -> обязательный однократный проход `simplify` фиксированными линзами через `invoke_subagent` (`STANDARD`: `1× simplify-reviewer`; `HIGH`/`XHIGH`: 3 параллельные линзы `simplify-reuse-reviewer`, `simplify-quality-reviewer`, `simplify-efficiency-reviewer` ДО ревью; проверяется на `Stop` и перед 1-м раундом `codex-lane review`).
   2. Независимое состязательное ревью `carbon-stack codex-lane review` (`gpt-6.2-sol` / `medium` для `HIGH`; `--xhigh` -> `gpt-6.2-astra` / `ultra` для `XHIGH`; `1..4` раунда, порог блокировки `CRITICAL`/`HIGH`). **`VERDICT: APPROVED` на любом раунде `1..4` сразу закрывает гейт.**
   3. При `Round 4: ESCALATE` -> 1 сфокусированный проход исследования -> до `2` проходов `carbon-stack codex-lane review --closure` (`CLOSURE_VALIDATION: READY` -> `[gate] verified` / `[gate] pr-ready`; 2-й `BLOCKED` -> терминальный `[gate] draft-blocked`). Циклов сброса (`redesign-reset`/`research-reset`) нет.
 - **Гигиена роя и дерева:**

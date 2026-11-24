@@ -33,6 +33,7 @@ pub const GATE_POLICY_WALK_DEPTH: usize = 16;
 pub const TEST_HARNESS_WALK_DEPTH: usize = 8;
 pub const TEST_HARNESS_SAMPLE_PATHS: usize = 8;
 
+#[cfg(test)]
 pub const SONNET_HIGH_MODEL: &str = "claude-sonnet-5-5-high";
 pub const OPUS_HIGH_MODEL: &str = "claude-opus-5-5-high";
 pub const CARBON_HIGH_MODEL: &str = "gemini-4-carbon-high";
@@ -68,18 +69,30 @@ pub fn is_codex_xhigh_turn(model: &str, effort: &str) -> bool {
 }
 
 pub const TS_EPS: f64 = 1e-6;
+pub const SIMPLIFY_LANE: &str = "simplify-reviewer";
+pub const SIMPLIFY_LENSES: &[&str] = &[
+    "simplify-reuse-reviewer",
+    "simplify-quality-reviewer",
+    "simplify-efficiency-reviewer",
+];
+pub const SIMPLIFY_REVIEWERS: &[&str] = &[
+    SIMPLIFY_LANE,
+    SIMPLIFY_LENSES[0],
+    SIMPLIFY_LENSES[1],
+    SIMPLIFY_LENSES[2],
+];
 pub const REVIEW_ENGINE_INTERNAL_OPUS: &str = "internal-opus";
 pub const REVIEW_ENGINE_INTERNAL_NEON: &str = "internal-neon";
 pub const REVIEW_ENGINE_INTERNAL_CARBON: &str = "internal-carbon";
 
-fn is_advisory_simplify_worker_name(low_name: &str) -> bool {
+fn is_simplify_worker_name(low_name: &str) -> bool {
     low_name.contains("simplify") || low_name.starts_with("simp-") || low_name.starts_with("simp_")
 }
 
 pub fn is_review_worker_name(name: &str) -> bool {
     let low_name = name.trim().to_ascii_lowercase();
-    // INVARIANT: Advisory simplify workers (`simplify-reviewer`, `simplify-reuse`, `simp-*`) are strictly non-blocking and must never be classified as mandatory gate reviewers.
-    if is_advisory_simplify_worker_name(&low_name) {
+    // INVARIANT: Simplify workers (`simplify-*`, `simp-*`) belong to the dedicated simplify lane and must not be classified as adversarial review workers.
+    if is_simplify_worker_name(&low_name) {
         return false;
     }
     low_name.contains("review")
@@ -4632,11 +4645,14 @@ pub fn receipt_requirements_summary(floor: &str, policy: Option<&Value>, has_tes
         return "honest content/render check (no adversarial review required)".to_string();
     }
     if floor == "STANDARD" {
-        let mut parts = vec![if has_tests {
-            "local verification/test execution".to_string()
-        } else {
-            "self-check (run any applicable check)".to_string()
-        }];
+        let mut parts = vec![
+            if has_tests {
+                "local verification/test execution".to_string()
+            } else {
+                "self-check (run any applicable check)".to_string()
+            },
+            format!("one mandatory `{}` pass via `invoke_subagent`", SIMPLIFY_LANE),
+        ];
         if json_truthy(pol.get("require_review_on_standard")) {
             parts.push("independent APPROVED review".to_string());
         }
@@ -4648,7 +4664,8 @@ pub fn receipt_requirements_summary(floor: &str, policy: Option<&Value>, has_tes
         ("XHIGH", " --xhigh", "--xhigh --closure", CODEX_ASTRA_MODEL)
     };
     format!(
-        "decisive test/check execution -> primary {} APPROVED review (1..{} rounds via `carbon-stack codex-lane review{}` on `{}` -> {}; APPROVED closes gate; after Round {} ESCALATE: focused research -> fix + re-test -> <={} `{}` passes)",
+        "decisive test/check execution -> mandatory 3-lens simplify ({}) via `invoke_subagent` -> primary {} APPROVED review (1..{} rounds via `carbon-stack codex-lane review{}` on `{}` -> {}; APPROVED closes gate; after Round {} ESCALATE: focused research -> fix + re-test -> <={} `{}` passes)",
+        SIMPLIFY_LENSES.join(", "),
         label,
         MAX_ORDINARY_REVIEW_ROUNDS,
         xhigh_flag,
@@ -5637,7 +5654,7 @@ pub fn is_review_swarm_worker_with_brief(
     brief: &str,
 ) -> bool {
     let low = name.trim().to_ascii_lowercase();
-    if is_advisory_simplify_worker_name(&low) {
+    if is_simplify_worker_name(&low) {
         return !brief.trim().is_empty() && is_review_worker_hint(name, brief);
     }
     let mdl = meta
@@ -7019,16 +7036,20 @@ mod tests {
 
     #[test]
     fn test_finite_gate_summary_and_expanded_research_mcps() {
+        let std_summary = receipt_requirements_summary("STANDARD", None, true);
+        assert!(std_summary.contains("simplify-reviewer"));
+
         let high_summary = receipt_requirements_summary("HIGH", None, false);
+        assert!(high_summary.contains("mandatory 3-lens simplify"));
+        assert!(high_summary.contains("simplify-reuse-reviewer, simplify-quality-reviewer, simplify-efficiency-reviewer"));
         assert!(high_summary.contains("primary independent APPROVED review"));
         assert!(high_summary.contains("APPROVED closes gate"));
         assert!(high_summary.contains("focused research -> fix + re-test -> <=2 `--closure` passes"));
-        assert!(!high_summary.contains("simplify once"));
         assert!(!high_summary.contains("redesign-reset"));
 
         let xhigh_summary = receipt_requirements_summary("XHIGH", None, false);
+        assert!(xhigh_summary.contains("mandatory 3-lens simplify"));
         assert!(xhigh_summary.contains("primary XHIGH APPROVED review"));
-        assert!(!xhigh_summary.contains("simplify once"));
         assert!(!xhigh_summary.contains("redesign-reset"));
 
         for srv in [

@@ -27,9 +27,9 @@ After running: verify actual system state matches expected outcome and separate 
 
 Determine risk by blast radius, data sensitivity, reversibility, and security boundary — not raw line count:
 - **`LOW`:** docs, comments, tests-only, static assets — run relevant deterministic checks; no independent review.
-- **`STANDARD`:** bounded logic or UI edits outside critical paths — run affected tests/linters (`require_tests_on_standard` if configured); optional advisory `simplify-reviewer` when helpful. Keep diffs compact (`<= 30–40 KB` per step).
-- **`HIGH`:** auth/permissions/secrets/crypto, DB migrations/schemas, CI/CD/deploy/release, plugin runtime hooks/manifests (`rust/src/**`, `hooks.json`, `mcp_config.json`), or wide cross-component diffs — affected checks + optional advisory `simplify` before review + independent review (`carbon-stack codex-lane review`, fallback `adversarial-reviewer` only on verified Codex outage; `1..4` rounds, `BLOCKING_THRESHOLD = HIGH`, `VERDICT: APPROVED` closes immediately).
-- **`XHIGH`:** fragile concurrency/state machines, security/hook enforcement invariants, complex cryptography, or critical multi-component boundaries — same track with `--xhigh` (`gpt-6.2-astra` `ultra` in Codex, or `adversarial-reviewer-xhigh` fallback).
+- **`STANDARD`:** bounded logic or UI edits outside critical paths — run affected tests/linters (`require_tests_on_standard` if configured) + **mandatory 1× `simplify-reviewer`** via `invoke_subagent(..., Model="inherit")` (fixed prompt in `plugin/agents/simplify-reviewer.md`; rerun tests if accepted edits were applied). Keep diffs compact (`<= 30–40 KB` per step).
+- **`HIGH`:** auth/permissions/secrets/crypto, DB migrations/schemas, CI/CD/deploy/release, plugin runtime hooks/manifests (`rust/src/**`, `hooks.json`, `mcp_config.json`), or wide cross-component diffs — affected checks + **mandatory 1× 3-lens simplify before review** (`simplify-reuse-reviewer`, `simplify-quality-reviewer`, `simplify-efficiency-reviewer` via `invoke_subagent(..., Model="inherit")`) + independent review (`carbon-stack codex-lane review`, fallback `adversarial-reviewer` only on verified Codex outage; `1..4` rounds, `BLOCKING_THRESHOLD = HIGH`, `VERDICT: APPROVED` closes immediately).
+- **`XHIGH`:** fragile concurrency/state machines, security/hook enforcement invariants, complex cryptography, or critical multi-component boundaries — same track (**mandatory 1× 3-lens simplify before review** + `--xhigh` review on `gpt-6.2-astra` `ultra` in Codex, or `adversarial-reviewer-xhigh` fallback).
 
 ## 4. Candidate Verification & Disabled Checks
 
@@ -42,7 +42,7 @@ Determine risk by blast radius, data sensitivity, reversibility, and security bo
 
 ## 5. Finite Review & Autonomous Closure
 
-- **Advisory `simplify` (`simplify` skill):** recommended once before Round 1 review on `HIGH`/`XHIGH` (`simplify-reviewer` or 3 lenses via `swarm`; never blocks `Stop` and never repeats after review).
+- **Mandatory `simplify` (`simplify` skill):** enforced on `Stop` and before Round 1 `codex-lane review` — `STANDARD`: 1× `simplify-reviewer`; `HIGH`/`XHIGH`: 1× 3 parallel fixed lenses (`simplify-reuse-reviewer`, `simplify-quality-reviewer`, `simplify-efficiency-reviewer`) via `invoke_subagent(..., Model="inherit")` using fixed prompts in `plugin/agents/simplify-*.md` (never custom prompts, never repeated after review; 2 failures on a required lens allow finite `[gate] draft-blocked` with `SIMPLIFY_UNAVAILABLE`).
 - **Review loop (`1..4` rounds, `BLOCKING_THRESHOLD = HIGH`):** only `CRITICAL`/`HIGH` defects with concrete reachable triggers (and broken acceptance criteria) block. Dismiss `Class C/D` / intent-conflicting noise via `carbon-stack codex-lane dispose`.
 - **After `Round 4: ESCALATE`:** freeze open blockers, run **one** focused evidence pass (code, tests, Context7, web), then fix + re-test and run `<= 2` `--closure` passes in the same session (`CLOSURE_VALIDATION: READY` -> `[gate] verified` / `[gate] pr-ready`; 2nd `BLOCKED` -> terminal `[gate] draft-blocked: <blocker and handoff>`). No reset cycles.
 - **Comment hygiene (`comment-density-guard`):** `PreToolUse` rejects overly dense/narration comments on code edits; keep comments limited to `INVARIANT:`, `SAFETY:`, and `WORKAROUND:`.

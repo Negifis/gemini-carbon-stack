@@ -10,7 +10,7 @@ description: "Load ONLY when delegating to swarm workers, Hydrogen browser/trans
    - **Координатор (планирование и рутина):** `Orchestrator (Neon)` допустим только для планирования и рутинных правок (его Execution Mode выполняется на лёгком `gemini-flash-worker-agy`), либо `Gemini 4 Carbon` для оркестрации.
    - **Быстрые / механические роли:** `Gemini 4 Hydrogen` (`low`..`xhigh` — `browser`, `translator`, быстрые скауты, простые параллельные билдеры).
    - **Сложная разведка, отладка, UI, тесты и архитектура:** `Gemini 4 Neon` (`low`..`xhigh`).
-   - **Совещательный `Simplify`:** `claude-sonnet-5-5-high` (fallback `gemini-4-neon-xhigh`, вторичный резерв `gemini-4-hydrogen-xhigh`, никогда Carbon).
+   - **Обязательный `Simplify` (фиксированные линзы Claude):** `invoke_subagent(..., Model="inherit")` без произвольных промптов — `STANDARD`: 1× `simplify-reviewer`; `HIGH`/`XHIGH`: 1× 3 линзы `simplify-reuse-reviewer`, `simplify-quality-reviewer`, `simplify-efficiency-reviewer` (рекомендуется параллельно) ДО ревью.
    - **Независимое ревью:** `carbon-stack codex-lane review --intent "..."` (fallback только при сбое Codex: `claude-opus-5-5-high` → `gemini-4-neon-xhigh` [`HIGH`] / `gemini-4-carbon-high` [`XHIGH`]).
    - **UI/UX визуальное ревью *(только UI)*:** read-only `visual-qa-reviewer` (с веб-поиском и `mobbin_mobbin`) до `VISUAL_REVIEW_VERDICT: APPROVED`.
 2. **Evidence, not authority & лимит ширины:** предпочитайте `<= 3` параллельных субагента; каждый вывод проверяйте родителем по реальному коду/диффу/выводу команд. В брифы передавайте `BUSINESS_INTENT`, релевантные плагины, MCP, скиллы и read-only веб-поиск.

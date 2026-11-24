@@ -1295,6 +1295,9 @@ pub struct ClosureCycleSummary {
     pub ordinary_cap_reached: bool, pub has_round_cap_escalate: bool, pub escalate_verdict_ts: f64,
     pub has_post_escalate_research: bool, pub legacy_three_round_closure_active: bool,
     pub has_fresh_ordinary_approved: bool, pub cycle_reset_ts: f64,
+    pub simplify_completed_ts: f64, pub first_ordinary_launch_ts: f64,
+    pub missing_simplify_lenses: Vec<String>, pub in_flight_simplify_lenses: Vec<String>,
+    pub has_transcript: bool,
 }
 
 pub fn active_cycle_closure_summary_for_marker(marker: &Value, session: &str, git_root: &str, tp: &str) -> ClosureCycleSummary {
@@ -2004,7 +2007,7 @@ fn sync_marker_before_review(eff_session: &str) -> Result<(), &'static str> {
     })
 }
 
-pub(crate) fn saved_thread_escalate_from_map(st: &Map<String, Value>) -> Option<(usize, f64, bool)> {
+pub(crate) fn saved_thread_escalate_from_map(st: &Map<String, Value>) -> Option<(usize, f64, f64, bool)> {
     let ord = rio::val_to_i64(st.get("ordinary_rounds_completed")).max(0) as usize;
     if ord < crate::cwg_stop::MAX_REVIEW_ROUNDS { return None; }
     // INVARIANT: Support both explicit `escalated` and pre-upgrade threads whose `last_review_output` ended with `VERDICT: ESCALATE` so evicted rollouts never deadlock CLI or Stop.
@@ -2015,11 +2018,20 @@ pub(crate) fn saved_thread_escalate_from_map(st: &Map<String, Value>) -> Option<
     if !explicit_esc && !legacy_esc { return None; }
     let esc_ts = { let t = val_to_f64(st.get("escalate_verdict_ts")); if t > 0.0 { t } else { val_to_f64(st.get("updated_ts")) } };
     if esc_ts <= 0.0 { return None; }
+    let esc_launch_ts = {
+        let el = val_to_f64(st.get("escalate_launch_ts"));
+        if el > 0.0 { el } else {
+            let ll = val_to_f64(st.get("last_launch_ts"));
+            if ll > 0.0 && ll <= esc_ts + 0.001 { ll } else { esc_ts }
+        }
+    };
+    let cycle_start = val_to_f64(st.get("cycle_first_launch_ts"));
+    let eff_launch_ts = if cycle_start > 0.0 { cycle_start.min(esc_launch_ts) } else { esc_launch_ts };
     let is_xh = cwg_common::is_codex_xhigh_turn(&val_to_str(st.get("model")), &val_to_str(st.get("effort")));
-    Some((ord, esc_ts, is_xh))
+    Some((ord, eff_launch_ts, esc_ts, is_xh))
 }
 
-pub(crate) fn saved_thread_escalate_evidence(session: &str, git_root: &str, cand_ts: f64, required_xhigh: bool) -> Option<(usize, f64, bool)> {
+pub(crate) fn saved_thread_escalate_evidence(session: &str, git_root: &str, cand_ts: f64, required_xhigh: bool) -> Option<(usize, f64, f64, bool)> {
     if session.trim().is_empty() || cand_ts <= 0.0 { return None; }
     let dig = session_root_digest(session, git_root);
     let (exact_name, lane_pref, now) = (format!("{}.json", dig), format!("{}-", dig), now_sec());
@@ -2028,8 +2040,8 @@ pub(crate) fn saved_thread_escalate_evidence(session: &str, git_root: &str, cand
         if name.ends_with(".dispositions.json") || (name != exact_name && !(name.starts_with(&lane_pref) && name.ends_with(".json"))) { return None; }
         let Value::Object(st) = rio::read_json(&ent.path())? else { return None; };
         if !thread_entry_matches_candidate(&st, cand_ts, now, 0, 0.0) { return None; }
-        saved_thread_escalate_from_map(&st).filter(|(_, _, is_xh)| !required_xhigh || *is_xh)
-    }).max_by(|a, b| a.1.total_cmp(&b.1))
+        saved_thread_escalate_from_map(&st).filter(|(_, _, _, is_xh)| !required_xhigh || *is_xh)
+    }).max_by(|a, b| a.2.total_cmp(&b.2).then_with(|| b.1.total_cmp(&a.1)))
 }
 
 pub(crate) fn saved_thread_cycle_reset_ts(session: &str, git_root: &str, cand_ts: f64) -> f64 {
@@ -2044,6 +2056,42 @@ pub(crate) fn saved_thread_cycle_reset_ts(session: &str, git_root: &str, cand_ts
         let ts = val_to_f64(st.get("cycle_reset_ts"));
         (ts >= cand_ts - 2.0).then_some(ts)
     }).reduce(f64::max).unwrap_or(0.0)
+}
+
+pub(crate) fn pre_review_simplify_error(cls: &ClosureCycleSummary, phase: &str) -> Option<String> {
+    let blocking_simplify = !cls.missing_simplify_lenses.is_empty()
+        || (phase == "ordinary"
+            && cls.counted_ordinary_rounds == 0
+            && cls.raw_ordinary_rounds == 0
+            && !cls.in_flight_simplify_lenses.is_empty());
+    if (phase == "ordinary" || phase == "closure") && cls.has_transcript && blocking_simplify {
+        let mut detail_parts = Vec::new();
+        if !cls.missing_simplify_lenses.is_empty() {
+            detail_parts.push(format!("missing: {}", cls.missing_simplify_lenses.join(", ")));
+        }
+        if !cls.in_flight_simplify_lenses.is_empty() {
+            detail_parts.push(format!("in_flight: {}", cls.in_flight_simplify_lenses.join(", ")));
+        }
+        return Some(format!(
+            "Complete the mandatory fixed-prompt simplify pass via `invoke_subagent` BEFORE launching independent review ({}). Pass only the bounded changed scope packet (diff/files/invariants), apply accepted edits, rerun tests, then run `carbon-stack codex-lane review`.",
+            detail_parts.join("; ")
+        ));
+    }
+    None
+}
+
+fn check_pre_review_simplify_guard(cls: &ClosureCycleSummary, phase: &str, pretty: bool) -> Option<i32> {
+    let hint = pre_review_simplify_error(cls, phase)?;
+    Some(fail_json(
+        "missing_pre_review_simplify",
+        &hint,
+        json!({
+            "round_consumed": false,
+            "missing_simplify_lenses": cls.missing_simplify_lenses,
+            "in_flight_simplify_lenses": cls.in_flight_simplify_lenses,
+        }),
+        pretty,
+    ))
 }
 
 fn check_review_cycle_guards(cls: &ClosureCycleSummary, phase: &str, eff_sess: &str, pretty: bool) -> Option<i32> {
@@ -2319,10 +2367,15 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
         return fail_json("marker_risk_latch_failed", "Failed to persist cycle XHIGH risk under marker lock; retry `carbon-stack codex-lane review --xhigh`.", json!({ "round_consumed": false }), args.pretty);
     }
 
+    let pre_cls_summary = active_cycle_closure_summary_with_risk(&eff_session, &git_root, "", req_risk);
+    if let Some(rc) = check_pre_review_simplify_guard(&pre_cls_summary, phase, args.pretty) {
+        return rc;
+    }
+
     let health = check_health();
     if !json_truthy(health.get("available")) { rio::print_cli_json(&health, args.pretty); return 2; }
     let binary = val_to_str(health.get("binary"));
-    let cls_summary = active_cycle_closure_summary_with_risk(&eff_session, &git_root, "", req_risk);
+    let cls_summary = pre_cls_summary;
     let cand_ts = candidate_first_ts(&eff_session);
     if let Some(rc) = check_review_cycle_guards(&cls_summary, phase, &eff_session, args.pretty) { return rc; }
 
@@ -2332,12 +2385,36 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
     let (diff_stat, diff_text, base_hint) = compute_base_diff(review_root, &resolved_diff_file, explicit_diff_body.as_ref(), &curr_tree);
 
     let (mut launch_gen, mut launch_gts, mut saved_thread) = (0u64, 0.0f64, None::<Map<String, Value>>);
+    let mut eff_cycle_reset_ts = 0.0f64;
     let (mut resume_sid, mut prior_ledger, mut id_stat, mut id_text) = (String::new(), String::new(), String::new(), String::new());
     let (mut inspect_hint, mut business_intent, mut prev_ml_sid) = (String::new(), String::new(), String::new());
+    let simplify_retire_ts = if cand_ts > 0.0 && cls_summary.simplify_completed_ts > 0.0 {
+        (cls_summary.simplify_completed_ts - cwg_common::TS_EPS).max(0.0)
+    } else {
+        0.0
+    };
     for pass in 0..2 {
         let (cg, ct) = current_handoff_goal_epoch(&git_root, &eff_session, cand_ts);
         let (mg, mt) = if cand_ts <= 0.0 { (cg, ct) } else { (0, 0.0) };
-        let cur_saved = (!args.new_session).then(|| active_thread_state_for_lane_with_epoch(&eff_session, &git_root, cand_ts, &eff_model, effort, mg, mt)).flatten();
+        let raw_saved = (!args.new_session).then(|| active_thread_state_for_lane_with_epoch(&eff_session, &git_root, cand_ts, &eff_model, effort, mg, mt)).flatten();
+        // INVARIANT: Retire pre-simplify / pre-reset thread state BEFORE selecting resume session or interdiff so the new cycle's Round 1 runs as a fresh full-candidate review (`ROUND_MODE: round_1_full_candidate`) rather than `delta_interdiff` with `SETTLED-SCOPE FREEZE`.
+        let cur_reset_ts = if cand_ts > 0.0 {
+            cls_summary.cycle_reset_ts.max(raw_saved.as_ref().map_or(0.0, |st| val_to_f64(st.get("cycle_reset_ts"))))
+        } else {
+            0.0
+        };
+        let retire_cutoff_ts = cur_reset_ts.max(simplify_retire_ts);
+        let saved_retired = retire_cutoff_ts > 0.0
+            && raw_saved.as_ref().is_some_and(|st| {
+                let lts = val_to_f64(st.get("last_launch_ts"));
+                let ref_ts = if lts > 0.0 { lts } else { val_to_f64(st.get("updated_ts")) };
+                let cstart = val_to_f64(st.get("cycle_first_launch_ts"));
+                ref_ts < retire_cutoff_ts || (cstart > 0.0 && cstart < retire_cutoff_ts)
+            });
+        let cur_saved = (!saved_retired).then_some(raw_saved.as_ref()).flatten().cloned();
+        let cur_force_fresh = args.new_session
+            || saved_retired
+            || (retire_cutoff_ts > 0.0 && cur_saved.is_none() && cls_summary.counted_ordinary_rounds == 0 && cls_summary.raw_ordinary_rounds == 0);
         if !args.resume.trim().is_empty() && !args.new_session && cand_ts <= 0.0 && (cg > 0 || ct > 0.0)
             && !is_markerless_explicit_resume_valid_for_goal_epoch(&eff_session, &git_root, &eff_model, effort, args.resume.trim(), cur_saved.as_ref(), cg, ct)
         {
@@ -2345,7 +2422,7 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
         }
         let cur_resume = resolve_resume_session_with_saved(ResumeSessionQuery {
             git_root: &git_root, session: &eff_session, candidate_first_ts: cand_ts,
-            explicit_resume: &args.resume, force_new: args.new_session, model: &eff_model, effort,
+            explicit_resume: &args.resume, force_new: cur_force_fresh, model: &eff_model, effort,
         }, Some(cur_saved.as_ref()));
         let prev_tree = cur_saved.as_ref().map(|st| val_to_str(st.get("last_reviewed_tree_oid"))).unwrap_or_default();
         let (cs, cb, ch) = if resolved_diff_file.is_empty() && cwg_common::is_git_oid(&prev_tree) {
@@ -2360,12 +2437,13 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
         } else { (String::new(), String::new(), base_hint.clone()) };
         launch_gen = cg; launch_gts = ct;
         prior_ledger = cur_saved.as_ref().map(|st| val_to_str(st.get("last_review_output"))).unwrap_or_default();
-        business_intent = resolve_business_intent(&args.intent, &eff_session, &git_root, cand_ts, cur_saved.as_ref());
+        business_intent = resolve_business_intent(&args.intent, &eff_session, &git_root, cand_ts, raw_saved.as_ref());
         prev_ml_sid = if args.new_session && cand_ts <= 0.0 {
             active_thread_state_for_lane_with_epoch(&eff_session, &git_root, 0.0, &eff_model, effort, mg, mt)
                 .map(|st| val_to_str(st.get("session_id"))).unwrap_or_default()
         } else { String::new() };
-        saved_thread = cur_saved; resume_sid = cur_resume; id_stat = cs; id_text = cb; inspect_hint = ch;
+        saved_thread = cur_saved; eff_cycle_reset_ts = cur_reset_ts;
+        resume_sid = cur_resume; id_stat = cs; id_text = cb; inspect_hint = ch;
         if cand_ts <= 0.0 && pass == 0 {
             let (rg, rt) = current_handoff_goal_epoch(&git_root, &eff_session, cand_ts);
             if rg != launch_gen || goal_ts_diverged(rt, launch_gts) { continue; }
@@ -2373,23 +2451,28 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
         break;
     }
 
-    // INVARIANT: When `cwg_stop` resets the cycle after an invalidated terminal `APPROVED`/`READY` (`cycle_reset_ts`), drop retired-cycle counts from `saved_thread` and persist the confirmed reset boundary so later delta rounds never regress if earlier rollouts leave the scan window.
-    let eff_cycle_reset_ts = if cand_ts > 0.0 {
-        cls_summary.cycle_reset_ts.max(saved_thread.as_ref().map_or(0.0, |st| val_to_f64(st.get("cycle_reset_ts"))))
-    } else {
-        0.0
-    };
-    let saved_retired = eff_cycle_reset_ts > 0.0
-        && saved_thread.as_ref().is_some_and(|st| {
-            let lts = val_to_f64(st.get("last_launch_ts"));
-            let ref_ts = if lts > 0.0 { lts } else { val_to_f64(st.get("updated_ts")) };
-            ref_ts < eff_cycle_reset_ts
-        });
-    let active_saved = (!saved_retired).then_some(saved_thread.as_ref()).flatten();
+    let active_saved = saved_thread.as_ref();
     let eff_ord = cls_summary.counted_ordinary_rounds.max(active_saved.map_or(0, |st| rio::val_to_i64(st.get("ordinary_rounds_completed")).max(0) as usize));
     let eff_cls = cls_summary.effective_pass_count.max(active_saved.map_or(0, |st| rio::val_to_i64(st.get("closure_passes_completed")).max(0) as usize));
-    let (saved_escalated, saved_esc_ts) = active_saved.and_then(saved_thread_escalate_from_map)
-        .map_or((cls_summary.has_round_cap_escalate, cls_summary.escalate_verdict_ts), |(_, ts, _)| (true, ts));
+    let (saved_escalated, saved_esc_launch_ts, saved_esc_ts) = active_saved.and_then(saved_thread_escalate_from_map)
+        .map_or((cls_summary.has_round_cap_escalate, 0.0, cls_summary.escalate_verdict_ts), |(_, lts, vts, _)| (true, lts, vts));
+    let saved_cycle_start = active_saved.map_or(0.0, |st| {
+        let cs = val_to_f64(st.get("cycle_first_launch_ts"));
+        if cs > 0.0 {
+            cs
+        } else if rio::val_to_i64(st.get("ordinary_rounds_completed")) > 0 {
+            let ll = val_to_f64(st.get("last_launch_ts"));
+            if ll > 0.0 { ll } else { val_to_f64(st.get("updated_ts")) }
+        } else {
+            0.0
+        }
+    });
+    // INVARIANT: Anchor `cycle_first_launch_ts` to the earliest positive launch timestamp across live cycle rounds and active saved state so `--new-session` or lane switches never erase pre-simplify cycle provenance.
+    let saved_cycle_first_launch_ts = [cls_summary.first_ordinary_launch_ts, saved_cycle_start]
+        .into_iter()
+        .filter(|&t| t > 0.0)
+        .reduce(f64::min)
+        .unwrap_or(0.0);
     let scope_summary = if args.summary.is_empty() { "Review current repository candidate changes." } else { args.summary.as_str() };
     let exp_round = if phase == "closure" { eff_cls + 1 } else { eff_ord + 1 };
     let to_phase = active_saved.map(|st| val_to_str(st.get("phase"))).unwrap_or_default();
@@ -2421,7 +2504,7 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
     let eff_timeout = args.timeout.unwrap_or(min_req_to) as f64;
     let attempts = if !resume_sid.is_empty() { vec![resume_sid.clone(), String::new()] } else { vec![String::new()] };
     let (mut final_res, mut packet_committed, mut launch_ts, mut verdict_ts) = (None::<CodexExecResult>, false, 0.0f64, 0.0f64);
-    let (mut used_resume, mut active_rid, mut win_ord, mut win_cls, mut used_interdiff) = (String::new(), String::new(), eff_ord, eff_cls, false);
+    let (mut used_resume, mut active_rid, mut win_ord, mut win_cls, mut used_interdiff, mut win_ml_fresh) = (String::new(), String::new(), eff_ord, eff_cls, false, false);
 
     for (att_idx, cur_res) in attempts.iter().enumerate() {
         active_rid = if att_idx == 0 || !args.review_id.is_empty() { review_id.clone() } else { format!("cwg-{}", random_hex_12()) };
@@ -2462,15 +2545,17 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
                 return 3;
             }
             CodexExecOutcome::ThinkingTimeout { mut sid } => {
+                let ml_fresh = fb_fresh && cand_ts <= 0.0;
                 if sid.is_empty() && !cur_res.is_empty() { sid = unwrap_primary_session_id(cur_res, cand_ts); }
-                if sid.is_empty() { sid = saved_thread.as_ref().map(|st| val_to_str(st.get("session_id"))).unwrap_or_default(); }
+                if sid.is_empty() && !fb_fresh { sid = saved_thread.as_ref().map(|st| val_to_str(st.get("session_id"))).unwrap_or_default(); }
                 let next_to = next_timeout_after(eff_timeout as i64);
                 let prev_t = if fb_fresh { String::new() } else { saved_thread.as_ref().map(|st| val_to_str(st.get("last_reviewed_tree_oid"))).unwrap_or_default() };
+                let to_cstart = if !ml_fresh && saved_cycle_first_launch_ts > 0.0 { saved_cycle_first_launch_ts } else { launch_ts };
                 let save_out = save_lane_thread_state_with_outcome(&eff_session, &git_root, cand_ts, &eff_model, effort, json!({
                     "session_id": sid, "last_review_id": active_rid, "session": eff_session, "git_root": rio::normalize_path(&git_root),
                     "candidate_first_ts": cand_ts, "handoff_goal_generation": launch_gen, "handoff_goal_updated_ts": launch_gts,
                     "model": eff_model, "effort": effort, "phase": phase, "xhigh": args.xhigh, "business_intent": business_intent,
-                    "ordinary_rounds_completed": att_ord, "closure_passes_completed": att_cls, "escalated": saved_escalated, "escalate_verdict_ts": saved_esc_ts, "last_reviewed_tree_oid": prev_t,
+                    "ordinary_rounds_completed": att_ord, "closure_passes_completed": att_cls, "escalated": !ml_fresh && saved_escalated, "escalate_launch_ts": if ml_fresh { 0.0 } else { saved_esc_launch_ts }, "escalate_verdict_ts": if ml_fresh { 0.0 } else { saved_esc_ts }, "cycle_first_launch_ts": to_cstart, "last_reviewed_tree_oid": prev_t,
                     "timeout_worktree_tree_oid": curr_tree, "timeout_diff_file_sha256": explicit_diff_sha,
                     "timeout_diff_file_path": resolved_diff_file, "pending_timeout_round": att_round, "last_review_output": att_prior,
                     "pending_timeout_resume": true, "last_timeout_seconds": eff_timeout as i64, "next_timeout_seconds": next_to, "cycle_reset_ts": eff_cycle_reset_ts, "last_launch_ts": launch_ts, "updated_ts": now_sec(),
@@ -2507,7 +2592,7 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
         {
             pkt_guard.committed = true; packet_committed = true;
         }
-        win_ord = att_ord; win_cls = att_cls; used_interdiff = att_used_interdiff; final_res = Some(exec_res);
+        win_ord = att_ord; win_cls = att_cls; used_interdiff = att_used_interdiff; win_ml_fresh = fb_fresh && cand_ts <= 0.0; final_res = Some(exec_res);
         break;
     }
 
@@ -2542,8 +2627,10 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
 
     reset_breaker_for_probe(launch_ts, verdict_ts);
     let (_, parsed_verdict) = cwg_common::extract_review_decision(&exec_res.stdout);
-    let next_escalated = if phase == "closure" { saved_escalated } else { parsed_verdict.as_deref() == Some("ESCALATE") };
-    let next_esc_ts = if phase == "closure" { saved_esc_ts } else if next_escalated { verdict_ts } else { 0.0 };
+    let next_escalated = if phase == "closure" { !win_ml_fresh && saved_escalated } else { parsed_verdict.as_deref() == Some("ESCALATE") };
+    let next_esc_ts = if phase == "closure" { if win_ml_fresh { 0.0 } else { saved_esc_ts } } else if next_escalated { verdict_ts } else { 0.0 };
+    let next_esc_launch_ts = if phase == "closure" { if win_ml_fresh { 0.0 } else { saved_esc_launch_ts } } else if next_escalated { launch_ts } else { 0.0 };
+    let next_cycle_first_launch_ts = if !win_ml_fresh && saved_cycle_first_launch_ts > 0.0 { saved_cycle_first_launch_ts } else { launch_ts };
     if !actual_sid.is_empty() {
         let rev_tree = if cwg_common::is_git_oid(&curr_tree) { curr_tree.as_str() } else { "" };
         let saved_ok = save_lane_thread_state(&eff_session, &git_root, cand_ts, &eff_model, effort, json!({
@@ -2552,7 +2639,8 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
             "model": eff_model, "effort": effort, "xhigh": args.xhigh, "business_intent": business_intent,
             "ordinary_rounds_completed": win_ord + usize::from(phase == "ordinary"),
             "closure_passes_completed": win_cls + usize::from(phase == "closure"),
-            "escalated": next_escalated, "escalate_verdict_ts": next_esc_ts,
+            "escalated": next_escalated, "escalate_launch_ts": next_esc_launch_ts, "escalate_verdict_ts": next_esc_ts,
+            "cycle_first_launch_ts": next_cycle_first_launch_ts,
             "last_reviewed_tree_oid": rev_tree, "last_review_output": rio::truncate_chars(exec_res.stdout.trim(), 12_000),
             "cycle_reset_ts": eff_cycle_reset_ts, "last_launch_ts": launch_ts, "updated_ts": now_sec(),
         }));
@@ -3226,7 +3314,13 @@ m = re.search(r"REVIEW_ID:\s*([A-Za-z0-9_-]+)", prompt)
 rid = m.group(1) if m else "cwg-unknown0"
 sid = "sess-live-" + uuid.uuid4().hex[:8]
 iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-verdict_line = "VERDICT: REVISE" if "FORCE_ORDINARY_REVISE_MOCK" in prompt else ("VERDICT: APPROVED" if "FORCE_ORDINARY_APPROVED_MOCK" in prompt else "CLOSURE_VALIDATION: READY")
+verdict_line = (
+    "VERDICT: ESCALATE" if "FORCE_ORDINARY_ESCALATE_MOCK" in prompt
+    else "CLOSURE_VALIDATION: BLOCKED" if "FORCE_CLOSURE_BLOCKED_MOCK" in prompt
+    else "VERDICT: REVISE" if "FORCE_ORDINARY_REVISE_MOCK" in prompt
+    else "VERDICT: APPROVED" if "FORCE_ORDINARY_APPROVED_MOCK" in prompt
+    else "CLOSURE_VALIDATION: READY"
+)
 rows = [
     {"type": "session_meta", "timestamp": iso, "payload": {"id": sid, "session_id": sid, "source": "exec", "thread_source": "user"}},
     {"type": "turn_context", "timestamp": iso, "payload": {"model": "gpt-6.2-sol", "effort": "high"}},
@@ -3271,6 +3365,12 @@ case "$prompt" in
   *FORCE_WRONG_PHASE_CLOSURE*)
     echo "CLOSURE_VALIDATION: BLOCKED"
     exit 0
+    ;;
+  *FORCE_ORDINARY_ESCALATE_MOCK*)
+    verdict_line="VERDICT: ESCALATE"
+    ;;
+  *FORCE_CLOSURE_BLOCKED_MOCK*)
+    verdict_line="CLOSURE_VALIDATION: BLOCKED"
     ;;
   *FORCE_ORDINARY_APPROVED_MOCK*)
     verdict_line="VERDICT: APPROVED"
@@ -4104,7 +4204,28 @@ exit 0
         let swg_logs = ord3_brain.join(sess_sw_guard).join(".system_generated").join("logs");
         fs::create_dir_all(&swg_dir).unwrap();
         fs::create_dir_all(&swg_logs).unwrap();
-        fs::write(swg_logs.join("transcript.jsonl"), "").unwrap();
+        let swg_simp_l = crate::win32_sqlite::format_iso_utc(base_t + 0.1);
+        let swg_simp_d = crate::win32_sqlite::format_iso_utc(base_t + 0.5);
+        let mut swg_simp_steps = vec![json!({
+            "step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE",
+            "created_at": swg_simp_l,
+            "tool_calls": cwg_common::SIMPLIFY_LENSES.iter().map(|&l| json!({"name": "invoke_subagent", "args": {"TypeName": l, "Model": "inherit"}})).collect::<Vec<_>>()
+        })];
+        for (i, _) in cwg_common::SIMPLIFY_LENSES.iter().enumerate() {
+            let cid = format!("cid-swg-simp-{}", i);
+            swg_simp_steps.push(json!({"step_index": 2 + i, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": swg_simp_l,
+                "content": format!("{{\"conversationId\": \"{}\", \"logAbsoluteUri\": \"file:///C:/nonexistent/{}.jsonl\"}}", cid, cid)}));
+        }
+        for (i, &l) in cwg_common::SIMPLIFY_LENSES.iter().enumerate() {
+            let cid = format!("cid-swg-simp-{}", i);
+            swg_simp_steps.push(json!({"step_index": 5 + i, "source": "SYSTEM", "type": "SYSTEM_MESSAGE", "status": "DONE", "created_at": swg_simp_d,
+                "content": format!("<SYSTEM_MESSAGE>\n[Message] timestamp={} sender={} priority=MESSAGE_PRIORITY_HIGH content=No actionable {} issues.\n</SYSTEM_MESSAGE>", swg_simp_d, cid, l)}));
+        }
+        fs::write(
+            swg_logs.join("transcript.jsonl"),
+            swg_simp_steps.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
         fs::write(
             swg_dir.join("members.json"),
             json!([
@@ -4172,24 +4293,23 @@ exit 0
             ]),
             2
         );
-        let swg_res_steps = [
-            json!({
-                "step_index": 1,
-                "source": "MODEL",
-                "type": "PLANNER_RESPONSE",
-                "status": "DONE",
-                "created_at": crate::win32_sqlite::format_iso_utc(base_t + 7.5),
-                "tool_calls": [{"name": "search_web", "args": {"query": "escalation remediation docs"}}]
-            }),
-            json!({
-                "step_index": 2,
-                "source": "SYSTEM",
-                "type": "GENERIC",
-                "status": "DONE",
-                "created_at": crate::win32_sqlite::format_iso_utc(base_t + 8.5),
-                "content": "ok"
-            }),
-        ];
+        let mut swg_res_steps = swg_simp_steps;
+        swg_res_steps.push(json!({
+            "step_index": 10,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": crate::win32_sqlite::format_iso_utc(base_t + 7.5),
+            "tool_calls": [{"name": "search_web", "args": {"query": "escalation remediation docs"}}]
+        }));
+        swg_res_steps.push(json!({
+            "step_index": 11,
+            "source": "SYSTEM",
+            "type": "GENERIC",
+            "status": "DONE",
+            "created_at": crate::win32_sqlite::format_iso_utc(base_t + 8.5),
+            "content": "ok"
+        }));
         fs::write(
             swg_logs.join("transcript.jsonl"),
             swg_res_steps.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n",
@@ -4755,7 +4875,10 @@ exit 0
         leg_checks.checks_count = 1;
         leg_checks.passed_count = 1;
         leg_checks.latest_pass_ts = cls1_ts + 4.0;
-        let leg_sub = crate::cwg_stop::SubagentEvidence::default();
+        let mut leg_sub = crate::cwg_stop::SubagentEvidence::default();
+        for &lens in cwg_common::SIMPLIFY_LENSES {
+            leg_sub.simplify_successes.insert(lens.to_string(), vec![cand_ts_leg + 1.0]);
+        }
         let leg_swarm = crate::cwg_stop::SwarmEvidence::default();
         let check_leg_close = |rec: &Value, sw: &crate::cwg_stop::SwarmEvidence, revs: &[Value]| {
             crate::cwg_stop::validate_candidate_closure(crate::cwg_stop::CandidateClosureInput {
@@ -7344,15 +7467,34 @@ print(verdict)
         ]);
         reset_breaker();
 
+        let make_simp_tx = |lenses: &[&str], launch_ts: f64, done_ts: f64, id_pref: &str| -> String {
+            let l_iso = crate::win32_sqlite::format_iso_utc(launch_ts);
+            let d_iso = crate::win32_sqlite::format_iso_utc(done_ts);
+            let tcs: Vec<Value> = lenses.iter().map(|&l| json!({"name": "invoke_subagent", "args": {"TypeName": l, "Model": "inherit"}})).collect();
+            let mut lines = vec![json!({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": l_iso, "tool_calls": tcs}).to_string()];
+            for (i, _) in lenses.iter().enumerate() {
+                let cid = format!("{}-{}", id_pref, i);
+                lines.push(json!({"step_index": 2 + i, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": l_iso,
+                    "content": format!("{{\"conversationId\": \"{}\", \"logAbsoluteUri\": \"file:///C:/nonexistent/{}.jsonl\"}}", cid, cid)}).to_string());
+            }
+            for (i, &l) in lenses.iter().enumerate() {
+                let cid = format!("{}-{}", id_pref, i);
+                lines.push(json!({"step_index": 2 + lenses.len() + i, "source": "SYSTEM", "type": "SYSTEM_MESSAGE", "status": "DONE", "created_at": d_iso,
+                    "content": format!("<SYSTEM_MESSAGE>\n[Message] timestamp={} sender={} priority=MESSAGE_PRIORITY_HIGH content=No actionable {} issues.\n</SYSTEM_MESSAGE>", d_iso, cid, l)}).to_string());
+            }
+            lines.join("\n") + "\n"
+        };
+
         // Subcase A (anom-4759625e): 4 ordinary rounds + ESCALATE + CLOSURE_VALIDATION: READY invalidated by later edit must unlock ordinary delta review (Round 1/4) instead of deadlocking at 4/4.
         let sess_a = "sess-post-ready-reset";
         let tp_a = br.join(sess_a).join(".system_generated").join("logs").join("transcript.jsonl");
         fs::create_dir_all(tp_a.parent().unwrap()).unwrap();
         let now = now_sec();
         let (first_ts, esc_ts, ready_ts, edit2_ts) = (now - 100.0, now - 60.0, now - 30.0, now - 10.0);
-        fs::write(&tp_a, format!("{}\n{}\n",
-            json!({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(now - 45.0), "tool_calls": [{"name": "search_web", "args": {"query": "docs"}}]}),
-            json!({"step_index": 2, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(now - 44.0), "content": "ok"})
+        fs::write(&tp_a, format!("{}{}\n{}\n",
+            make_simp_tx(cwg_common::SIMPLIFY_LENSES, first_ts + 2.0, first_ts + 4.0, "cid-a-simp"),
+            json!({"step_index": 10, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(now - 45.0), "tool_calls": [{"name": "search_web", "args": {"query": "docs"}}]}),
+            json!({"step_index": 11, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(now - 44.0), "content": "ok"})
         )).unwrap();
         let auth_p = rd.join("auth.rs");
         fs::write(&auth_p, "pub fn v1() {}\n").unwrap();
@@ -7512,5 +7654,289 @@ print(verdict)
         assert_eq!(cls_c.counted_ordinary_rounds, 4, "old pre-reset rollout must not block hydrating missing post-reset round");
         assert!(cls_c.has_round_cap_escalate && cls_c.has_post_escalate_research);
         assert!(check_review_cycle_guards(&cls_c, "closure", sess_c, false).is_none(), "--closure must be admitted after post-reset 4/4 ESCALATE with partial eviction");
+
+        // Subcase D (R2 #1 + R2 #2 end-to-end CLI):
+        // (D1) 4 pre-simplify ordinary rounds ending in APPROVED with saved_thread at 4/4, followed by 3 mandatory simplify lenses -> codex-lane review must retire pre-simplify saved counts and execute post-simplify Round 1 cleanly!
+        let sess_d = "sess-r2-presimp-4rounds-cli";
+        let tp_d = br.join(sess_d).join(".system_generated").join("logs").join("transcript.jsonl");
+        fs::create_dir_all(tp_d.parent().unwrap()).unwrap();
+        let simp_done_ts = now - 8.0;
+        fs::write(&tp_d, make_simp_tx(cwg_common::SIMPLIFY_LENSES, simp_done_ts - 3.0, simp_done_ts, "cid-d-simp")).unwrap();
+        rio::write_json(&cwg_common::marker_path(sess_d), &json!({
+            "session": sess_d, "first_ts": first_ts, "last_durable_ts": first_ts + 2.0,
+            "cwd": rio::normalize_path(&repo_s), "git_root": rio::normalize_path(&repo_s),
+            "paths": [auth_norm],
+            "content_marks": [{"ts": first_ts + 2.0, "fp": fp2, "unknown": false}],
+            "gate_max_review_rounds": 4, "closed": false,
+        })).unwrap();
+        let pre_r4_ts = simp_done_ts - 15.0;
+        assert!(save_lane_thread_state(sess_d, &repo_s, first_ts, cwg_common::CODEX_SOL_MODEL, "medium", json!({
+            "session_id": "sid-d-pre4", "ordinary_rounds_completed": 4, "closure_passes_completed": 0,
+            "escalated": false, "xhigh": false, "last_review_output": "VERDICT: APPROVED",
+            "last_reviewed_tree_oid": "1111111111111111111111111111111111111111",
+            "last_launch_ts": pre_r4_ts - 1.0, "updated_ts": pre_r4_ts,
+        })));
+        for idx in 1..=4usize {
+            let rid = format!("cwg-dpre0000000{}", idx);
+            let ptxt = format!("REVIEW_ID: {}\nPACKET_NONCE: bead0000000{}\n", rid, idx);
+            record_packet(&rid, &ptxt, &repo_s, "medium", "ordinary", sess_d);
+            let ts = first_ts + 10.0 + (idx as f64) * 5.0;
+            let mut pd = rio::read_json(&packet_path(&rid)).unwrap();
+            pd["created_ts"] = json!(ts - 0.5);
+            rio::write_json(&packet_path(&rid), &pd).unwrap();
+            let iso = crate::win32_sqlite::format_iso_utc(ts);
+            let verd = if idx == 4 { "VERDICT: APPROVED" } else { "VERDICT: REVISE" };
+            fs::write(sd.join(format!("rollout-subd-{}.jsonl", idx)), [
+                json!({"type": "session_meta", "timestamp": iso, "payload": {"id": format!("sid-d-{}", idx), "source": "exec"}}),
+                json!({"type": "turn_context", "timestamp": iso, "payload": {"model": "gpt-6.2-sol", "effort": "medium"}}),
+                json!({"type": "response_item", "timestamp": iso, "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": ptxt}]}}),
+                json!({"type": "event_msg", "timestamp": iso, "payload": {"type": "task_complete", "last_agent_message": verd}}),
+            ].into_iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n").unwrap();
+        }
+        let cls_d = active_cycle_closure_summary_with_risk(sess_d, &repo_s, "", "");
+        assert_eq!(cls_d.counted_ordinary_rounds, 0, "4 pre-simplify rounds must not consume post-simplify slots");
+        assert!(!cls_d.ordinary_cap_reached && !cls_d.has_fresh_ordinary_approved);
+        let diff_d = tmp.0.join("diff-d.patch");
+        fs::write(&diff_d, "diff --git a/auth.py b/auth.py\n+ok\n").unwrap();
+        let rc_d = run_cli(&["review".into(), "--cwd".into(), repo_s.clone(), "--session".into(), sess_d.into(), "--diff-file".into(), diff_d.to_string_lossy().into_owned(), "--summary".into(), "FORCE_ORDINARY_APPROVED_MOCK post-simplify r1".into()]);
+        assert_eq!(rc_d, 0, "post-simplify Round 1 after 4 pre-simplify rounds + saved_thread 4/4 must succeed");
+        let saved_d = active_thread_state_for_lane(sess_d, &repo_s, Some(first_ts), cwg_common::CODEX_SOL_MODEL, "medium").unwrap();
+        assert_eq!(rio::val_to_i64(saved_d.get("ordinary_rounds_completed")), 1);
+        let new_sid_d = val_to_str(saved_d.get("session_id"));
+        assert!(!new_sid_d.is_empty() && new_sid_d != "sid-d-pre4" && !new_sid_d.starts_with("sid-d-"), "post-simplify Round 1 must start a fresh Codex session instead of resuming retired thread: {}", new_sid_d);
+        let d_rollout = fs::read_to_string(sd.join(format!("rollout-primary-{}.jsonl", new_sid_d))).unwrap_or_default();
+        assert!(d_rollout.contains("ROUND_MODE: round_1_full_candidate") && d_rollout.contains("GIT DIFF SNAPSHOT"), "post-simplify Round 1 packet must be full candidate review, got: {}", d_rollout);
+        assert!(!d_rollout.contains("ROUND_MODE: delta_interdiff") && !d_rollout.contains("SETTLED-SCOPE FREEZE"), "post-simplify Round 1 must NOT run delta_interdiff / SETTLED-SCOPE FREEZE");
+        assert!(active_cycle_closure_summary_with_risk(sess_d, &repo_s, "", "").has_fresh_ordinary_approved);
+
+        // (D2) Cycle reset after invalidated STANDARD APPROVED -> HIGH edit must block codex-lane review AND internal fallback guard until 3 HIGH simplify lenses complete.
+        let sess_d2 = "sess-r2-reset-high-cli";
+        let tp_d2 = br.join(sess_d2).join(".system_generated").join("logs").join("transcript.jsonl");
+        fs::create_dir_all(tp_d2.parent().unwrap()).unwrap();
+        fs::write(&tp_d2, make_simp_tx(&[cwg_common::SIMPLIFY_LANE], first_ts + 5.0, first_ts + 8.0, "cid-d2-std")).unwrap();
+        rio::write_json(&cwg_common::marker_path(sess_d2), &json!({
+            "session": sess_d2, "first_ts": first_ts, "last_durable_ts": edit2_ts,
+            "cwd": rio::normalize_path(&repo_s), "git_root": rio::normalize_path(&repo_s),
+            "paths": [auth_norm],
+            "content_marks": [{"ts": first_ts, "fp": fp1, "unknown": false}, {"ts": edit2_ts, "fp": fp2, "unknown": false}],
+            "gate_max_review_rounds": 4, "closed": false,
+        })).unwrap();
+        let rid_d2 = "cwg-d2std0000001";
+        let ptxt_d2 = format!("REVIEW_ID: {}\nPACKET_NONCE: face00000001\n", rid_d2);
+        record_packet(rid_d2, &ptxt_d2, &repo_s, "medium", "ordinary", sess_d2);
+        let ts_d2 = first_ts + 15.0;
+        let mut pd_d2 = rio::read_json(&packet_path(rid_d2)).unwrap();
+        pd_d2["created_ts"] = json!(ts_d2 - 0.5);
+        rio::write_json(&packet_path(rid_d2), &pd_d2).unwrap();
+        let iso_d2 = crate::win32_sqlite::format_iso_utc(ts_d2);
+        fs::write(sd.join("rollout-subd2.jsonl"), [
+            json!({"type": "session_meta", "timestamp": iso_d2, "payload": {"id": "sid-d2-1", "source": "exec"}}),
+            json!({"type": "turn_context", "timestamp": iso_d2, "payload": {"model": "gpt-6.2-sol", "effort": "medium"}}),
+            json!({"type": "response_item", "timestamp": iso_d2, "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": ptxt_d2}]}}),
+            json!({"type": "event_msg", "timestamp": iso_d2, "payload": {"type": "task_complete", "last_agent_message": "VERDICT: APPROVED"}}),
+        ].into_iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n").unwrap();
+        let cls_d2 = active_cycle_closure_summary_with_risk(sess_d2, &repo_s, "", "");
+        assert!((cls_d2.cycle_reset_ts - edit2_ts).abs() < 0.01);
+        assert!(cls_d2.has_transcript && cls_d2.missing_simplify_lenses.len() == 3);
+        let rc_d2_blk = run_cli(&["review".into(), "--cwd".into(), repo_s.clone(), "--session".into(), sess_d2.into(), "--diff-file".into(), diff_d.to_string_lossy().into_owned(), "--summary".into(), "FORCE_ORDINARY_APPROVED_MOCK bypass after reset".into()]);
+        assert_eq!(rc_d2_blk, 2, "codex-lane review after cycle reset to HIGH must block before 3 simplify lenses");
+        assert!(crate::cwg_stop::pre_review_simplify_block_for_session(sess_d2, &tp_d2.to_string_lossy(), "").is_some_and(|m| m.contains("simplify-reuse-reviewer")));
+
+        // (D3 · R3 #3) --closure must ALSO reject when mandatory simplify lenses are missing (e.g. STANDARD ESCALATE + research, then CI edit elevates to HIGH before --closure).
+        let sess_d3 = "sess-r3-closure-missing-simp";
+        let tp_d3 = br.join(sess_d3).join(".system_generated").join("logs").join("transcript.jsonl");
+        fs::create_dir_all(tp_d3.parent().unwrap()).unwrap();
+        fs::write(&tp_d3, format!("{}{}\n{}\n",
+            make_simp_tx(&[cwg_common::SIMPLIFY_LANE], first_ts + 5.0, first_ts + 8.0, "cid-d3-std"),
+            json!({"step_index": 10, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(now - 5.0), "tool_calls": [{"name": "search_web", "args": {"query": "docs"}}]}),
+            json!({"step_index": 11, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(now - 4.0), "content": "ok"})
+        )).unwrap();
+        rio::write_json(&cwg_common::marker_path(sess_d3), &json!({
+            "session": sess_d3, "first_ts": first_ts, "last_durable_ts": edit2_ts,
+            "cwd": rio::normalize_path(&repo_s), "git_root": rio::normalize_path(&repo_s),
+            "paths": [auth_norm],
+            "content_marks": [{"ts": first_ts, "fp": fp1, "unknown": false}, {"ts": edit2_ts, "fp": fp2, "unknown": false}],
+            "gate_max_review_rounds": 4, "closed": false,
+        })).unwrap();
+        assert!(save_lane_thread_state(sess_d3, &repo_s, first_ts, cwg_common::CODEX_SOL_MODEL, "medium", json!({
+            "session_id": "sid-d3-esc", "ordinary_rounds_completed": 4, "closure_passes_completed": 0,
+            "escalated": true, "escalate_launch_ts": first_ts + 35.0, "escalate_verdict_ts": first_ts + 40.0,
+            "cycle_first_launch_ts": first_ts + 12.0, "last_launch_ts": first_ts + 35.0,
+            "xhigh": false, "last_review_output": "VERDICT: ESCALATE", "updated_ts": first_ts + 40.0,
+        })));
+        let cls_d3 = active_cycle_closure_summary_with_risk(sess_d3, &repo_s, "", "");
+        assert!(pre_review_simplify_error(&cls_d3, "closure").is_some_and(|m| m.contains("simplify-reuse-reviewer")));
+        let rc_d3_cls = run_cli(&["review".into(), "--closure".into(), "--cwd".into(), repo_s.clone(), "--session".into(), sess_d3.into(), "--diff-file".into(), diff_d.to_string_lossy().into_owned(), "--summary".into(), "closure before HIGH simplify".into()]);
+        assert_eq!(rc_d3_cls, 2, "--closure must block missing_pre_review_simplify when 3 HIGH simplify lenses are missing");
+
+        // (D4 · R3 #1) Saved ESCALATE whose Round 4 launched BEFORE simplify completed and finished AFTER simplify completed must NOT hydrate 4 post-simplify rounds or unlock --closure.
+        let sess_d4 = "sess-r3-straddle-escalate";
+        let tp_d4 = br.join(sess_d4).join(".system_generated").join("logs").join("transcript.jsonl");
+        fs::create_dir_all(tp_d4.parent().unwrap()).unwrap();
+        let d4_simp_ts = now - 20.0;
+        let d4_r4_launch = d4_simp_ts - 5.0;
+        let d4_r4_verdict = d4_simp_ts + 4.0;
+        fs::write(&tp_d4, format!("{}{}\n{}\n",
+            make_simp_tx(cwg_common::SIMPLIFY_LENSES, d4_simp_ts - 3.0, d4_simp_ts, "cid-d4-simp"),
+            json!({"step_index": 10, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(now - 5.0), "tool_calls": [{"name": "search_web", "args": {"query": "docs"}}]}),
+            json!({"step_index": 11, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(now - 4.0), "content": "ok"})
+        )).unwrap();
+        rio::write_json(&cwg_common::marker_path(sess_d4), &json!({
+            "session": sess_d4, "first_ts": first_ts, "last_durable_ts": first_ts + 2.0,
+            "cwd": rio::normalize_path(&repo_s), "git_root": rio::normalize_path(&repo_s),
+            "paths": [auth_norm],
+            "content_marks": [{"ts": first_ts + 2.0, "fp": fp2, "unknown": false}],
+            "gate_max_review_rounds": 4, "closed": false,
+        })).unwrap();
+        assert!(save_lane_thread_state(sess_d4, &repo_s, first_ts, cwg_common::CODEX_SOL_MODEL, "medium", json!({
+            "session_id": "sid-d4-straddle", "ordinary_rounds_completed": 4, "closure_passes_completed": 0,
+            "escalated": true, "escalate_launch_ts": d4_r4_launch, "escalate_verdict_ts": d4_r4_verdict,
+            "cycle_first_launch_ts": first_ts + 10.0, "last_launch_ts": d4_r4_launch,
+            "xhigh": false, "last_review_output": "VERDICT: ESCALATE", "updated_ts": d4_r4_verdict,
+        })));
+        let rid_d4 = "cwg-d4esc0000004";
+        let ptxt_d4 = format!("REVIEW_ID: {}\nPACKET_NONCE: cafe000000d4\n", rid_d4);
+        record_packet(rid_d4, &ptxt_d4, &repo_s, "medium", "ordinary", sess_d4);
+        let mut pd_d4 = rio::read_json(&packet_path(rid_d4)).unwrap();
+        pd_d4["created_ts"] = json!(d4_r4_launch);
+        rio::write_json(&packet_path(rid_d4), &pd_d4).unwrap();
+        fs::write(sd.join("rollout-subd4.jsonl"), [
+            json!({"type": "session_meta", "timestamp": crate::win32_sqlite::format_iso_utc(d4_r4_launch), "payload": {"id": "sid-d4-straddle", "source": "exec"}}),
+            json!({"type": "turn_context", "timestamp": crate::win32_sqlite::format_iso_utc(d4_r4_launch), "payload": {"model": "gpt-6.2-sol", "effort": "medium"}}),
+            json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(d4_r4_launch), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": ptxt_d4}]}}),
+            json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(d4_r4_verdict), "payload": {"type": "task_complete", "last_agent_message": "VERDICT: ESCALATE"}}),
+        ].into_iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n").unwrap();
+        let cls_d4 = active_cycle_closure_summary_with_risk(sess_d4, &repo_s, "", "");
+        assert_eq!(cls_d4.counted_ordinary_rounds, 0, "pre-simplify-launched ESCALATE finishing after simplify must NOT hydrate 4 rounds");
+        assert!(!cls_d4.has_round_cap_escalate && !cls_d4.ordinary_cap_reached);
+        // Also verify same-cycle membership: even if Round 4 itself launched after simplify, an earlier cycle_first_launch_ts (< simplify) prevents hydrating 4 rounds.
+        let mixed_cycle_st = json!({
+            "ordinary_rounds_completed": 4, "escalated": true, "model": cwg_common::CODEX_SOL_MODEL, "effort": "medium",
+            "cycle_first_launch_ts": first_ts + 10.0, "escalate_launch_ts": d4_simp_ts + 2.0, "escalate_verdict_ts": d4_simp_ts + 4.0,
+        });
+        let (_, mixed_eff_launch, _, _) = saved_thread_escalate_from_map(mixed_cycle_st.as_object().unwrap()).unwrap();
+        assert!(mixed_eff_launch < d4_simp_ts - 0.001, "mixed pre/post-simplify cycle must anchor eff_launch_ts to cycle_first_launch_ts");
+        let rc_d4_cls = run_cli(&["review".into(), "--closure".into(), "--cwd".into(), repo_s.clone(), "--session".into(), sess_d4.into(), "--diff-file".into(), diff_d.to_string_lossy().into_owned(), "--summary".into(), "straddle escalate closure".into()]);
+        assert_eq!(rc_d4_cls, 2, "--closure must be rejected when ESCALATE launched before simplify");
+        let rc_d4_ord = run_cli(&["review".into(), "--cwd".into(), repo_s.clone(), "--session".into(), sess_d4.into(), "--diff-file".into(), diff_d.to_string_lossy().into_owned(), "--summary".into(), "FORCE_ORDINARY_APPROVED_MOCK post-straddle r1".into()]);
+        assert_eq!(rc_d4_ord, 0, "fresh post-simplify Round 1 must succeed after straddling pre-simplify ESCALATE");
+
+        // (D5 · R4 #1) STANDARD candidate runs R1..R3, proactively runs 3 HIGH simplify lenses, then launches Round 4 ESCALATE with `--new-session`; later CI edit elevates to HIGH -> saved cycle_first_launch_ts MUST remain R1's launch time (not R4's), rejecting hydration of 3 pre-simplify rounds and rejecting `--closure`.
+        let sess_d5 = "sess-r4-newsession-esc-provenance";
+        let std_f = rd.join("util.rs");
+        fs::write(&std_f, "pub fn x() -> i32 { 1 }\n").unwrap();
+        let std_norm = rio::normalize_path(&std_f.to_string_lossy());
+        let fp_std5 = cwg_common::content_fingerprint(std::slice::from_ref(&std_norm), cwg_common::MAX_FINGERPRINT_FILE_BYTES);
+        let tp_d5 = br.join(sess_d5).join(".system_generated").join("logs").join("transcript.jsonl");
+        fs::create_dir_all(tp_d5.parent().unwrap()).unwrap();
+        let d5_r1_ts = first_ts + 10.0;
+        let d5_simp_ts = first_ts + 45.0;
+        fs::write(&tp_d5, format!("{}{}",
+            make_simp_tx(&[cwg_common::SIMPLIFY_LANE], first_ts + 2.0, first_ts + 4.0, "cid-d5-std"),
+            make_simp_tx(cwg_common::SIMPLIFY_LENSES, d5_simp_ts - 3.0, d5_simp_ts, "cid-d5-hi"),
+        )).unwrap();
+        rio::write_json(&cwg_common::marker_path(sess_d5), &json!({
+            "session": sess_d5, "first_ts": first_ts, "last_durable_ts": first_ts + 1.0,
+            "cwd": rio::normalize_path(&repo_s), "git_root": rio::normalize_path(&repo_s),
+            "paths": [std_norm.clone()],
+            "content_marks": [{"ts": first_ts + 1.0, "fp": fp_std5, "unknown": false}],
+            "gate_max_review_rounds": 4, "closed": false,
+        })).unwrap();
+        for idx in 1..=3usize {
+            let rid = format!("cwg-d5std000000{}", idx);
+            let ptxt = format!("REVIEW_ID: {}\nPACKET_NONCE: d5000000000{}\n", rid, idx);
+            record_packet(&rid, &ptxt, &repo_s, "medium", "ordinary", sess_d5);
+            let lts = d5_r1_ts + ((idx - 1) as f64) * 8.0;
+            let mut pd = rio::read_json(&packet_path(&rid)).unwrap();
+            pd["created_ts"] = json!(lts);
+            rio::write_json(&packet_path(&rid), &pd).unwrap();
+            let iso = crate::win32_sqlite::format_iso_utc(lts + 1.0);
+            fs::write(sd.join(format!("rollout-subd5-{}.jsonl", idx)), [
+                json!({"type": "session_meta", "timestamp": iso, "payload": {"id": format!("sid-d5-{}", idx), "source": "exec"}}),
+                json!({"type": "turn_context", "timestamp": iso, "payload": {"model": "gpt-6.2-sol", "effort": "medium"}}),
+                json!({"type": "response_item", "timestamp": iso, "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": ptxt}]}}),
+                json!({"type": "event_msg", "timestamp": iso, "payload": {"type": "task_complete", "last_agent_message": "VERDICT: REVISE"}}),
+            ].into_iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n").unwrap();
+        }
+        let rc_d5_r4 = run_cli(&["review".into(), "--new-session".into(), "--cwd".into(), repo_s.clone(), "--session".into(), sess_d5.into(), "--diff-file".into(), diff_d.to_string_lossy().into_owned(), "--summary".into(), "FORCE_ORDINARY_ESCALATE_MOCK r4 new-session".into()]);
+        assert_eq!(rc_d5_r4, 0, "STANDARD Round 4 --new-session ESCALATE must succeed");
+        let saved_d5 = active_thread_state_for_lane(sess_d5, &repo_s, Some(first_ts), cwg_common::CODEX_SOL_MODEL, "medium").unwrap();
+        assert_eq!(rio::val_to_i64(saved_d5.get("ordinary_rounds_completed")), 4);
+        let d5_cstart = val_to_f64(saved_d5.get("cycle_first_launch_ts"));
+        assert!(d5_cstart > 0.0 && (d5_cstart - d5_r1_ts).abs() <= 2.0, "cycle_first_launch_ts must preserve R1 launch time across --new-session, got {} vs {}", d5_cstart, d5_r1_ts);
+        // Append post-ESCALATE research and elevate candidate to HIGH via CI/auth file edit.
+        let mut tp_d5_body = fs::read_to_string(&tp_d5).unwrap();
+        tp_d5_body.push_str(&format!("{}\n{}\n",
+            json!({"step_index": 30, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(now_sec() + 1.0), "tool_calls": [{"name": "search_web", "args": {"query": "docs"}}]}),
+            json!({"step_index": 31, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(now_sec() + 2.0), "content": "ok"})
+        ));
+        fs::write(&tp_d5, tp_d5_body).unwrap();
+        rio::write_json(&cwg_common::marker_path(sess_d5), &json!({
+            "session": sess_d5, "first_ts": first_ts, "last_durable_ts": now_sec(),
+            "cwd": rio::normalize_path(&repo_s), "git_root": rio::normalize_path(&repo_s),
+            "paths": [std_norm.clone(), auth_norm],
+            "content_marks": [{"ts": first_ts + 1.0, "fp": fp_std5, "unknown": false}, {"ts": now_sec(), "fp": fp2, "unknown": false}],
+            "gate_max_review_rounds": 4, "closed": false,
+        })).unwrap();
+        let cls_d5_hi = active_cycle_closure_summary_with_risk(sess_d5, &repo_s, "", "");
+        assert_eq!(cls_d5_hi.counted_ordinary_rounds, 1, "HIGH elevation must count ONLY the 1 post-simplify round, NOT re-hydrate 3 pre-simplify STANDARD rounds");
+        assert!(!cls_d5_hi.has_round_cap_escalate && !cls_d5_hi.ordinary_cap_reached);
+        let rc_d5_cls = run_cli(&["review".into(), "--closure".into(), "--cwd".into(), repo_s.clone(), "--session".into(), sess_d5.into(), "--diff-file".into(), diff_d.to_string_lossy().into_owned(), "--summary".into(), "blocked closure on 1 post-simplify round".into()]);
+        assert_eq!(rc_d5_cls, 2, "--closure must be rejected when only 1 of 4 rounds ran after HIGH simplify");
+
+        // (D6 · Hole #1 & #2) Hydrated REVISE propagates esc_launch_ts into first_ordinary_launch_ts across `--closure --new-session` after R1..R3 eviction, AND pre-upgrade saved_thread without cycle_first_launch_ts falls back to last_launch_ts.
+        let sess_d6 = "sess-r4-closure-newsession-evict";
+        let tp_d6 = br.join(sess_d6).join(".system_generated").join("logs").join("transcript.jsonl");
+        fs::create_dir_all(tp_d6.parent().unwrap()).unwrap();
+        let d6_r1_ts = first_ts + 12.0;
+        let d6_simp_ts = first_ts + 45.0;
+        let d6_r4_ts = first_ts + 55.0;
+        fs::write(&tp_d6, format!("{}{}{}\n{}\n",
+            make_simp_tx(&[cwg_common::SIMPLIFY_LANE], first_ts + 2.0, first_ts + 4.0, "cid-d6-std"),
+            make_simp_tx(cwg_common::SIMPLIFY_LENSES, d6_simp_ts - 3.0, d6_simp_ts, "cid-d6-hi"),
+            json!({"step_index": 30, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(d6_r4_ts + 5.0), "tool_calls": [{"name": "search_web", "args": {"query": "docs"}}]}),
+            json!({"step_index": 31, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(d6_r4_ts + 6.0), "content": "ok"})
+        )).unwrap();
+        rio::write_json(&cwg_common::marker_path(sess_d6), &json!({
+            "session": sess_d6, "first_ts": first_ts, "last_durable_ts": first_ts + 1.0,
+            "cwd": rio::normalize_path(&repo_s), "git_root": rio::normalize_path(&repo_s),
+            "paths": [std_norm.clone()],
+            "content_marks": [{"ts": first_ts + 1.0, "fp": fp_std5, "unknown": false}],
+            "gate_max_review_rounds": 4, "closed": false,
+        })).unwrap();
+        assert!(save_lane_thread_state(sess_d6, &repo_s, first_ts, cwg_common::CODEX_SOL_MODEL, "medium", json!({
+            "session_id": "sid-d6-esc", "ordinary_rounds_completed": 4, "closure_passes_completed": 0,
+            "escalated": true, "escalate_launch_ts": d6_r4_ts, "escalate_verdict_ts": d6_r4_ts + 1.0,
+            "cycle_first_launch_ts": d6_r1_ts, "last_launch_ts": d6_r4_ts,
+            "xhigh": false, "last_review_output": "VERDICT: ESCALATE", "updated_ts": d6_r4_ts + 1.0,
+        })));
+        let rid_d6 = "cwg-d6esc0000004";
+        let ptxt_d6 = format!("REVIEW_ID: {}\nPACKET_NONCE: d60000000004\n", rid_d6);
+        record_packet(rid_d6, &ptxt_d6, &repo_s, "medium", "ordinary", sess_d6);
+        let mut pd_d6 = rio::read_json(&packet_path(rid_d6)).unwrap();
+        pd_d6["created_ts"] = json!(d6_r4_ts);
+        rio::write_json(&packet_path(rid_d6), &pd_d6).unwrap();
+        fs::write(sd.join("rollout-subd6-r4.jsonl"), [
+            json!({"type": "session_meta", "timestamp": crate::win32_sqlite::format_iso_utc(d6_r4_ts), "payload": {"id": "sid-d6-esc", "source": "exec"}}),
+            json!({"type": "turn_context", "timestamp": crate::win32_sqlite::format_iso_utc(d6_r4_ts), "payload": {"model": "gpt-6.2-sol", "effort": "medium"}}),
+            json!({"type": "response_item", "timestamp": crate::win32_sqlite::format_iso_utc(d6_r4_ts), "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": ptxt_d6}]}}),
+            json!({"type": "event_msg", "timestamp": crate::win32_sqlite::format_iso_utc(d6_r4_ts + 1.0), "payload": {"type": "task_complete", "last_agent_message": "VERDICT: ESCALATE"}}),
+        ].into_iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n").unwrap();
+        let cls_d6_std = active_cycle_closure_summary_with_risk(sess_d6, &repo_s, "", "");
+        assert!((cls_d6_std.first_ordinary_launch_ts - d6_r1_ts).abs() <= 0.01, "hydrated REVISE must preserve earliest cycle launch_ts {}, got {}", d6_r1_ts, cls_d6_std.first_ordinary_launch_ts);
+        let rc_d6_cls = run_cli(&["review".into(), "--closure".into(), "--new-session".into(), "--cwd".into(), repo_s.clone(), "--session".into(), sess_d6.into(), "--diff-file".into(), diff_d.to_string_lossy().into_owned(), "--summary".into(), "FORCE_CLOSURE_BLOCKED_MOCK closure new-session".into()]);
+        assert_eq!(rc_d6_cls, 0, "STANDARD --closure --new-session after R1..R3 eviction must succeed");
+        let saved_d6_after = active_thread_state_for_lane(sess_d6, &repo_s, Some(first_ts), cwg_common::CODEX_SOL_MODEL, "medium").unwrap();
+        assert!((val_to_f64(saved_d6_after.get("cycle_first_launch_ts")) - d6_r1_ts).abs() <= 0.01, "closure --new-session must preserve original cycle_first_launch_ts");
+        rio::write_json(&cwg_common::marker_path(sess_d6), &json!({
+            "session": sess_d6, "first_ts": first_ts, "last_durable_ts": now_sec(),
+            "cwd": rio::normalize_path(&repo_s), "git_root": rio::normalize_path(&repo_s),
+            "paths": [std_norm, auth_norm],
+            "content_marks": [{"ts": first_ts + 1.0, "fp": fp_std5, "unknown": false}, {"ts": now_sec(), "fp": fp2, "unknown": false}],
+            "gate_max_review_rounds": 4, "closed": false,
+        })).unwrap();
+        let cls_d6_hi = active_cycle_closure_summary_with_risk(sess_d6, &repo_s, "", "");
+        assert_eq!(cls_d6_hi.counted_ordinary_rounds, 1, "HIGH elevation after --closure --new-session must NOT re-hydrate 3 pre-simplify rounds");
+        assert!(!cls_d6_hi.has_round_cap_escalate);
     }
 }
