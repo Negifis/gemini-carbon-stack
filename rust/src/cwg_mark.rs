@@ -264,10 +264,8 @@ fn validation_non_runner_re() -> &'static Regex {
         let node_test_arg = node_script_arg_pat(
             r"(?:test[-_][A-Za-z0-9_.-]*|[A-Za-z0-9_][A-Za-z0-9_.-]*[-_.]tests?|[A-Za-z0-9_][A-Za-z0-9_.-]*\.spec)\.(?:c?js|mjs)",
         );
-        let pkg_script =
-            r"(?:[A-Za-z0-9_.-]+:)*(?:test|tests|lint|build|typecheck|check)(?:[:_-][A-Za-z0-9_:.-]+)*";
         let pat = format!(
-            r#"(?i)\A\s*(?:\$null\s*\|\s*)?(?:&\s*)?(?:{ruff}\s+check\b|{py}\s+(?:-(?:X\s+utf8|[uBEsSO])\s+)*(?:-m\s+(?:pytest|unittest|py_compile|compileall|mypy|ruff|flake8)\b|{inst}\s+(?:[^\r\n|;&]*\s)?(?:--diagnose|--dry-run)(?:\z|[\s|;&])|{mcp}\s+--semgrep-scan\b)|{cs}\s+install\s+(?:[^\r\n|;&]*\s)?(?:--diagnose|--dry-run)(?:\z|[\s|;&])|(?:uvx(?:\.exe)?\s+(?:--offline\s+)?--from\s+semgrep\s+)?semgrep(?:\.exe)?\s+(?:--legacy\s+)?scan\b|{node}\s+(?:(?:--no-warnings|--experimental-[A-Za-z0-9_-]+)\s+)*(?:(?:--test|--check)(?:\z|[\s|;&])|{node_test_arg})|bun(?:\.exe)?\s+(?:test(?:\z|[\s|;&])|run\s+{pkg_s}\b)|deno(?:\.exe)?\s+(?:test|check|lint)(?:\z|[\s|;&])|npm(?:\.cmd)?\s+(?:test\b|run\s+{pkg_s}\b)|(?:pnpm|yarn)(?:\.cmd)?\s+(?:run\s+)?(?:test\b|{pkg_s}\b)|(?:flutter|dart)(?:\.bat|\.exe)?\s+(?:test|analyze)\b|cargo(?:\.exe)?\s+(?:\+[A-Za-z0-9._-]+\s+)?(?:test|check|clippy)\b|go(?:\.exe)?\s+(?:test|vet)\b|dotnet(?:\.exe)?\s+(?:test|build)\b|{agy}\s+plugin\s+validate\b)"#,
+            r#"(?i)\A\s*(?:\$null\s*\|\s*)?(?:&\s*)?(?:{ruff}\s+check\b|{py}\s+(?:-(?:X\s+utf8|[uBEsSO])\s+)*(?:-m\s+(?:pytest|unittest|py_compile|compileall|mypy|ruff|flake8)\b|{inst}\s+(?:[^\r\n|;&]*\s)?(?:--diagnose|--dry-run)(?:\z|[\s|;&])|{mcp}\s+--semgrep-scan\b)|{cs}\s+install\s+(?:[^\r\n|;&]*\s)?(?:--diagnose|--dry-run)(?:\z|[\s|;&])|(?:uvx(?:\.exe)?\s+(?:--offline\s+)?--from\s+semgrep\s+)?semgrep(?:\.exe)?\s+(?:--legacy\s+)?scan\b|{node}\s+(?:(?:--no-warnings|--experimental-[A-Za-z0-9_-]+)\s+)*(?:(?:--test|--check)(?:\z|[\s|;&])|{node_test_arg})|deno(?:\.exe)?\s+(?:test|check|lint)(?:\z|[\s|;&])|(?:flutter|dart)(?:\.bat|\.exe)?\s+(?:test|analyze)\b|cargo(?:\.exe)?\s+(?:\+[A-Za-z0-9._-]+\s+)?(?:test|check|clippy)\b|go(?:\.exe)?\s+(?:test|vet)\b|dotnet(?:\.exe)?\s+(?:test|build)\b|{agy}\s+plugin\s+validate\b)"#,
             ruff = ruff,
             py = py,
             inst = install,
@@ -276,7 +274,6 @@ fn validation_non_runner_re() -> &'static Regex {
             agy = agy,
             node = node,
             node_test_arg = node_test_arg,
-            pkg_s = pkg_script,
         );
         Regex::new(&pat).expect("validation_non_runner_re")
     })
@@ -846,6 +843,175 @@ fn parse_npx_validation_runner(tokens: &[String]) -> Option<(&'static str, usize
     }
 }
 
+fn pkg_script_name_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)\A(?:[A-Za-z0-9_.-]+:)*(?:test|tests|lint|build|typecheck|check)(?:[:_-][A-Za-z0-9_:.-]+)*\z",
+        )
+        .expect("pkg_script_name_re")
+    })
+}
+
+#[derive(Clone, Copy)]
+enum PkgMgr {
+    Npm,
+    Pnpm,
+    Yarn,
+    Bun,
+}
+
+fn pkg_mgr_kind(name: &str) -> Option<PkgMgr> {
+    if name.eq_ignore_ascii_case("npm") || name.eq_ignore_ascii_case("npm.cmd") {
+        Some(PkgMgr::Npm)
+    } else if name.eq_ignore_ascii_case("pnpm") || name.eq_ignore_ascii_case("pnpm.cmd") {
+        Some(PkgMgr::Pnpm)
+    } else if name.eq_ignore_ascii_case("yarn") || name.eq_ignore_ascii_case("yarn.cmd") {
+        Some(PkgMgr::Yarn)
+    } else if name.eq_ignore_ascii_case("bun") || name.eq_ignore_ascii_case("bun.exe") {
+        Some(PkgMgr::Bun)
+    } else {
+        None
+    }
+}
+
+fn is_flag_value(v: &str) -> bool {
+    !v.is_empty() && !v.starts_with('-')
+}
+
+enum FlagScan {
+    Consumed,
+    NotValueFlag,
+    Malformed,
+}
+
+fn consume_flag_value(
+    tokens: &[String],
+    i: &mut usize,
+    exact_flags: &[&str],
+    eq_prefixes: &[&str],
+) -> FlagScan {
+    let raw = tokens[*i].as_str();
+    if exact_flags.contains(&raw) {
+        let Some(val) = tokens.get(*i + 1) else {
+            return FlagScan::Malformed;
+        };
+        if !is_flag_value(val) {
+            return FlagScan::Malformed;
+        }
+        *i += 2;
+        return FlagScan::Consumed;
+    }
+    for pfx in eq_prefixes {
+        if let Some(val) = raw.strip_prefix(pfx) {
+            if !is_flag_value(val) {
+                return FlagScan::Malformed;
+            }
+            *i += 1;
+            return FlagScan::Consumed;
+        }
+    }
+    FlagScan::NotValueFlag
+}
+
+fn parse_pkg_mgr_validation_runner(tokens: &[String]) -> bool {
+    // INVARIANT: Unified token-based validation admission for npm/pnpm/yarn/bun supporting single-target directory/workspace flags while failing closed on multi-package filters (`--filter`/`-F`) and unknown/abbreviated npm flags before `--`.
+    let Some(mgr) = tokens.first().and_then(|h| pkg_mgr_kind(h.as_str())) else {
+        return false;
+    };
+    let (silent, exact, eq): (&[&str], &[&str], &[&str]) = match mgr {
+        PkgMgr::Npm => (
+            &["--silent", "-s"],
+            &["--prefix", "-w", "--workspace"],
+            &["--prefix=", "-w=", "--workspace="],
+        ),
+        PkgMgr::Pnpm => (&["--silent", "-s"], &["--dir", "-C"], &["--dir="]),
+        PkgMgr::Yarn => (&["--silent", "-s"], &["--cwd"], &["--cwd="]),
+        PkgMgr::Bun => (&[], &["--cwd"], &["--cwd="]),
+    };
+    let mut i = 1usize;
+    while i < tokens.len() {
+        let raw = tokens[i].as_str();
+        if silent.contains(&raw) {
+            i += 1;
+            continue;
+        }
+        match consume_flag_value(tokens, &mut i, exact, eq) {
+            FlagScan::Consumed => continue,
+            FlagScan::Malformed => return false,
+            FlagScan::NotValueFlag => {}
+        }
+        if raw.starts_with('-') {
+            return false;
+        }
+        break;
+    }
+    if matches!(mgr, PkgMgr::Yarn)
+        && tokens
+            .get(i)
+            .is_some_and(|t| t.eq_ignore_ascii_case("workspace"))
+    {
+        if !tokens.get(i + 1).is_some_and(|ws| is_flag_value(ws)) {
+            return false;
+        }
+        i += 2;
+    }
+    let Some(sub) = tokens.get(i) else {
+        return false;
+    };
+    match mgr {
+        PkgMgr::Npm => {
+            let mut tail_i = if sub.eq_ignore_ascii_case("test") {
+                i + 1
+            } else if sub.eq_ignore_ascii_case("run")
+                && tokens
+                    .get(i + 1)
+                    .is_some_and(|s| pkg_script_name_re().is_match(s))
+            {
+                i + 2
+            } else {
+                return false;
+            };
+            while tail_i < tokens.len() {
+                let raw = tokens[tail_i].as_str();
+                if raw == "--" {
+                    break;
+                }
+                if silent.contains(&raw) {
+                    tail_i += 1;
+                    continue;
+                }
+                match consume_flag_value(tokens, &mut tail_i, exact, eq) {
+                    FlagScan::Consumed => continue,
+                    FlagScan::Malformed => return false,
+                    FlagScan::NotValueFlag => {}
+                }
+                if raw.starts_with('-') {
+                    return false;
+                }
+                tail_i += 1;
+            }
+            true
+        }
+        PkgMgr::Bun => {
+            sub.eq_ignore_ascii_case("test")
+                || (sub.eq_ignore_ascii_case("run")
+                    && tokens
+                        .get(i + 1)
+                        .is_some_and(|s| pkg_script_name_re().is_match(s)))
+        }
+        PkgMgr::Pnpm | PkgMgr::Yarn => {
+            if sub.eq_ignore_ascii_case("run") {
+                tokens
+                    .get(i + 1)
+                    .is_some_and(|s| pkg_script_name_re().is_match(s))
+            } else {
+                pkg_script_name_re().is_match(sub)
+            }
+        }
+    }
+}
+
 fn has_non_executing_validation_arg_tokens(
     tokens: &[String],
     npx_runner: Option<(&'static str, usize)>,
@@ -870,10 +1036,7 @@ fn has_non_executing_validation_arg_tokens(
     let is_dotnet = matches!(cmd_base.as_str(), "dotnet" | "dotnet.exe");
     let is_go = matches!(cmd_base.as_str(), "go" | "go.exe");
     let is_node = matches!(cmd_base.as_str(), "node" | "node.exe");
-    let is_pkg_mgr = matches!(
-        cmd_base.as_str(),
-        "npm" | "npm.cmd" | "pnpm" | "pnpm.cmd" | "yarn" | "yarn.cmd" | "bun" | "bun.exe"
-    );
+    let is_pkg_mgr = pkg_mgr_kind(&cmd_base).is_some();
     let (is_jest, is_vitest, is_tsc, is_eslint, arg_start) = match npx_runner {
         Some((r, start)) => (r == "jest", r == "vitest", r == "tsc", r == "eslint", start),
         None => (
@@ -919,6 +1082,12 @@ fn has_non_executing_validation_arg_tokens(
             return true;
         }
         let key = key_raw.to_ascii_lowercase();
+        if is_pkg_mgr
+            && !saw_double_dash
+            && matches!(key.as_str(), "--ignore-scripts" | "--ignorescripts")
+        {
+            return true;
+        }
         if matches!(key.as_str(), "-b" | "--build") {
             saw_build_flag = true;
         }
@@ -1044,7 +1213,10 @@ fn is_validation_segment_with_mode(
     if has_non_executing_validation_arg_tokens(tokens, npx_runner) {
         return false;
     }
-    if npx_runner.is_some() || validation_non_runner_re().is_match(seg) {
+    if npx_runner.is_some()
+        || parse_pkg_mgr_validation_runner(tokens)
+        || validation_non_runner_re().is_match(seg)
+    {
         return true;
     }
     if allow_extended
@@ -5369,6 +5541,61 @@ mod tests {
                 "$null | npm.cmd test -w backend -- --runInBand; $null | git status --short",
                 "UNCERTAIN",
             ),
+            (
+                r#"npm --prefix "C:\wt\verify-2458dd8bf" test -w license-admin"#,
+                "VALIDATION",
+            ),
+            (
+                r#"npm --prefix "C:\wt\verify-2458dd8bf" run build -w license-admin"#,
+                "VALIDATION",
+            ),
+            (
+                r#"npm.cmd --prefix="C:\wt\verify-2458dd8bf" -w license-admin run typecheck"#,
+                "VALIDATION",
+            ),
+            ("npm -s -w license-admin test", "VALIDATION"),
+            ("npm --workspace=license-admin run lint", "VALIDATION"),
+            (r#"pnpm --dir "C:\wt\app" test"#, "VALIDATION"),
+            ("pnpm -C apps/web run build", "VALIDATION"),
+            ("pnpm.cmd --filter @app/web test", "UNCERTAIN"),
+            ("pnpm -F @app/web typecheck", "UNCERTAIN"),
+            (r#"yarn --cwd "C:\wt\app" test"#, "VALIDATION"),
+            ("yarn --cwd=apps/web workspace @app/web run build", "VALIDATION"),
+            ("yarn workspace @app/web test", "VALIDATION"),
+            (r#"bun --cwd "C:\wt\app" test"#, "VALIDATION"),
+            (r#"bun.exe --cwd "C:\wt\app" run typecheck"#, "VALIDATION"),
+            ("bun.exe --filter web run typecheck", "UNCERTAIN"),
+            ("bun --filter web typecheck", "UNCERTAIN"),
+            ("npm --prefix ./apps/web run build --if-pre", "UNCERTAIN"),
+            ("npm run build --if-p", "UNCERTAIN"),
+            ("npm test --ignore-scr", "UNCERTAIN"),
+            ("npm test --userconfig evil.npmrc", "UNCERTAIN"),
+            ("npm test -w", "UNCERTAIN"),
+            ("npm test -w -- --runInBand", "UNCERTAIN"),
+            ("npm test src/foo.test.ts", "VALIDATION"),
+            (r#"npm --prefix "C:\wt\app" test --ignore-scripts"#, "UNCERTAIN"),
+            ("npm --ignore-scripts test", "UNCERTAIN"),
+            ("npm run build --ignore-scripts", "UNCERTAIN"),
+            ("pnpm --dir apps/web --ignore-scripts test", "UNCERTAIN"),
+            (r#"npm --prefix "C:\wt\app" test --if-present"#, "UNCERTAIN"),
+            (r#"npm --prefix "C:\wt\app" test --dry-run"#, "UNCERTAIN"),
+            (r#"npm --prefix "C:\wt\app" test -- --listTests"#, "UNCERTAIN"),
+            (r#"npm --prefix "C:\wt\app" test -v"#, "UNCERTAIN"),
+            (r#"npm --prefix "C:\wt\app" run deploy"#, "UNCERTAIN"),
+            (r#"npm --prefix "" test"#, "UNCERTAIN"),
+            ("npm --prefix -w test", "UNCERTAIN"),
+            ("npm --prefix= test", "UNCERTAIN"),
+            ("npm --prefi apps/web test", "UNCERTAIN"),
+            ("npm --userconfig evil.npmrc test", "UNCERTAIN"),
+            ("npm --workspaces test", "UNCERTAIN"),
+            ("npm -- test", "UNCERTAIN"),
+            ("npm run --prefix test", "UNCERTAIN"),
+            ("npm test-foo", "UNCERTAIN"),
+            ("pnpm -r test", "UNCERTAIN"),
+            ("pnpm -f apps/web test", "UNCERTAIN"),
+            ("pnpm -c apps/web test", "UNCERTAIN"),
+            ("yarn workspace -v test", "UNCERTAIN"),
+            ("bun --cwd apps/web test-extra", "UNCERTAIN"),
             (
                 "$null | npx --workspace backend jest src/__tests__/foo.test.ts --runInBand",
                 "VALIDATION",

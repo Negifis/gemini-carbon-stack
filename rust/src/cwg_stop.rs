@@ -10604,6 +10604,180 @@ mod tests {
     }
 
     #[test]
+    fn test_anom_1ba1a936_npm_prefix_bg_validation_clears_prior_failure() {
+        let _guard = crate::win32_sqlite::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!(
+            "cwg-anom-1ba1a936-{}-{}",
+            std::process::id(),
+            (now_sec() * 1000.0) as u64
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        let shome = tmp.join("stack_home");
+        let prev_home = std::env::var_os("CARBON_STACK_HOME");
+        std::env::set_var("CARBON_STACK_HOME", &shome);
+
+        let repo_dir = tmp.join("repo");
+        fs::create_dir_all(repo_dir.join(".git")).unwrap();
+        let src_file = repo_dir.join("license-admin").join("src").join("InfoTooltip.tsx");
+        fs::create_dir_all(src_file.parent().unwrap()).unwrap();
+        fs::write(&src_file, "export const InfoTooltip = () => null;\n").unwrap();
+        let src_norm = rio::normalize_path(&src_file.to_string_lossy());
+        let src_fp = cwg_common::content_fingerprint(std::slice::from_ref(&src_norm), 4_000_000);
+        let repo_norm = rio::normalize_path(&repo_dir.to_string_lossy());
+
+        let sess = "sess-anom-1ba1a936";
+        let first_ts = rio::parse_iso_ts("2026-11-25T10:46:17Z");
+        let last_durable_ts = rio::parse_iso_ts("2026-11-25T11:17:00Z");
+        let marker = json!({
+            "session": sess,
+            "cwd": repo_norm,
+            "git_root": repo_norm,
+            "first_ts": first_ts,
+            "last_durable_ts": last_durable_ts,
+            "edits": 2,
+            "paths": [src_norm],
+            "operational": false,
+            "closed": false,
+            "content_marks": [{"ts": last_durable_ts, "fp": src_fp}],
+        });
+
+        let chained_fail_cmd = "Set-Location \"C:\\wt\\fix\"\n$ErrorActionPreference = \"Stop\"\n$null | npm test -w license-admin\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\nWrite-Host \"ALL_CHECKS_PASSED\"";
+        let standalone_build_cmd = r#"npm --prefix "C:\wt\verify-2458dd8bf" run build -w license-admin"#;
+        let standalone_test_cmd = r#"npm --prefix "C:\wt\verify-2458dd8bf" test -w license-admin"#;
+
+        let steps = vec![
+            json!({
+                "step_index": 1935,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-25T10:49:15Z",
+                "tool_calls": [{"name": "run_command", "args": {"CommandLine": chained_fail_cmd}}]
+            }),
+            json!({
+                "step_index": 1937,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "created_at": "2026-11-25T10:49:20Z",
+                "content": "Created At: 2026-11-25T15:49:20+05:00\nTool is running as a background task with task id: sess-anom-1ba1a936/task-1937\n"
+            }),
+            json!({
+                "step_index": 1939,
+                "source": "SYSTEM",
+                "type": "SYSTEM_MESSAGE",
+                "created_at": "2026-11-25T10:49:46Z",
+                "content": "The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-25T10:49:42Z sender=sess-anom-1ba1a936/task-1937 priority=MESSAGE_PRIORITY_HIGH content=Task id \"sess-anom-1ba1a936/task-1937\" finished with result:\nCommand exited with code 1.\n\nCommand output:\nFAIL\n</SYSTEM_MESSAGE>"
+            }),
+            json!({
+                "step_index": 2159,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-25T11:18:23Z",
+                "tool_calls": [
+                    {"name": "update_focus", "args": {"focus": "Running standalone checks"}},
+                    {"name": "run_command", "args": {"CommandLine": standalone_test_cmd}},
+                    {"name": "run_command", "args": {"CommandLine": standalone_build_cmd}}
+                ]
+            }),
+            json!({
+                "step_index": 2160,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": "2026-11-25T11:18:30Z",
+                "content": "OK"
+            }),
+            json!({
+                "step_index": 2161,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "created_at": "2026-11-25T11:18:31Z",
+                "content": "Created At: 2026-11-25T16:18:31+05:00\nTool is running as a background task with task id: sess-anom-1ba1a936/task-2161\n"
+            }),
+            json!({
+                "step_index": 2162,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "created_at": "2026-11-25T11:18:32Z",
+                "content": "Created At: 2026-11-25T16:18:32+05:00\nTool is running as a background task with task id: sess-anom-1ba1a936/task-2162\n"
+            }),
+            json!({
+                "step_index": 2164,
+                "source": "SYSTEM",
+                "type": "SYSTEM_MESSAGE",
+                "created_at": "2026-11-25T11:19:10Z",
+                "content": "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-25T11:19:02Z sender=sess-anom-1ba1a936/task-2161 priority=MESSAGE_PRIORITY_HIGH content=Task id \"sess-anom-1ba1a936/task-2161\" finished with result:\nCommand exited with code 1.\n\nCommand output:\nTIMEOUT\n</SYSTEM_MESSAGE>"
+            }),
+            json!({
+                "step_index": 2165,
+                "source": "SYSTEM",
+                "type": "SYSTEM_MESSAGE",
+                "created_at": "2026-11-25T11:19:10Z",
+                "content": "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-25T11:19:08Z sender=sess-anom-1ba1a936/task-2162 priority=MESSAGE_PRIORITY_HIGH content=Task id \"sess-anom-1ba1a936/task-2162\" finished with result:\nCommand exited with code 0.\n\nCommand output:\nbuilt in 1.15s\n</SYSTEM_MESSAGE>"
+            }),
+            json!({
+                "step_index": 2166,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-25T11:19:11Z",
+                "tool_calls": [{"name": "run_command", "args": {"CommandLine": standalone_test_cmd}}]
+            }),
+            json!({
+                "step_index": 2167,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "created_at": "2026-11-25T11:19:20Z",
+                "content": "Created At: 2026-11-25T16:19:20+05:00\nTool is running as a background task with task id: sess-anom-1ba1a936/task-2167\n"
+            }),
+            json!({
+                "step_index": 2169,
+                "source": "SYSTEM",
+                "type": "SYSTEM_MESSAGE",
+                "created_at": "2026-11-25T11:19:38Z",
+                "content": "The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-25T11:19:34Z sender=sess-anom-1ba1a936/task-2167 priority=MESSAGE_PRIORITY_HIGH content=Task id \"sess-anom-1ba1a936/task-2167\" finished with result:\nThe tool's output was truncated due to being too long. You can find the full output in a file at file:///tmp/output.txt.\n\nHere is a preview with the middle of the output truncated:\nCommand exited with code 0.\n\nCommand output:\n40 passed (40)\n</SYSTEM_MESSAGE>"
+            }),
+        ];
+
+        let ev = read_checks_evidence_with_steps_in_cwd(sess, first_ts, &steps, &repo_norm);
+        assert!(
+            ev.passed_count >= 2 && ev.latest_pass_ts > ev.latest_fail_ts && ev.latest_pass_ts >= last_durable_ts,
+            "standalone background `npm --prefix ... run build/test -w license-admin` must clear prior failure and postdate last_durable_ts: {:?}",
+            ev
+        );
+        let rcp_std =
+            cwg_common::parse_terminal_receipt("[gate] verified: STANDARD; vitest + build")
+                .unwrap();
+        let std_simp_sw = completed_swarm_simplify_ev(&[cwg_common::SIMPLIFY_LANE], last_durable_ts + 120.0);
+        let (ok_pass, why_pass) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_std),
+            marker_in: &marker,
+            checks_ev: &ev,
+            sub_ev: &SubagentEvidence::default(),
+            swarm_ev: &std_simp_sw,
+            codex_reviews: &[],
+            ctx: None,
+            steps: None,
+            transcript_path: None,
+        });
+        assert!(
+            ok_pass,
+            "standalone background `npm --prefix ... test -w license-admin` must satisfy Stop gate: {}",
+            why_pass
+        );
+
+        match prev_home {
+            Some(v) => std::env::set_var("CARBON_STACK_HOME", v),
+            None => std::env::remove_var("CARBON_STACK_HOME"),
+        }
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn test_anom_232ff9d9_draft_blocked_closure_cap_and_anom_65718cd1_standalone_docs() {
         let _guard = crate::win32_sqlite::TEST_ENV_LOCK
             .lock()
