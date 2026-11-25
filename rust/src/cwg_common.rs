@@ -33,7 +33,6 @@ pub const GATE_POLICY_WALK_DEPTH: usize = 16;
 pub const TEST_HARNESS_WALK_DEPTH: usize = 8;
 pub const TEST_HARNESS_SAMPLE_PATHS: usize = 8;
 
-#[cfg(test)]
 pub const SONNET_HIGH_MODEL: &str = "claude-sonnet-5-5-high";
 pub const OPUS_HIGH_MODEL: &str = "claude-opus-5-5-high";
 pub const CARBON_HIGH_MODEL: &str = "gemini-4-carbon-high";
@@ -81,12 +80,230 @@ pub const SIMPLIFY_REVIEWERS: &[&str] = &[
     SIMPLIFY_LENSES[1],
     SIMPLIFY_LENSES[2],
 ];
+pub const SIMPLIFY_SWARM_LANE: &str = SIMPLIFY_LANE;
+pub const SIMPLIFY_SWARM_LENSES: &[&str] = &[
+    "simplify-reuse",
+    "simplify-quality",
+    "simplify-efficiency",
+];
+const SIMPLIFY_LANE_WORKERS: &[(&str, &str)] = &[
+    (SIMPLIFY_LANE, SIMPLIFY_SWARM_LANE),
+    (SIMPLIFY_LENSES[0], SIMPLIFY_SWARM_LENSES[0]),
+    (SIMPLIFY_LENSES[1], SIMPLIFY_SWARM_LENSES[1]),
+    (SIMPLIFY_LENSES[2], SIMPLIFY_SWARM_LENSES[2]),
+];
+pub const SIMPLIFY_MODEL_CHAIN: &[&str] = &[
+    SONNET_HIGH_MODEL,
+    NEON_XHIGH_MODEL,
+    HYDROGEN_XHIGH_MODEL,
+];
+pub const SIMPLIFY_FIXED_LENS_MARKER_PREFIX: &str = "[FIXED_SIMPLIFY_LENS:";
+pub const SWARM_PUBLISH_NUDGE_TEXT: &str = "Call post_message with your result";
 pub const REVIEW_ENGINE_INTERNAL_OPUS: &str = "internal-opus";
 pub const REVIEW_ENGINE_INTERNAL_NEON: &str = "internal-neon";
 pub const REVIEW_ENGINE_INTERNAL_CARBON: &str = "internal-carbon";
 
-fn is_simplify_worker_name(low_name: &str) -> bool {
+pub fn is_simplify_worker_name(low_name: &str) -> bool {
     low_name.contains("simplify") || low_name.starts_with("simp-") || low_name.starts_with("simp_")
+}
+
+pub fn canonical_simplify_lane_for_worker(name: &str) -> Option<&'static str> {
+    let low = name.trim().to_ascii_lowercase();
+    let base = match low.rsplit_once('-') {
+        Some((prefix, suffix))
+            if !prefix.is_empty()
+                && !suffix.is_empty()
+                && suffix.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            prefix
+        }
+        _ => low.as_str(),
+    };
+    SIMPLIFY_LANE_WORKERS
+        .iter()
+        .find_map(|&(lane, worker)| (base == lane || base == worker).then_some(lane))
+}
+
+pub fn simplify_swarm_worker_for_lane(lane: &str) -> &'static str {
+    // INVARIANT: Callers pass canonical simplify lanes; unknown inputs default to `SIMPLIFY_SWARM_LANE` for diagnostic continuity.
+    SIMPLIFY_LANE_WORKERS
+        .iter()
+        .find_map(|&(l, worker)| (l == lane).then_some(worker))
+        .unwrap_or(SIMPLIFY_SWARM_LANE)
+}
+
+pub fn simplify_swarm_workers_desc<S: AsRef<str>>(lanes: &[S]) -> String {
+    lanes
+        .iter()
+        .map(|l| simplify_swarm_worker_for_lane(l.as_ref()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn strip_md_frontmatter(raw: &str) -> &str {
+    let s = raw.strip_prefix('\u{feff}').unwrap_or(raw);
+    let Some(rest) = s.strip_prefix("---\r\n").or_else(|| s.strip_prefix("---\n")) else {
+        return s.trim();
+    };
+    if let Some(idx) = rest.find("\n---") {
+        let after = &rest[idx + 4..];
+        let body = after
+            .strip_prefix("\r\n")
+            .or_else(|| after.strip_prefix('\n'))
+            .unwrap_or(after);
+        return body.trim();
+    }
+    s.trim()
+}
+
+pub fn fixed_simplify_prompt(lane: &str) -> Option<&'static str> {
+    // INVARIANT: Embed verbatim Claude simplify lens prompts from `plugin/agents/simplify-*.md` at compile time so PreToolUse injection has a single zero-drift source of truth.
+    let raw = match lane {
+        "simplify-reviewer" => include_str!("../../plugin/agents/simplify-reviewer.md"),
+        "simplify-reuse-reviewer" => include_str!("../../plugin/agents/simplify-reuse-reviewer.md"),
+        "simplify-quality-reviewer" => {
+            include_str!("../../plugin/agents/simplify-quality-reviewer.md")
+        }
+        "simplify-efficiency-reviewer" => {
+            include_str!("../../plugin/agents/simplify-efficiency-reviewer.md")
+        }
+        _ => return None,
+    };
+    Some(strip_md_frontmatter(raw))
+}
+
+pub fn fixed_simplify_lens_marker(lane: &str) -> String {
+    format!("{} {}]", SIMPLIFY_FIXED_LENS_MARKER_PREFIX, lane)
+}
+
+pub fn has_fixed_simplify_prompt(lane: &str, text: &str) -> bool {
+    let Some(prompt_body) = fixed_simplify_prompt(lane) else {
+        return false;
+    };
+    let marker = fixed_simplify_lens_marker(lane);
+    let norm_text = text.replace("\r\n", "\n");
+    let body = norm_text.trim();
+    let Some(after_marker) = body.strip_prefix(&marker) else {
+        return false;
+    };
+    let Some(after_nl) = after_marker.strip_prefix('\n') else {
+        return false;
+    };
+    let norm_prompt = prompt_body.replace("\r\n", "\n");
+    after_nl.trim_start_matches('\n').starts_with(norm_prompt.as_str())
+}
+
+fn is_mention_ident(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+}
+
+fn mention_matches_worker(tok: &str, wname: &str) -> bool {
+    if tok.eq_ignore_ascii_case(wname) {
+        return true;
+    }
+    if let Some((prefix, suffix)) = wname.rsplit_once('-') {
+        if !prefix.is_empty()
+            && !suffix.is_empty()
+            && suffix.bytes().all(|b| b.is_ascii_digit())
+            && tok.eq_ignore_ascii_case(prefix)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_mention_group_sep(seg: &str) -> bool {
+    let trimmed = seg.trim_matches(|c: char| {
+        c.is_whitespace() || matches!(c, ',' | ';' | ':' | '/' | '&' | '+' | '-')
+    });
+    trimmed.is_empty() || trimmed.eq_ignore_ascii_case("and") || trimmed == "и"
+}
+
+pub fn has_fixed_simplify_prompt_for_worker(lane: &str, worker_name: &str, raw_text: &str) -> bool {
+    // INVARIANT: Match the target worker's own leading same-line mention group with exact parity to `rio::text_mentions_swarm_worker` / `extract_worker_scoped_brief` (`@worker`, `@group-prefix`, `@all`, comma-separated mention groups) and verify the verbatim fixed prompt immediately after that group, preventing cross-worker prompt spoofing.
+    let norm = raw_text.replace("\r\n", "\n");
+    let trimmed = norm.trim();
+    let target = worker_name.trim();
+    if target.is_empty() {
+        return has_fixed_simplify_prompt(lane, trimmed);
+    }
+    let mut offset = 0usize;
+    loop {
+        let slice = &trimmed[offset..];
+        let line_end = slice.find('\n').unwrap_or(slice.len());
+        let line = &slice[..line_end];
+        let lead_ws = line.len() - line.trim_start_matches(|c: char| c == ' ' || c == '\t').len();
+        let line_trim = &line[lead_ws..];
+        if line_trim.starts_with('@') {
+            let mut pos = 0usize;
+            let mut matched_target = false;
+            let mut last_tok_end = 0usize;
+            let lb = line_trim.as_bytes();
+            while pos < lb.len() && lb[pos] == b'@' {
+                let mut end = pos + 1;
+                while end < lb.len() && is_mention_ident(lb[end]) {
+                    end += 1;
+                }
+                if end <= pos + 1 {
+                    break;
+                }
+                let tok = &line_trim[pos + 1..end];
+                if tok.eq_ignore_ascii_case("all") || mention_matches_worker(tok, target) {
+                    matched_target = true;
+                }
+                last_tok_end = end;
+                let rest_line = &line_trim[end..];
+                if let Some(next_at) = rest_line.find('@') {
+                    if is_mention_group_sep(&rest_line[..next_at]) {
+                        pos = end + next_at;
+                        continue;
+                    }
+                }
+                break;
+            }
+            if matched_target && last_tok_end > 0 {
+                let after_group = &slice[lead_ws + last_tok_end..];
+                if after_group
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_whitespace() || c == ':' || c == ',')
+                {
+                    let rest = after_group
+                        .trim_start_matches(|c: char| c.is_whitespace() || c == ':' || c == ',');
+                    if has_fixed_simplify_prompt(lane, rest) {
+                        return true;
+                    }
+                }
+            }
+        }
+        if line_end >= slice.len() {
+            break;
+        }
+        offset += line_end + 1;
+    }
+    false
+}
+
+pub fn build_fixed_simplify_brief(lane: &str, scope_packet: &str) -> Option<String> {
+    let prompt_body = fixed_simplify_prompt(lane)?;
+    let marker = fixed_simplify_lens_marker(lane);
+    let trimmed = scope_packet.trim();
+    if has_fixed_simplify_prompt(lane, trimmed) {
+        return Some(trimmed.to_string());
+    }
+    Some(format!(
+        "{}\n{}\n\n## Swarm Delivery\nPost ONLY your final completed simplify report once to the swarm board via `post_message` starting with `@coordinator [done]` (never post interim status updates; strictly read-only; never edit files or run builds/tests).\n\n## Candidate Scope Packet\n{}",
+        marker, prompt_body, trimmed
+    ))
+}
+
+pub fn simplify_model_chain_desc() -> String {
+    SIMPLIFY_MODEL_CHAIN
+        .iter()
+        .map(|m| format!("`{}`", m))
+        .collect::<Vec<_>>()
+        .join(" -> ")
 }
 
 pub fn is_review_worker_name(name: &str) -> bool {
@@ -4651,7 +4868,11 @@ pub fn receipt_requirements_summary(floor: &str, policy: Option<&Value>, has_tes
             } else {
                 "self-check (run any applicable check)".to_string()
             },
-            format!("one mandatory `{}` pass via `invoke_subagent`", SIMPLIFY_LANE),
+            format!(
+                "one mandatory `{}` pass via `swarm` ({})",
+                SIMPLIFY_SWARM_LANE,
+                simplify_model_chain_desc()
+            ),
         ];
         if json_truthy(pol.get("require_review_on_standard")) {
             parts.push("independent APPROVED review".to_string());
@@ -4664,8 +4885,9 @@ pub fn receipt_requirements_summary(floor: &str, policy: Option<&Value>, has_tes
         ("XHIGH", " --xhigh", "--xhigh --closure", CODEX_ASTRA_MODEL)
     };
     format!(
-        "decisive test/check execution -> mandatory 3-lens simplify ({}) via `invoke_subagent` -> primary {} APPROVED review (1..{} rounds via `carbon-stack codex-lane review{}` on `{}` -> {}; APPROVED closes gate; after Round {} ESCALATE: focused research -> fix + re-test -> <={} `{}` passes)",
-        SIMPLIFY_LENSES.join(", "),
+        "decisive test/check execution -> mandatory 3-lens simplify ({}) via `swarm` ({}) -> primary {} APPROVED review (1..{} rounds via `carbon-stack codex-lane review{}` on `{}` -> {}; APPROVED closes gate; after Round {} ESCALATE: focused research -> fix + re-test -> <={} `{}` passes)",
+        SIMPLIFY_SWARM_LENSES.join(", "),
+        simplify_model_chain_desc(),
         label,
         MAX_ORDINARY_REVIEW_ROUNDS,
         xhigh_flag,
@@ -5655,6 +5877,9 @@ pub fn is_review_swarm_worker_with_brief(
 ) -> bool {
     let low = name.trim().to_ascii_lowercase();
     if is_simplify_worker_name(&low) {
+        if brief.contains(SIMPLIFY_FIXED_LENS_MARKER_PREFIX) {
+            return false;
+        }
         return !brief.trim().is_empty() && is_review_worker_hint(name, brief);
     }
     let mdl = meta
@@ -5676,30 +5901,6 @@ pub fn extract_worker_scoped_brief(
     worker_name: &str,
     known_workers: &[&str],
 ) -> String {
-    fn is_ident(b: u8) -> bool {
-        b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
-    }
-    fn mention_matches_worker(tok: &str, wname: &str) -> bool {
-        if tok.eq_ignore_ascii_case(wname) {
-            return true;
-        }
-        if let Some((prefix, suffix)) = wname.rsplit_once('-') {
-            if !prefix.is_empty()
-                && !suffix.is_empty()
-                && suffix.bytes().all(|b| b.is_ascii_digit())
-                && tok.eq_ignore_ascii_case(prefix)
-            {
-                return true;
-            }
-        }
-        false
-    }
-    fn is_mention_sep(seg: &str) -> bool {
-        let trimmed = seg.trim_matches(|c: char| {
-            c.is_whitespace() || matches!(c, ',' | ';' | ':' | '/' | '&' | '+' | '-')
-        });
-        trimmed.is_empty() || trimmed.eq_ignore_ascii_case("and") || trimmed == "и"
-    }
     fn clean_body(raw: &str) -> &str {
         let trimmed = raw
             .trim_start_matches(|c: char| c.is_whitespace() || c == ':' || c == ',')
@@ -5728,9 +5929,9 @@ pub fn extract_worker_scoped_brief(
     let mut has_target = false;
     let mut i = 0usize;
     while i < tb.len() {
-        if tb[i] == b'@' && (i == 0 || !is_ident(tb[i - 1])) {
+        if tb[i] == b'@' && (i == 0 || !is_mention_ident(tb[i - 1])) {
             let mut end = i + 1;
-            while end < tb.len() && is_ident(tb[end]) {
+            while end < tb.len() && is_mention_ident(tb[end]) {
                 end += 1;
             }
             if end > i + 1 {
@@ -5773,7 +5974,7 @@ pub fn extract_worker_scoped_brief(
             cur_line_has_text || gap.chars().any(char::is_alphanumeric)
         };
         let merge_with_prev = groups.last().is_some_and(|last| {
-            is_mention_sep(gap) && (!sep_has_clause_break || !last.line_has_text)
+            is_mention_group_sep(gap) && (!sep_has_clause_break || !last.line_has_text)
         });
         if merge_with_prev {
             if let Some(last) = groups.last_mut() {
@@ -6097,6 +6298,22 @@ pub fn extract_worker_scoped_brief(
 pub fn active_review_workers(brain_root: &Path, session: &str) -> Vec<String> {
     let members = rio::load_swarm_members(brain_root, session);
     active_review_workers_with_members(brain_root, session, &members)
+}
+
+pub fn active_simplify_workers(brain_root: &Path, session: &str) -> Vec<String> {
+    let members = rio::load_swarm_members(brain_root, session);
+    let mut alive: Vec<String> = members
+        .iter()
+        .filter(|(name, meta)| {
+            meta.is_object()
+                && !rio::is_swarm_role_member(name, Some(meta))
+                && !rio::is_swarm_member_killed(Some(meta))
+                && canonical_simplify_lane_for_worker(name).is_some()
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    alive.sort();
+    alive
 }
 
 pub fn append_coordinator_board_briefs(
@@ -6441,7 +6658,8 @@ mod tests {
         assert!(high_sum.contains(CARBON_HIGH_MODEL));
 
         let xhigh_sum = receipt_requirements_summary("XHIGH", None, true);
-        assert!(!xhigh_sum.contains(NEON_XHIGH_MODEL));
+        let xhigh_review_part = xhigh_sum.split("primary independent").nth(1).unwrap_or("");
+        assert!(!xhigh_review_part.contains(NEON_XHIGH_MODEL));
         assert!(xhigh_sum.contains(&format!(
             "`{}` -> {}",
             CODEX_ASTRA_MODEL,
@@ -7038,14 +7256,33 @@ mod tests {
     fn test_finite_gate_summary_and_expanded_research_mcps() {
         let std_summary = receipt_requirements_summary("STANDARD", None, true);
         assert!(std_summary.contains("simplify-reviewer"));
+        assert!(std_summary.contains(SONNET_HIGH_MODEL));
 
         let high_summary = receipt_requirements_summary("HIGH", None, false);
         assert!(high_summary.contains("mandatory 3-lens simplify"));
-        assert!(high_summary.contains("simplify-reuse-reviewer, simplify-quality-reviewer, simplify-efficiency-reviewer"));
+        assert!(high_summary.contains("simplify-reuse, simplify-quality, simplify-efficiency"));
+        assert!(high_summary.contains(SONNET_HIGH_MODEL));
+        assert!(high_summary.contains(NEON_XHIGH_MODEL));
+        assert!(high_summary.contains(HYDROGEN_XHIGH_MODEL));
         assert!(high_summary.contains("primary independent APPROVED review"));
         assert!(high_summary.contains("APPROVED closes gate"));
         assert!(high_summary.contains("focused research -> fix + re-test -> <=2 `--closure` passes"));
         assert!(!high_summary.contains("redesign-reset"));
+
+        assert_eq!(canonical_simplify_lane_for_worker("simplify-reviewer"), Some(SIMPLIFY_LANE));
+        assert_eq!(canonical_simplify_lane_for_worker("simplify-reuse"), Some(SIMPLIFY_LENSES[0]));
+        assert_eq!(canonical_simplify_lane_for_worker("simplify-quality-2"), Some(SIMPLIFY_LENSES[1]));
+        assert_eq!(canonical_simplify_lane_for_worker("simplify-efficiency-1"), Some(SIMPLIFY_LENSES[2]));
+        assert_eq!(canonical_simplify_lane_for_worker("simplify-custom"), None);
+        for &lane in SIMPLIFY_REVIEWERS {
+            let prompt = fixed_simplify_prompt(lane).expect("fixed simplify prompt embedded");
+            assert!(!prompt.starts_with("---"), "frontmatter must be stripped for {}", lane);
+            assert!(prompt.len() > 400, "embedded prompt too short for {}", lane);
+            let wrapped = build_fixed_simplify_brief(lane, "Repo: /tmp/r\nFiles: src/a.rs").unwrap();
+            assert!(wrapped.starts_with(&fixed_simplify_lens_marker(lane)));
+            assert!(wrapped.contains(prompt));
+            assert_eq!(build_fixed_simplify_brief(lane, &wrapped).unwrap(), wrapped, "brief wrapping must be idempotent");
+        }
 
         let xhigh_summary = receipt_requirements_summary("XHIGH", None, false);
         assert!(xhigh_summary.contains("mandatory 3-lens simplify"));

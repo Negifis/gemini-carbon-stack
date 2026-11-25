@@ -121,48 +121,93 @@ pub fn guard_shell_command(cmd: &str, cwd: &str) -> (String, Option<String>) {
     guard_shell_command_with_session(cmd, cwd, "")
 }
 
+const MIN_DELEGATION_PROMPT_CHARS: usize = 16;
+
 pub fn guard_swarm_invocation_with_payload(
     args: &Value,
     payload: Option<&Value>,
-) -> (String, Option<String>) {
+) -> (String, Option<String>, Option<Value>) {
     let action = val_to_str(args.get("action")).trim().to_lowercase();
     if action != "add" && action != "model" {
-        return ("allow".to_string(), None);
+        return ("allow".to_string(), None, None);
     }
     let model = val_to_str(args.get("model")).trim().to_string();
     if !model.is_empty() && cwg_common::is_flash_model(&model) {
-        return ("deny".to_string(), Some(hydrogen_policy_msg()));
+        return ("deny".to_string(), Some(hydrogen_policy_msg()), None);
     }
+    let wname = val_to_str(args.get("name"));
+    let wname_low = wname.trim().to_ascii_lowercase();
+    let brief = val_to_str(args.get("brief"));
+    let sess = payload.map(rio::session_key).unwrap_or_default();
+    let tp = payload
+        .and_then(|p| p.get("transcriptPath").or_else(|| p.get("transcript_path")))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if cwg_common::is_simplify_worker_name(&wname_low) {
+        let Some(lane) = cwg_common::canonical_simplify_lane_for_worker(&wname) else {
+            return (
+                "deny".to_string(),
+                Some(format!(
+                    "[Code Work Gate] Unrecognized simplify worker name `{}`. Use exact canonical lens worker names: `{}` (STANDARD) or `{}` (HIGH/XHIGH) on {}.",
+                    wname.trim(),
+                    cwg_common::SIMPLIFY_SWARM_LANE,
+                    cwg_common::SIMPLIFY_SWARM_LENSES.join("`, `"),
+                    cwg_common::simplify_model_chain_desc(),
+                )),
+                None,
+            );
+        };
+        if let Some(err) =
+            cwg_stop::simplify_model_priority_error_for_session(&sess, tp, &model, lane)
+        {
+            return ("deny".to_string(), Some(format!("[Code Work Gate] {}", err)), None);
+        }
+        if action == "add" {
+            if brief.trim().chars().count() < MIN_DELEGATION_PROMPT_CHARS {
+                return (
+                    "deny".to_string(),
+                    Some(format!(
+                        "[Code Work Gate] Simplify worker `{}` brief must include a bounded candidate scope packet (repo/cwd, changed files or diff range, core invariants); PreToolUse injects the fixed Claude prompt automatically.",
+                        wname.trim()
+                    )),
+                    None,
+                );
+            }
+            // INVARIANT: `Stop` independently verifies `[FIXED_SIMPLIFY_LENS: <lane>]` (`has_fixed_prompt`) as backstop.
+            if let Some(fixed_brief) =
+                cwg_common::build_fixed_simplify_brief(lane, &brief).filter(|b| b != &brief)
+            {
+                return ("allow".to_string(), None, Some(json!({"brief": fixed_brief})));
+            }
+        }
+        return ("allow".to_string(), None, None);
+    }
+
     if action == "add" {
-        if let Some(p) = payload {
-            let wname = val_to_str(args.get("name"));
-            let brief = val_to_str(args.get("brief"));
-            if cwg_common::is_review_swarm_worker_with_brief(&wname, Some(args), &brief) {
-                let sess = rio::session_key(p);
-                let tp = p
-                    .get("transcriptPath")
-                    .or_else(|| p.get("transcript_path"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let min_risk = if wname.to_ascii_lowercase().contains("xhigh")
-                    || cwg_common::is_review_tier_xhigh(&brief)
-                {
-                    "XHIGH"
-                } else {
-                    ""
-                };
-                if let Some(err) = cwg_stop::pre_review_simplify_block_for_session(&sess, tp, min_risk) {
-                    return ("deny".to_string(), Some(format!("[Code Work Gate] {}", err)));
-                }
+        if payload.is_some()
+            && cwg_common::is_review_swarm_worker_with_brief(&wname, Some(args), &brief)
+        {
+            let min_risk = if wname_low.contains("xhigh")
+                || cwg_common::is_review_tier_xhigh(&brief)
+            {
+                "XHIGH"
+            } else {
+                ""
+            };
+            if let Some(err) = cwg_stop::pre_review_simplify_block_for_session(&sess, tp, min_risk)
+            {
+                return ("deny".to_string(), Some(format!("[Code Work Gate] {}", err)), None);
             }
         }
     }
-    ("allow".to_string(), None)
+    ("allow".to_string(), None, None)
 }
 
 #[cfg(test)]
 pub fn guard_swarm_invocation(args: &Value) -> (String, Option<String>) {
-    guard_swarm_invocation_with_payload(args, None)
+    let (dec, reason, _) = guard_swarm_invocation_with_payload(args, None);
+    (dec, reason)
 }
 
 fn active_constraints(cwd: &str, workspace_paths: &[String], session: &str) -> (String, String) {
@@ -219,7 +264,7 @@ pub fn guard_subagent_invocation_with_payload(
         );
     }
 
-    if prompt.chars().count() < 16 {
+    if prompt.chars().count() < MIN_DELEGATION_PROMPT_CHARS {
         return (
             "deny".to_string(),
             Some(
@@ -228,6 +273,19 @@ pub fn guard_subagent_invocation_with_payload(
             ),
             None,
         );
+    }
+
+    if cwg_common::SIMPLIFY_REVIEWERS.contains(&base_sub_type) {
+        let sess = rio::session_key(payload);
+        if let Some(err) =
+            cwg_stop::simplify_native_fallback_error_for_session(&sess, transcript_path, base_sub_type)
+        {
+            return (
+                "deny".to_string(),
+                Some(format!("[Code Work Gate] {}", err)),
+                None,
+            );
+        }
     }
 
     if codex_lane::NATIVE_REVIEWERS.contains(&base_sub_type) {
@@ -482,10 +540,11 @@ pub fn guard_swarm_wait(payload: &Value, args: Option<&Value>) -> (String, Optio
             return (
                 "deny".to_string(),
                 Some(format!(
-                    "[Swarm Wait Guard] Активных работающих воркеров не осталось (head=#{}{}), а воркер(ы) ({}) завершили ход в `waiting` без вызова `post_message` после задания. Вызов `swarm_wait` сейчас приведёт к вечному зависанию: разбудите воркера через `post_message('@<name> Call post_message with your result')` или перезапустите его.",
+                    "[Swarm Wait Guard] Активных работающих воркеров не осталось (head=#{}{}), а воркер(ы) ({}) завершили ход в `waiting` без вызова `post_message` после задания. Вызов `swarm_wait` сейчас приведёт к вечному зависанию: разбудите воркера через `post_message('@<name> {}')` или перезапустите его.",
                     head_seq,
                     since_note,
                     unposted_parked.join(", "),
+                    cwg_common::SWARM_PUBLISH_NUDGE_TEXT,
                 )),
             );
         }
@@ -529,7 +588,7 @@ pub fn evaluate_pre_tool_use(payload: &Value) -> (String, Option<String>, Option
             }
         }
         "swarm" => {
-            let (dec, reason) = guard_swarm_invocation_with_payload(&args, Some(payload));
+            let (dec, reason, overwrite) = guard_swarm_invocation_with_payload(&args, Some(payload));
             if dec != "allow" {
                 rio::log_hook_event(
                     "hygiene-events",
@@ -537,6 +596,9 @@ pub fn evaluate_pre_tool_use(payload: &Value) -> (String, Option<String>, Option
                     json!({"session": session, "reason": reason.as_deref().unwrap_or("")}),
                 );
                 return (dec, reason, None);
+            }
+            if overwrite.is_some() {
+                return ("allow".to_string(), None, overwrite);
             }
         }
         "swarm_wait" => {
@@ -890,6 +952,134 @@ mod tests {
         let (dec_recovered, reason_recovered) = guard_swarm_wait(&payload, Some(&args));
         assert_eq!(dec_recovered, "allow", "recovered working worker must be allowed, got: {:?}", reason_recovered);
         assert!(reason_recovered.is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_guard_swarm_simplify_fixed_prompt_injection_and_model_chain() {
+        let _guard = crate::win32_sqlite::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = env::temp_dir().join(format!("carbon-simp-guard-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let _home_guard = HomeGuard::enter(&root.join("carbon-home"));
+        let sid = format!("test-simp-guard-{}", std::process::id());
+        let brain_root = root.join("brain");
+        let tp = brain_root
+            .join(&sid)
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl");
+        fs::create_dir_all(tp.parent().unwrap()).unwrap();
+        let now_iso = crate::win32_sqlite::format_iso_utc(crate::win32_sqlite::now_sec());
+        fs::write(
+            &tp,
+            format!(
+                "{}\n",
+                json!({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": now_iso, "content": "simplify"})
+            ),
+        )
+        .unwrap();
+
+        let make_sw_payload = |args: Value| {
+            json!({
+                "conversationId": sid,
+                "transcriptPath": tp.to_string_lossy(),
+                "toolCall": {"name": "swarm", "args": args}
+            })
+        };
+
+        // 1. Primary claude-sonnet-5-5-high -> allow + PreToolUse overwrite injects fixed Claude prompt + [FIXED_SIMPLIFY_LENS: ...].
+        let (dec_ok, why_ok, ov_ok) = evaluate_pre_tool_use(&make_sw_payload(json!({
+            "action": "add",
+            "name": "simplify-reuse",
+            "model": cwg_common::SONNET_HIGH_MODEL,
+            "brief": "Repo C:/repo, changed rust/src/a.rs, keep API intact."
+        })));
+        assert_eq!(dec_ok, "allow", "unexpected deny: {:?}", why_ok);
+        let injected = ov_ok
+            .as_ref()
+            .and_then(|v| v.get("brief"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            injected.contains("[FIXED_SIMPLIFY_LENS: simplify-reuse-reviewer]")
+                && injected.contains("Repo C:/repo, changed rust/src/a.rs")
+                && injected.contains("post_message"),
+            "overwrite brief must inject fixed Claude prompt + marker + original scope: {}",
+            injected
+        );
+
+        // 2. Reject unknown simplify-* worker name, short brief, disallowed models (Opus/Carbon/Flash/empty), and unverified Neon/Hydrogen fallbacks.
+        assert_eq!(
+            evaluate_pre_tool_use(&make_sw_payload(json!({
+                "action": "add", "name": "simplify-custom", "model": cwg_common::SONNET_HIGH_MODEL, "brief": "Repo C:/repo changed files"
+            }))).0,
+            "deny"
+        );
+        assert_eq!(
+            evaluate_pre_tool_use(&make_sw_payload(json!({
+                "action": "add", "name": "simplify-reuse", "model": cwg_common::SONNET_HIGH_MODEL, "brief": "short"
+            }))).0,
+            "deny"
+        );
+        for bad_model in ["", cwg_common::OPUS_HIGH_MODEL, cwg_common::CARBON_HIGH_MODEL, "gemini-3-flash", cwg_common::NEON_XHIGH_MODEL, cwg_common::HYDROGEN_XHIGH_MODEL] {
+            let (d, _, _) = evaluate_pre_tool_use(&make_sw_payload(json!({
+                "action": "add", "name": "simplify-reuse", "model": bad_model, "brief": "Repo C:/repo changed rust/src/a.rs"
+            })));
+            assert_eq!(d, "deny", "model `{}` must be denied before outages", bad_model);
+        }
+
+        // Native invoke_subagent(simplify-*) must be denied while swarm chain is available.
+        let native_payload = json!({
+            "conversationId": sid,
+            "transcriptPath": tp.to_string_lossy(),
+            "toolCall": {"name": "invoke_subagent", "args": {"TypeName": "simplify-reuse-reviewer", "Model": "inherit", "Prompt": "Repo C:/repo changed rust/src/a.rs"}}
+        });
+        assert_eq!(evaluate_pre_tool_use(&native_payload).0, "deny");
+
+        // 3. After verified Sonnet 0% quota via `swarm(models)` -> Neon allowed (with fixed prompt overwrite), Hydrogen still denied!
+        let models_tx = |quotas: Value| -> String {
+            format!(
+                "{}\n{}\n",
+                json!({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": now_iso, "tool_calls": [{"name": "swarm", "args": {"action": "models", "all": true}}]}),
+                json!({"step_index": 2, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": now_iso, "content": json!({"models": [cwg_common::SONNET_HIGH_MODEL, cwg_common::NEON_XHIGH_MODEL, cwg_common::HYDROGEN_XHIGH_MODEL], "quotas": quotas}).to_string()})
+            )
+        };
+        fs::write(&tp, models_tx(json!({cwg_common::SONNET_HIGH_MODEL: {"quota_remaining": "0%"}}))).unwrap();
+        let (dec_neon, _, ov_neon) = evaluate_pre_tool_use(&make_sw_payload(json!({
+            "action": "add", "name": "simplify-quality", "model": cwg_common::NEON_XHIGH_MODEL, "brief": "Repo C:/repo changed rust/src/a.rs"
+        })));
+        assert_eq!(dec_neon, "allow");
+        assert!(ov_neon.and_then(|v| v.get("brief").and_then(|s| s.as_str()).map(|s| s.contains("[FIXED_SIMPLIFY_LENS: simplify-quality-reviewer]"))).unwrap_or(false));
+        assert_eq!(
+            evaluate_pre_tool_use(&make_sw_payload(json!({
+                "action": "add", "name": "simplify-quality", "model": cwg_common::HYDROGEN_XHIGH_MODEL, "brief": "Repo C:/repo changed rust/src/a.rs"
+            }))).0,
+            "deny"
+        );
+
+        // 4. After Sonnet + Neon 0% quota -> Hydrogen allowed, native invoke_subagent still denied.
+        fs::write(&tp, models_tx(json!({
+            cwg_common::SONNET_HIGH_MODEL: {"quota_remaining": "0%"},
+            cwg_common::NEON_XHIGH_MODEL: {"quota_remaining": "0%"}
+        }))).unwrap();
+        assert_eq!(
+            evaluate_pre_tool_use(&make_sw_payload(json!({
+                "action": "add", "name": "simplify-efficiency", "model": cwg_common::HYDROGEN_XHIGH_MODEL, "brief": "Repo C:/repo changed rust/src/a.rs"
+            }))).0,
+            "allow"
+        );
+        assert_eq!(evaluate_pre_tool_use(&native_payload).0, "deny");
+
+        // 5. After all 3 swarm simplify tiers have 0% quota -> native invoke_subagent last-resort fallback allowed.
+        fs::write(&tp, models_tx(json!({
+            cwg_common::SONNET_HIGH_MODEL: {"quota_remaining": "0%"},
+            cwg_common::NEON_XHIGH_MODEL: {"quota_remaining": "0%"},
+            cwg_common::HYDROGEN_XHIGH_MODEL: {"quota_remaining": "0%"}
+        }))).unwrap();
+        assert_eq!(evaluate_pre_tool_use(&native_payload).0, "allow");
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -2067,14 +2067,22 @@ pub(crate) fn pre_review_simplify_error(cls: &ClosureCycleSummary, phase: &str) 
     if (phase == "ordinary" || phase == "closure") && cls.has_transcript && blocking_simplify {
         let mut detail_parts = Vec::new();
         if !cls.missing_simplify_lenses.is_empty() {
-            detail_parts.push(format!("missing: {}", cls.missing_simplify_lenses.join(", ")));
+            detail_parts.push(format!(
+                "missing: {}",
+                cwg_common::simplify_swarm_workers_desc(&cls.missing_simplify_lenses)
+            ));
         }
         if !cls.in_flight_simplify_lenses.is_empty() {
-            detail_parts.push(format!("in_flight: {}", cls.in_flight_simplify_lenses.join(", ")));
+            detail_parts.push(format!(
+                "in_flight: {}",
+                cwg_common::simplify_swarm_workers_desc(&cls.in_flight_simplify_lenses)
+            ));
         }
         return Some(format!(
-            "Complete the mandatory fixed-prompt simplify pass via `invoke_subagent` BEFORE launching independent review ({}). Pass only the bounded changed scope packet (diff/files/invariants), apply accepted edits, rerun tests, then run `carbon-stack codex-lane review`.",
-            detail_parts.join("; ")
+            "Complete the mandatory fixed-prompt simplify pass via `swarm(action=\"add\", model=\"{}\", ...)` BEFORE launching independent review ({}; fallback chain: {}; PreToolUse injects the fixed Claude lens prompt automatically). Apply accepted edits, rerun tests, kill simplify workers via `swarm(action=\"kill\", ...)`, then run `carbon-stack codex-lane review`.",
+            cwg_common::SONNET_HIGH_MODEL,
+            detail_parts.join("; "),
+            cwg_common::simplify_model_chain_desc(),
         ));
     }
     None
@@ -2370,6 +2378,17 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
     let pre_cls_summary = active_cycle_closure_summary_with_risk(&eff_session, &git_root, "", req_risk);
     if let Some(rc) = check_pre_review_simplify_guard(&pre_cls_summary, phase, args.pretty) {
         return rc;
+    }
+    if !eff_session.is_empty() {
+        let alive_simp = crate::cwg_stop::active_simplify_workers_for_session(&eff_session, "");
+        if !alive_simp.is_empty() {
+            return fail_json(
+                "active_simplify_workers_present",
+                "Kill all completed/waiting simplify swarm workers via `swarm(action=\"kill\", ...)` BEFORE launching `carbon-stack codex-lane review`.",
+                json!({ "round_consumed": false, "workers": alive_simp }),
+                args.pretty,
+            );
+        }
     }
 
     let health = check_health();
@@ -4206,34 +4225,43 @@ exit 0
         fs::create_dir_all(&swg_logs).unwrap();
         let swg_simp_l = crate::win32_sqlite::format_iso_utc(base_t + 0.1);
         let swg_simp_d = crate::win32_sqlite::format_iso_utc(base_t + 0.5);
-        let mut swg_simp_steps = vec![json!({
-            "step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE",
-            "created_at": swg_simp_l,
-            "tool_calls": cwg_common::SIMPLIFY_LENSES.iter().map(|&l| json!({"name": "invoke_subagent", "args": {"TypeName": l, "Model": "inherit"}})).collect::<Vec<_>>()
+        let swg_simp_steps = vec![json!({
+            "step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE",
+            "created_at": swg_simp_l, "content": "verify closure guard"
         })];
-        for (i, _) in cwg_common::SIMPLIFY_LENSES.iter().enumerate() {
-            let cid = format!("cid-swg-simp-{}", i);
-            swg_simp_steps.push(json!({"step_index": 2 + i, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": swg_simp_l,
-                "content": format!("{{\"conversationId\": \"{}\", \"logAbsoluteUri\": \"file:///C:/nonexistent/{}.jsonl\"}}", cid, cid)}));
-        }
-        for (i, &l) in cwg_common::SIMPLIFY_LENSES.iter().enumerate() {
-            let cid = format!("cid-swg-simp-{}", i);
-            swg_simp_steps.push(json!({"step_index": 5 + i, "source": "SYSTEM", "type": "SYSTEM_MESSAGE", "status": "DONE", "created_at": swg_simp_d,
-                "content": format!("<SYSTEM_MESSAGE>\n[Message] timestamp={} sender={} priority=MESSAGE_PRIORITY_HIGH content=No actionable {} issues.\n</SYSTEM_MESSAGE>", swg_simp_d, cid, l)}));
-        }
         fs::write(
             swg_logs.join("transcript.jsonl"),
             swg_simp_steps.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n",
         )
         .unwrap();
-        fs::write(
-            swg_dir.join("members.json"),
-            json!([
-                {"name": "reviewer-1", "model": cwg_common::OPUS_HIGH_MODEL, "state": "killed", "killed": true}
-            ])
-            .to_string(),
-        )
-        .unwrap();
+        let mut swg_members = Map::new();
+        swg_members.insert(
+            "reviewer-1".to_string(),
+            json!({"role": "worker", "model": cwg_common::OPUS_HIGH_MODEL, "state": "killed", "killed": true}),
+        );
+        let mut swg_board: Vec<String> = Vec::new();
+        let mut swg_seq = 1i64;
+        for (i, &l) in cwg_common::SIMPLIFY_LENSES.iter().enumerate() {
+            let wname = cwg_common::simplify_swarm_worker_for_lane(l).to_string();
+            let brief = cwg_common::build_fixed_simplify_brief(l, "Bounded diff scope").unwrap();
+            swg_members.insert(
+                wname.clone(),
+                json!({
+                    "role": "worker",
+                    "conversation_id": format!("cid-swg-simp-{}", i),
+                    "model": cwg_common::SONNET_HIGH_MODEL,
+                    "brief": brief,
+                    "state": "killed",
+                    "killed": true,
+                }),
+            );
+            swg_board.push(json!({"seq": swg_seq, "agent": "coordinator", "time": swg_simp_l, "text": format!("@{} {}", wname, brief)}).to_string());
+            swg_seq += 1;
+            swg_board.push(json!({"seq": swg_seq, "agent": wname, "time": swg_simp_d, "text": format!("@coordinator [done] No actionable {} issues.", l)}).to_string());
+            swg_seq += 1;
+        }
+        fs::write(swg_dir.join("members.json"), json!({"members": swg_members}).to_string()).unwrap();
+        fs::write(swg_dir.join("board.jsonl"), swg_board.join("\n") + "\n").unwrap();
         let inv_before_swg = fs::read_to_string(&inv_log).unwrap_or_default().lines().count();
         assert_eq!(
             run_cli(&[
@@ -4315,14 +4343,11 @@ exit 0
             swg_res_steps.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n",
         )
         .unwrap();
-        fs::write(
-            swg_dir.join("members.json"),
-            json!([
-                {"name": "reviewer-1", "model": cwg_common::OPUS_HIGH_MODEL, "state": "waiting", "killed": false}
-            ])
-            .to_string(),
-        )
-        .unwrap();
+        swg_members.insert(
+            "reviewer-1".to_string(),
+            json!({"role": "worker", "model": cwg_common::OPUS_HIGH_MODEL, "state": "waiting", "killed": false}),
+        );
+        fs::write(swg_dir.join("members.json"), json!({"members": swg_members}).to_string()).unwrap();
         assert_eq!(
             run_cli(&[
                 "review".to_string(),
@@ -4342,14 +4367,11 @@ exit 0
             fs::read_to_string(&inv_log).unwrap_or_default().lines().count(),
             inv_before_swg
         );
-        fs::write(
-            swg_dir.join("members.json"),
-            json!([
-                {"name": "reviewer-1", "model": cwg_common::OPUS_HIGH_MODEL, "state": "killed", "killed": true}
-            ])
-            .to_string(),
-        )
-        .unwrap();
+        swg_members.insert(
+            "reviewer-1".to_string(),
+            json!({"role": "worker", "model": cwg_common::OPUS_HIGH_MODEL, "state": "killed", "killed": true}),
+        );
+        fs::write(swg_dir.join("members.json"), json!({"members": swg_members}).to_string()).unwrap();
         assert_eq!(
             run_cli(&[
                 "review".to_string(),
@@ -4875,11 +4897,18 @@ exit 0
         leg_checks.checks_count = 1;
         leg_checks.passed_count = 1;
         leg_checks.latest_pass_ts = cls1_ts + 4.0;
-        let mut leg_sub = crate::cwg_stop::SubagentEvidence::default();
+        let leg_sub = crate::cwg_stop::SubagentEvidence::default();
+        let mut leg_swarm = crate::cwg_stop::SwarmEvidence::default();
         for &lens in cwg_common::SIMPLIFY_LENSES {
-            leg_sub.simplify_successes.insert(lens.to_string(), vec![cand_ts_leg + 1.0]);
+            leg_swarm.simplify_runs.push(crate::cwg_stop::SwarmSimplifyRun {
+                lane: lens,
+                worker: cwg_common::simplify_swarm_worker_for_lane(lens).to_string(),
+                model: cwg_common::SONNET_HIGH_MODEL.to_string(),
+                launch_ts: cand_ts_leg + 0.5,
+                done_ts: cand_ts_leg + 1.0,
+                has_fixed_prompt: true,
+            });
         }
-        let leg_swarm = crate::cwg_stop::SwarmEvidence::default();
         let check_leg_close = |rec: &Value, sw: &crate::cwg_stop::SwarmEvidence, revs: &[Value]| {
             crate::cwg_stop::validate_candidate_closure(crate::cwg_stop::CandidateClosureInput {
                 receipt: Some(rec),
@@ -7467,22 +7496,37 @@ print(verdict)
         ]);
         reset_breaker();
 
-        let make_simp_tx = |lenses: &[&str], launch_ts: f64, done_ts: f64, id_pref: &str| -> String {
-            let l_iso = crate::win32_sqlite::format_iso_utc(launch_ts);
-            let d_iso = crate::win32_sqlite::format_iso_utc(done_ts);
-            let tcs: Vec<Value> = lenses.iter().map(|&l| json!({"name": "invoke_subagent", "args": {"TypeName": l, "Model": "inherit"}})).collect();
-            let mut lines = vec![json!({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": l_iso, "tool_calls": tcs}).to_string()];
-            for (i, _) in lenses.iter().enumerate() {
-                let cid = format!("{}-{}", id_pref, i);
-                lines.push(json!({"step_index": 2 + i, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": l_iso,
-                    "content": format!("{{\"conversationId\": \"{}\", \"logAbsoluteUri\": \"file:///C:/nonexistent/{}.jsonl\"}}", cid, cid)}).to_string());
+        let write_swarm_simp = |sess: &str, entries: &[(&[&str], f64, f64)]| {
+            let sw_dir = br.join(sess).join(".system_generated").join("swarm");
+            fs::create_dir_all(&sw_dir).unwrap();
+            let mut members = Map::new();
+            let mut board: Vec<String> = Vec::new();
+            let mut seq = 1i64;
+            for (batch_i, &(lenses, launch_ts, done_ts)) in entries.iter().enumerate() {
+                let l_iso = crate::win32_sqlite::format_iso_utc(launch_ts);
+                let d_iso = crate::win32_sqlite::format_iso_utc(done_ts);
+                for (i, &l) in lenses.iter().enumerate() {
+                    let wname = cwg_common::simplify_swarm_worker_for_lane(l).to_string();
+                    let brief = cwg_common::build_fixed_simplify_brief(l, "Bounded diff scope").unwrap();
+                    members.insert(
+                        wname.clone(),
+                        json!({
+                            "role": "worker",
+                            "conversation_id": format!("cid-simp-{}-{}-{}", sess, batch_i, i),
+                            "model": cwg_common::SONNET_HIGH_MODEL,
+                            "brief": brief,
+                            "state": "killed",
+                            "killed": true,
+                        }),
+                    );
+                    board.push(json!({"seq": seq, "agent": "coordinator", "time": l_iso, "text": format!("@{} {}", wname, brief)}).to_string());
+                    seq += 1;
+                    board.push(json!({"seq": seq, "agent": wname, "time": d_iso, "text": format!("@coordinator [done] No actionable {} issues.", l)}).to_string());
+                    seq += 1;
+                }
             }
-            for (i, &l) in lenses.iter().enumerate() {
-                let cid = format!("{}-{}", id_pref, i);
-                lines.push(json!({"step_index": 2 + lenses.len() + i, "source": "SYSTEM", "type": "SYSTEM_MESSAGE", "status": "DONE", "created_at": d_iso,
-                    "content": format!("<SYSTEM_MESSAGE>\n[Message] timestamp={} sender={} priority=MESSAGE_PRIORITY_HIGH content=No actionable {} issues.\n</SYSTEM_MESSAGE>", d_iso, cid, l)}).to_string());
-            }
-            lines.join("\n") + "\n"
+            fs::write(sw_dir.join("members.json"), json!({"members": members}).to_string()).unwrap();
+            fs::write(sw_dir.join("board.jsonl"), board.join("\n") + "\n").unwrap();
         };
 
         // Subcase A (anom-4759625e): 4 ordinary rounds + ESCALATE + CLOSURE_VALIDATION: READY invalidated by later edit must unlock ordinary delta review (Round 1/4) instead of deadlocking at 4/4.
@@ -7491,8 +7535,8 @@ print(verdict)
         fs::create_dir_all(tp_a.parent().unwrap()).unwrap();
         let now = now_sec();
         let (first_ts, esc_ts, ready_ts, edit2_ts) = (now - 100.0, now - 60.0, now - 30.0, now - 10.0);
-        fs::write(&tp_a, format!("{}{}\n{}\n",
-            make_simp_tx(cwg_common::SIMPLIFY_LENSES, first_ts + 2.0, first_ts + 4.0, "cid-a-simp"),
+        write_swarm_simp(sess_a, &[(cwg_common::SIMPLIFY_LENSES, first_ts + 2.0, first_ts + 4.0)]);
+        fs::write(&tp_a, format!("{}\n{}\n",
             json!({"step_index": 10, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(now - 45.0), "tool_calls": [{"name": "search_web", "args": {"query": "docs"}}]}),
             json!({"step_index": 11, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(now - 44.0), "content": "ok"})
         )).unwrap();
@@ -7661,7 +7705,8 @@ print(verdict)
         let tp_d = br.join(sess_d).join(".system_generated").join("logs").join("transcript.jsonl");
         fs::create_dir_all(tp_d.parent().unwrap()).unwrap();
         let simp_done_ts = now - 8.0;
-        fs::write(&tp_d, make_simp_tx(cwg_common::SIMPLIFY_LENSES, simp_done_ts - 3.0, simp_done_ts, "cid-d-simp")).unwrap();
+        write_swarm_simp(sess_d, &[(cwg_common::SIMPLIFY_LENSES, simp_done_ts - 3.0, simp_done_ts)]);
+        fs::write(&tp_d, format!("{}\n", json!({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "d1"}))).unwrap();
         rio::write_json(&cwg_common::marker_path(sess_d), &json!({
             "session": sess_d, "first_ts": first_ts, "last_durable_ts": first_ts + 2.0,
             "cwd": rio::normalize_path(&repo_s), "git_root": rio::normalize_path(&repo_s),
@@ -7713,7 +7758,8 @@ print(verdict)
         let sess_d2 = "sess-r2-reset-high-cli";
         let tp_d2 = br.join(sess_d2).join(".system_generated").join("logs").join("transcript.jsonl");
         fs::create_dir_all(tp_d2.parent().unwrap()).unwrap();
-        fs::write(&tp_d2, make_simp_tx(&[cwg_common::SIMPLIFY_LANE], first_ts + 5.0, first_ts + 8.0, "cid-d2-std")).unwrap();
+        write_swarm_simp(sess_d2, &[(&[cwg_common::SIMPLIFY_LANE], first_ts + 5.0, first_ts + 8.0)]);
+        fs::write(&tp_d2, format!("{}\n", json!({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "d2"}))).unwrap();
         rio::write_json(&cwg_common::marker_path(sess_d2), &json!({
             "session": sess_d2, "first_ts": first_ts, "last_durable_ts": edit2_ts,
             "cwd": rio::normalize_path(&repo_s), "git_root": rio::normalize_path(&repo_s),
@@ -7740,14 +7786,14 @@ print(verdict)
         assert!(cls_d2.has_transcript && cls_d2.missing_simplify_lenses.len() == 3);
         let rc_d2_blk = run_cli(&["review".into(), "--cwd".into(), repo_s.clone(), "--session".into(), sess_d2.into(), "--diff-file".into(), diff_d.to_string_lossy().into_owned(), "--summary".into(), "FORCE_ORDINARY_APPROVED_MOCK bypass after reset".into()]);
         assert_eq!(rc_d2_blk, 2, "codex-lane review after cycle reset to HIGH must block before 3 simplify lenses");
-        assert!(crate::cwg_stop::pre_review_simplify_block_for_session(sess_d2, &tp_d2.to_string_lossy(), "").is_some_and(|m| m.contains("simplify-reuse-reviewer")));
+        assert!(crate::cwg_stop::pre_review_simplify_block_for_session(sess_d2, &tp_d2.to_string_lossy(), "").is_some_and(|m| m.contains("simplify-reuse")));
 
         // (D3 · R3 #3) --closure must ALSO reject when mandatory simplify lenses are missing (e.g. STANDARD ESCALATE + research, then CI edit elevates to HIGH before --closure).
         let sess_d3 = "sess-r3-closure-missing-simp";
         let tp_d3 = br.join(sess_d3).join(".system_generated").join("logs").join("transcript.jsonl");
         fs::create_dir_all(tp_d3.parent().unwrap()).unwrap();
-        fs::write(&tp_d3, format!("{}{}\n{}\n",
-            make_simp_tx(&[cwg_common::SIMPLIFY_LANE], first_ts + 5.0, first_ts + 8.0, "cid-d3-std"),
+        write_swarm_simp(sess_d3, &[(&[cwg_common::SIMPLIFY_LANE], first_ts + 5.0, first_ts + 8.0)]);
+        fs::write(&tp_d3, format!("{}\n{}\n",
             json!({"step_index": 10, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(now - 5.0), "tool_calls": [{"name": "search_web", "args": {"query": "docs"}}]}),
             json!({"step_index": 11, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(now - 4.0), "content": "ok"})
         )).unwrap();
@@ -7765,7 +7811,7 @@ print(verdict)
             "xhigh": false, "last_review_output": "VERDICT: ESCALATE", "updated_ts": first_ts + 40.0,
         })));
         let cls_d3 = active_cycle_closure_summary_with_risk(sess_d3, &repo_s, "", "");
-        assert!(pre_review_simplify_error(&cls_d3, "closure").is_some_and(|m| m.contains("simplify-reuse-reviewer")));
+        assert!(pre_review_simplify_error(&cls_d3, "closure").is_some_and(|m| m.contains("simplify-reuse")));
         let rc_d3_cls = run_cli(&["review".into(), "--closure".into(), "--cwd".into(), repo_s.clone(), "--session".into(), sess_d3.into(), "--diff-file".into(), diff_d.to_string_lossy().into_owned(), "--summary".into(), "closure before HIGH simplify".into()]);
         assert_eq!(rc_d3_cls, 2, "--closure must block missing_pre_review_simplify when 3 HIGH simplify lenses are missing");
 
@@ -7776,8 +7822,8 @@ print(verdict)
         let d4_simp_ts = now - 20.0;
         let d4_r4_launch = d4_simp_ts - 5.0;
         let d4_r4_verdict = d4_simp_ts + 4.0;
-        fs::write(&tp_d4, format!("{}{}\n{}\n",
-            make_simp_tx(cwg_common::SIMPLIFY_LENSES, d4_simp_ts - 3.0, d4_simp_ts, "cid-d4-simp"),
+        write_swarm_simp(sess_d4, &[(cwg_common::SIMPLIFY_LENSES, d4_simp_ts - 3.0, d4_simp_ts)]);
+        fs::write(&tp_d4, format!("{}\n{}\n",
             json!({"step_index": 10, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(now - 5.0), "tool_calls": [{"name": "search_web", "args": {"query": "docs"}}]}),
             json!({"step_index": 11, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(now - 4.0), "content": "ok"})
         )).unwrap();
@@ -7831,10 +7877,14 @@ print(verdict)
         fs::create_dir_all(tp_d5.parent().unwrap()).unwrap();
         let d5_r1_ts = first_ts + 10.0;
         let d5_simp_ts = first_ts + 45.0;
-        fs::write(&tp_d5, format!("{}{}",
-            make_simp_tx(&[cwg_common::SIMPLIFY_LANE], first_ts + 2.0, first_ts + 4.0, "cid-d5-std"),
-            make_simp_tx(cwg_common::SIMPLIFY_LENSES, d5_simp_ts - 3.0, d5_simp_ts, "cid-d5-hi"),
-        )).unwrap();
+        write_swarm_simp(
+            sess_d5,
+            &[
+                (&[cwg_common::SIMPLIFY_LANE], first_ts + 2.0, first_ts + 4.0),
+                (cwg_common::SIMPLIFY_LENSES, d5_simp_ts - 3.0, d5_simp_ts),
+            ],
+        );
+        fs::write(&tp_d5, format!("{}\n", json!({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "d5"}))).unwrap();
         rio::write_json(&cwg_common::marker_path(sess_d5), &json!({
             "session": sess_d5, "first_ts": first_ts, "last_durable_ts": first_ts + 1.0,
             "cwd": rio::normalize_path(&repo_s), "git_root": rio::normalize_path(&repo_s),
@@ -7891,9 +7941,14 @@ print(verdict)
         let d6_r1_ts = first_ts + 12.0;
         let d6_simp_ts = first_ts + 45.0;
         let d6_r4_ts = first_ts + 55.0;
-        fs::write(&tp_d6, format!("{}{}{}\n{}\n",
-            make_simp_tx(&[cwg_common::SIMPLIFY_LANE], first_ts + 2.0, first_ts + 4.0, "cid-d6-std"),
-            make_simp_tx(cwg_common::SIMPLIFY_LENSES, d6_simp_ts - 3.0, d6_simp_ts, "cid-d6-hi"),
+        write_swarm_simp(
+            sess_d6,
+            &[
+                (&[cwg_common::SIMPLIFY_LANE], first_ts + 2.0, first_ts + 4.0),
+                (cwg_common::SIMPLIFY_LENSES, d6_simp_ts - 3.0, d6_simp_ts),
+            ],
+        );
+        fs::write(&tp_d6, format!("{}\n{}\n",
             json!({"step_index": 30, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(d6_r4_ts + 5.0), "tool_calls": [{"name": "search_web", "args": {"query": "docs"}}]}),
             json!({"step_index": 31, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(d6_r4_ts + 6.0), "content": "ok"})
         )).unwrap();

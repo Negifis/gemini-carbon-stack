@@ -23,7 +23,7 @@ Three-phase orchestration for parallel discovery, isolated disjoint building, an
 | Coordinator (Planning / Routine) | `Orchestrator (Neon)` / `Gemini 4 Carbon` | Planning, task slicing, routine edits (`Orchestrator (Neon)` Execution Mode uses `gemini-flash-worker-agy`) |
 | Fast Scouts & Mechanical Builders | `gemini-4-hydrogen-medium` / `-high` | Multi-subsystem exploration (`3+` areas), `browser` QA, `translator`, straightforward edits |
 | Architecture, Debugging, UI, Tests | `gemini-4-neon-medium`..`-xhigh` | Call graphs/contracts, race/flakiness debugging, complex UI-to-code, unit/E2E tests |
-| Mandatory Simplify (fixed Claude lenses) | `invoke_subagent(..., Model="inherit")` (not ad-hoc `swarm` briefs) | `STANDARD`: 1× `simplify-reviewer`; `HIGH`/`XHIGH`: 3 parallel lenses (`simplify-{reuse,quality,efficiency}-reviewer`) before review |
+| Mandatory Simplify (fixed Claude lenses) | `claude-sonnet-5-5-high` → `gemini-4-neon-xhigh` → `gemini-4-hydrogen-xhigh` | `STANDARD`: 1× `simplify-reviewer`; `HIGH`/`XHIGH`: 3 parallel lenses (`simplify-reuse`, `simplify-quality`, `simplify-efficiency`) via `swarm` (`PreToolUse` injects verbatim Claude prompts) before review; kill after completion |
 | Logic Review Escalation | `claude-opus-5-5-high` → `gemini-4-neon-xhigh` (`HIGH`) / `gemini-4-carbon-high` (`XHIGH`) | Only after verified `codex-lane` outage |
 
 ## 3. Disjoint Building & Worktree Isolation

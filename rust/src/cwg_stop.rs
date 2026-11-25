@@ -239,6 +239,12 @@ fn board_ts_upper_bound(bts: f64, coarse: bool) -> f64 {
 fn reset_sticky_issue_state(state: &mut Map<String, Value>) {
     state.insert("opus_issue_verified".to_string(), Value::Bool(false));
     state.insert("opus_issue_ts".to_string(), json!(0.0));
+    state.insert("sonnet_issue_verified".to_string(), Value::Bool(false));
+    state.insert("sonnet_issue_ts".to_string(), json!(0.0));
+    state.insert("neon_simplify_issue_verified".to_string(), Value::Bool(false));
+    state.insert("neon_simplify_issue_ts".to_string(), json!(0.0));
+    state.insert("hydrogen_simplify_issue_verified".to_string(), Value::Bool(false));
+    state.insert("hydrogen_simplify_issue_ts".to_string(), json!(0.0));
 }
 
 pub(crate) fn subagent_uri_re() -> &'static Regex {
@@ -1283,6 +1289,9 @@ struct MemberTranscriptSummary {
     error_ts: f64,
     error_timestamps: Vec<ParsedTs>,
     parked_or_done: bool,
+    clean_terminal_turn: bool,
+    last_was_confirmed_post: bool,
+    has_steps: bool,
     parked_ts: f64,
     start_ts: f64,
 }
@@ -1414,8 +1423,11 @@ fn member_transcript_summary(member_tp: Option<&Path>, first_ts: f64) -> MemberT
             });
 
     let mut parked_or_done = false;
+    let mut clean_terminal_turn = false;
+    let mut last_was_confirmed_post = false;
     if last_source == "MODEL" && last_type == "PLANNER_RESPONSE" && last_tcs_empty {
         parked_or_done = true;
+        clean_terminal_turn = last_status != "ERROR";
     } else if last_type == "GENERIC"
         && last_status == "DONE"
         && (last_content_low.contains("waiting for a message")
@@ -1423,6 +1435,13 @@ fn member_transcript_summary(member_tp: Option<&Path>, first_ts: f64) -> MemberT
             || prev_called_wait)
     {
         parked_or_done = true;
+        clean_terminal_turn = true;
+    } else if last_type == "GENERIC"
+        && last_status == "DONE"
+        && (last_content_low.contains("\"status\":\"posted\"")
+            || last_content_low.contains("\"status\": \"posted\""))
+    {
+        last_was_confirmed_post = true;
     } else if has_error {
         parked_or_done = true;
     }
@@ -1448,6 +1467,9 @@ fn member_transcript_summary(member_tp: Option<&Path>, first_ts: f64) -> MemberT
         error_ts,
         error_timestamps,
         parked_or_done,
+        clean_terminal_turn,
+        last_was_confirmed_post,
+        has_steps: true,
         parked_ts,
         start_ts,
     }
@@ -1492,6 +1514,16 @@ fn parse_outer_sys_msg_sender(sys_txt: &str) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+#[derive(Debug, Clone)]
+pub struct SwarmSimplifyRun {
+    pub lane: &'static str,
+    pub worker: String,
+    pub model: String,
+    pub launch_ts: f64,
+    pub done_ts: f64,
+    pub has_fixed_prompt: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SwarmEvidence {
     pub reviews: Vec<Value>,
@@ -1502,6 +1534,16 @@ pub struct SwarmEvidence {
     pub passive_bg_tasks: Vec<String>,
     pub opus_issue_verified: bool,
     pub opus_issue_ts: f64,
+    pub sonnet_issue_verified: bool,
+    pub sonnet_issue_ts: f64,
+    pub neon_simplify_issue_verified: bool,
+    pub neon_simplify_issue_ts: f64,
+    pub hydrogen_simplify_issue_verified: bool,
+    pub hydrogen_simplify_issue_ts: f64,
+    pub simplify_runs: Vec<SwarmSimplifyRun>,
+    pub simplify_failures: HashMap<String, Vec<f64>>,
+    pub in_flight_simplify_lenses: Vec<String>,
+    pub active_simplify_workers: Vec<String>,
     pub codex_cmd_failed: bool,
     pub codex_issue_ts: f64,
     pub codex_issue_step: isize,
@@ -1791,14 +1833,46 @@ pub fn scan_swarm_activity(input: SwarmScanInput<'_>) -> SwarmEvidence {
     };
 
     let record_model_failure =
-        |ev: &mut SwarmEvidence, models: &HashSet<String>, _worker_name: &str, min_ts: f64| {
+        |ev: &mut SwarmEvidence, models: &HashSet<String>, worker_name: &str, min_ts: f64| {
+            let eff_ts = if min_ts > 0.0 { min_ts } else { now_sec() };
             if models
                 .iter()
                 .any(|m| m.contains(cwg_common::OPUS_HIGH_MODEL))
             {
                 mark_issue_ts(&mut ev.opus_issue_verified, &mut ev.opus_issue_ts, min_ts);
-                ev.review_failures
-                    .push(if min_ts > 0.0 { min_ts } else { now_sec() });
+                ev.review_failures.push(eff_ts);
+            }
+            if models
+                .iter()
+                .any(|m| m.contains(cwg_common::SONNET_HIGH_MODEL))
+            {
+                mark_issue_ts(&mut ev.sonnet_issue_verified, &mut ev.sonnet_issue_ts, min_ts);
+            }
+            if let Some(lane) = cwg_common::canonical_simplify_lane_for_worker(worker_name) {
+                if models
+                    .iter()
+                    .any(|m| m.contains(cwg_common::NEON_XHIGH_MODEL))
+                {
+                    mark_issue_ts(
+                        &mut ev.neon_simplify_issue_verified,
+                        &mut ev.neon_simplify_issue_ts,
+                        min_ts,
+                    );
+                }
+                if models
+                    .iter()
+                    .any(|m| m.contains(cwg_common::HYDROGEN_XHIGH_MODEL))
+                {
+                    mark_issue_ts(
+                        &mut ev.hydrogen_simplify_issue_verified,
+                        &mut ev.hydrogen_simplify_issue_ts,
+                        min_ts,
+                    );
+                }
+                ev.simplify_failures
+                    .entry(lane.to_string())
+                    .or_default()
+                    .push(eff_ts);
             }
         };
 
@@ -1948,22 +2022,53 @@ pub fn scan_swarm_activity(input: SwarmScanInput<'_>) -> SwarmEvidence {
                     })
                     .unwrap_or_default();
                 let quotas_opt = md.get("quotas").and_then(|v| v.as_object());
-                let missing = !avail.is_empty()
-                    && allow_missing_avail
-                    && !avail.contains(cwg_common::OPUS_HIGH_MODEL);
-                let exhausted =
-                    quotas_opt.is_some_and(|q| quota_exhausted(q, cwg_common::OPUS_HIGH_MODEL));
-                if missing || exhausted {
+                let is_unavailable = |model_id: &str| -> bool {
+                    let missing =
+                        !avail.is_empty() && allow_missing_avail && !avail.contains(model_id);
+                    let exhausted = quotas_opt.is_some_and(|q| quota_exhausted(q, model_id));
+                    missing || exhausted
+                };
+                if is_unavailable(cwg_common::OPUS_HIGH_MODEL) {
                     mark_issue_ts(&mut ev.opus_issue_verified, &mut ev.opus_issue_ts, res_ts);
+                }
+                if is_unavailable(cwg_common::SONNET_HIGH_MODEL) {
+                    mark_issue_ts(&mut ev.sonnet_issue_verified, &mut ev.sonnet_issue_ts, res_ts);
+                }
+                if is_unavailable(cwg_common::NEON_XHIGH_MODEL) {
+                    mark_issue_ts(
+                        &mut ev.neon_simplify_issue_verified,
+                        &mut ev.neon_simplify_issue_ts,
+                        res_ts,
+                    );
+                }
+                if is_unavailable(cwg_common::HYDROGEN_XHIGH_MODEL) {
+                    mark_issue_ts(
+                        &mut ev.hydrogen_simplify_issue_verified,
+                        &mut ev.hydrogen_simplify_issue_ts,
+                        res_ts,
+                    );
                 }
             }
         }
 
-        // INVARIANT: Only model/quota/availability failures count (never duplicate worker names or bad args).
-        if is_err && !req_model.is_empty() && model_failure_re().is_match(&err_detail) {
+        // INVARIANT: Only genuine upstream model/quota/runtime failures count — never local PreToolUse hook denials, duplicate worker names, or invalid args.
+        let local_denial = is_local_hook_denial(&err_detail);
+        let is_model_fail = is_err && !local_denial && model_failure_re().is_match(&err_detail);
+        if is_model_fail && !req_model.is_empty() {
             let mut single = HashSet::new();
             single.insert(req_model);
             record_model_failure(ev, &single, &wname, res_ts);
+        } else if is_err
+            && !local_denial
+            && action == "add"
+            && (is_model_fail || is_subagent_runtime_failure(&err_detail))
+        {
+            if let Some(lane) = cwg_common::canonical_simplify_lane_for_worker(&wname) {
+                ev.simplify_failures
+                    .entry(lane.to_string())
+                    .or_default()
+                    .push(if res_ts > 0.0 { res_ts } else { now_sec() });
+            }
         }
     };
 
@@ -2402,8 +2507,10 @@ pub fn scan_swarm_activity(input: SwarmScanInput<'_>) -> SwarmEvidence {
             ""
         };
 
-        let mut coord_posts: Vec<(f64, bool, String, Option<usize>, i64, f64)> = Vec::new();
-        let mut broadcast_posts: Vec<(f64, bool, String, Option<usize>, i64, f64)> = Vec::new();
+        let simp_lane_opt = cwg_common::canonical_simplify_lane_for_worker(mname);
+        let mut coord_posts: Vec<(f64, bool, String, Option<usize>, i64, f64, bool)> = Vec::new();
+        let mut broadcast_posts: Vec<(f64, bool, String, Option<usize>, i64, f64, bool)> =
+            Vec::new();
         let mut worker_board_posts: Vec<(f64, bool, f64, String, i64)> = Vec::new();
         let mut last_board_ts = 0.0f64;
 
@@ -2417,6 +2524,9 @@ pub fn scan_swarm_activity(input: SwarmScanInput<'_>) -> SwarmEvidence {
             let entry_pub_ub = cwg_common::coarse_ts_upper_bound(entry.pub_ts, entry.pub_coarse);
             if entry.poster == "coordinator" {
                 if rio::text_mentions_swarm_worker(&entry.text, mname) {
+                    let raw_has_fixed = simp_lane_opt.is_some_and(|sl| {
+                        cwg_common::has_fixed_simplify_prompt_for_worker(sl, mname, &entry.text)
+                    });
                     let scoped =
                         cwg_common::extract_worker_scoped_brief(&entry.text, mname, &known_workers);
                     coord_posts.push((
@@ -2426,8 +2536,12 @@ pub fn scan_swarm_activity(input: SwarmScanInput<'_>) -> SwarmEvidence {
                         entry.step_idx,
                         entry.seq,
                         entry_pub_ub,
+                        raw_has_fixed,
                     ));
                 } else if rio::text_contains_mention(&entry.text, "all") {
+                    let raw_has_fixed = simp_lane_opt.is_some_and(|sl| {
+                        cwg_common::has_fixed_simplify_prompt_for_worker(sl, "all", &entry.text)
+                    });
                     let scoped =
                         cwg_common::extract_worker_scoped_brief(&entry.text, mname, &known_workers);
                     broadcast_posts.push((
@@ -2437,6 +2551,7 @@ pub fn scan_swarm_activity(input: SwarmScanInput<'_>) -> SwarmEvidence {
                         entry.step_idx,
                         entry.seq,
                         entry_pub_ub,
+                        raw_has_fixed,
                     ));
                 }
             } else if entry.poster == *mname {
@@ -2642,7 +2757,34 @@ pub fn scan_swarm_activity(input: SwarmScanInput<'_>) -> SwarmEvidence {
                     .iter()
                     .any(|(_, lo, _)| first_switch_req_ts.is_some_and(|fs| *lo < fs - TS_EPS))
             };
-            if !has_initial_epoch_tsum {
+            let is_simplify_worker = cwg_common::canonical_simplify_lane_for_worker(mname).is_some();
+            if is_simplify_worker && has_any_switch {
+                // INVARIANT: For simplify workers switched via `swarm(action="model")`, attribute post-switch host `SYSTEM_MESSAGE` errors strictly via `resolve_window_model` while failing closed on/inside switch boundaries so confirmed Neon failures unlock Hydrogen.
+                for h_pt in host_errs.iter().copied().filter(|p| p.ts > 0.0) {
+                    let on_switch_boundary = switch_ts_any(&model_events, false, |t| {
+                        (h_pt.ts - t).abs() <= TS_EPS
+                    });
+                    if on_switch_boundary {
+                        continue;
+                    }
+                    let h_mdl = resolve_window_model(
+                        &model_events,
+                        &cur_model,
+                        true,
+                        h_pt.ts,
+                        h_pt.coarse,
+                    );
+                    if h_mdl.is_empty() {
+                        continue;
+                    }
+                    let already_in_epoch = attempt_errors
+                        .iter()
+                        .any(|(m, _, _)| m.as_deref() == Some(h_mdl.as_str()));
+                    if !already_in_epoch {
+                        attempt_errors.push((Some(h_mdl), h_pt.ts, 0.0));
+                    }
+                }
+            } else if !has_initial_epoch_tsum {
                 if !has_any_switch {
                     if let Some(h_lo) = host_errs
                         .iter()
@@ -3126,6 +3268,14 @@ pub fn scan_swarm_activity(input: SwarmScanInput<'_>) -> SwarmEvidence {
         }
         worker_last_activity.insert(mname.clone(), max_act);
 
+        let worker_state_low = val_to_str(minfo.get("state")).trim().to_ascii_lowercase();
+        let simp_still_working = !killed
+            && simp_lane_opt.is_some()
+            && worker_state_low == "working"
+            && (!tsum.has_steps || !tsum.clean_terminal_turn);
+        if !killed && simp_lane_opt.is_some() {
+            ev.active_simplify_workers.push(mname.clone());
+        }
         let eff_park_ts = tsum.parked_ts.max(host_err_ts);
         let parked_after_assign = (tsum.parked_or_done || host_err_ts > 0.0)
             && (latest_assign_ts == 0.0
@@ -3134,16 +3284,32 @@ pub fn scan_swarm_activity(input: SwarmScanInput<'_>) -> SwarmEvidence {
 
         if !killed
             && latest_assign_ts >= first_ts - 2.0
-            && !has_reply_since_assign
-            && !parked_after_assign
+            && ((!has_reply_since_assign && !parked_after_assign) || simp_still_working)
         {
             ev.in_flight_workers.push(format!("swarm:{}", mname));
+            if let Some(sl) = simp_lane_opt {
+                if !ev.in_flight_simplify_lenses.iter().any(|x| x == sl) {
+                    ev.in_flight_simplify_lenses.push(sl.to_string());
+                }
+            }
             continue;
         }
         if !killed {
             ev.idle_unkilled_workers.push(mname.clone());
         }
         if combined_outputs.is_empty() {
+            if let Some(sl) = simp_lane_opt {
+                if latest_assign_ts >= first_ts - 2.0
+                    && parked_after_assign
+                    && !tsum.has_error
+                    && host_errs.is_empty()
+                {
+                    ev.simplify_failures
+                        .entry(sl.to_string())
+                        .or_default()
+                        .push(eff_park_ts.max(latest_assign_ts));
+                }
+            }
             continue;
         }
 
@@ -3154,6 +3320,7 @@ pub fn scan_swarm_activity(input: SwarmScanInput<'_>) -> SwarmEvidence {
             text: String,
             step_idx: Option<usize>,
             seq: i64,
+            has_exact_fixed_simplify: bool,
         }
         impl ReviewWindow {
             fn bare(ts: f64) -> Self {
@@ -3164,11 +3331,12 @@ pub fn scan_swarm_activity(input: SwarmScanInput<'_>) -> SwarmEvidence {
                     text: String::new(),
                     step_idx: None,
                     seq: 0,
+                    has_exact_fixed_simplify: false,
                 }
             }
         }
         let mut windows: Vec<ReviewWindow> = Vec::new();
-        for (ts, coarse, txt, st_i, seq, pub_ub) in &coord_posts {
+        for (ts, coarse, txt, st_i, seq, pub_ub, raw_fixed) in &coord_posts {
             windows.push(ReviewWindow {
                 ts: *ts,
                 coarse_ts: *coarse,
@@ -3176,9 +3344,10 @@ pub fn scan_swarm_activity(input: SwarmScanInput<'_>) -> SwarmEvidence {
                 text: txt.clone(),
                 step_idx: *st_i,
                 seq: *seq,
+                has_exact_fixed_simplify: *raw_fixed,
             });
         }
-        for (ts, coarse, txt, st_i, seq, pub_ub) in &broadcast_posts {
+        for (ts, coarse, txt, st_i, seq, pub_ub, raw_fixed) in &broadcast_posts {
             windows.push(ReviewWindow {
                 ts: *ts,
                 coarse_ts: *coarse,
@@ -3186,6 +3355,7 @@ pub fn scan_swarm_activity(input: SwarmScanInput<'_>) -> SwarmEvidence {
                 text: txt.clone(),
                 step_idx: *st_i,
                 seq: *seq,
+                has_exact_fixed_simplify: *raw_fixed,
             });
         }
         if let Some(switches) = model_switches.get(mname) {
@@ -3197,6 +3367,7 @@ pub fn scan_swarm_activity(input: SwarmScanInput<'_>) -> SwarmEvidence {
                     text: item.1.clone(),
                     step_idx: item.2,
                     seq: 0,
+                    has_exact_fixed_simplify: false,
                 });
             }
         }
@@ -3314,6 +3485,7 @@ pub fn scan_swarm_activity(input: SwarmScanInput<'_>) -> SwarmEvidence {
             order_ts: f64,
             attr_ts: f64,
             attr_coarse: bool,
+            is_confirmed_board_post: bool,
             text: String,
         }
         let mut bucketed_outputs: HashMap<usize, Vec<BucketedOut>> = HashMap::new();
@@ -3377,6 +3549,7 @@ pub fn scan_swarm_activity(input: SwarmScanInput<'_>) -> SwarmEvidence {
                     order_ts: out.order_ts,
                     attr_ts: out.attr_ts,
                     attr_coarse: out.attr_coarse,
+                    is_confirmed_board_post: out.bseq > 0,
                     text: out.text.clone(),
                 });
         }
@@ -3412,6 +3585,124 @@ pub fn scan_swarm_activity(input: SwarmScanInput<'_>) -> SwarmEvidence {
             let win_ts = windows[w_idx].ts;
             let win_step_idx = windows[w_idx].step_idx;
             let win_outs = &bucketed_outputs[&w_idx];
+            if let Some(sl) = simp_lane_opt {
+                // INVARIANT: Verify exact LF-normalized canonical fixed prompt strictly on this worker's raw board segment (inheriting across `[model-switch]` retries and ONLY the exact `Swarm Wait Guard` publish nudge `SWARM_PUBLISH_NUDGE_TEXT`, never across narrowed/ad-hoc assignments or pre-candidate workers).
+                let is_publish_nudge = |t: &str| -> bool {
+                    t.trim()
+                        .trim_end_matches(|c: char| matches!(c, '.' | '!' | '?'))
+                        .eq_ignore_ascii_case(cwg_common::SWARM_PUBLISH_NUDGE_TEXT)
+                };
+                let mut crossed_nudge = false;
+                let mut active_assign_win: Option<&ReviewWindow> = None;
+                for i in (0..=w_idx).rev() {
+                    let wt = windows[i].text.as_str();
+                    if wt.is_empty() || wt.starts_with("[model-switch") {
+                        continue;
+                    }
+                    if !windows[i].has_exact_fixed_simplify && is_publish_nudge(wt) {
+                        crossed_nudge = true;
+                        continue;
+                    }
+                    active_assign_win = Some(&windows[i]);
+                    break;
+                }
+                let has_fixed_prompt = match active_assign_win {
+                    Some(aw) => {
+                        aw.has_exact_fixed_simplify
+                            && (!crossed_nudge || aw.ts == 0.0 || aw.ts >= first_ts - 2.0)
+                    }
+                    None => cwg_common::has_fixed_simplify_prompt(sl, &meta_brief),
+                };
+                let eff_launch_ts = launch_ts_or_start(win_ts, tsum.start_ts, first_ts);
+                let is_last_win = w_idx + 1 >= windows.len()
+                    || windows[w_idx + 1..]
+                        .iter()
+                        .all(|w| w.text.is_empty() || w.text.starts_with("[model-switch"));
+                // INVARIANT: Accept a confirmed final board report (`[done]` / `no actionable`, `bseq > 0`) either when the turn parked cleanly OR when the coordinator called `swarm kill` immediately after the confirmed `posted` ack without subsequent errors (while interim status posts still fail `is_final_simplify_report` and hung tool calls fail both flags).
+                let turn_completed_cleanly = !tsum.has_steps
+                    || !is_last_win
+                    || tsum.clean_terminal_turn
+                    || tsum.last_was_confirmed_post;
+                let untimestamped_err =
+                    tsum.has_error && tsum.error_ts <= 0.0 && tsum.error_timestamps.is_empty();
+                let has_done_prefix = |txt: &str| -> bool {
+                    let tr = txt.trim();
+                    tr.get(..19)
+                        .is_some_and(|p| p.eq_ignore_ascii_case("@coordinator [done]"))
+                        && tr[19..]
+                            .chars()
+                            .next()
+                            .is_none_or(|c| c.is_whitespace() || matches!(c, ':' | '-' | ',' | '.'))
+                };
+                let is_exact_clean_no_actionable = |txt: &str| -> bool {
+                    let tr = txt.trim();
+                    let body = if tr
+                        .get(..12)
+                        .is_some_and(|p| p.eq_ignore_ascii_case("@coordinator"))
+                    {
+                        tr[12..].trim_start_matches(|c: char| {
+                            c.is_whitespace() || matches!(c, ':' | ',')
+                        })
+                    } else {
+                        tr
+                    };
+                    matches!(
+                        body.to_ascii_lowercase().as_str(),
+                        "no actionable simplifications."
+                            | "no actionable reuse simplifications."
+                            | "no actionable quality simplifications."
+                            | "no actionable efficiency simplifications."
+                    )
+                };
+                let is_final_simplify_report = |txt: &str| -> bool {
+                    has_done_prefix(txt)
+                        || (tsum.clean_terminal_turn && is_exact_clean_no_actionable(txt))
+                };
+                if eff_launch_ts >= first_ts - 2.0 && turn_completed_cleanly && !untimestamped_err {
+                    if let Some(good_bo) = win_outs.iter().rev().find(|bo| {
+                        bo.is_confirmed_board_post && is_final_simplify_report(&bo.text)
+                    }) {
+                        let post_ts = good_bo.raw_ts.max(good_bo.order_ts);
+                        let err_after_post = tsum
+                            .error_timestamps
+                            .iter()
+                            .chain(host_errs.iter())
+                            .any(|e| {
+                                e.ts > 0.0
+                                    && e.ts >= eff_launch_ts - TS_EPS
+                                    && (post_ts <= 0.0 || e.ts >= post_ts - TS_EPS)
+                            });
+                        if !err_after_post {
+                            let max_win_ots = win_outs
+                                .iter()
+                                .filter(|x| x.is_confirmed_board_post)
+                                .map(|x| x.raw_ts.max(x.order_ts))
+                                .reduce(f64::max)
+                                .unwrap_or(0.0);
+                            let done_ts = eff_launch_ts.max(post_ts.max(max_win_ots));
+                            let win_model = resolve_window_model(
+                                &model_events,
+                                &cur_model,
+                                has_any_switch,
+                                good_bo.attr_ts,
+                                good_bo.attr_coarse,
+                            );
+                            ev.simplify_runs.push(SwarmSimplifyRun {
+                                lane: sl,
+                                worker: mname.clone(),
+                                model: win_model,
+                                launch_ts: eff_launch_ts,
+                                done_ts,
+                                has_fixed_prompt,
+                            });
+                        }
+                    }
+                }
+                if has_fixed_prompt {
+                    // INVARIANT: A fixed-prompt simplify worker report must never be misinterpreted as an adversarial review verdict even if quoted diff text contains `VERDICT:`.
+                    continue;
+                }
+            }
             let mut r_kind: Option<String> = None;
             let mut r_verdict: Option<String> = None;
             let mut r_ts = 0.0f64;
@@ -3552,7 +3843,7 @@ pub fn scan_swarm_activity(input: SwarmScanInput<'_>) -> SwarmEvidence {
 pub struct SubagentEvidence {
     pub reviews: Vec<Value>,
     pub review_failures: Vec<f64>,
-    pub simplify_successes: HashMap<String, Vec<f64>>,
+    pub simplify_successes: HashMap<String, Vec<(f64, f64)>>,
     pub simplify_failures: HashMap<String, Vec<f64>>,
     pub in_flight_simplify_lenses: Vec<String>,
     pub in_flight_subagents: Vec<String>,
@@ -3562,6 +3853,13 @@ impl SubagentEvidence {
     pub fn simplify_completed_count(&self) -> usize {
         self.simplify_successes.values().map(Vec::len).sum()
     }
+}
+
+fn is_local_hook_denial(text: &str) -> bool {
+    text.contains("[Code Work Gate]")
+        || text.contains("[Model Policy Guard]")
+        || text.contains("[Subagent ")
+        || text.contains("[Swarm ")
 }
 
 fn is_subagent_runtime_failure(body: &str) -> bool {
@@ -3704,9 +4002,10 @@ pub fn scan_native_subagents(
             };
             let Some(sm) = subagent_uri_re().captures(blob) else {
                 let blob_low = blob.to_lowercase();
-                if g_status == "ERROR"
-                    || blob_low.contains("error")
-                    || blob_low.contains("failed")
+                if !is_local_hook_denial(blob)
+                    && (g_status == "ERROR"
+                        || blob_low.contains("error")
+                        || blob_low.contains("failed"))
                 {
                     let err_ts = if call_ts > 0.0 { call_ts } else { now_sec() };
                     if NATIVE_REVIEWERS.contains(&base_tname) {
@@ -3741,15 +4040,12 @@ pub fn scan_native_subagents(
                     .iter()
                     .any(|(_, b)| !b.trim().is_empty() && !is_subagent_runtime_failure(b));
                 if has_delivered_ok && (delivered_max_ts > 0.0 || call_ts > 0.0) {
-                    let eff_launch_ts = if call_ts > 0.0 {
-                        call_ts
-                    } else {
-                        delivered_max_ts
-                    };
+                    // INVARIANT: Record launch (`call_ts`, 0.0 fail-closed if unknown) separately from completion (`done_ts`) so post-launch swarm failures cannot retroactively authorize an earlier native invoke_subagent call.
+                    let done_ts = call_ts.max(delivered_max_ts);
                     ev.simplify_successes
                         .entry(base_tname_low)
                         .or_default()
-                        .push(eff_launch_ts.max(delivered_max_ts));
+                        .push((call_ts, done_ts));
                     continue;
                 }
             }
@@ -3877,7 +4173,7 @@ pub fn scan_native_subagents(
                     ev.simplify_successes
                         .entry(base_tname_low)
                         .or_default()
-                        .push(eff_end_ts);
+                        .push((call_ts, eff_end_ts));
                 } else {
                     ev.simplify_failures
                         .entry(base_tname_low)
@@ -3898,24 +4194,172 @@ enum SimplifyLaneState {
     Exhausted,
 }
 
-fn evaluate_simplify_states(
+#[derive(Debug, Clone, Default)]
+struct EffectiveSimplifyEvidence {
+    successes: HashMap<&'static str, Vec<f64>>,
+    failures: HashMap<&'static str, Vec<f64>>,
+    priority_errors: HashMap<&'static str, String>,
+    in_flight_lenses: Vec<String>,
+    all_swarm_tiers_degraded: bool,
+}
+
+impl SwarmEvidence {
+    fn all_simplify_tiers_degraded(&self) -> bool {
+        self.sonnet_issue_verified
+            && self.neon_simplify_issue_verified
+            && self.hydrogen_simplify_issue_verified
+    }
+}
+
+fn tier_failed_before_launch(verified: bool, issue_ts: f64, launch_ts: f64) -> bool {
+    verified && (issue_ts <= 0.0 || (launch_ts > 0.0 && launch_ts >= issue_ts - TS_EPS))
+}
+
+fn simplify_run_priority_error(run: &SwarmSimplifyRun, swarm_ev: &SwarmEvidence) -> Option<String> {
+    if !run.has_fixed_prompt {
+        return Some(format!(
+            "simplify worker `{}` ran without the fixed Claude prompt (`{}`); launch via `swarm(action=\"add\", name=\"{}\", model=\"{}\", ...)` so PreToolUse injects the fixed prompt",
+            run.worker,
+            cwg_common::fixed_simplify_lens_marker(run.lane),
+            cwg_common::simplify_swarm_worker_for_lane(run.lane),
+            cwg_common::SONNET_HIGH_MODEL,
+        ));
+    }
+    match run.model.as_str() {
+        cwg_common::SONNET_HIGH_MODEL => None,
+        cwg_common::NEON_XHIGH_MODEL => {
+            if tier_failed_before_launch(
+                swarm_ev.sonnet_issue_verified,
+                swarm_ev.sonnet_issue_ts,
+                run.launch_ts,
+            ) {
+                None
+            } else {
+                Some(format!(
+                    "simplify `{}` ran on `{}` before a verified `{}` error/quota/availability failure; run simplify on `{}` first",
+                    run.worker,
+                    cwg_common::NEON_XHIGH_MODEL,
+                    cwg_common::SONNET_HIGH_MODEL,
+                    cwg_common::SONNET_HIGH_MODEL,
+                ))
+            }
+        }
+        cwg_common::HYDROGEN_XHIGH_MODEL => {
+            if tier_failed_before_launch(
+                swarm_ev.sonnet_issue_verified,
+                swarm_ev.sonnet_issue_ts,
+                run.launch_ts,
+            ) && tier_failed_before_launch(
+                swarm_ev.neon_simplify_issue_verified,
+                swarm_ev.neon_simplify_issue_ts,
+                run.launch_ts,
+            ) {
+                None
+            } else {
+                Some(format!(
+                    "simplify `{}` ran on `{}` before verified `{}` -> `{}` failures; follow {}",
+                    run.worker,
+                    cwg_common::HYDROGEN_XHIGH_MODEL,
+                    cwg_common::SONNET_HIGH_MODEL,
+                    cwg_common::NEON_XHIGH_MODEL,
+                    cwg_common::simplify_model_chain_desc(),
+                ))
+            }
+        }
+        other => Some(format!(
+            "simplify `{}` ran on disallowed model `{}`; mandatory simplify must use {}",
+            run.worker,
+            if other.is_empty() { "<unknown>" } else { other },
+            cwg_common::simplify_model_chain_desc(),
+        )),
+    }
+}
+
+fn collect_effective_simplify_evidence(
     sub_ev: &SubagentEvidence,
+    swarm_ev: &SwarmEvidence,
+) -> EffectiveSimplifyEvidence {
+    let mut out = EffectiveSimplifyEvidence {
+        all_swarm_tiers_degraded: swarm_ev.all_simplify_tiers_degraded(),
+        ..Default::default()
+    };
+    for run in &swarm_ev.simplify_runs {
+        if let Some(err) = simplify_run_priority_error(run, swarm_ev) {
+            out.priority_errors.entry(run.lane).or_insert(err);
+        } else {
+            out.successes.entry(run.lane).or_default().push(run.done_ts);
+        }
+    }
+    for (lane, fails) in &swarm_ev.simplify_failures {
+        if let Some(canon) = cwg_common::canonical_simplify_lane_for_worker(lane) {
+            out.failures.entry(canon).or_default().extend(fails.iter().copied());
+        }
+    }
+    for lens in &swarm_ev.in_flight_simplify_lenses {
+        if !out.in_flight_lenses.iter().any(|x| x == lens) {
+            out.in_flight_lenses.push(lens.clone());
+        }
+    }
+    // INVARIANT: Native `invoke_subagent(simplify-*)` is last-resort fallback ONLY after all 3 swarm simplify tiers (`claude-sonnet-5-5-high` -> `gemini-4-neon-xhigh` -> `gemini-4-hydrogen-xhigh`) have verified failures/outages.
+    let all_tier_outage_ts = swarm_ev
+        .sonnet_issue_ts
+        .max(swarm_ev.neon_simplify_issue_ts)
+        .max(swarm_ev.hydrogen_simplify_issue_ts);
+    for &lane in cwg_common::SIMPLIFY_REVIEWERS {
+        if let Some(succs) = sub_ev.simplify_successes.get(lane) {
+            for &(launch_ts, done_ts) in succs {
+                if out.all_swarm_tiers_degraded
+                    && (all_tier_outage_ts <= 0.0
+                        || (launch_ts > 0.0 && launch_ts >= all_tier_outage_ts - TS_EPS))
+                {
+                    out.successes.entry(lane).or_default().push(done_ts);
+                } else {
+                    out.priority_errors.entry(lane).or_insert_with(|| {
+                        format!(
+                            "native `invoke_subagent({})` ran while swarm simplify chain ({}) was still available; launch `swarm(action=\"add\", name=\"{}\", model=\"{}\", ...)` first",
+                            lane,
+                            cwg_common::simplify_model_chain_desc(),
+                            cwg_common::simplify_swarm_worker_for_lane(lane),
+                            cwg_common::SONNET_HIGH_MODEL,
+                        )
+                    });
+                }
+            }
+        }
+        if out.all_swarm_tiers_degraded {
+            if let Some(fails) = sub_ev.simplify_failures.get(lane) {
+                for &ts in fails {
+                    if all_tier_outage_ts <= 0.0 || ts >= all_tier_outage_ts - TS_EPS {
+                        out.failures.entry(lane).or_default().push(ts);
+                    }
+                }
+            }
+        }
+    }
+    if out.all_swarm_tiers_degraded {
+        for lens in &sub_ev.in_flight_simplify_lenses {
+            if !out.in_flight_lenses.iter().any(|x| x == lens) {
+                out.in_flight_lenses.push(lens.clone());
+            }
+        }
+    }
+    out
+}
+
+fn evaluate_simplify_states(
+    eff: &EffectiveSimplifyEvidence,
     durable_ts: f64,
 ) -> HashMap<&'static str, SimplifyLaneState> {
-    // INVARIANT: Simplify completions are candidate-bound (`>= first_ts`) so applying simplify's own edits never triggers an infinite re-simplify loop; 2+ failures at/after the latest success with the latest failure at/after `durable_ts` mark a lane `Exhausted` for finite `draft-blocked` escape.
+    // INVARIANT: Simplify completions are candidate-bound (`>= first_ts`) so applying simplify's own edits never triggers an infinite re-simplify loop; exhausted lanes (2+ failures after all swarm tiers degrade, or 3+ total failures after latest success with latest failure >= `durable_ts`) allow finite `draft-blocked` escape.
     let mut out = HashMap::new();
     for &lane in cwg_common::SIMPLIFY_REVIEWERS {
-        let successes = sub_ev
-            .simplify_successes
-            .get(lane)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        let failures = sub_ev
-            .simplify_failures
-            .get(lane)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        let latest_success = successes.iter().copied().reduce(f64::max).unwrap_or(0.0);
+        let successes = eff.successes.get(lane).map(Vec::as_slice).unwrap_or(&[]);
+        let failures = eff.failures.get(lane).map(Vec::as_slice).unwrap_or(&[]);
+        let latest_success = successes
+            .iter()
+            .copied()
+            .max_by(f64::total_cmp)
+            .unwrap_or(0.0);
         let latest_fail = failures
             .iter()
             .copied()
@@ -3936,7 +4380,9 @@ fn evaluate_simplify_states(
                 });
             }
         }
-        if retry_count >= 2 && latest_retry.unwrap_or(0.0) >= durable_ts - TS_EPS {
+        let exhausted = latest_retry.unwrap_or(0.0) >= durable_ts - TS_EPS
+            && ((retry_count >= 2 && eff.all_swarm_tiers_degraded) || retry_count >= 3);
+        if exhausted {
             out.insert(lane, SimplifyLaneState::Exhausted);
         } else if retry_count > 0 {
             out.insert(lane, SimplifyLaneState::Failed);
@@ -3971,7 +4417,7 @@ fn missing_simplify_lenses(
 
 fn simplify_completed_ts(
     effective_risk: &str,
-    sub_ev: &SubagentEvidence,
+    eff: &EffectiveSimplifyEvidence,
     missing_simplify: &[&str],
 ) -> f64 {
     if !missing_simplify.is_empty() {
@@ -3985,8 +4431,8 @@ fn simplify_completed_ts(
     let mut ready_ts = 0.0_f64;
     for &lane in required {
         // INVARIANT: Anchor each lens to its earliest valid candidate completion (`min`) so later retries cannot advance the cutoff and launder counted post-simplify rounds.
-        let first_ok = sub_ev
-            .simplify_successes
+        let first_ok = eff
+            .successes
             .get(lane)
             .map(Vec::as_slice)
             .unwrap_or(&[])
@@ -4007,12 +4453,22 @@ fn format_simplify_block_reason(
     effective_risk: &str,
     missing: &[&str],
     states: &HashMap<&'static str, SimplifyLaneState>,
+    eff: &EffectiveSimplifyEvidence,
 ) -> String {
-    let lenses = cwg_common::SIMPLIFY_LENSES.join(", ");
+    let swarm_lenses = cwg_common::SIMPLIFY_SWARM_LENSES.join(", ");
     let needed = match effective_risk {
-        "HIGH" | "XHIGH" => format!("one completed pass from each of the 3 lenses ({})", lenses),
-        _ => format!("one completed `{}` pass", cwg_common::SIMPLIFY_LANE),
+        "HIGH" | "XHIGH" => format!(
+            "one completed pass from each of the 3 fixed-prompt lenses ({}) on {}",
+            swarm_lenses,
+            cwg_common::simplify_model_chain_desc(),
+        ),
+        _ => format!(
+            "one completed fixed-prompt `{}` pass on {}",
+            cwg_common::SIMPLIFY_SWARM_LANE,
+            cwg_common::simplify_model_chain_desc(),
+        ),
     };
+    let missing_desc = cwg_common::simplify_swarm_workers_desc(missing);
     let failed: Vec<&str> = missing
         .iter()
         .copied()
@@ -4028,24 +4484,33 @@ fn format_simplify_block_reason(
         .copied()
         .filter(|&l| states.get(l) == Some(&SimplifyLaneState::Exhausted))
         .collect();
+    let prio_note = missing
+        .iter()
+        .find_map(|l| eff.priority_errors.get(l))
+        .map(|e| format!(" [{}]", e))
+        .unwrap_or_default();
     let fail_tail = if failed.is_empty() {
         String::new()
     } else if exhausted.is_empty() {
-        format!(" (last attempt failed: {})", failed.join(", "))
+        format!(
+            " (last attempt failed: {})",
+            cwg_common::simplify_swarm_workers_desc(&failed)
+        )
     } else {
         format!(
             " (last attempt failed: {}; exhausted: {} — finite `[gate] draft-blocked` is permitted)",
-            failed.join(", "),
-            exhausted.join(", ")
+            cwg_common::simplify_swarm_workers_desc(&failed),
+            cwg_common::simplify_swarm_workers_desc(&exhausted)
         )
     };
     format!(
-        "{}: a `{}` candidate requires {} via `invoke_subagent` before review/closure (missing: {}){}",
+        "{}: a `{}` candidate requires {} via `swarm` before review/closure (missing: {}){}{}",
         SIMPLIFY_BLOCK_PREFIX,
         effective_risk,
         needed,
-        missing.join(", "),
-        fail_tail
+        missing_desc,
+        fail_tail,
+        prio_note
     )
 }
 
@@ -5239,10 +5704,11 @@ fn validate_candidate_closure_inner(
         }
     }
 
+    let eff_simp = collect_effective_simplify_evidence(sub_ev, swarm_ev);
     let (simplify_states, missing_simplify, simplify_unavailable) = if effective_risk == "LOW" {
         (HashMap::new(), Vec::new(), false)
     } else {
-        let states = evaluate_simplify_states(sub_ev, durable_ts);
+        let states = evaluate_simplify_states(&eff_simp, durable_ts);
         let mut missing = missing_simplify_lenses(&effective_risk, &states);
         if !missing.is_empty() && is_standalone_doc() {
             missing.clear();
@@ -5253,7 +5719,7 @@ fn validate_candidate_closure_inner(
                 .any(|&l| states.get(l) == Some(&SimplifyLaneState::Exhausted));
         (states, missing, unavailable)
     };
-    let simplify_ready_ts = simplify_completed_ts(&effective_risk, sub_ev, &missing_simplify);
+    let simplify_ready_ts = simplify_completed_ts(&effective_risk, &eff_simp, &missing_simplify);
     let review_ran_after_simplify = |r: &Value| -> bool {
         simplify_ready_ts <= 0.0 || val_to_f64(r.get("launch_ts")) + TS_EPS >= simplify_ready_ts
     };
@@ -5718,7 +6184,7 @@ fn validate_candidate_closure_inner(
                     cycle_reset_ts: p_ts,
                     simplify_completed_ts: simplify_ready_ts,
                     missing_simplify_lenses: probe_missing_simplify,
-                    in_flight_simplify_lenses: sub_ev.in_flight_simplify_lenses.clone(),
+                    in_flight_simplify_lenses: eff_simp.in_flight_lenses.clone(),
                     has_transcript: probe_has_transcript,
                     ..Default::default()
                 };
@@ -5808,7 +6274,7 @@ fn validate_candidate_closure_inner(
         probe.has_fresh_ordinary_approved = !probe_early_reject && has_fresh_valid_app;
         probe.simplify_completed_ts = simplify_ready_ts;
         probe.missing_simplify_lenses = probe_missing_simplify;
-        probe.in_flight_simplify_lenses = sub_ev.in_flight_simplify_lenses.clone();
+        probe.in_flight_simplify_lenses = eff_simp.in_flight_lenses.clone();
         probe.has_transcript = probe_has_transcript;
     }
 
@@ -5822,24 +6288,34 @@ fn validate_candidate_closure_inner(
         && blocked_closure_count < MAX_CLOSURE_PASSES;
 
     let (tail_ok, mut tail_msg) = (|| -> (bool, String) {
-        if !probing && is_closing_kind {
+        let active_swarm_kill_block = || -> Option<String> {
             let marker_sess = val_to_str(marker.get("session"));
-            if !marker_sess.is_empty() {
-                let tp_hint = transcript_path.unwrap_or("");
-                let brain_root = rio::swarm_brain_and_cid(tp_hint, &marker_sess)
-                    .0
-                    .unwrap_or_else(|| rio::resolve_brain_root(""));
-                let alive_workers =
-                    cwg_common::active_review_workers(&brain_root, &marker_sess);
-                if !alive_workers.is_empty() {
-                    return (
-                        false,
-                        format!(
-                            "waiting/active review swarm workers ({}) must be killed via `swarm(action=\"kill\", ...)` before closing the gate",
-                            alive_workers.join(", ")
-                        ),
-                    );
-                }
+            if marker_sess.is_empty() {
+                return None;
+            }
+            let tp_hint = transcript_path.unwrap_or("");
+            let brain_root = rio::swarm_brain_and_cid(tp_hint, &marker_sess)
+                .0
+                .unwrap_or_else(|| rio::resolve_brain_root(""));
+            let alive_workers = cwg_common::active_review_workers(&brain_root, &marker_sess);
+            if !alive_workers.is_empty() {
+                return Some(format!(
+                    "waiting/active review swarm workers ({}) must be killed via `swarm(action=\"kill\", ...)` before closing the gate",
+                    alive_workers.join(", ")
+                ));
+            }
+            let alive_simplify = cwg_common::active_simplify_workers(&brain_root, &marker_sess);
+            if !alive_simplify.is_empty() {
+                return Some(format!(
+                    "waiting/active simplify swarm workers ({}) must be killed via `swarm(action=\"kill\", ...)` before closing the gate",
+                    alive_simplify.join(", ")
+                ));
+            }
+            None
+        };
+        if !probing && is_closing_kind {
+            if let Some(err) = active_swarm_kill_block() {
+                return (false, err);
             }
         }
         if is_closing_kind && blocked_closure_count >= MAX_CLOSURE_PASSES {
@@ -5848,7 +6324,12 @@ fn validate_candidate_closure_inner(
         if !probing && is_closing_kind && !missing_simplify.is_empty() {
             return (
                 false,
-                format_simplify_block_reason(&effective_risk, &missing_simplify, &simplify_states),
+                format_simplify_block_reason(
+                    &effective_risk,
+                    &missing_simplify,
+                    &simplify_states,
+                    &eff_simp,
+                ),
             );
         }
 
@@ -6254,8 +6735,16 @@ fn validate_candidate_closure_inner(
                 val_to_str(r.get("verdict")) == "ESCALATE"
                     && (effective_risk != "XHIGH" || json_truthy(r.get("xhigh")))
             });
+        let allow_draft_blocked = || -> (bool, String) {
+            if !probing {
+                if let Some(err) = active_swarm_kill_block() {
+                    return (false, err);
+                }
+            }
+            (true, "draft-blocked".to_string())
+        };
         if ord_cap_exhausted && !has_round_cap_esc && pending_reset_kind.is_empty() {
-            return (true, "draft-blocked".to_string());
+            return allow_draft_blocked();
         }
         let after_escalate = ordinary_reviews.len() >= MAX_REVIEW_ROUNDS
             || cycle_counted_ordinary_n >= MAX_REVIEW_ROUNDS
@@ -6271,10 +6760,10 @@ fn validate_candidate_closure_inner(
                 || blocked_closure_count >= MAX_CLOSURE_PASSES
                 || closure_budget_exhausted_no_ready)
         {
-            return (true, "draft-blocked".to_string());
+            return allow_draft_blocked();
         }
         if review_unavailable || simplify_unavailable {
-            return (true, "draft-blocked".to_string());
+            return allow_draft_blocked();
         }
         if has_round_cap_esc && pending_reset_kind.is_empty() {
             return (
@@ -6343,6 +6832,27 @@ pub fn merge_sticky_outage_state(state: &mut Map<String, Value>, swarm_ev: &mut 
         "opus_issue_ts",
         &mut swarm_ev.opus_issue_verified,
         &mut swarm_ev.opus_issue_ts,
+    );
+    merge_sticky_issue_entry(
+        state,
+        "sonnet_issue_verified",
+        "sonnet_issue_ts",
+        &mut swarm_ev.sonnet_issue_verified,
+        &mut swarm_ev.sonnet_issue_ts,
+    );
+    merge_sticky_issue_entry(
+        state,
+        "neon_simplify_issue_verified",
+        "neon_simplify_issue_ts",
+        &mut swarm_ev.neon_simplify_issue_verified,
+        &mut swarm_ev.neon_simplify_issue_ts,
+    );
+    merge_sticky_issue_entry(
+        state,
+        "hydrogen_simplify_issue_verified",
+        "hydrogen_simplify_issue_ts",
+        &mut swarm_ev.hydrogen_simplify_issue_verified,
+        &mut swarm_ev.hydrogen_simplify_issue_ts,
     );
 }
 
@@ -6534,6 +7044,139 @@ fn max_cycle_declared_receipt_risk(steps: &[Value], min_ts: f64) -> String {
     }
 }
 
+fn load_swarm_evidence_for_session_guard(session: &str, transcript_path: &str) -> SwarmEvidence {
+    let sess = session.trim();
+    let marker = (!sess.is_empty() && sess != "unknown")
+        .then(|| cwg_common::read_active_marker_with_pending(sess))
+        .flatten();
+    let first_ts_val = marker
+        .as_ref()
+        .map(|m| val_to_f64(m.get("first_ts")))
+        .filter(|&t| t > 0.0)
+        .unwrap_or_else(|| (now_sec() - MODELS_LEAD_IN_MAX_SEC).max(0.0));
+    let eff_round_start = marker
+        .as_ref()
+        .map(|m| val_to_i64(m.get("round_start_msg_id")))
+        .unwrap_or(0);
+    let eff_cwd = marker
+        .as_ref()
+        .map(|m| {
+            let gr = val_to_str(m.get("git_root"));
+            if !gr.is_empty() { gr } else { val_to_str(m.get("cwd")) }
+        })
+        .unwrap_or_default();
+    let eff_tp = resolve_session_transcript_path(sess, transcript_path);
+    let tp_opt = (!eff_tp.is_empty()).then_some(eff_tp.as_str());
+    let steps = if !eff_tp.is_empty() {
+        rio::read_transcript_steps(&eff_tp, 4000)
+    } else {
+        Vec::new()
+    };
+    let mut swarm_ev = scan_swarm_activity(SwarmScanInput {
+        steps: &steps,
+        transcript_path: tp_opt,
+        first_ts: first_ts_val,
+        round_start_msg_id: eff_round_start,
+        cwd: &eff_cwd,
+        marker: marker.as_ref(),
+    });
+    if !sess.is_empty() && sess != "unknown" {
+        if let Some(Value::Object(mut st)) =
+            rio::read_json(&cwg_common::enforcement_state_path(sess))
+        {
+            let st_fts = val_to_f64(st.get("candidate_first_ts"));
+            if marker.is_none() || (st_fts - first_ts_val).abs() < TS_EPS {
+                merge_sticky_outage_state(&mut st, &mut swarm_ev);
+            }
+        }
+    }
+    swarm_ev
+}
+
+pub fn simplify_model_priority_error_for_session(
+    session: &str,
+    transcript_path: &str,
+    requested_model: &str,
+    lane: &str,
+) -> Option<String> {
+    let model = requested_model.trim().to_ascii_lowercase();
+    let worker = cwg_common::simplify_swarm_worker_for_lane(lane);
+    if model == cwg_common::SONNET_HIGH_MODEL {
+        return None;
+    }
+    if model.is_empty() {
+        return Some(format!(
+            "Mandatory simplify worker `{}` requires explicit `model=\"{}\"` (fallback chain: {}).",
+            worker,
+            cwg_common::SONNET_HIGH_MODEL,
+            cwg_common::simplify_model_chain_desc(),
+        ));
+    }
+    if model != cwg_common::NEON_XHIGH_MODEL && model != cwg_common::HYDROGEN_XHIGH_MODEL {
+        return Some(format!(
+            "Disallowed model `{}` for simplify worker `{}`. Mandatory simplify must use {} (never Flash, Carbon, or Opus).",
+            requested_model.trim(),
+            worker,
+            cwg_common::simplify_model_chain_desc(),
+        ));
+    }
+    let swarm_ev = load_swarm_evidence_for_session_guard(session, transcript_path);
+    if !swarm_ev.sonnet_issue_verified {
+        return Some(format!(
+            "Simplify worker `{}` must try primary `{}` first; fallback to `{}` is allowed ONLY after a verified `{}` error, quota exhaustion, or unavailability (check `swarm(action=\"models\")` or attempt `{}` first).",
+            worker,
+            cwg_common::SONNET_HIGH_MODEL,
+            model,
+            cwg_common::SONNET_HIGH_MODEL,
+            cwg_common::SONNET_HIGH_MODEL,
+        ));
+    }
+    if model == cwg_common::HYDROGEN_XHIGH_MODEL && !swarm_ev.neon_simplify_issue_verified {
+        return Some(format!(
+            "Simplify worker `{}` must try fallback #1 `{}` before secondary fallback `{}`; escalate to `{}` ONLY after verified `{}` AND `{}` failures.",
+            worker,
+            cwg_common::NEON_XHIGH_MODEL,
+            cwg_common::HYDROGEN_XHIGH_MODEL,
+            cwg_common::HYDROGEN_XHIGH_MODEL,
+            cwg_common::SONNET_HIGH_MODEL,
+            cwg_common::NEON_XHIGH_MODEL,
+        ));
+    }
+    None
+}
+
+pub fn simplify_native_fallback_error_for_session(
+    session: &str,
+    transcript_path: &str,
+    lane: &str,
+) -> Option<String> {
+    let swarm_ev = load_swarm_evidence_for_session_guard(session, transcript_path);
+    if swarm_ev.all_simplify_tiers_degraded() {
+        return None;
+    }
+    let worker = cwg_common::simplify_swarm_worker_for_lane(lane);
+    Some(format!(
+        "Run mandatory fixed-prompt simplify via `swarm(action=\"add\", name=\"{}\", model=\"{}\", brief=\"<scope packet>\")` (fallback chain: {}; PreToolUse injects the fixed Claude prompt from `plugin/agents/{}.md` automatically). Native `invoke_subagent({})` is reserved ONLY when all 3 swarm simplify tiers are unavailable.",
+        worker,
+        cwg_common::SONNET_HIGH_MODEL,
+        cwg_common::simplify_model_chain_desc(),
+        lane,
+        lane,
+    ))
+}
+
+pub(crate) fn active_simplify_workers_for_session(session: &str, transcript_path: &str) -> Vec<String> {
+    let sess = session.trim();
+    if sess.is_empty() || sess == "unknown" {
+        return Vec::new();
+    }
+    let eff_tp = resolve_session_transcript_path(sess, transcript_path);
+    let brain_root = rio::swarm_brain_and_cid(&eff_tp, sess)
+        .0
+        .unwrap_or_else(|| rio::resolve_brain_root(""));
+    cwg_common::active_simplify_workers(&brain_root, sess)
+}
+
 pub fn pre_review_simplify_block_for_session(
     session: &str,
     transcript_path: &str,
@@ -6546,7 +7189,17 @@ pub fn pre_review_simplify_block_for_session(
     let marker = cwg_common::read_active_marker_with_pending(sess)
         .filter(|m| cwg_common::candidate_class(m) == cwg_common::WORK_PERSISTENT)?;
     let sum = evaluate_closure_cycle_for_marker(&marker, sess, "", transcript_path, min_risk_override);
-    codex_lane::pre_review_simplify_error(&sum, "ordinary")
+    if let Some(err) = codex_lane::pre_review_simplify_error(&sum, "ordinary") {
+        return Some(err);
+    }
+    let alive_simp = active_simplify_workers_for_session(sess, transcript_path);
+    if !alive_simp.is_empty() {
+        return Some(format!(
+            "waiting/active simplify swarm workers ({}) must be killed via `swarm(action=\"kill\", ...)` before starting independent review",
+            alive_simp.join(", ")
+        ));
+    }
+    None
 }
 
 pub fn evaluate_closure_cycle_for_marker(
@@ -6963,14 +7616,18 @@ pub fn format_block_message(
         let simplify_hint = if is_simplify_block {
             if floor == "HIGH" || floor == "XHIGH" {
                 format!(
-                    "- Для обязательного упрощения (`{}`) вызовите параллельно 3 фиксированные линзы через `invoke_subagent(..., Model=\"inherit\")` ДО ревью: `{}` (передайте только пакет изменений: diff/файлы/инварианты, без произвольных инструкций линз); примените принятые правки, перепрогоните тесты и затем запустите ревью.\n",
+                    "- Для обязательного упрощения (`{}`) запустите параллельно 3 фиксированные линзы через `swarm(action=\"add\", model=\"{}\", ...)` ДО ревью: `{}` (цепочка фоллбэка при сбое/квоте: {}; PreToolUse сам подставит фиксированный Claude-промпт, передайте в `brief` только пакет изменений: cwd/diff/файлы/инварианты); после отчёта примените правки, перепрогоните тесты, завершите воркеров `swarm(action=\"kill\", ...)` и запустите ревью.\n",
                     floor,
-                    cwg_common::SIMPLIFY_LENSES.join("`, `")
+                    cwg_common::SONNET_HIGH_MODEL,
+                    cwg_common::SIMPLIFY_SWARM_LENSES.join("`, `"),
+                    cwg_common::simplify_model_chain_desc(),
                 )
             } else {
                 format!(
-                    "- Для обязательного упрощения (`STANDARD`) вызовите один раз `invoke_subagent(TypeName=\"{}\", Model=\"inherit\", ...)` с пакетом изменений (diff/файлы/инварианты, без произвольного промпта); после принятых правок перепрогоните тесты.\n",
-                    cwg_common::SIMPLIFY_LANE
+                    "- Для обязательного упрощения (`STANDARD`) запустите один раз `swarm(action=\"add\", name=\"{}\", model=\"{}\", brief=\"<пакет изменений>\")` (фоллбэк: {}; PreToolUse подставит фиксированный Claude-промпт); примените принятые правки, перепрогоните тесты и завершите воркера `swarm(action=\"kill\", ...)`.\n",
+                    cwg_common::SIMPLIFY_SWARM_LANE,
+                    cwg_common::SONNET_HIGH_MODEL,
+                    cwg_common::simplify_model_chain_desc(),
                 )
             }
         } else {
@@ -7388,7 +8045,7 @@ pub fn decide_stop(payload: &Value) -> Option<String> {
                 "{}:{}:{}:{}",
                 swarm_ev.worker_activity_count.unwrap_or(0),
                 sub_ev.reviews.len(),
-                sub_ev.simplify_completed_count(),
+                sub_ev.simplify_completed_count() + swarm_ev.simplify_runs.len(),
                 in_flight.join(",")
             );
             let waits = if val_to_str(state.get("last_wait_progress")) != progress_sig {
@@ -7612,15 +8269,100 @@ mod tests {
         }
     }
 
-    fn completed_simplify_ev(lenses: &[&str], ts: f64) -> SubagentEvidence {
-        let mut ev = SubagentEvidence::default();
+    fn completed_swarm_simplify_ev(lenses: &[&'static str], ts: f64) -> SwarmEvidence {
+        completed_swarm_simplify_ev_with_model(lenses, cwg_common::SONNET_HIGH_MODEL, ts, true)
+    }
+
+    fn completed_swarm_simplify_ev_with_model(
+        lenses: &[&'static str],
+        model: &str,
+        ts: f64,
+        has_fixed_prompt: bool,
+    ) -> SwarmEvidence {
+        let mut ev = SwarmEvidence::default();
         for &lane in lenses {
-            ev.simplify_successes
-                .entry(lane.to_string())
-                .or_default()
-                .push(ts);
+            let canon = cwg_common::canonical_simplify_lane_for_worker(lane).unwrap_or(lane);
+            let worker = cwg_common::simplify_swarm_worker_for_lane(canon).to_string();
+            ev.simplify_runs.push(SwarmSimplifyRun {
+                lane: canon,
+                worker,
+                model: model.to_string(),
+                launch_ts: (ts - 1.0).max(0.0),
+                done_ts: ts,
+                has_fixed_prompt,
+            });
         }
         ev
+    }
+
+    fn write_swarm_simplify_session(
+        brain_root: &Path,
+        session: &str,
+        lenses: &[&str],
+        model: &str,
+        launch_ts: f64,
+        done_ts: Option<f64>,
+        killed: bool,
+        with_fixed_marker: bool,
+        extra_transcript: &str,
+    ) -> PathBuf {
+        let l_iso = crate::win32_sqlite::format_iso_utc(launch_ts);
+        let mut members_obj = Map::new();
+        let mut board_rows: Vec<Value> = Vec::new();
+        let mut seq = 1i64;
+        for (i, &lane) in lenses.iter().enumerate() {
+            let canon = cwg_common::canonical_simplify_lane_for_worker(lane).unwrap_or(lane);
+            let worker = cwg_common::simplify_swarm_worker_for_lane(canon).to_string();
+            let brief = if with_fixed_marker {
+                cwg_common::build_fixed_simplify_brief(canon, "Bounded candidate scope packet")
+                    .unwrap_or_default()
+            } else {
+                "Ad-hoc custom simplify prompt without fixed marker".to_string()
+            };
+            members_obj.insert(
+                worker.clone(),
+                json!({
+                    "role": "worker",
+                    "conversation_id": format!("cid-simp-{}-{}", session, i),
+                    "model": model,
+                    "brief": brief,
+                    "state": if killed { "killed" } else if done_ts.is_some() { "waiting" } else { "working" },
+                    "killed": killed,
+                }),
+            );
+            board_rows.push(json!({
+                "seq": seq,
+                "agent": "coordinator",
+                "time": l_iso,
+                "text": format!("@{} {}", worker, brief),
+            }));
+            seq += 1;
+            if let Some(dts) = done_ts {
+                board_rows.push(json!({
+                    "seq": seq,
+                    "agent": worker,
+                    "time": crate::win32_sqlite::format_iso_utc(dts),
+                    "text": format!("@coordinator [done] No actionable {} issues.", canon),
+                }));
+                seq += 1;
+            }
+        }
+        let tx = if extra_transcript.trim().is_empty() {
+            format!(
+                "{}\n",
+                json!({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "implement task"})
+            )
+        } else {
+            extra_transcript.to_string()
+        };
+        setup_neon_session_env(
+            brain_root,
+            session,
+            &tx,
+            json!({"members": members_obj}),
+            &board_rows,
+            &[],
+        )
     }
 
     fn simplify_transcript_lines(
@@ -7867,10 +8609,10 @@ mod tests {
             latest_fail_ts: 0.0,
             ..Default::default()
         };
-        let sub_ev = completed_simplify_ev(cwg_common::SIMPLIFY_LENSES, 116.0);
+        let sub_ev = SubagentEvidence::default();
 
         // INVARIANT: Missing independent review must reject HIGH closure.
-        let swarm_empty = SwarmEvidence::default();
+        let swarm_empty = completed_swarm_simplify_ev(cwg_common::SIMPLIFY_LENSES, 116.0);
         let receipt_ok = cwg_common::parse_terminal_receipt("[gate] verified: HIGH; all checks passed").unwrap();
         let (ok0, reason0) = validate_candidate_closure(CandidateClosureInput {
             receipt: Some(&receipt_ok),
@@ -8110,9 +8852,9 @@ mod tests {
             latest_fail_ts: 0.0,
             ..Default::default()
         };
-        let sub_ev = completed_simplify_ev(cwg_common::SIMPLIFY_LENSES, t0 + 0.05);
+        let sub_ev = SubagentEvidence::default();
 
-        let sw_pass1 = SwarmEvidence::default();
+        let sw_pass1 = completed_swarm_simplify_ev(cwg_common::SIMPLIFY_LENSES, t0 + 0.05);
 
         let ord_e1 = json!({"review_id": "cwg-o1", "engine": "codex", "kind": "ordinary", "verdict": "REVISE", "launch_ts": t0 + 0.1, "verdict_ts": t0 + 0.2, "xhigh": false});
         let ord_e2 = json!({"review_id": "cwg-o2", "engine": "codex", "kind": "ordinary", "verdict": "REVISE", "launch_ts": t0 + 0.3, "verdict_ts": t0 + 0.4, "xhigh": false});
@@ -9836,13 +10578,13 @@ mod tests {
             "standalone background `npx --workspace backend jest` must be credited as passing verification: {:?}",
             ev_standalone
         );
-        let std_simp_ev = completed_simplify_ev(&[cwg_common::SIMPLIFY_LANE], first_ts + 50.0);
+        let std_simp_sw = completed_swarm_simplify_ev(&[cwg_common::SIMPLIFY_LANE], first_ts + 50.0);
         let (ok_pass, why_pass) = validate_candidate_closure(CandidateClosureInput {
             receipt: Some(&rcp_std),
             marker_in: &marker,
             checks_ev: &ev_standalone,
-            sub_ev: &std_simp_ev,
-            swarm_ev: &SwarmEvidence::default(),
+            sub_ev: &SubagentEvidence::default(),
+            swarm_ev: &std_simp_sw,
             codex_reviews: &[],
             ctx: None,
             steps: None,
@@ -10155,8 +10897,8 @@ mod tests {
             latest_pass_ts: t_edit2 + 10.0,
             ..Default::default()
         };
-        let sub_empty = completed_simplify_ev(cwg_common::SIMPLIFY_LENSES, t_edit2 + 15.0);
-        let sw_ev = scan_swarm_activity(SwarmScanInput {
+        let sub_empty = SubagentEvidence::default();
+        let mut sw_ev = scan_swarm_activity(SwarmScanInput {
             steps: &[],
             transcript_path: Some(&tp_str),
             first_ts: t_first,
@@ -10164,6 +10906,8 @@ mod tests {
             cwd: &repo_str,
             marker: Some(&marker_r2),
         });
+        sw_ev.simplify_runs =
+            completed_swarm_simplify_ev(cwg_common::SIMPLIFY_LENSES, t_edit2 + 15.0).simplify_runs;
         let four_revise: Vec<Value> = (1..=4)
             .map(|i| {
                 let lts = t_edit2 + 20.0 + (i as f64) * 5.0;
@@ -10240,8 +10984,8 @@ mod tests {
                 {"ts": 1050.0, "fp": "fp-v2", "unknown": false},
             ]);
             m_r6["current_diff_hash"] = json!("fp-v2");
-            let sub_empty = completed_simplify_ev(cwg_common::SIMPLIFY_LENSES, 1005.0);
-            let sw_r6 = SwarmEvidence::default();
+            let sub_empty = SubagentEvidence::default();
+            let sw_r6 = completed_swarm_simplify_ev(cwg_common::SIMPLIFY_LENSES, 1005.0);
             let r6_reviews = vec![
                 json!({"review_id": "r6-1", "kind": "ordinary", "verdict": "REVISE", "engine": "codex", "xhigh": false, "launch_ts": 1010.0, "verdict_ts": 1012.0}),
                 json!({"review_id": "r6-prem-cls", "kind": "closure", "verdict": "BLOCKED", "engine": "codex", "xhigh": false, "launch_ts": 1015.0, "verdict_ts": 1016.0}),
@@ -11520,13 +12264,13 @@ mod tests {
         assert!(!ok_missing, "HIGH candidate without 3-lens simplify must block");
         assert!(why_missing.contains("mandatory simplify incomplete"), "got: {}", why_missing);
 
-        let high_simp_ev = completed_simplify_ev(cwg_common::SIMPLIFY_LENSES, 116.0);
+        let high_simp_sw = completed_swarm_simplify_ev(cwg_common::SIMPLIFY_LENSES, 116.0);
         let (ok, res) = validate_candidate_closure(CandidateClosureInput {
             receipt: Some(&receipt),
             marker_in: &marker,
             checks_ev: &checks_ev,
-            sub_ev: &high_simp_ev,
-            swarm_ev: &SwarmEvidence::default(),
+            sub_ev: &SubagentEvidence::default(),
+            swarm_ev: &high_simp_sw,
             codex_reviews: &codex_reviews,
             ctx: None,
             steps: None,
@@ -11549,7 +12293,7 @@ mod tests {
                         "role": "worker",
                         "conversation_id": "cid-simplify-wait",
                         "model": cwg_common::SONNET_HIGH_MODEL,
-                        "brief": "Read-only single-pass simplify across Reuse, Quality, Efficiency. Emit SIMPLIFY_LENS: ALL and SIMPLIFY_VERDICT: CLEAN or POLISH_AVAILABLE with behavior-preservation proof.",
+                        "brief": "Read-only single-pass simplify across Reuse, Quality, Efficiency.",
                         "killed": false
                     },
                     "doc-helper": {
@@ -11567,8 +12311,8 @@ mod tests {
                 }
             }),
             &[
-                json!({"seq": 1, "agent": "coordinator", "time": "2026-11-22T09:59:50Z", "text": "@simplify-reviewer single-pass advisory simplify across Reuse/Quality/Efficiency; emit SIMPLIFY_LENS: ALL and SIMPLIFY_VERDICT: CLEAN or POLISH_AVAILABLE"}),
-                json!({"seq": 2, "agent": "simplify-reviewer", "time": "2026-11-22T09:59:55Z", "text": "@coordinator [done] advisory simplify pass complete\nSIMPLIFY_VERDICT: CLEAN"}),
+                json!({"seq": 1, "agent": "coordinator", "time": "2026-11-22T09:59:50Z", "text": "@simplify-reviewer single-pass simplify"}),
+                json!({"seq": 2, "agent": "simplify-reviewer", "time": "2026-11-22T09:59:55Z", "text": "@coordinator [done] simplify pass complete"}),
                 json!({"seq": 3, "agent": "doc-helper", "time": "2026-11-22T10:00:00Z", "text": "@coordinator [done] updated docs index"}),
                 json!({"seq": 4, "agent": "helper-1", "time": "2026-11-22T10:00:05Z", "text": "@coordinator [done] helper slice complete"}),
             ],
@@ -11576,12 +12320,60 @@ mod tests {
         );
         let tp_helper_str = tp_helper.to_string_lossy().into_owned();
         assert!(cwg_common::active_review_workers(&brain_helper, sess_helper).is_empty());
+        assert_eq!(
+            cwg_common::active_simplify_workers(&brain_helper, sess_helper),
+            vec!["simplify-reviewer".to_string()]
+        );
+        let (ok_simp_alive, why_simp_alive) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&receipt),
+            marker_in: &m_helper,
+            checks_ev: &checks_ev,
+            sub_ev: &SubagentEvidence::default(),
+            swarm_ev: &high_simp_sw,
+            codex_reviews: &codex_reviews,
+            ctx: None,
+            steps: None,
+            transcript_path: Some(&tp_helper_str),
+        });
+        assert!(
+            !ok_simp_alive && why_simp_alive.contains("simplify swarm workers"),
+            "unkilled simplify-reviewer must block Stop closure: {}",
+            why_simp_alive
+        );
+        // Once simplify-reviewer is killed, ordinary non-review/non-simplify helpers (doc-helper, helper-1) must NOT block APPROVED Stop.
+        let sw_dir_helper = brain_helper.join(sess_helper).join(".system_generated").join("swarm");
+        rio::write_json(
+            &sw_dir_helper.join("members.json"),
+            &json!({
+                "members": {
+                    "simplify-reviewer": {
+                        "role": "worker",
+                        "conversation_id": "cid-simplify-wait",
+                        "model": cwg_common::SONNET_HIGH_MODEL,
+                        "killed": true
+                    },
+                    "doc-helper": {
+                        "role": "worker",
+                        "conversation_id": "cid-doc-wait",
+                        "model": cwg_common::SONNET_HIGH_MODEL,
+                        "killed": false
+                    },
+                    "helper-1": {
+                        "role": "worker",
+                        "conversation_id": "cid-helper-wait",
+                        "model": cwg_common::SONNET_HIGH_MODEL,
+                        "killed": false
+                    }
+                }
+            }),
+        )
+        .unwrap();
         let (ok_helper, res_helper) = validate_candidate_closure(CandidateClosureInput {
             receipt: Some(&receipt),
             marker_in: &m_helper,
             checks_ev: &checks_ev,
-            sub_ev: &high_simp_ev,
-            swarm_ev: &SwarmEvidence::default(),
+            sub_ev: &SubagentEvidence::default(),
+            swarm_ev: &high_simp_sw,
             codex_reviews: &codex_reviews,
             ctx: None,
             steps: None,
@@ -12068,27 +12860,25 @@ mod tests {
         let now = now_sec();
         let first_ts = now - 60.0;
         let check_ts = now - 20.0;
-        let tp = td.path.join("transcript.jsonl");
-        let simp_lines = simplify_transcript_lines(
+        let ext_brain = td.path.join("brain");
+        let tp = write_swarm_simplify_session(
+            &ext_brain,
+            sess,
             cwg_common::SIMPLIFY_LENSES,
+            cwg_common::SONNET_HIGH_MODEL,
             first_ts + 10.0,
             Some(first_ts + 15.0),
-            2,
-            "cid-ext-simp",
-        );
-        fs::write(
-            &tp,
-            format!(
-                "{}\n{}",
+            true,
+            true,
+            &format!(
+                "{}\n",
                 json!({
                     "step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE",
                     "created_at": crate::win32_sqlite::format_iso_utc(check_ts),
                     "tool_calls": [{"name": "run_command", "args": {"CommandLine": "npm test"}}]
-                }),
-                simp_lines
+                })
             ),
-        )
-        .unwrap();
+        );
         let chk_p = cwg_common::checks_ledger_path(sess);
         fs::create_dir_all(chk_p.parent().unwrap()).unwrap();
         fs::write(
@@ -12250,8 +13040,8 @@ mod tests {
             latest_pass_ts: now_esc - 35.0,
             ..Default::default()
         };
-        let sub_esc = completed_simplify_ev(cwg_common::SIMPLIFY_LENSES, now_esc - 32.0);
-        let sw_esc = SwarmEvidence::default();
+        let sub_esc = SubagentEvidence::default();
+        let sw_esc = completed_swarm_simplify_ev(cwg_common::SIMPLIFY_LENSES, now_esc - 32.0);
         let four_esc: Vec<Value> = (1..=4)
             .map(|i| {
                 let lts = now_esc - 30.0 + (i as f64) * 4.0;
@@ -12477,30 +13267,138 @@ mod tests {
         });
         assert!(!ok_std_miss && why_std_miss.contains("missing: simplify-reviewer"), "got: {}", why_std_miss);
         let blk_std_msg = format_block_message(&why_std_miss, 1, &m_std, "sess-simp-std", "n-std", None);
-        assert!(blk_std_msg.contains("TypeName=\"simplify-reviewer\""), "got: {}", blk_std_msg);
+        assert!(
+            blk_std_msg.contains("name=\"simplify-reviewer\"")
+                && blk_std_msg.contains(cwg_common::SONNET_HIGH_MODEL),
+            "got: {}",
+            blk_std_msg
+        );
 
-        // Scan real JSONL transcript (launched at first_ts + 20 < post-simplify edit at first_ts + 35): candidate-bound so applying simplify edits never loops.
-        let std_tp = td.path.join("std-transcript.jsonl");
-        fs::write(&std_tp, simplify_transcript_lines(&["gemini-carbon-stack:simplify-reviewer"], first_ts + 20.0, Some(first_ts + 25.0), 1, "cid-std")).unwrap();
-        let std_steps = rio::read_transcript_steps(&std_tp.to_string_lossy(), 200);
-        let std_sub_ev = scan_native_subagents(&std_steps, Some(&std_tp.to_string_lossy()), first_ts);
+        // Scan real swarm fixture on claude-sonnet-5-5-high (launched at first_ts + 20 < post-simplify edit at first_ts + 35): candidate-bound so applying simplify edits never loops.
+        let std_brain = td.path.join("std-brain");
+        let std_tp = write_swarm_simplify_session(
+            &std_brain,
+            "sess-simp-std",
+            &[cwg_common::SIMPLIFY_LANE],
+            cwg_common::SONNET_HIGH_MODEL,
+            first_ts + 20.0,
+            Some(first_ts + 25.0),
+            true,
+            true,
+            "",
+        );
+        let std_tp_s = std_tp.to_string_lossy().into_owned();
+        let std_steps = rio::read_transcript_steps(&std_tp_s, 200);
+        let std_sw_ev = scan_swarm_activity(SwarmScanInput {
+            steps: &std_steps,
+            transcript_path: Some(&std_tp_s),
+            first_ts,
+            round_start_msg_id: 0,
+            cwd: &repo_norm,
+            marker: Some(&m_std),
+        });
+        assert_eq!(std_sw_ev.simplify_runs.len(), 1);
+        assert!(std_sw_ev.simplify_runs[0].has_fixed_prompt);
         let (ok_std_ok, res_std_ok) = validate_candidate_closure(CandidateClosureInput {
             receipt: Some(&rcp_std), marker_in: &m_std, checks_ev: &checks_ok,
-            sub_ev: &std_sub_ev, swarm_ev: &SwarmEvidence::default(),
-            codex_reviews: &[], ctx: None, steps: Some(&std_steps), transcript_path: None,
+            sub_ev: &SubagentEvidence::default(), swarm_ev: &std_sw_ev,
+            codex_reviews: &[], ctx: None, steps: Some(&std_steps), transcript_path: Some(&std_tp_s),
         });
-        assert!(ok_std_ok && res_std_ok == "verified", "STANDARD with 1x simplify-reviewer must pass after post-simplify edit: {}", res_std_ok);
+        assert!(ok_std_ok && res_std_ok == "verified", "STANDARD with 1x Sonnet simplify-reviewer must pass after post-simplify edit: {}", res_std_ok);
 
-        let two_lenses = completed_simplify_ev(&["simplify-reuse-reviewer", "simplify-quality-reviewer"], first_ts + 20.0);
+        // Ad-hoc simplify worker WITHOUT [FIXED_SIMPLIFY_LENS: ...] marker must be rejected.
+        let adhoc_sw = completed_swarm_simplify_ev_with_model(
+            &[cwg_common::SIMPLIFY_LANE],
+            cwg_common::SONNET_HIGH_MODEL,
+            first_ts + 20.0,
+            false,
+        );
+        let (ok_adhoc, why_adhoc) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_std), marker_in: &m_std, checks_ev: &checks_ok,
+            sub_ev: &SubagentEvidence::default(), swarm_ev: &adhoc_sw,
+            codex_reviews: &[], ctx: None, steps: None, transcript_path: None,
+        });
+        assert!(!ok_adhoc && why_adhoc.contains("fixed Claude prompt"), "ad-hoc brief without fixed prompt marker must fail: {}", why_adhoc);
+
+        // Model priority enforcement in Stop: Neon without Sonnet outage is rejected, allowed after Sonnet outage; Hydrogen without Neon outage is rejected, allowed after Sonnet+Neon outage; native invoke_subagent rejected until all 3 swarm tiers fail!
+        let mut neon_sw = completed_swarm_simplify_ev_with_model(
+            &[cwg_common::SIMPLIFY_LANE],
+            cwg_common::NEON_XHIGH_MODEL,
+            first_ts + 25.0,
+            true,
+        );
+        let (ok_neon_no_out, why_neon_no_out) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_std), marker_in: &m_std, checks_ev: &checks_ok,
+            sub_ev: &SubagentEvidence::default(), swarm_ev: &neon_sw,
+            codex_reviews: &[], ctx: None, steps: None, transcript_path: None,
+        });
+        assert!(!ok_neon_no_out && why_neon_no_out.contains(cwg_common::SONNET_HIGH_MODEL), "Neon before Sonnet outage must fail: {}", why_neon_no_out);
+        neon_sw.sonnet_issue_verified = true;
+        neon_sw.sonnet_issue_ts = first_ts + 20.0;
+        let (ok_neon_ok, res_neon_ok) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_std), marker_in: &m_std, checks_ev: &checks_ok,
+            sub_ev: &SubagentEvidence::default(), swarm_ev: &neon_sw,
+            codex_reviews: &[], ctx: None, steps: None, transcript_path: None,
+        });
+        assert!(ok_neon_ok && res_neon_ok == "verified", "Neon after verified Sonnet outage must pass: {}", res_neon_ok);
+
+        let mut hydro_sw = completed_swarm_simplify_ev_with_model(
+            &[cwg_common::SIMPLIFY_LANE],
+            cwg_common::HYDROGEN_XHIGH_MODEL,
+            first_ts + 28.0,
+            true,
+        );
+        hydro_sw.sonnet_issue_verified = true;
+        hydro_sw.sonnet_issue_ts = first_ts + 20.0;
+        let (ok_hydro_no_neon, why_hydro_no_neon) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_std), marker_in: &m_std, checks_ev: &checks_ok,
+            sub_ev: &SubagentEvidence::default(), swarm_ev: &hydro_sw,
+            codex_reviews: &[], ctx: None, steps: None, transcript_path: None,
+        });
+        assert!(!ok_hydro_no_neon && why_hydro_no_neon.contains(cwg_common::NEON_XHIGH_MODEL), "Hydrogen before Neon outage must fail: {}", why_hydro_no_neon);
+        hydro_sw.neon_simplify_issue_verified = true;
+        hydro_sw.neon_simplify_issue_ts = first_ts + 24.0;
+        let (ok_hydro_ok, res_hydro_ok) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_std), marker_in: &m_std, checks_ev: &checks_ok,
+            sub_ev: &SubagentEvidence::default(), swarm_ev: &hydro_sw,
+            codex_reviews: &[], ctx: None, steps: None, transcript_path: None,
+        });
+        assert!(ok_hydro_ok && res_hydro_ok == "verified", "Hydrogen after verified Sonnet+Neon outage must pass: {}", res_hydro_ok);
+
+        let nat_fb_tp = td.path.join("nat-fb-std.jsonl");
+        fs::write(&nat_fb_tp, simplify_transcript_lines(&["gemini-carbon-stack:simplify-reviewer"], first_ts + 28.0, Some(first_ts + 30.0), 1, "cid-nat-std")).unwrap();
+        let nat_fb_steps = rio::read_transcript_steps(&nat_fb_tp.to_string_lossy(), 200);
+        let native_std_ev = scan_native_subagents(&nat_fb_steps, Some(&nat_fb_tp.to_string_lossy()), first_ts);
+        let (ok_nat_no_out, why_nat_no_out) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_std), marker_in: &m_std, checks_ev: &checks_ok,
+            sub_ev: &native_std_ev, swarm_ev: &SwarmEvidence::default(),
+            codex_reviews: &[], ctx: None, steps: None, transcript_path: None,
+        });
+        assert!(!ok_nat_no_out && why_nat_no_out.contains("native `invoke_subagent"), "native invoke_subagent while swarm chain is available must fail: {}", why_nat_no_out);
+        let mut all_tiers_down = SwarmEvidence::default();
+        all_tiers_down.sonnet_issue_verified = true;
+        all_tiers_down.sonnet_issue_ts = first_ts + 20.0;
+        all_tiers_down.neon_simplify_issue_verified = true;
+        all_tiers_down.neon_simplify_issue_ts = first_ts + 24.0;
+        all_tiers_down.hydrogen_simplify_issue_verified = true;
+        all_tiers_down.hydrogen_simplify_issue_ts = first_ts + 27.0;
+        let (ok_nat_ok, res_nat_ok) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_std), marker_in: &m_std, checks_ev: &checks_ok,
+            sub_ev: &native_std_ev, swarm_ev: &all_tiers_down,
+            codex_reviews: &[], ctx: None, steps: None, transcript_path: None,
+        });
+        assert!(ok_nat_ok && res_nat_ok == "verified", "native invoke_subagent after all 3 swarm tiers fail must pass: {}", res_nat_ok);
+
+        let two_lenses = completed_swarm_simplify_ev(&["simplify-reuse-reviewer", "simplify-quality-reviewer"], first_ts + 20.0);
         assert!(!validate_candidate_closure(CandidateClosureInput {
             receipt: Some(&rcp_std), marker_in: &m_std, checks_ev: &checks_ok,
-            sub_ev: &two_lenses, swarm_ev: &SwarmEvidence::default(),
+            sub_ev: &SubagentEvidence::default(), swarm_ev: &two_lenses,
             codex_reviews: &[], ctx: None, steps: None, transcript_path: None,
         }).0);
-        let three_lenses = completed_simplify_ev(cwg_common::SIMPLIFY_LENSES, first_ts + 20.0);
+        let three_lenses = completed_swarm_simplify_ev(cwg_common::SIMPLIFY_LENSES, first_ts + 20.0);
         let (ok_std_3, why_std_3) = validate_candidate_closure(CandidateClosureInput {
             receipt: Some(&rcp_std), marker_in: &m_std, checks_ev: &checks_ok,
-            sub_ev: &three_lenses, swarm_ev: &SwarmEvidence::default(),
+            sub_ev: &SubagentEvidence::default(), swarm_ev: &three_lenses,
             codex_reviews: &[], ctx: None, steps: None, transcript_path: None,
         });
         assert!(
@@ -12523,35 +13421,36 @@ mod tests {
 
         let (ok_hi_comb, why_hi_comb) = validate_candidate_closure(CandidateClosureInput {
             receipt: Some(&rcp_hi), marker_in: &m_hi, checks_ev: &checks_ok,
-            sub_ev: &std_sub_ev, swarm_ev: &SwarmEvidence::default(),
+            sub_ev: &SubagentEvidence::default(), swarm_ev: &std_sw_ev,
             codex_reviews: &rev_hi, ctx: None, steps: None, transcript_path: None,
         });
-        assert!(!ok_hi_comb && why_hi_comb.contains("simplify-reuse-reviewer"), "combined simplify-reviewer must NOT satisfy HIGH: {}", why_hi_comb);
+        assert!(!ok_hi_comb && why_hi_comb.contains("simplify-reuse"), "combined simplify-reviewer must NOT satisfy HIGH: {}", why_hi_comb);
         let blk_hi_msg = format_block_message(&why_hi_comb, 1, &m_hi, "sess-simp-hi", "n-hi", None);
         assert!(
-            blk_hi_msg.contains("simplify-reuse-reviewer")
-                && blk_hi_msg.contains("simplify-quality-reviewer")
-                && blk_hi_msg.contains("simplify-efficiency-reviewer")
+            blk_hi_msg.contains("simplify-reuse")
+                && blk_hi_msg.contains("simplify-quality")
+                && blk_hi_msg.contains("simplify-efficiency")
+                && blk_hi_msg.contains(cwg_common::SONNET_HIGH_MODEL)
                 && !blk_hi_msg.contains("Для независимого ревью"),
-            "HIGH simplify block must guide 3 fixed lenses first without jumping to review hint: {}",
+            "HIGH simplify block must guide 3 fixed swarm lenses first without jumping to review hint: {}",
             blk_hi_msg
         );
 
         let (ok_hi_2, why_hi_2) = validate_candidate_closure(CandidateClosureInput {
             receipt: Some(&rcp_hi), marker_in: &m_hi, checks_ev: &checks_ok,
-            sub_ev: &two_lenses, swarm_ev: &SwarmEvidence::default(),
+            sub_ev: &SubagentEvidence::default(), swarm_ev: &two_lenses,
             codex_reviews: &rev_hi, ctx: None, steps: None, transcript_path: None,
         });
-        assert!(!ok_hi_2 && why_hi_2.contains("missing: simplify-efficiency-reviewer"), "got: {}", why_hi_2);
+        assert!(!ok_hi_2 && why_hi_2.contains("missing: simplify-efficiency"), "got: {}", why_hi_2);
 
         assert!(validate_candidate_closure(CandidateClosureInput {
             receipt: Some(&rcp_hi), marker_in: &m_hi, checks_ev: &checks_ok,
-            sub_ev: &three_lenses, swarm_ev: &SwarmEvidence::default(),
+            sub_ev: &SubagentEvidence::default(), swarm_ev: &three_lenses,
             codex_reviews: &rev_hi, ctx: None, steps: None, transcript_path: None,
         }).0);
         assert!(validate_candidate_closure(CandidateClosureInput {
             receipt: Some(&rcp_xhi), marker_in: &m_hi, checks_ev: &checks_ok,
-            sub_ev: &three_lenses, swarm_ev: &SwarmEvidence::default(),
+            sub_ev: &SubagentEvidence::default(), swarm_ev: &three_lenses,
             codex_reviews: &rev_xhi, ctx: None, steps: None, transcript_path: None,
         }).0);
 
@@ -12562,7 +13461,7 @@ mod tests {
         })];
         let (ok_pre_rev, why_pre_rev) = validate_candidate_closure(CandidateClosureInput {
             receipt: Some(&rcp_hi), marker_in: &m_hi, checks_ev: &checks_ok,
-            sub_ev: &three_lenses, swarm_ev: &SwarmEvidence::default(),
+            sub_ev: &SubagentEvidence::default(), swarm_ev: &three_lenses,
             codex_reviews: &pre_simp_approved, ctx: None, steps: None, transcript_path: None,
         });
         assert!(!ok_pre_rev && why_pre_rev.contains("BEFORE mandatory simplify"), "got: {}", why_pre_rev);
@@ -12570,7 +13469,7 @@ mod tests {
         let _ = validate_candidate_closure_inner(
             CandidateClosureInput {
                 receipt: Some(&rcp_hi), marker_in: &m_hi, checks_ev: &checks_ok,
-                sub_ev: &three_lenses, swarm_ev: &SwarmEvidence::default(),
+                sub_ev: &SubagentEvidence::default(), swarm_ev: &three_lenses,
                 codex_reviews: &pre_simp_approved, ctx: None, steps: None, transcript_path: None,
             },
             Some(&mut pre_probe),
@@ -12579,7 +13478,7 @@ mod tests {
         let recovered_after_pre = vec![pre_simp_approved[0].clone(), rev_hi[0].clone()];
         let (ok_rec_post, res_rec_post) = validate_candidate_closure(CandidateClosureInput {
             receipt: Some(&rcp_hi), marker_in: &m_hi, checks_ev: &checks_ok,
-            sub_ev: &three_lenses, swarm_ev: &SwarmEvidence::default(),
+            sub_ev: &SubagentEvidence::default(), swarm_ev: &three_lenses,
             codex_reviews: &recovered_after_pre, ctx: None, steps: None, transcript_path: None,
         });
         assert!(ok_rec_post && res_rec_post == "verified", "post-simplify APPROVED after premature pre-simplify APPROVED must close cleanly: {}", res_rec_post);
@@ -12599,41 +13498,60 @@ mod tests {
         let rcp_pr = cwg_common::parse_terminal_receipt("[gate] pr-ready: HIGH; closure ready").unwrap();
         let (ok_pre_pr, why_pre_pr) = validate_candidate_closure(CandidateClosureInput {
             receipt: Some(&rcp_pr), marker_in: &m_hi, checks_ev: &checks_ok,
-            sub_ev: &three_lenses, swarm_ev: &SwarmEvidence::default(),
+            sub_ev: &SubagentEvidence::default(), swarm_ev: &three_lenses,
             codex_reviews: &pre_cls_revs, ctx: None, steps: Some(&pre_res_steps), transcript_path: None,
         });
         assert!(!ok_pre_pr && why_pre_pr.contains("BEFORE mandatory simplify"), "got: {}", why_pre_pr);
 
         // Pre-candidate stale simplify calls (launched before first_ts - 2) must NOT carry over.
-        let stale_tp = td.path.join("stale-simp.jsonl");
-        fs::write(&stale_tp, simplify_transcript_lines(cwg_common::SIMPLIFY_LENSES, first_ts - 30.0, Some(first_ts - 20.0), 1, "cid-stale")).unwrap();
-        let stale_steps = rio::read_transcript_steps(&stale_tp.to_string_lossy(), 200);
-        let stale_sub_ev = scan_native_subagents(&stale_steps, Some(&stale_tp.to_string_lossy()), first_ts);
-        assert!(stale_sub_ev.simplify_successes.is_empty(), "pre-candidate simplify must not leak into new candidate");
+        let stale_brain = td.path.join("stale-brain");
+        let stale_tp = write_swarm_simplify_session(
+            &stale_brain,
+            "sess-simp-stale",
+            cwg_common::SIMPLIFY_LENSES,
+            cwg_common::SONNET_HIGH_MODEL,
+            first_ts - 30.0,
+            Some(first_ts - 20.0),
+            true,
+            true,
+            "",
+        );
+        let stale_tp_s = stale_tp.to_string_lossy().into_owned();
+        let stale_steps = rio::read_transcript_steps(&stale_tp_s, 200);
+        let stale_sw_ev = scan_swarm_activity(SwarmScanInput {
+            steps: &stale_steps,
+            transcript_path: Some(&stale_tp_s),
+            first_ts,
+            round_start_msg_id: 0,
+            cwd: &repo_norm,
+            marker: Some(&m_hi),
+        });
+        assert!(stale_sw_ev.simplify_runs.is_empty(), "pre-candidate swarm simplify must not leak into new candidate");
 
-        // 4. Failure retry vs 2-failure Exhausted -> allows terminal draft-blocked.
-        let mut fail1_ev = completed_simplify_ev(&["simplify-reuse-reviewer", "simplify-quality-reviewer"], first_ts + 20.0);
-        fail1_ev.simplify_failures.insert("simplify-efficiency-reviewer".to_string(), vec![first_ts + 22.0]);
+        // 4. Failure retry vs Exhausted (3 failures or 2 failures with all swarm tiers degraded) -> allows terminal draft-blocked.
+        let mut fail1_sw = completed_swarm_simplify_ev(&["simplify-reuse-reviewer", "simplify-quality-reviewer"], first_ts + 20.0);
+        fail1_sw.simplify_failures.insert("simplify-efficiency-reviewer".to_string(), vec![first_ts + 22.0]);
         let rcp_draft = cwg_common::parse_terminal_receipt("[gate] draft-blocked: SIMPLIFY_UNAVAILABLE").unwrap();
         assert!(!validate_candidate_closure(CandidateClosureInput {
             receipt: Some(&rcp_draft), marker_in: &m_hi, checks_ev: &checks_ok,
-            sub_ev: &fail1_ev, swarm_ev: &SwarmEvidence::default(),
+            sub_ev: &SubagentEvidence::default(), swarm_ev: &fail1_sw,
             codex_reviews: &[], ctx: None, steps: None, transcript_path: None,
         }).0, "single simplify failure must require retry before draft-blocked");
-        fail1_ev.simplify_failures.get_mut("simplify-efficiency-reviewer").unwrap().push(first_ts + 26.0);
+        fail1_sw.simplify_failures.get_mut("simplify-efficiency-reviewer").unwrap().push(first_ts + 26.0);
+        fail1_sw.simplify_failures.get_mut("simplify-efficiency-reviewer").unwrap().push(first_ts + 29.0);
         let (ok_exh_v, why_exh_v) = validate_candidate_closure(CandidateClosureInput {
             receipt: Some(&rcp_hi), marker_in: &m_hi, checks_ev: &checks_ok,
-            sub_ev: &fail1_ev, swarm_ev: &SwarmEvidence::default(),
+            sub_ev: &SubagentEvidence::default(), swarm_ev: &fail1_sw,
             codex_reviews: &[], ctx: None, steps: None, transcript_path: None,
         });
         assert!(!ok_exh_v && why_exh_v.contains("draft-blocked"), "exhausted lane block must surface draft-blocked escape: {}", why_exh_v);
         assert!(validate_candidate_closure(CandidateClosureInput {
             receipt: Some(&rcp_draft), marker_in: &m_hi, checks_ev: &checks_ok,
-            sub_ev: &fail1_ev, swarm_ev: &SwarmEvidence::default(),
+            sub_ev: &SubagentEvidence::default(), swarm_ev: &fail1_sw,
             codex_reviews: &[], ctx: None, steps: None, transcript_path: None,
-        }).0, "2 simplify failures after durable edit must allow terminal draft-blocked");
+        }).0, "3 simplify failures after durable edit must allow terminal draft-blocked");
 
-        // 5. codex-lane review Round 1 pre-review guard blocks missing OR in-flight simplify lenses when transcript exists, and clears once all 3 lenses complete.
+        // 5. codex-lane review Round 1 pre-review guard blocks missing, in-flight, OR unkilled simplify workers, and clears once all 3 lenses complete and are killed.
         let cli_sess = "sess-codex-pre-simp";
         let m_cli = json!({
             "session": cli_sess, "class": cwg_common::WORK_PERSISTENT, "closed": false,
@@ -12642,25 +13560,38 @@ mod tests {
             "content_marks": [{"ts": first_ts + 10.0, "fp": fp_hi}],
         });
         rio::write_json(&cwg_common::marker_path(cli_sess), &m_cli).unwrap();
-        let cli_tp = td.path.join("cli-simp.jsonl");
-        fs::write(&cli_tp, format!("{}\n", json!({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "fix ci"}))).unwrap();
+        let cli_brain = td.path.join("cli-brain");
+        let cli_tp = write_swarm_simplify_session(
+            &cli_brain, cli_sess, &[], cwg_common::SONNET_HIGH_MODEL, first_ts + 20.0, None, true, true, "",
+        );
         let cli_tp_s = cli_tp.to_string_lossy().into_owned();
 
         let sum_miss = evaluate_closure_cycle_for_marker(&m_cli, cli_sess, &repo_norm, &cli_tp_s, "");
         assert!(sum_miss.has_transcript && sum_miss.missing_simplify_lenses.len() == 3);
-        assert!(codex_lane::pre_review_simplify_error(&sum_miss, "ordinary").is_some_and(|m| m.contains("simplify-reuse-reviewer")));
+        assert!(codex_lane::pre_review_simplify_error(&sum_miss, "ordinary").is_some_and(|m| m.contains("simplify-reuse")));
 
-        // Write in-flight (not yet delivered) 3 lenses: still blocked.
-        fs::write(&cli_tp, simplify_transcript_lines(cwg_common::SIMPLIFY_LENSES, first_ts + 20.0, None, 1, "cid-inf")).unwrap();
+        // In-flight (not yet posted) 3 swarm lenses: still blocked.
+        let _ = write_swarm_simplify_session(
+            &cli_brain, cli_sess, cwg_common::SIMPLIFY_LENSES, cwg_common::SONNET_HIGH_MODEL, first_ts + 20.0, None, false, true, "",
+        );
         let sum_inf = evaluate_closure_cycle_for_marker(&m_cli, cli_sess, &repo_norm, &cli_tp_s, "");
         assert!(sum_inf.has_transcript && sum_inf.missing_simplify_lenses.len() == 3 && sum_inf.in_flight_simplify_lenses.len() == 3);
         assert!(codex_lane::pre_review_simplify_error(&sum_inf, "ordinary").is_some_and(|m| m.contains("in_flight:")));
 
-        // Write completed 3 lenses: pre-review guard clears!
-        fs::write(&cli_tp, simplify_transcript_lines(cwg_common::SIMPLIFY_LENSES, first_ts + 20.0, Some(first_ts + 25.0), 1, "cid-ok")).unwrap();
+        // Completed 3 lenses STILL UNKILLED -> pre_review_simplify_error clears, but pre_review_simplify_block_for_session & codex-lane CLI reject until killed!
+        let _ = write_swarm_simplify_session(
+            &cli_brain, cli_sess, cwg_common::SIMPLIFY_LENSES, cwg_common::SONNET_HIGH_MODEL, first_ts + 20.0, Some(first_ts + 25.0), false, true, "",
+        );
+        assert!(pre_review_simplify_block_for_session(cli_sess, &cli_tp_s, "").is_some_and(|m| m.contains("must be killed")));
+
+        // Killed completed 3 lenses -> clears cleanly!
+        let _ = write_swarm_simplify_session(
+            &cli_brain, cli_sess, cwg_common::SIMPLIFY_LENSES, cwg_common::SONNET_HIGH_MODEL, first_ts + 20.0, Some(first_ts + 25.0), true, true, "",
+        );
         let sum_ok = evaluate_closure_cycle_for_marker(&m_cli, cli_sess, &repo_norm, &cli_tp_s, "");
         assert!(sum_ok.has_transcript && sum_ok.missing_simplify_lenses.is_empty() && sum_ok.in_flight_simplify_lenses.is_empty());
         assert!(codex_lane::pre_review_simplify_error(&sum_ok, "ordinary").is_none());
+        assert!(pre_review_simplify_block_for_session(cli_sess, &cli_tp_s, "").is_none());
 
         // Sibling transcript_full.jsonl without transcript.jsonl must still set has_transcript = true.
         let full_only_dir = td.path.join("full_only_logs");
@@ -12671,16 +13602,25 @@ mod tests {
         let sum_full_only = evaluate_closure_cycle_for_marker(&m_cli, cli_sess, &repo_norm, &missing_compact_tp, "");
         assert!(sum_full_only.has_transcript && sum_full_only.missing_simplify_lenses.len() == 3);
 
-        // Test live CLI rejection via codex_lane::run_cli when transcript under brain_root has missing simplify.
+        // Test live CLI rejection via codex_lane::run_cli when transcript under brain_root has missing simplify AND when completed simplify workers are unkilled.
         let brain_dir = td.path.join("brain_cli");
-        let brain_tp = rio::member_transcript_path(&brain_dir, cli_sess);
-        fs::create_dir_all(brain_tp.parent().unwrap()).unwrap();
-        fs::write(&brain_tp, format!("{}\n", json!({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "fix ci"}))).unwrap();
+        let brain_tp = write_swarm_simplify_session(
+            &brain_dir, cli_sess, &[], cwg_common::SONNET_HIGH_MODEL, first_ts + 20.0, None, true, true, "",
+        );
         let prev_br = std::env::var("ANTIGRAVITY_BRAIN_ROOT").ok();
         unsafe { std::env::set_var("ANTIGRAVITY_BRAIN_ROOT", &brain_dir) };
         let rc_pre = codex_lane::run_cli(&[
             "review".into(), "--cwd".into(), repo_norm.clone(), "--session".into(), cli_sess.into(),
             "--summary".into(), "round 1 without simplify".into(),
+        ]);
+        assert_eq!(rc_pre, 2, "codex-lane review Round 1 must reject missing_pre_review_simplify when 3 lenses have not completed");
+
+        let _ = write_swarm_simplify_session(
+            &brain_dir, cli_sess, cwg_common::SIMPLIFY_LENSES, cwg_common::SONNET_HIGH_MODEL, first_ts + 20.0, Some(first_ts + 25.0), false, true, "",
+        );
+        let rc_alive = codex_lane::run_cli(&[
+            "review".into(), "--cwd".into(), repo_norm.clone(), "--session".into(), cli_sess.into(),
+            "--summary".into(), "round 1 with unkilled simplify".into(),
         ]);
         unsafe {
             match prev_br {
@@ -12688,9 +13628,12 @@ mod tests {
                 None => std::env::remove_var("ANTIGRAVITY_BRAIN_ROOT"),
             }
         }
-        assert_eq!(rc_pre, 2, "codex-lane review Round 1 must reject missing_pre_review_simplify when 3 lenses have not completed");
+        assert_eq!(rc_alive, 2, "codex-lane review Round 1 must reject active_simplify_workers_present when simplify workers are not killed");
 
-        // R1 #1: Internal fallback review routes (`invoke_subagent(adversarial-reviewer*)` and `swarm(add, internal-reviewer)`) must ALSO deny before simplify and allow once all 3 lenses complete.
+        // R1 #1: Internal fallback review routes (`invoke_subagent(adversarial-reviewer*)` and `swarm(add, internal-reviewer)`) must ALSO deny before simplify and allow once all 3 lenses complete and are killed.
+        let _ = write_swarm_simplify_session(
+            &brain_dir, cli_sess, &[], cwg_common::SONNET_HIGH_MODEL, first_ts + 20.0, None, true, true, "",
+        );
         let guard_payload_miss = json!({
             "conversationId": cli_sess,
             "transcriptPath": brain_tp.to_string_lossy(),
@@ -12700,28 +13643,45 @@ mod tests {
             &json!({"TypeName": "adversarial-reviewer", "Model": "inherit", "Prompt": "Review this HIGH candidate thoroughly."}),
         );
         assert_eq!(sub_dec_miss, "deny");
-        assert!(sub_why_miss.as_deref().unwrap_or("").contains("simplify-reuse-reviewer"));
+        assert!(sub_why_miss.as_deref().unwrap_or("").contains("simplify-reuse"));
 
-        let (sw_dec_miss, sw_why_miss) = crate::safety_guards::guard_swarm_invocation_with_payload(
+        let (sw_dec_miss, sw_why_miss, _) = crate::safety_guards::guard_swarm_invocation_with_payload(
             &json!({"action": "add", "name": "internal-reviewer", "model": cwg_common::OPUS_HIGH_MODEL, "brief": "Adversarial review of candidate"}),
             Some(&guard_payload_miss),
         );
         assert_eq!(sw_dec_miss, "deny");
-        assert!(sw_why_miss.as_deref().unwrap_or("").contains("simplify-reuse-reviewer"));
+        assert!(sw_why_miss.as_deref().unwrap_or("").contains("simplify-reuse"));
 
-        let (sw_scout_ok, _) = crate::safety_guards::guard_swarm_invocation_with_payload(
+        let (sw_scout_ok, _, _) = crate::safety_guards::guard_swarm_invocation_with_payload(
             &json!({"action": "add", "name": "scout-1", "model": cwg_common::NEON_HIGH_MODEL, "brief": "Map repository files"}),
             Some(&guard_payload_miss),
         );
         assert_eq!(sw_scout_ok, "allow", "non-review swarm worker must remain allowed before simplify");
 
-        fs::write(&brain_tp, simplify_transcript_lines(cwg_common::SIMPLIFY_LENSES, first_ts + 20.0, Some(first_ts + 25.0), 1, "cid-guard-ok")).unwrap();
+        // Verify PreToolUse hook denial mentioning "quota" does NOT poison neon_simplify_issue_verified!
+        let poison_tx = format!(
+            "{}\n{}\n",
+            json!({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": crate::win32_sqlite::format_iso_utc(first_ts + 12.0), "tool_calls": [{"name": "swarm", "args": {"action": "add", "name": "simplify-reuse", "model": cwg_common::NEON_XHIGH_MODEL, "brief": "Bounded diff packet"}}]}),
+            json!({"step_index": 2, "source": "SYSTEM", "type": "GENERIC", "status": "ERROR", "created_at": crate::win32_sqlite::format_iso_utc(first_ts + 12.2), "content": "[Code Work Gate] Simplify worker `simplify-reuse` must try primary `claude-sonnet-5-5-high` first; fallback to `gemini-4-neon-xhigh` is allowed ONLY after a verified `claude-sonnet-5-5-high` error, quota exhaustion, or unavailability"})
+        );
+        let _ = write_swarm_simplify_session(
+            &brain_dir, cli_sess, &[], cwg_common::SONNET_HIGH_MODEL, first_ts + 20.0, None, true, true, &poison_tx,
+        );
+        let (sw_hydro_still_deny, _, _) = crate::safety_guards::guard_swarm_invocation_with_payload(
+            &json!({"action": "add", "name": "simplify-reuse", "model": cwg_common::HYDROGEN_XHIGH_MODEL, "brief": "Bounded diff packet for reuse lens"}),
+            Some(&guard_payload_miss),
+        );
+        assert_eq!(sw_hydro_still_deny, "deny", "local PreToolUse denial mentioning quota must NOT mark Neon degraded");
+
+        let _ = write_swarm_simplify_session(
+            &brain_dir, cli_sess, cwg_common::SIMPLIFY_LENSES, cwg_common::SONNET_HIGH_MODEL, first_ts + 20.0, Some(first_ts + 25.0), true, true, "",
+        );
         let (sub_dec_ok, _, _) = crate::safety_guards::guard_subagent_invocation_with_payload(
             &guard_payload_miss,
             &json!({"TypeName": "adversarial-reviewer", "Model": "inherit", "Prompt": "Review this HIGH candidate thoroughly."}),
         );
         assert_eq!(sub_dec_ok, "allow");
-        let (sw_dec_ok, _) = crate::safety_guards::guard_swarm_invocation_with_payload(
+        let (sw_dec_ok, _, _) = crate::safety_guards::guard_swarm_invocation_with_payload(
             &json!({"action": "add", "name": "internal-reviewer", "model": cwg_common::OPUS_HIGH_MODEL, "brief": "Adversarial review of candidate"}),
             Some(&guard_payload_miss),
         );
@@ -12729,9 +13689,11 @@ mod tests {
 
         // R2 #1: Cycle reset (STANDARD with require_review_on_standard gets APPROVED, then CI edit elevates risk to HIGH and sets pending_reset_ts) must preserve transcript & missing 3 HIGH simplify lenses in BOTH codex-lane and internal fallback guards.
         let esc_sess = "sess-r2-reset-std-to-high";
-        let esc_tp = td.path.join("r2-reset-std-to-high.jsonl");
+        let esc_brain = td.path.join("esc-brain");
+        let esc_tp = write_swarm_simplify_session(
+            &esc_brain, esc_sess, &[cwg_common::SIMPLIFY_LANE], cwg_common::SONNET_HIGH_MODEL, first_ts + 5.0, Some(first_ts + 8.0), true, true, "",
+        );
         let esc_tp_s = esc_tp.to_string_lossy().into_owned();
-        fs::write(&esc_tp, simplify_transcript_lines(&[cwg_common::SIMPLIFY_LANE], first_ts + 5.0, Some(first_ts + 8.0), 1, "cid-std-1")).unwrap();
         let m_std_esc = json!({
             "session": esc_sess, "class": cwg_common::WORK_PERSISTENT, "closed": false,
             "first_ts": first_ts, "last_ts": first_ts + 30.0, "last_durable_ts": first_ts + 30.0,
@@ -12747,19 +13709,21 @@ mod tests {
             "launch_ts": first_ts + 12.0, "verdict_ts": first_ts + 15.0, "xhigh": false,
         })];
         let esc_steps = rio::read_transcript_steps(&esc_tp_s, 200);
-        let esc_sub_ev = scan_native_subagents(&esc_steps, Some(&esc_tp_s), first_ts);
+        let esc_sw_ev = scan_swarm_activity(SwarmScanInput {
+            steps: &esc_steps, transcript_path: Some(&esc_tp_s), first_ts, round_start_msg_id: 0, cwd: &repo_norm, marker: Some(&m_std_esc),
+        });
         let mut reset_probe = codex_lane::ClosureCycleSummary::default();
         let _ = validate_candidate_closure_inner(
             CandidateClosureInput {
                 receipt: Some(&rcp_hi), marker_in: &m_std_esc, checks_ev: &checks_ok,
-                sub_ev: &esc_sub_ev, swarm_ev: &SwarmEvidence::default(),
+                sub_ev: &SubagentEvidence::default(), swarm_ev: &esc_sw_ev,
                 codex_reviews: &std_app_rev, ctx: None, steps: Some(&esc_steps), transcript_path: Some(&esc_tp_s),
             },
             Some(&mut reset_probe),
         );
         assert!(reset_probe.cycle_reset_ts > first_ts + 25.0, "expected cycle reset after CI edit");
         assert!(reset_probe.has_transcript && reset_probe.missing_simplify_lenses.len() == 3, "cycle reset probe must keep transcript & 3 missing HIGH simplify lenses: {:?}", reset_probe);
-        assert!(codex_lane::pre_review_simplify_error(&reset_probe, "ordinary").is_some_and(|m| m.contains("simplify-reuse-reviewer")));
+        assert!(codex_lane::pre_review_simplify_error(&reset_probe, "ordinary").is_some_and(|m| m.contains("simplify-reuse")));
 
         // R2 #1b: Non-reset escalation (STANDARD Round 1 REVISE -> CI edit raises to HIGH) must ALSO block Round 2 until all 3 HIGH lenses complete.
         let std_revise_rev = vec![json!({
@@ -12770,13 +13734,13 @@ mod tests {
         let _ = validate_candidate_closure_inner(
             CandidateClosureInput {
                 receipt: Some(&rcp_hi), marker_in: &m_std_esc, checks_ev: &checks_ok,
-                sub_ev: &esc_sub_ev, swarm_ev: &SwarmEvidence::default(),
+                sub_ev: &SubagentEvidence::default(), swarm_ev: &esc_sw_ev,
                 codex_reviews: &std_revise_rev, ctx: None, steps: Some(&esc_steps), transcript_path: Some(&esc_tp_s),
             },
             Some(&mut nonreset_probe),
         );
         assert_eq!(nonreset_probe.counted_ordinary_rounds, 1);
-        assert!(codex_lane::pre_review_simplify_error(&nonreset_probe, "ordinary").is_some_and(|m| m.contains("simplify-reuse-reviewer")));
+        assert!(codex_lane::pre_review_simplify_error(&nonreset_probe, "ordinary").is_some_and(|m| m.contains("simplify-reuse")));
 
         // R2 #2: 4 pre-simplify ordinary rounds ending in APPROVED followed by mandatory 3-lens simplify must reject Stop closure with BEFORE mandatory simplify AND keep post-simplify ordinary round budget at 0/4 (no deadlock / forced draft-blocked).
         let four_pre_simp = vec![
@@ -12787,7 +13751,7 @@ mod tests {
         ];
         let (ok_4pre, why_4pre) = validate_candidate_closure(CandidateClosureInput {
             receipt: Some(&rcp_hi), marker_in: &m_hi, checks_ev: &checks_ok,
-            sub_ev: &three_lenses, swarm_ev: &SwarmEvidence::default(),
+            sub_ev: &SubagentEvidence::default(), swarm_ev: &three_lenses,
             codex_reviews: &four_pre_simp, ctx: None, steps: None, transcript_path: None,
         });
         assert!(!ok_4pre && why_4pre.contains("BEFORE mandatory simplify"), "got: {}", why_4pre);
@@ -12795,7 +13759,7 @@ mod tests {
         let _ = validate_candidate_closure_inner(
             CandidateClosureInput {
                 receipt: Some(&rcp_hi), marker_in: &m_hi, checks_ev: &checks_ok,
-                sub_ev: &three_lenses, swarm_ev: &SwarmEvidence::default(),
+                sub_ev: &SubagentEvidence::default(), swarm_ev: &three_lenses,
                 codex_reviews: &four_pre_simp, ctx: None, steps: None, transcript_path: None,
             },
             Some(&mut probe_4pre),
@@ -12808,15 +13772,22 @@ mod tests {
         after_4pre_recovered.push(rev_hi[0].clone());
         let (ok_4pre_rec, res_4pre_rec) = validate_candidate_closure(CandidateClosureInput {
             receipt: Some(&rcp_hi), marker_in: &m_hi, checks_ev: &checks_ok,
-            sub_ev: &three_lenses, swarm_ev: &SwarmEvidence::default(),
+            sub_ev: &SubagentEvidence::default(), swarm_ev: &three_lenses,
             codex_reviews: &after_4pre_recovered, ctx: None, steps: None, transcript_path: None,
         });
         assert!(ok_4pre_rec && res_4pre_rec == "verified", "post-simplify APPROVED after 4 pre-simplify rounds must close verified: {}", res_4pre_rec);
 
         // Anti-laundering: A later simplify failure + retry after 4 post-simplify REVISE rounds must NOT advance simplify_completed_ts or clear counted post-simplify rounds.
-        let mut launder_ev = three_lenses.clone();
-        launder_ev.simplify_failures.insert("simplify-reuse-reviewer".to_string(), vec![first_ts + 80.0]);
-        launder_ev.simplify_successes.get_mut("simplify-reuse-reviewer").unwrap().push(first_ts + 85.0);
+        let mut launder_sw = three_lenses.clone();
+        launder_sw.simplify_failures.insert("simplify-reuse-reviewer".to_string(), vec![first_ts + 80.0]);
+        launder_sw.simplify_runs.push(SwarmSimplifyRun {
+            lane: "simplify-reuse-reviewer",
+            worker: "simplify-reuse-2".to_string(),
+            model: cwg_common::SONNET_HIGH_MODEL.to_string(),
+            launch_ts: first_ts + 82.0,
+            done_ts: first_ts + 85.0,
+            has_fixed_prompt: true,
+        });
         let four_post_revise = vec![
             json!({"engine": "codex", "kind": "ordinary", "verdict": "REVISE", "launch_ts": first_ts + 30.0, "verdict_ts": first_ts + 31.0, "xhigh": false}),
             json!({"engine": "codex", "kind": "ordinary", "verdict": "REVISE", "launch_ts": first_ts + 40.0, "verdict_ts": first_ts + 41.0, "xhigh": false}),
@@ -12827,7 +13798,7 @@ mod tests {
         let _ = validate_candidate_closure_inner(
             CandidateClosureInput {
                 receipt: Some(&rcp_hi), marker_in: &m_hi, checks_ev: &checks_ok,
-                sub_ev: &launder_ev, swarm_ev: &SwarmEvidence::default(),
+                sub_ev: &SubagentEvidence::default(), swarm_ev: &launder_sw,
                 codex_reviews: &four_post_revise, ctx: None, steps: None, transcript_path: None,
             },
             Some(&mut launder_probe),
@@ -12835,5 +13806,353 @@ mod tests {
         assert_eq!(launder_probe.counted_ordinary_rounds, 4, "later simplify retry must never launder 4 counted post-simplify rounds");
         assert!(launder_probe.ordinary_cap_reached);
         assert!((launder_probe.simplify_completed_ts - (first_ts + 20.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_simplify_codex_r1_regressions() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let td = TempEnvDir::new("simplify-r1-reg");
+        let repo = td.path.join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let std_file = repo.join("src").join("util.rs");
+        fs::create_dir_all(std_file.parent().unwrap()).unwrap();
+        fs::write(&std_file, "pub fn rate_limit() -> u16 { 429 }\n").unwrap();
+        let repo_norm = rio::normalize_path(&repo.to_string_lossy());
+        let std_norm = rio::normalize_path(&std_file.to_string_lossy());
+        let fp_std = cwg_common::content_fingerprint(std::slice::from_ref(&std_norm), 4_000_000);
+        let now = now_sec();
+        let first_ts = now - 100.0;
+        let iso = |ts: f64| crate::win32_sqlite::format_iso_utc(ts);
+        let fixed_std_brief = cwg_common::build_fixed_simplify_brief(
+            cwg_common::SIMPLIFY_LANE,
+            "Repo C:/repo changed src/util.rs",
+        )
+        .unwrap();
+        let fixed_reuse_brief = cwg_common::build_fixed_simplify_brief(
+            "simplify-reuse-reviewer",
+            "Repo C:/repo changed src/util.rs",
+        )
+        .unwrap();
+        let checks_ok = ChecksEvidence {
+            checks_count: 1,
+            passed_count: 1,
+            latest_pass_ts: first_ts + 40.0,
+            ..Default::default()
+        };
+
+        // R1 #1: Free assistant text, unconfirmed transcript-only post, intermediate post stopped right after "posted" or followed by hung/killed tool call or error must NOT count; valid final board report quoting "429" / "timed out" MUST count.
+        let brain1 = td.path.join("brain1");
+        let sess1 = "sess-r1-1";
+        let w_cid_free = "cid-free-text";
+        let w_cid_hung = "cid-hung-mid";
+        let w_cid_stopped_post = "cid-stopped-after-post";
+        let w_cid_unconf_post = "cid-unconfirmed-post";
+        let w_cid_err = "cid-post-then-err";
+        let w_cid_429 = "cid-valid-429";
+        let w_cid_killed_on_done = "cid-killed-after-done-post";
+        let w_cid_interim_no_act = "cid-interim-no-actionable";
+        let write_w_tx = |cid: &str, rows: &[Value]| {
+            let p = rio::member_transcript_path(&brain1, cid);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(&p, rows.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n").unwrap();
+        };
+        write_w_tx(w_cid_free, &[
+            json!({"step_index": 0, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": iso(first_ts + 12.0), "content": "No actionable simplifications.", "tool_calls": []}),
+        ]);
+        write_w_tx(w_cid_hung, &[
+            json!({"step_index": 0, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": iso(first_ts + 12.0), "tool_calls": [{"name": "post_message", "args": {"text": "@coordinator starting simplify..."}}]}),
+            json!({"step_index": 1, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": iso(first_ts + 12.2), "content": "{\"status\":\"posted\"}"}),
+            json!({"step_index": 2, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": iso(first_ts + 13.0), "tool_calls": [{"name": "read_file", "args": {"Path": "src/util.rs"}}]}),
+        ]);
+        write_w_tx(w_cid_stopped_post, &[
+            json!({"step_index": 0, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": iso(first_ts + 12.0), "tool_calls": [{"name": "post_message", "args": {"text": "@coordinator starting simplify..."}}]}),
+            json!({"step_index": 1, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": iso(first_ts + 12.2), "content": "{\"status\":\"posted\"}"}),
+        ]);
+        write_w_tx(w_cid_unconf_post, &[
+            json!({"step_index": 0, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": iso(first_ts + 12.0), "tool_calls": [{"name": "post_message", "args": {"text": "@coordinator [done] No actionable simplifications."}}]}),
+            json!({"step_index": 1, "source": "SYSTEM", "type": "GENERIC", "status": "ERROR", "created_at": iso(first_ts + 12.2), "content": "board write failed"}),
+            json!({"step_index": 2, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": iso(first_ts + 12.5), "content": "Done.", "tool_calls": []}),
+        ]);
+        write_w_tx(w_cid_err, &[
+            json!({"step_index": 0, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": iso(first_ts + 12.0), "tool_calls": [{"name": "post_message", "args": {"text": "@coordinator [done] partial"}}]}),
+            json!({"step_index": 1, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": iso(first_ts + 12.2), "content": "{\"status\":\"posted\"}"}),
+            json!({"step_index": 2, "source": "MODEL", "type": "ERROR_MESSAGE", "status": "ERROR", "created_at": iso(first_ts + 14.0), "content": "connection dropped"}),
+        ]);
+        write_w_tx(w_cid_429, &[
+            json!({"step_index": 0, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": iso(first_ts + 12.0), "tool_calls": [{"name": "post_message", "args": {"text": "@coordinator [done] Checked HTTP 429 retry and timed out branch: No actionable simplifications."}}]}),
+            json!({"step_index": 1, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": iso(first_ts + 12.2), "content": "{\"status\":\"posted\"}"}),
+            json!({"step_index": 2, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": iso(first_ts + 12.5), "content": "Done.", "tool_calls": []}),
+        ]);
+        // R3-1: Worker killed immediately after posting final `@coordinator [done]` report (transcript ends on `{"status":"posted"}` ack, no subsequent error) MUST still count!
+        write_w_tx(w_cid_killed_on_done, &[
+            json!({"step_index": 0, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": iso(first_ts + 12.0), "tool_calls": [{"name": "post_message", "args": {"text": "@coordinator [done] No actionable simplifications."}}]}),
+            json!({"step_index": 1, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": iso(first_ts + 12.2), "content": "{\"status\":\"posted\"}"}),
+        ]);
+        // R1-1 (R4 regression): Interim post mentioning "No actionable findings yet; still checking tests" without `@coordinator [done]` prefix killed right after `posted` MUST be rejected!
+        write_w_tx(w_cid_interim_no_act, &[
+            json!({"step_index": 0, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": iso(first_ts + 12.0), "tool_calls": [{"name": "post_message", "args": {"text": "@coordinator No actionable findings yet; still checking tests"}}]}),
+            json!({"step_index": 1, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": iso(first_ts + 12.2), "content": "{\"status\":\"posted\"}"}),
+        ]);
+        let tp1 = setup_neon_session_env(
+            &brain1,
+            sess1,
+            &format!("{}\n", json!({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": iso(first_ts), "content": "simplify"})),
+            json!({"members": {
+                "simplify-reviewer-1": {"role": "worker", "conversation_id": w_cid_free, "model": cwg_common::SONNET_HIGH_MODEL, "brief": fixed_std_brief, "state": "killed", "killed": true},
+                "simplify-reviewer-2": {"role": "worker", "conversation_id": w_cid_hung, "model": cwg_common::SONNET_HIGH_MODEL, "brief": fixed_std_brief, "state": "killed", "killed": true},
+                "simplify-reviewer-3": {"role": "worker", "conversation_id": w_cid_err, "model": cwg_common::SONNET_HIGH_MODEL, "brief": fixed_std_brief, "state": "killed", "killed": true},
+                "simplify-reviewer-4": {"role": "worker", "conversation_id": w_cid_429, "model": cwg_common::SONNET_HIGH_MODEL, "brief": fixed_std_brief, "state": "killed", "killed": true},
+                "simplify-reviewer-5": {"role": "worker", "conversation_id": w_cid_stopped_post, "model": cwg_common::SONNET_HIGH_MODEL, "brief": fixed_std_brief, "state": "killed", "killed": true},
+                "simplify-reviewer-6": {"role": "worker", "conversation_id": w_cid_unconf_post, "model": cwg_common::SONNET_HIGH_MODEL, "brief": fixed_std_brief, "state": "killed", "killed": true},
+                "simplify-reviewer-7": {"role": "worker", "conversation_id": w_cid_killed_on_done, "model": cwg_common::SONNET_HIGH_MODEL, "brief": fixed_std_brief, "state": "killed", "killed": true},
+                "simplify-reviewer-8": {"role": "worker", "conversation_id": w_cid_interim_no_act, "model": cwg_common::SONNET_HIGH_MODEL, "brief": fixed_std_brief, "state": "killed", "killed": true},
+            }}),
+            &[
+                json!({"seq": 1, "agent": "coordinator", "time": iso(first_ts + 10.0), "text": format!("@simplify-reviewer-1 {}", fixed_std_brief)}),
+                json!({"seq": 2, "agent": "coordinator", "time": iso(first_ts + 10.0), "text": format!("@simplify-reviewer-2 {}", fixed_std_brief)}),
+                json!({"seq": 3, "agent": "simplify-reviewer-2", "time": iso(first_ts + 12.2), "text": "@coordinator starting simplify..."}),
+                json!({"seq": 4, "agent": "coordinator", "time": iso(first_ts + 10.0), "text": format!("@simplify-reviewer-3 {}", fixed_std_brief)}),
+                json!({"seq": 5, "agent": "simplify-reviewer-3", "time": iso(first_ts + 12.2), "text": "@coordinator [done] partial"}),
+                json!({"seq": 6, "agent": "coordinator", "time": iso(first_ts + 10.0), "text": format!("@simplify-reviewer-4 {}", fixed_std_brief)}),
+                json!({"seq": 7, "agent": "simplify-reviewer-4", "time": iso(first_ts + 12.2), "text": "@coordinator [done] Checked HTTP 429 retry and timed out branch: No actionable simplifications."}),
+                json!({"seq": 8, "agent": "coordinator", "time": iso(first_ts + 10.0), "text": format!("@simplify-reviewer-5 {}", fixed_std_brief)}),
+                json!({"seq": 9, "agent": "simplify-reviewer-5", "time": iso(first_ts + 12.2), "text": "@coordinator starting simplify..."}),
+                json!({"seq": 10, "agent": "coordinator", "time": iso(first_ts + 10.0), "text": format!("@simplify-reviewer-6 {}", fixed_std_brief)}),
+                json!({"seq": 11, "agent": "coordinator", "time": iso(first_ts + 10.0), "text": format!("@simplify-reviewer-7 {}", fixed_std_brief)}),
+                json!({"seq": 12, "agent": "simplify-reviewer-7", "time": iso(first_ts + 12.2), "text": "@coordinator [done] No actionable simplifications."}),
+                json!({"seq": 13, "agent": "coordinator", "time": iso(first_ts + 10.0), "text": format!("@simplify-reviewer-8 {}", fixed_std_brief)}),
+                json!({"seq": 14, "agent": "simplify-reviewer-8", "time": iso(first_ts + 12.2), "text": "@coordinator No actionable findings yet; still checking tests"}),
+            ],
+            &[],
+        );
+        let tp1_s = tp1.to_string_lossy().into_owned();
+        let sw1 = scan_swarm_activity(SwarmScanInput {
+            steps: &rio::read_transcript_steps(&tp1_s, 200),
+            transcript_path: Some(&tp1_s),
+            first_ts,
+            round_start_msg_id: 0,
+            cwd: &repo_norm,
+            marker: None,
+        });
+        let sw1_workers: BTreeSet<&str> = sw1.simplify_runs.iter().map(|r| r.worker.as_str()).collect();
+        assert_eq!(
+            sw1_workers,
+            BTreeSet::from(["simplify-reviewer-4", "simplify-reviewer-7"]),
+            "only confirmed final reports (clean park or killed right after done post) may count: {:?}",
+            sw1.simplify_runs
+        );
+        assert!(sw1.simplify_runs.iter().all(|r| r.has_fixed_prompt));
+
+        // R1 #2 + R2-1: Collapsed-whitespace prompt fails exact check and gets rewritten by build_fixed_simplify_brief; marker-only spoof and ad-hoc follow-up fail; Swarm Wait Guard `Call post_message` nudge preserves in-candidate fixed prompt!
+        let collapsed_brief = fixed_std_brief.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            !cwg_common::has_fixed_simplify_prompt(cwg_common::SIMPLIFY_LANE, &collapsed_brief),
+            "collapsed-whitespace prompt must NOT pass exact canonical fixed-prompt check"
+        );
+        let rewritten_collapsed =
+            cwg_common::build_fixed_simplify_brief(cwg_common::SIMPLIFY_LANE, &collapsed_brief).unwrap();
+        assert_ne!(rewritten_collapsed, collapsed_brief);
+        assert!(cwg_common::has_fixed_simplify_prompt(cwg_common::SIMPLIFY_LANE, &rewritten_collapsed));
+        let brain2 = td.path.join("brain2");
+        let sess2 = "sess-r1-2";
+        let spoof_brief = format!("{} Just check util.rs quickly.", cwg_common::fixed_simplify_lens_marker(cwg_common::SIMPLIFY_LANE));
+        let tp2 = setup_neon_session_env(
+            &brain2,
+            sess2,
+            &format!("{}\n", json!({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": iso(first_ts), "content": "simplify"})),
+            json!({"members": {
+                "simplify-reviewer-1": {"role": "worker", "conversation_id": "cid-spoof", "model": cwg_common::SONNET_HIGH_MODEL, "brief": spoof_brief, "state": "killed", "killed": true},
+                "simplify-reviewer-2": {"role": "worker", "conversation_id": "cid-reused", "model": cwg_common::SONNET_HIGH_MODEL, "brief": fixed_std_brief, "state": "killed", "killed": true},
+                "simplify-reviewer-3": {"role": "worker", "conversation_id": "cid-nudged", "model": cwg_common::SONNET_HIGH_MODEL, "brief": fixed_std_brief, "state": "killed", "killed": true},
+                "simplify-reviewer-4": {"role": "worker", "conversation_id": "cid-narrow", "model": cwg_common::SONNET_HIGH_MODEL, "brief": fixed_std_brief, "state": "killed", "killed": true},
+                "simplify-reuse-1": {"role": "worker", "conversation_id": "cid-multi-1", "model": cwg_common::SONNET_HIGH_MODEL, "brief": fixed_reuse_brief, "state": "killed", "killed": true},
+                "simplify-reuse-2": {"role": "worker", "conversation_id": "cid-multi-2", "model": cwg_common::SONNET_HIGH_MODEL, "brief": "short", "state": "killed", "killed": true},
+                "simplify-quality-3": {"role": "worker", "conversation_id": "cid-grp-3", "model": cwg_common::SONNET_HIGH_MODEL, "brief": "short", "state": "killed", "killed": true},
+            }}),
+            &[
+                json!({"seq": 1, "agent": "coordinator", "time": iso(first_ts + 10.0), "text": format!("@simplify-reviewer-1 {}", spoof_brief)}),
+                json!({"seq": 2, "agent": "simplify-reviewer-1", "time": iso(first_ts + 12.0), "text": "@coordinator [done] No actionable simplifications."}),
+                json!({"seq": 3, "agent": "coordinator", "time": iso(first_ts - 50.0), "text": format!("@simplify-reviewer-2 {}", fixed_std_brief)}),
+                json!({"seq": 4, "agent": "coordinator", "time": iso(first_ts + 15.0), "text": "@simplify-reviewer-2 ad-hoc follow-up without fixed prompt"}),
+                json!({"seq": 5, "agent": "simplify-reviewer-2", "time": iso(first_ts + 18.0), "text": "@coordinator [done] Done follow-up."}),
+                json!({"seq": 6, "agent": "coordinator", "time": iso(first_ts + 10.0), "text": format!("@simplify-reviewer-3 {}", fixed_std_brief)}),
+                json!({"seq": 7, "agent": "coordinator", "time": iso(first_ts + 16.0), "text": format!("@simplify-reviewer-3 {}", cwg_common::SWARM_PUBLISH_NUDGE_TEXT)}),
+                json!({"seq": 8, "agent": "simplify-reviewer-3", "time": iso(first_ts + 19.0), "text": "@coordinator [done] No actionable simplifications."}),
+                // R3-2: Narrowed follow-up mentioning `post_message` is NOT the exact Swarm Wait Guard nudge and must lose has_fixed_prompt!
+                json!({"seq": 9, "agent": "coordinator", "time": iso(first_ts + 10.0), "text": format!("@simplify-reviewer-4 {}", fixed_std_brief)}),
+                json!({"seq": 10, "agent": "coordinator", "time": iso(first_ts + 16.0), "text": "@simplify-reviewer-4 Check only parser.rs and send result via post_message"}),
+                json!({"seq": 11, "agent": "simplify-reviewer-4", "time": iso(first_ts + 19.0), "text": "@coordinator [done] No actionable simplifications."}),
+                // R3-3: Multi-worker board post giving fixed brief to @simplify-reuse-1 and short brief to @simplify-reuse-2 must NOT credit @simplify-reuse-2!
+                json!({"seq": 12, "agent": "coordinator", "time": iso(first_ts + 10.0), "text": format!("@simplify-reuse-1 {}\n@simplify-reuse-2 Check only parser.rs", fixed_reuse_brief)}),
+                json!({"seq": 13, "agent": "simplify-reuse-1", "time": iso(first_ts + 14.0), "text": "@coordinator [done] No actionable reuse simplifications."}),
+                json!({"seq": 14, "agent": "simplify-reuse-2", "time": iso(first_ts + 14.5), "text": "@coordinator [done] No actionable reuse simplifications."}),
+                // R4-1: Group mention `@simplify-quality <fixed>` MUST credit numeric-suffixed `simplify-quality-3`!
+                json!({"seq": 15, "agent": "coordinator", "time": iso(first_ts + 10.0), "text": format!("@simplify-quality {}", cwg_common::build_fixed_simplify_brief("simplify-quality-reviewer", "Repo C:/repo changed src/util.rs").unwrap())}),
+                json!({"seq": 16, "agent": "simplify-quality-3", "time": iso(first_ts + 14.5), "text": "@coordinator [done] No actionable quality simplifications."}),
+            ],
+            &[],
+        );
+        let tp2_s = tp2.to_string_lossy().into_owned();
+        let sw2 = scan_swarm_activity(SwarmScanInput {
+            steps: &rio::read_transcript_steps(&tp2_s, 200),
+            transcript_path: Some(&tp2_s),
+            first_ts,
+            round_start_msg_id: 0,
+            cwd: &repo_norm,
+            marker: None,
+        });
+        assert_eq!(sw2.simplify_runs.len(), 7, "got: {:?}", sw2.simplify_runs);
+        for run in &sw2.simplify_runs {
+            if matches!(run.worker.as_str(), "simplify-reviewer-3" | "simplify-reuse-1" | "simplify-quality-3") {
+                assert!(run.has_fixed_prompt, "exact nudge, targeted fixed worker, and group mention for numeric suffix must preserve has_fixed_prompt: {:?}", run);
+            } else {
+                assert!(!run.has_fixed_prompt, "spoof, ad-hoc, narrowed nudge, and cross-worker mention must fail has_fixed_prompt: {:?}", run);
+            }
+        }
+
+        // R1 #3: Confirmed Neon failure via SYSTEM_MESSAGE AFTER swarm(action="model") switch unlocks Hydrogen, while switch-boundary SYSTEM_MESSAGE fails closed.
+        let brain3 = td.path.join("brain3");
+        let sess3 = "sess-r1-3";
+        let m_s3 = json!({
+            "session": sess3, "class": cwg_common::WORK_PERSISTENT, "closed": false,
+            "first_ts": first_ts, "last_ts": first_ts + 5.0, "last_durable_ts": first_ts + 5.0,
+            "cwd": repo_norm, "git_root": repo_norm, "paths": [std_norm],
+            "content_marks": [{"ts": first_ts + 5.0, "fp": fp_std}],
+        });
+        rio::write_json(&cwg_common::marker_path(sess3), &m_s3).unwrap();
+        let build_switch_tx = |neon_err_ts: f64| -> String {
+            [
+                json!({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": iso(first_ts), "content": "simplify"}),
+                json!({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": iso(first_ts + 10.0), "tool_calls": [{"name": "swarm", "args": {"action": "add", "name": "simplify-reuse", "model": cwg_common::SONNET_HIGH_MODEL, "brief": fixed_reuse_brief}}]}),
+                json!({"step_index": 2, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": iso(first_ts + 10.2), "content": "{\"status\":\"added\",\"model\":\"claude-sonnet-5-5-high\"}"}),
+                json!({"step_index": 3, "source": "SYSTEM", "type": "SYSTEM_MESSAGE", "status": "DONE", "created_at": iso(first_ts + 11.0), "content": format!("<SYSTEM_MESSAGE>\n[Message] timestamp={} sender=system content=Swarm Worker (simplify-reuse) with id \"cid-sw-neon\" encountered an error: insufficient quota\n</SYSTEM_MESSAGE>", iso(first_ts + 11.0))}),
+                json!({"step_index": 4, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": iso(first_ts + 12.0), "tool_calls": [{"name": "swarm", "args": {"action": "model", "name": "simplify-reuse", "model": cwg_common::NEON_XHIGH_MODEL}}]}),
+                json!({"step_index": 5, "source": "SYSTEM", "type": "GENERIC", "status": "DONE", "created_at": iso(first_ts + 13.0), "content": "{\"status\":\"switched\",\"model\":\"gemini-4-neon-xhigh\"}"}),
+                json!({"step_index": 6, "source": "SYSTEM", "type": "SYSTEM_MESSAGE", "status": "DONE", "created_at": iso(neon_err_ts), "content": format!("<SYSTEM_MESSAGE>\n[Message] timestamp={} sender=system content=Swarm Worker (simplify-reuse) with id \"cid-sw-neon\" encountered an error: quota exhausted\n</SYSTEM_MESSAGE>", iso(neon_err_ts))}),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n") + "\n"
+        };
+        let tp3_boundary = setup_neon_session_env(
+            &brain3,
+            sess3,
+            &build_switch_tx(first_ts + 12.5),
+            json!({"members": {"simplify-reuse": {"role": "worker", "conversation_id": "cid-sw-neon", "model": cwg_common::NEON_XHIGH_MODEL, "brief": fixed_reuse_brief, "state": "waiting", "killed": false}}}),
+            &[json!({"seq": 1, "agent": "coordinator", "time": iso(first_ts + 10.0), "text": format!("@simplify-reuse {}", fixed_reuse_brief)})],
+            &[],
+        );
+        let p3 = json!({"conversationId": sess3, "transcriptPath": tp3_boundary.to_string_lossy()});
+        assert_eq!(
+            crate::safety_guards::guard_swarm_invocation_with_payload(
+                &json!({"action": "model", "name": "simplify-reuse", "model": cwg_common::HYDROGEN_XHIGH_MODEL}),
+                Some(&p3),
+            ).0,
+            "deny",
+            "in-flight switch boundary SYSTEM_MESSAGE must fail closed and NOT unlock Hydrogen"
+        );
+        fs::write(&tp3_boundary, build_switch_tx(first_ts + 16.0)).unwrap();
+        let (dec_h_ok, why_h_ok, _) = crate::safety_guards::guard_swarm_invocation_with_payload(
+            &json!({"action": "model", "name": "simplify-reuse", "model": cwg_common::HYDROGEN_XHIGH_MODEL}),
+            Some(&p3),
+        );
+        assert_eq!(dec_h_ok, "allow", "post-switch confirmed Neon SYSTEM_MESSAGE error must unlock Hydrogen: {:?}", why_h_ok);
+
+        // R1 #4: Native invoke_subagent launched BEFORE 3rd swarm tier outage (finishing after) must be REJECTED; launched AFTER all 3 outages must PASS.
+        let m_std = json!({
+            "session": "sess-r1-4", "class": cwg_common::WORK_PERSISTENT, "closed": false,
+            "first_ts": first_ts, "last_ts": first_ts + 10.0, "last_durable_ts": first_ts + 10.0,
+            "cwd": repo_norm, "git_root": repo_norm, "paths": [std_norm],
+            "content_marks": [{"ts": first_ts + 10.0, "fp": fp_std}],
+        });
+        let rcp_std = cwg_common::parse_terminal_receipt("[gate] verified: STANDARD; tested").unwrap();
+        let mut all_down = SwarmEvidence::default();
+        all_down.sonnet_issue_verified = true;
+        all_down.sonnet_issue_ts = first_ts + 20.0;
+        all_down.neon_simplify_issue_verified = true;
+        all_down.neon_simplify_issue_ts = first_ts + 24.0;
+        all_down.hydrogen_simplify_issue_verified = true;
+        all_down.hydrogen_simplify_issue_ts = first_ts + 27.0;
+        let pre_nat_tp = td.path.join("r1-4-pre.jsonl");
+        fs::write(&pre_nat_tp, simplify_transcript_lines(&[cwg_common::SIMPLIFY_LANE], first_ts + 15.0, Some(first_ts + 30.0), 1, "cid-pre-nat")).unwrap();
+        let pre_nat_ev = scan_native_subagents(&rio::read_transcript_steps(&pre_nat_tp.to_string_lossy(), 200), Some(&pre_nat_tp.to_string_lossy()), first_ts);
+        assert!(!validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_std), marker_in: &m_std, checks_ev: &checks_ok,
+            sub_ev: &pre_nat_ev, swarm_ev: &all_down, codex_reviews: &[], ctx: None, steps: None, transcript_path: None,
+        }).0, "native invoke_subagent launched BEFORE 3rd swarm outage must NOT retroactively pass");
+        let post_nat_tp = td.path.join("r1-4-post.jsonl");
+        fs::write(&post_nat_tp, simplify_transcript_lines(&[cwg_common::SIMPLIFY_LANE], first_ts + 28.0, Some(first_ts + 31.0), 1, "cid-post-nat")).unwrap();
+        let post_nat_ev = scan_native_subagents(&rio::read_transcript_steps(&post_nat_tp.to_string_lossy(), 200), Some(&post_nat_tp.to_string_lossy()), first_ts);
+        assert!(validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_std), marker_in: &m_std, checks_ev: &checks_ok,
+            sub_ev: &post_nat_ev, swarm_ev: &all_down, codex_reviews: &[], ctx: None, steps: None, transcript_path: None,
+        }).0, "native invoke_subagent launched AFTER all 3 swarm outages must pass");
+
+        // R1 #5: 3 PreToolUse-denied native invoke_subagent(simplify-*) calls while Sonnet is healthy must NOT count as failures or unlock draft-blocked: SIMPLIFY_UNAVAILABLE.
+        let denied_nat_tp = td.path.join("r1-5-denied.jsonl");
+        let mut denied_lines = Vec::new();
+        for i in 0..3usize {
+            let t = first_ts + 15.0 + (i as f64) * 2.0;
+            denied_lines.push(json!({"step_index": i * 2 + 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": iso(t), "tool_calls": [{"name": "invoke_subagent", "args": {"TypeName": cwg_common::SIMPLIFY_LANE, "Model": "inherit", "Prompt": "Bounded diff"}}]}).to_string());
+            denied_lines.push(json!({"step_index": i * 2 + 2, "source": "SYSTEM", "type": "GENERIC", "status": "ERROR", "created_at": iso(t + 0.1), "content": "[Code Work Gate] Run mandatory fixed-prompt simplify via swarm first. Native invoke_subagent is reserved ONLY when all 3 swarm tiers are unavailable."}).to_string());
+        }
+        fs::write(&denied_nat_tp, denied_lines.join("\n") + "\n").unwrap();
+        let denied_nat_ev = scan_native_subagents(&rio::read_transcript_steps(&denied_nat_tp.to_string_lossy(), 200), Some(&denied_nat_tp.to_string_lossy()), first_ts);
+        assert!(denied_nat_ev.simplify_failures.is_empty(), "PreToolUse-denied native simplify calls must NOT record simplify_failures: {:?}", denied_nat_ev.simplify_failures);
+        let rcp_draft = cwg_common::parse_terminal_receipt("[gate] draft-blocked: SIMPLIFY_UNAVAILABLE").unwrap();
+        assert!(!validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_draft), marker_in: &m_std, checks_ev: &checks_ok,
+            sub_ev: &denied_nat_ev, swarm_ev: &SwarmEvidence::default(), codex_reviews: &[], ctx: None, steps: None, transcript_path: None,
+        }).0);
+
+        // R1 #6: draft-blocked (e.g. SIMPLIFY_UNAVAILABLE) must STILL reject if another simplify swarm worker is alive (killed: false), and pass once killed.
+        let brain6 = td.path.join("brain6");
+        let sess6 = "sess-r1-6";
+        let m6 = json!({
+            "session": sess6, "class": cwg_common::WORK_PERSISTENT, "closed": false,
+            "first_ts": first_ts, "last_ts": first_ts + 10.0, "last_durable_ts": first_ts + 10.0,
+            "cwd": repo_norm, "git_root": repo_norm, "paths": [std_norm],
+            "content_marks": [{"ts": first_ts + 10.0, "fp": fp_std}],
+        });
+        let tp6 = setup_neon_session_env(
+            &brain6,
+            sess6,
+            "",
+            json!({"members": {"simplify-quality": {"role": "worker", "conversation_id": "cid-alive-6", "model": cwg_common::SONNET_HIGH_MODEL, "state": "waiting", "killed": false}}}),
+            &[],
+            &[],
+        );
+        let tp6_s = tp6.to_string_lossy().into_owned();
+        let mut exh_sw = SwarmEvidence::default();
+        exh_sw.simplify_failures.insert(
+            cwg_common::SIMPLIFY_LANE.to_string(),
+            vec![first_ts + 12.0, first_ts + 14.0, first_ts + 16.0],
+        );
+        let (ok_d_alive, why_d_alive) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_draft), marker_in: &m6, checks_ev: &checks_ok,
+            sub_ev: &SubagentEvidence::default(), swarm_ev: &exh_sw, codex_reviews: &[], ctx: None, steps: None, transcript_path: Some(&tp6_s),
+        });
+        assert!(!ok_d_alive && why_d_alive.contains("simplify swarm workers"), "draft-blocked must block while simplify worker is unkilled: {}", why_d_alive);
+        rio::write_json(
+            &brain6.join(sess6).join(".system_generated").join("swarm").join("members.json"),
+            &json!({"members": {"simplify-quality": {"role": "worker", "conversation_id": "cid-alive-6", "model": cwg_common::SONNET_HIGH_MODEL, "state": "killed", "killed": true}}}),
+        ).unwrap();
+        let (ok_d_killed, res_d_killed) = validate_candidate_closure(CandidateClosureInput {
+            receipt: Some(&rcp_draft), marker_in: &m6, checks_ev: &checks_ok,
+            sub_ev: &SubagentEvidence::default(), swarm_ev: &exh_sw, codex_reviews: &[], ctx: None, steps: None, transcript_path: Some(&tp6_s),
+        });
+        assert!(ok_d_killed && res_d_killed == "draft-blocked", "draft-blocked must pass once all simplify workers are killed: {}", res_d_killed);
+        // Live decide_stop check: draft-blocked with alive simplify worker blocks on block 1/3 (while preserving MAX_BLOCKS_PER_CANDIDATE finite cap).
+        rio::write_json(&cwg_common::marker_path(sess6), &m6).unwrap();
+        rio::write_json(
+            &brain6.join(sess6).join(".system_generated").join("swarm").join("members.json"),
+            &json!({"members": {"simplify-quality": {"role": "worker", "conversation_id": "cid-alive-6", "model": cwg_common::SONNET_HIGH_MODEL, "state": "waiting", "killed": false}}}),
+        ).unwrap();
+        let stop_blk6 = decide_stop(&json!({
+            "conversationId": sess6, "transcriptPath": tp6_s, "fullyIdle": true,
+            "lastAssistantMessage": "[gate] draft-blocked: SIMPLIFY_UNAVAILABLE"
+        }));
+        assert!(stop_blk6.is_some(), "live decide_stop must block draft-blocked on block 1/3 while simplify worker is alive");
     }
 }

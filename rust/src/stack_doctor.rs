@@ -1436,14 +1436,34 @@ pub(crate) fn collect_doctor_report_for_os(
                     "planning_and_routine": cwg_common::ORCHESTRATOR_NEON_MODEL,
                 },
                 "pipeline_order": format!(
-                    "unittest -> mandatory simplify (STANDARD: 1x {}; HIGH/XHIGH: 3 parallel fixed lenses before review) -> primary review (1..{}) -> APPROVED | (Round {} ESCALATE -> mandatory research -> fix + re-test -> <={} --closure passes -> pr-ready/draft-blocked)",
-                    cwg_common::SIMPLIFY_LANE, max_rounds, max_rounds, max_closure
+                    "unittest -> mandatory simplify (STANDARD: 1x {}; HIGH/XHIGH: 3 parallel fixed lenses [{}] via swarm {} -> {} -> {} before review) -> primary review (1..{}) -> APPROVED | (Round {} ESCALATE -> mandatory research -> fix + re-test -> <={} --closure passes -> pr-ready/draft-blocked)",
+                    cwg_common::SIMPLIFY_SWARM_LANE,
+                    cwg_common::SIMPLIFY_SWARM_LENSES.join(", "),
+                    cwg_common::SONNET_HIGH_MODEL,
+                    cwg_common::NEON_XHIGH_MODEL,
+                    cwg_common::HYDROGEN_XHIGH_MODEL,
+                    max_rounds, max_rounds, max_closure
                 ),
                 "mandatory_simplify": {
-                    "enforcement": "hard Stop gate + Round 1 codex-lane pre-review guard",
-                    "standard": cwg_common::SIMPLIFY_LANE,
-                    "high_and_xhigh": cwg_common::SIMPLIFY_LENSES,
-                    "invocation": "invoke_subagent(TypeName=<fixed-agent>, Model='inherit') using fixed Claude prompts from plugin/agents/simplify-*.md",
+                    "enforcement": "PreToolUse fixed-prompt injection + model priority guard + hard Stop gate + Round 1 codex-lane pre-review guard",
+                    "primary_model": cwg_common::SONNET_HIGH_MODEL,
+                    "fallback_model": cwg_common::NEON_XHIGH_MODEL,
+                    "secondary_fallback_model": cwg_common::HYDROGEN_XHIGH_MODEL,
+                    "standard": cwg_common::SIMPLIFY_SWARM_LANE,
+                    "high_and_xhigh": cwg_common::SIMPLIFY_SWARM_LENSES,
+                    "canonical_lanes": {
+                        "standard": cwg_common::SIMPLIFY_LANE,
+                        "high_and_xhigh": cwg_common::SIMPLIFY_LENSES,
+                    },
+                    "fixed_prompts_source": "plugin/agents/simplify-*.md (embedded + injected via PreToolUse overwrite)",
+                    "invocation": format!(
+                        "swarm(action='add', name='{}'|'{}', model='{}' -> fallback '{}' -> '{}', brief='<scope packet>'); kill workers after completion; invoke_subagent(TypeName='simplify-*', Model='inherit') only after all 3 swarm tiers fail",
+                        cwg_common::SIMPLIFY_SWARM_LANE,
+                        cwg_common::SIMPLIFY_SWARM_LENSES.join("|"),
+                        cwg_common::SONNET_HIGH_MODEL,
+                        cwg_common::NEON_XHIGH_MODEL,
+                        cwg_common::HYDROGEN_XHIGH_MODEL,
+                    ),
                 },
                 "plugin_agents": plugin_agents,
                 "external_review": format!(
@@ -1465,6 +1485,7 @@ pub(crate) fn collect_doctor_report_for_os(
                         "infra-sre-diagnostician",
                         "test-author",
                         "complex_disjoint_builder",
+                        "simplify_fallback",
                         "high_review_escalation",
                     ],
                 },
@@ -1477,6 +1498,7 @@ pub(crate) fn collect_doctor_report_for_os(
                         "gitlab-delivery-analyst",
                         "scout_swarm",
                         "simple_disjoint_builder",
+                        "simplify_secondary_fallback",
                     ],
                 },
             }),
@@ -1786,12 +1808,41 @@ mod tests {
             cwg_common::ORCHESTRATOR_NEON_MODEL
         );
         assert_eq!(
+            report["model_routing"]["mandatory_simplify"]["primary_model"],
+            cwg_common::SONNET_HIGH_MODEL
+        );
+        assert_eq!(
+            report["model_routing"]["mandatory_simplify"]["fallback_model"],
+            cwg_common::NEON_XHIGH_MODEL
+        );
+        assert_eq!(
+            report["model_routing"]["mandatory_simplify"]["secondary_fallback_model"],
+            cwg_common::HYDROGEN_XHIGH_MODEL
+        );
+        assert_eq!(
             report["model_routing"]["mandatory_simplify"]["standard"],
-            cwg_common::SIMPLIFY_LANE
+            cwg_common::SIMPLIFY_SWARM_LANE
         );
         assert_eq!(
             report["model_routing"]["mandatory_simplify"]["high_and_xhigh"],
+            json!(cwg_common::SIMPLIFY_SWARM_LENSES)
+        );
+        assert_eq!(
+            report["model_routing"]["mandatory_simplify"]["canonical_lanes"]["standard"],
+            cwg_common::SIMPLIFY_LANE
+        );
+        assert_eq!(
+            report["model_routing"]["mandatory_simplify"]["canonical_lanes"]["high_and_xhigh"],
             json!(cwg_common::SIMPLIFY_LENSES)
+        );
+        let simp_inv = report["model_routing"]["mandatory_simplify"]["invocation"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            simp_inv.contains(cwg_common::SONNET_HIGH_MODEL)
+                && simp_inv.contains(cwg_common::NEON_XHIGH_MODEL)
+                && simp_inv.contains(cwg_common::HYDROGEN_XHIGH_MODEL)
+                && simp_inv.contains(cwg_common::SIMPLIFY_SWARM_LANE)
         );
         assert_eq!(
             report["model_routing"]["direct_engineering"]["architecture_and_review_fixes"],
@@ -1845,7 +1896,7 @@ mod tests {
             .as_str()
             .unwrap_or("");
         assert!(pipeline.starts_with(
-            "unittest -> mandatory simplify (STANDARD: 1x simplify-reviewer; HIGH/XHIGH: 3 parallel fixed lenses before review) -> primary review (1..4) -> APPROVED"
+            "unittest -> mandatory simplify (STANDARD: 1x simplify-reviewer; HIGH/XHIGH: 3 parallel fixed lenses [simplify-reuse, simplify-quality, simplify-efficiency] via swarm claude-sonnet-5-5-high -> gemini-4-neon-xhigh -> gemini-4-hydrogen-xhigh before review) -> primary review (1..4) -> APPROVED"
         ));
         assert!(pipeline.contains(
             "mandatory research -> fix + re-test -> <=2 --closure passes -> pr-ready/draft-blocked"

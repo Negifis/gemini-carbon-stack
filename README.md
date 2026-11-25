@@ -24,7 +24,7 @@
 ## Finite Verification & Swarm Architecture
 
 - **Линейный конечный контур (`HIGH` / `XHIGH`):**
-  1. Детерминированные проверки/тесты -> обязательный однократный проход `simplify` фиксированными линзами через `invoke_subagent` (`STANDARD`: `1× simplify-reviewer`; `HIGH`/`XHIGH`: 3 параллельные линзы `simplify-reuse-reviewer`, `simplify-quality-reviewer`, `simplify-efficiency-reviewer` ДО ревью; проверяется на `Stop` и перед 1-м раундом `codex-lane review`).
+  1. Детерминированные проверки/тесты -> обязательный однократный проход `simplify` фиксированными линзами Claude через `swarm` (`claude-sonnet-5-5-high`, фоллбэк только при подтверждённом сбое/0% квоты: `gemini-4-neon-xhigh` → `gemini-4-hydrogen-xhigh`; `STANDARD`: `1× simplify-reviewer`; `HIGH`/`XHIGH`: 3 параллельные линзы `simplify-reuse`, `simplify-quality`, `simplify-efficiency` ДО ревью; фиксированные промпты из `plugin/agents/simplify-*.md` инжектируются `PreToolUse`; проверяется на `Stop` и перед 1-м раундом `codex-lane review`).
   2. Независимое состязательное ревью `carbon-stack codex-lane review` (`gpt-6.2-sol` / `medium` для `HIGH`; `--xhigh` -> `gpt-6.2-astra` / `ultra` для `XHIGH`; `1..4` раунда, порог блокировки `CRITICAL`/`HIGH`). **`VERDICT: APPROVED` на любом раунде `1..4` сразу закрывает гейт.**
   3. При `Round 4: ESCALATE` -> 1 сфокусированный проход исследования -> до `2` проходов `carbon-stack codex-lane review --closure` (`CLOSURE_VALIDATION: READY` -> `[gate] verified` / `[gate] pr-ready`; 2-й `BLOCKED` -> терминальный `[gate] draft-blocked`). Циклов сброса (`redesign-reset`/`research-reset`) нет.
 - **Гигиена роя и дерева:**

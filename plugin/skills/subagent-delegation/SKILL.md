@@ -29,7 +29,7 @@ A subagent's report is a lead/evidence — never self-validating truth. Before r
 | Fast scouts / mechanical disjoint builders | `swarm` | `gemini-4-hydrogen-medium` / `-high` |
 | Live UI / browser verification | `swarm` (`gemini-4-hydrogen-*`) -> `invoke_subagent(TypeName="browser", Model="inherit")` (or direct `inherit` if already on Hydrogen) | `gemini-4-hydrogen-low`..`-xhigh` |
 | Technical translation | `swarm` (`gemini-4-hydrogen-*`) or direct `translator` | `gemini-4-hydrogen-low`..`-high` |
-| Mandatory simplify (`STANDARD`: 1×; `HIGH`/`XHIGH`: 3 parallel lenses before review) | `invoke_subagent` (`simplify-reviewer` or `simplify-{reuse,quality,efficiency}-reviewer`, fixed prompts in `plugin/agents/simplify-*.md`) | `inherit` |
+| Mandatory simplify (`STANDARD`: 1×; `HIGH`/`XHIGH`: 3 parallel lenses before review) | `swarm` (`simplify-reviewer` or `simplify-{reuse,quality,efficiency}`; `PreToolUse` injects fixed Claude prompts from `plugin/agents/simplify-*.md`; kill after completion; native `invoke_subagent` only if all 3 swarm tiers fail) | `claude-sonnet-5-5-high` → `gemini-4-neon-xhigh` → `gemini-4-hydrogen-xhigh` |
 | Independent review (`HIGH`/`XHIGH`) | `carbon-stack codex-lane review` (fallback on Codex outage: `claude-opus-5-5-high` -> `gemini-4-neon-xhigh` [`HIGH`] / `gemini-4-carbon-high` [`XHIGH`]) | OpenAI Codex / Opus escalation |
 
 ## 4. Isolation & Cleanup Rules

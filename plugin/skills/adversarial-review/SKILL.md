@@ -10,7 +10,7 @@ description: "Pragmatic independent adversarial code review (codex-lane primary,
 ## 1. Pre-Review Hygiene (`<= 30–40 KB`)
 
 - State `3–5` core invariants before coding and split work into atomic commits/worktrees **`<= 30–40 KB`** (~500–1,000 LOC). Split candidates `> 80 KB` before launching Round 1.
-- Complete local tests/checks first, then run the mandatory single-pass 3-lens `simplify` (`simplify-reuse-reviewer`, `simplify-quality-reviewer`, `simplify-efficiency-reviewer` via `invoke_subagent(..., Model="inherit")`) **before** Round 1 (`simplify` skill).
+- Complete local tests/checks first, then run the mandatory single-pass 3-lens `simplify` (`simplify-reuse`, `simplify-quality`, `simplify-efficiency` via `swarm` on `claude-sonnet-5-5-high`, fallback `gemini-4-neon-xhigh` -> `gemini-4-hydrogen-xhigh`, `PreToolUse` injects fixed Claude prompts; kill workers cleanly) **before** Round 1 (`simplify` skill).
 - Never use `gemini-3.8-flash-*` (`flash`/`flash_lite`); run complex architecture and Codex review fixes (`R1 -> R4`) on direct **`Gemini 4 Neon (High/XHigh)`** (not `Orchestrator (Neon)`, whose Execution Mode delegates to `gemini-flash-worker-agy`).
 
 ## 2. Primary Review: OpenAI Codex (`carbon-stack codex-lane`)
