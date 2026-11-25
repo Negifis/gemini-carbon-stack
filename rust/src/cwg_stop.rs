@@ -18,7 +18,7 @@ use crate::win32_sqlite::now_sec;
 
 pub const MAX_BLOCKS_PER_CANDIDATE: i64 = 3;
 pub const MAX_BACKGROUND_WAITS: i64 = 8;
-pub const MAX_TOTAL_BACKGROUND_WAITS: i64 = 32;
+pub const MAX_TOTAL_BACKGROUND_WAITS: i64 = 128;
 pub const MAX_REVIEW_ROUNDS: usize = cwg_common::MAX_ORDINARY_REVIEW_ROUNDS;
 pub const LEGACY_MAX_REVIEW_ROUNDS: usize = 3;
 pub const MAX_RAW_ORDINARY_ROUNDS: usize = MAX_REVIEW_ROUNDS * 2;
@@ -269,6 +269,17 @@ fn system_swarm_err_re() -> &'static Regex {
             r#"(?i)\[Message\]\s+timestamp=(?P<ts>\S+)\s+sender=system\b[^\n]*Swarm Worker \((?P<name>[A-Za-z0-9._-]+)\)[^\n]*with id "(?P<cid>[A-Za-z0-9._-]+)" encountered an error[^\n]*?:\s*(?P<err>.+)"#,
         )
         .expect("system_swarm_err_re")
+    })
+}
+
+fn system_subagent_err_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // INVARIANT: Anchor to `\A` host `[Message] ... sender=system ... content=The subagent ... with id "<cid>" encountered an error` so child stdout cannot spoof a subagent crash.
+        Regex::new(
+            r#"(?is)\A\s*(?:The following is a <SYSTEM_MESSAGE>[^\r\n]*\r?\n\s*)*(?:<SYSTEM_MESSAGE>\s*\r?\n\s*)?\[Message\]\s+timestamp=(?P<ts>\S+)\s+sender=system(?:\s+priority=\S+)?\s+content=The subagent [^\r\n]*\bwith id "(?P<cid>[A-Za-z0-9._-]+)" encountered an error"#,
+        )
+        .expect("system_subagent_err_re")
     })
 }
 
@@ -1100,6 +1111,7 @@ pub(crate) struct TimedChunk {
     pub(crate) text: String,
     kind: &'static str,
     is_signoff: bool,
+    status_done: bool,
 }
 
 pub(crate) fn extract_subagent_timed_chunks(
@@ -1186,6 +1198,7 @@ pub(crate) fn extract_subagent_timed_chunks(
                         text: msg,
                         kind: "send",
                         is_signoff: false,
+                        status_done: true,
                     });
                     finished = true;
                     sent_any = true;
@@ -1193,13 +1206,17 @@ pub(crate) fn extract_subagent_timed_chunks(
             }
             just_sent_to_parent = sent_any && only_parent_sends;
         } else {
+            let step_status = st.get("status").and_then(Value::as_str);
+            let status_done = step_status.is_some_and(|s| s.eq_ignore_ascii_case("DONE"));
+            let status_not_aborted = step_status.is_none_or(|s| s.eq_ignore_ascii_case("DONE"));
             let content = val_to_str(st.get("content")).trim().to_string();
-            if !content.is_empty() {
+            if status_not_aborted && !content.is_empty() {
                 chunks.push(TimedChunk {
                     ts,
                     text: content,
                     kind: "final",
                     is_signoff: just_sent_to_parent,
+                    status_done,
                 });
                 finished = true;
             }
@@ -1271,6 +1288,7 @@ fn merge_subagent_chunks(
             text,
             kind,
             is_signoff,
+            status_done: true,
         })
         .collect()
 }
@@ -1496,7 +1514,16 @@ fn is_bool_arg_true(v: Option<&Value>) -> bool {
     }
 }
 
-fn parse_outer_sys_msg_sender(sys_txt: &str) -> Option<&str> {
+struct OuterSysMsgHeader<'a> {
+    sender: &'a str,
+    ts: &'a str,
+    content: &'a str,
+}
+
+const SERVER_RESTART_NOTICE_PREFIX: &str =
+    "[Notice] All your subagents and background tasks have been stopped due to server restart";
+
+fn parse_outer_sys_msg_header(sys_txt: &str) -> Option<OuterSysMsgHeader<'_>> {
     let mut rest = sys_txt.trim_start();
     while rest.starts_with("The following is a <SYSTEM_MESSAGE>") {
         let (_, tail) = rest.split_once('\n')?;
@@ -1507,11 +1534,84 @@ fn parse_outer_sys_msg_sender(sys_txt: &str) -> Option<&str> {
     }
     let after_msg = rest.strip_prefix("[Message]")?;
     let line = after_msg.lines().next().unwrap_or("");
-    let before_content = line.split(" content=").next().unwrap_or(line);
-    before_content
-        .split_whitespace()
-        .find_map(|tok| tok.strip_prefix("sender="))
-        .filter(|s| !s.is_empty())
+    let (meta, content) = line.split_once(" content=").unwrap_or((line, ""));
+    let mut sender = "";
+    let mut ts = "";
+    for tok in meta.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("sender=") {
+            sender = v;
+        } else if let Some(v) = tok.strip_prefix("timestamp=") {
+            ts = v;
+        }
+    }
+    if sender.is_empty() {
+        return None;
+    }
+    Some(OuterSysMsgHeader {
+        sender,
+        ts,
+        content,
+    })
+}
+
+fn parse_outer_sys_msg_sender(sys_txt: &str) -> Option<&str> {
+    parse_outer_sys_msg_header(sys_txt).map(|h| h.sender)
+}
+
+fn is_server_restart_notice(sys_txt: &str) -> bool {
+    parse_outer_sys_msg_header(sys_txt).is_some_and(|h| {
+        h.sender.eq_ignore_ascii_case("system")
+            && h.content
+                .trim_start()
+                .starts_with(SERVER_RESTART_NOTICE_PREFIX)
+    })
+}
+
+enum TimerCond {
+    Never,
+    Any,
+    Sender(String),
+}
+
+impl TimerCond {
+    fn from_arg(raw: Option<&Value>) -> Self {
+        let s = raw
+            .map(|v| val_to_str(Some(v)))
+            .unwrap_or_default();
+        let trimmed = s.trim().trim_matches('"').trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("never") {
+            Self::Never
+        } else if trimmed.eq_ignore_ascii_case("any") {
+            Self::Any
+        } else {
+            Self::Sender(trimmed.to_string())
+        }
+    }
+
+    fn retires_on(&self, tid: &str, outer_sender: &str) -> bool {
+        outer_sender == tid
+            || match self {
+                Self::Never => false,
+                Self::Any => true,
+                Self::Sender(expected) => outer_sender == expected.as_str(),
+            }
+    }
+}
+
+fn parse_live_bg_task_ids(blob: &str) -> Option<HashSet<String>> {
+    if blob.contains("No background tasks are currently running") {
+        return Some(HashSet::new());
+    }
+    let (_, tail) = blob.split_once("currently running:")?;
+    let Value::Array(items) = serde_json::from_str::<Value>(tail.trim()).ok()? else {
+        return None;
+    };
+    let mut live = HashSet::with_capacity(items.len());
+    for v in &items {
+        let tid = v.get("taskId").and_then(Value::as_str)?;
+        live.insert(tid.to_string());
+    }
+    Some(live)
 }
 
 #[derive(Debug, Clone)]
@@ -1804,7 +1904,7 @@ pub fn scan_swarm_activity(input: SwarmScanInput<'_>) -> SwarmEvidence {
     let mut pending_codex_tasks: HashMap<String, (String, f64)> = HashMap::new();
     let mut pending_bg_tasks: BTreeSet<String> = BTreeSet::new();
     let mut passive_bg_tasks: BTreeSet<String> = BTreeSet::new();
-    let mut oneshot_timer_tasks: HashSet<String> = HashSet::new();
+    let mut oneshot_timer_tasks: HashMap<String, TimerCond> = HashMap::new();
 
     let mark_issue_ts = |verified: &mut bool, issue_ts: &mut f64, min_ts: f64| {
         *verified = true;
@@ -2136,7 +2236,11 @@ pub fn scan_swarm_activity(input: SwarmScanInput<'_>) -> SwarmEvidence {
                 .unwrap_or_default();
             let sys_ts = sys_pt.ts;
             let sys_txt = val_to_str(st.get("content"));
-            if !pending_bg_tasks.is_empty() || !passive_bg_tasks.is_empty() {
+            if is_server_restart_notice(&sys_txt) {
+                pending_bg_tasks.clear();
+                passive_bg_tasks.clear();
+                oneshot_timer_tasks.clear();
+            } else if !pending_bg_tasks.is_empty() || !passive_bg_tasks.is_empty() {
                 let has_task_id = sys_txt.contains("Task id \"");
                 let outer_sender = parse_outer_sys_msg_sender(&sys_txt);
                 if has_task_id || outer_sender.is_some() {
@@ -2149,9 +2253,12 @@ pub fn scan_swarm_activity(input: SwarmScanInput<'_>) -> SwarmEvidence {
                                 && (sys_txt.contains(&format!("Task id \"{}\" finished", tid))
                                     || sys_txt.contains(&format!("Task id \"{}\" was canceled", tid))
                                     || sys_txt.contains(&format!("Task id \"{}\" was cancelled", tid)));
-                            let timer_fire = outer_sender == Some(tid.as_str())
-                                && oneshot_timer_tasks.contains(tid.as_str());
-                            task_notice || timer_fire
+                            let timer_fire_or_cond = outer_sender.is_some_and(|s| {
+                                oneshot_timer_tasks
+                                    .get(tid.as_str())
+                                    .is_some_and(|cond| cond.retires_on(tid.as_str(), s))
+                            });
+                            task_notice || timer_fire_or_cond
                         })
                         .cloned()
                         .collect();
@@ -2360,12 +2467,13 @@ pub fn scan_swarm_activity(input: SwarmScanInput<'_>) -> SwarmEvidence {
                             .is_empty()
                     });
                     if is_daemon {
-                        passive_bg_tasks.insert(bg_tid);
+                        passive_bg_tasks.insert(bg_tid.clone());
                     } else {
                         pending_bg_tasks.insert(bg_tid.clone());
-                        if !is_cron {
-                            oneshot_timer_tasks.insert(bg_tid);
-                        }
+                    }
+                    if !is_cron {
+                        let cond = TimerCond::from_arg(targs.and_then(|m| m.get("TimerCondition")));
+                        oneshot_timer_tasks.insert(bg_tid, cond);
                     }
                 }
                 continue;
@@ -2387,6 +2495,12 @@ pub fn scan_swarm_activity(input: SwarmScanInput<'_>) -> SwarmEvidence {
                     pending_bg_tasks.remove(&tid);
                     passive_bg_tasks.remove(&tid);
                     oneshot_timer_tasks.remove(&tid);
+                } else if action == "list" {
+                    if let Some(live) = parse_live_bg_task_ids(blob) {
+                        pending_bg_tasks.retain(|t| live.contains(t));
+                        passive_bg_tasks.retain(|t| live.contains(t));
+                        oneshot_timer_tasks.retain(|t, _| live.contains(t));
+                    }
                 }
                 continue;
             }
@@ -3916,23 +4030,50 @@ pub fn scan_native_subagents(
     }
 
     let mut delivered_by_sender: HashMap<String, Vec<(f64, String)>> = HashMap::new();
+    let mut system_errored_cids: HashMap<String, f64> = HashMap::new();
+    let mut last_server_restart_ts: f64 = 0.0;
     for st in steps {
         if st.get("source").and_then(|v| v.as_str()) == Some("SYSTEM")
             && st.get("type").and_then(|v| v.as_str()) == Some("SYSTEM_MESSAGE")
         {
             let content = val_to_str(st.get("content"));
+            let step_ts = || {
+                st.get("created_at")
+                    .and_then(|v| v.as_str())
+                    .map(rio::parse_iso_ts)
+                    .unwrap_or(0.0)
+            };
+            if is_server_restart_notice(&content) {
+                let hdr_ts = parse_outer_sys_msg_header(&content)
+                    .map(|h| rio::parse_iso_ts(h.ts))
+                    .unwrap_or(0.0);
+                let rts = hdr_ts.max(step_ts());
+                if rts > last_server_restart_ts {
+                    last_server_restart_ts = rts;
+                }
+                continue;
+            }
+            if let Some(ecaps) = system_subagent_err_re().captures(&content) {
+                if let Some(cid_m) = ecaps.name("cid") {
+                    let parsed_ts = ecaps
+                        .name("ts")
+                        .map(|m| rio::parse_iso_ts(m.as_str()))
+                        .unwrap_or(0.0);
+                    let err_ts = if parsed_ts > 0.0 { parsed_ts } else { step_ts() };
+                    let entry = system_errored_cids
+                        .entry(cid_m.as_str().to_string())
+                        .or_insert(0.0);
+                    if err_ts > *entry {
+                        *entry = err_ts;
+                    }
+                }
+                continue;
+            }
             if let Some(caps) = subagent_msg_re().captures(&content) {
                 let sender = caps.name("sender").map_or("", |m| m.as_str()).to_string();
                 let ts_str = caps.name("ts").map_or("", |m| m.as_str());
                 let parsed_ts = rio::parse_iso_ts(ts_str);
-                let msg_ts = if parsed_ts > 0.0 {
-                    parsed_ts
-                } else {
-                    st.get("created_at")
-                        .and_then(|v| v.as_str())
-                        .map(rio::parse_iso_ts)
-                        .unwrap_or(0.0)
-                };
+                let msg_ts = if parsed_ts > 0.0 { parsed_ts } else { step_ts() };
                 let raw_body = caps.name("body").map_or("", |m| m.as_str());
                 let body = sys_msg_close_re()
                     .replace(raw_body, "")
@@ -4027,10 +4168,23 @@ pub fn scan_native_subagents(
                 .map(|v| v.as_slice())
                 .unwrap_or(&[]);
 
-            if !is_native_reviewer && !is_simplify_lane && !delivered.is_empty() {
+            let raw_system_err_ts = system_errored_cids
+                .get(cid)
+                .copied()
+                .filter(|&err_ts| err_ts == 0.0 || call_ts == 0.0 || err_ts >= call_ts - 2.0);
+            let server_restarted_ts = (last_server_restart_ts > 0.0
+                && call_ts > 0.0
+                && last_server_restart_ts > call_ts)
+                .then_some(last_server_restart_ts);
+            let host_terminated_ts = raw_system_err_ts.or(server_restarted_ts);
+
+            if !is_native_reviewer
+                && !is_simplify_lane
+                && (!delivered.is_empty() || raw_system_err_ts.is_some())
+            {
                 continue;
             }
-            if is_simplify_lane && !delivered.is_empty() {
+            if is_simplify_lane && !delivered.is_empty() && host_terminated_ts.is_none() {
                 let delivered_max_ts = delivered
                     .iter()
                     .map(|(ts, _)| *ts)
@@ -4074,6 +4228,19 @@ pub fn scan_native_subagents(
                 sub_done = true;
             }
             if !sub_done {
+                if let Some(term_ts) = host_terminated_ts {
+                    let eff_ts = term_ts.max(call_ts);
+                    let fail_ts = if eff_ts > 0.0 { eff_ts } else { now_sec() };
+                    if is_native_reviewer {
+                        ev.review_failures.push(fail_ts);
+                    } else if is_simplify_lane {
+                        ev.simplify_failures
+                            .entry(base_tname_low)
+                            .or_default()
+                            .push(fail_ts);
+                    }
+                    continue;
+                }
                 let short_cid: String = cid.chars().take(8).collect();
                 ev.in_flight_subagents
                     .push(format!("{}:{}", tname, short_cid));
@@ -4164,21 +4331,35 @@ pub fn scan_native_subagents(
                     now_sec()
                 };
                 let eff_end_ts = eff_launch_ts.max(fallback_end_ts);
+                let has_final_output = sub_chunks.iter().any(|c| {
+                    c.kind == "final"
+                        && c.status_done
+                        && !c.text.trim().is_empty()
+                        && !is_subagent_runtime_failure(&c.text)
+                });
                 let has_output = sub_chunks.iter().any(|c| !c.text.trim().is_empty())
                     || delivered.iter().any(|(_, b)| !b.trim().is_empty());
                 let runtime_abort_only = sub_chunks.is_empty()
                     && !delivered.is_empty()
                     && delivered.iter().all(|(_, b)| is_subagent_runtime_failure(b));
-                if has_output && !runtime_abort_only {
+                let succeeded = if host_terminated_ts.is_some() {
+                    // INVARIANT: Under host crash or server restart, require a completed `final` turn in the child transcript so an intermediate `send_message` status is never credited as a completed simplify run.
+                    has_final_output
+                } else {
+                    has_output && !runtime_abort_only
+                };
+                if succeeded {
                     ev.simplify_successes
                         .entry(base_tname_low)
                         .or_default()
                         .push((call_ts, eff_end_ts));
                 } else {
+                    let fail_ts = host_terminated_ts
+                        .map_or(eff_end_ts, |term_ts| eff_end_ts.max(term_ts));
                     ev.simplify_failures
                         .entry(base_tname_low)
                         .or_default()
-                        .push(eff_end_ts);
+                        .push(fail_ts);
                 }
             }
         }
@@ -8054,26 +8235,29 @@ pub fn decide_stop(payload: &Value) -> Option<String> {
                 val_to_i64(state.get("waits"))
             };
             let total_waits = val_to_i64(state.get("total_waits"));
-            if (effective_not_idle || !in_flight.is_empty())
-                && waits < MAX_BACKGROUND_WAITS
-                && total_waits < MAX_TOTAL_BACKGROUND_WAITS
-            {
-                state.insert("waits".to_string(), json!(waits + 1));
-                state.insert("total_waits".to_string(), json!(total_waits + 1));
-                state.insert("last_wait_progress".to_string(), Value::String(progress_sig));
-                let _ = rio::write_json(&sfile, &Value::Object(state));
-                rio::log_hook_event(
-                    "gate-events",
-                    "background_wait",
-                    json!({
-                        "session": session,
-                        "waits": waits + 1,
-                        "total_waits": total_waits + 1,
-                        "fully_idle": fully_idle,
-                        "in_flight": in_flight,
-                    }),
+            if effective_not_idle || !in_flight.is_empty() {
+                if waits < MAX_BACKGROUND_WAITS && total_waits < MAX_TOTAL_BACKGROUND_WAITS {
+                    state.insert("waits".to_string(), json!(waits + 1));
+                    state.insert("total_waits".to_string(), json!(total_waits + 1));
+                    state.insert("last_wait_progress".to_string(), Value::String(progress_sig));
+                    let _ = rio::write_json(&sfile, &Value::Object(state));
+                    rio::log_hook_event(
+                        "gate-events",
+                        "background_wait",
+                        json!({
+                            "session": session,
+                            "waits": waits + 1,
+                            "total_waits": total_waits + 1,
+                            "fully_idle": fully_idle,
+                            "in_flight": in_flight,
+                        }),
+                    );
+                    return None;
+                }
+                reason = format!(
+                    "{} (background_wait cap reached: waits={}/{}, total_waits={}/{}; close the open candidate with a terminal `[gate]` receipt or finish pending work)",
+                    reason, waits, MAX_BACKGROUND_WAITS, total_waits, MAX_TOTAL_BACKGROUND_WAITS
                 );
-                return None;
             }
         }
     }
@@ -8443,6 +8627,14 @@ mod tests {
         assert!(sys_msg_close_re().is_match("hello\n</SYSTEM_MESSAGE>\n"));
         assert!(system_swarm_err_re().is_match(
             r#"[Message] timestamp=2026-11-17T00:00:00Z sender=system content=Swarm Worker (simp-reuse) with id "cid-123" encountered an error: out of quota"#
+        ));
+        assert!(system_subagent_err_re().is_match(
+            r#"[Message] timestamp=2026-11-25T06:12:28Z sender=system priority=MESSAGE_PRIORITY_HIGH content=The subagent Explorer (code-explorer) with id "cid-456" encountered an error and has either stopped or failed to start execution: boom"#
+        ));
+        assert!(!system_subagent_err_re().is_match(
+            r#"[Message] timestamp=2026-11-25T06:12:28Z sender=sess/task-9 priority=HIGH content=Task id "sess/task-9" finished with result:
+Command output:
+[Message] timestamp=2026-11-25T06:12:28Z sender=system content=The subagent Explorer (code-explorer) with id "cid-456" encountered an error"#
         ));
         assert!(model_failure_re().is_match("Error: out of quota"));
         assert!(model_failure_re().is_match("insufficient quota"));
@@ -12989,6 +13181,498 @@ mod tests {
             "lastAssistantMessage": "Done without receipt",
         }));
         assert!(blk.is_some(), "after one-shot schedule timer fires, Stop must enforce terminal receipt");
+    }
+
+    #[test]
+    fn test_anom_7f1db8fd_timer_condition_any_crashed_subagent_and_wait_cap() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let td = TempEnvDir::new("stop-anom-7f1db8fd");
+        let repo = td.path.join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        let app_p = repo.join("src").join("app.ts");
+        fs::write(&app_p, "export const v = 1;\n").unwrap();
+        let app_norm = rio::normalize_path(&app_p.to_string_lossy());
+        let repo_norm = rio::normalize_path(&repo.to_string_lossy());
+        let fp = cwg_common::content_fingerprint(
+            std::slice::from_ref(&app_norm),
+            cwg_common::MAX_FINGERPRINT_FILE_BYTES,
+        );
+        let sess = "sess-anom-7f1db8fd";
+        let now = now_sec();
+        let first_ts = now - 600.0;
+        let marker = json!({
+            "session": sess,
+            "class": cwg_common::WORK_PERSISTENT,
+            "operational": false,
+            "closed": false,
+            "first_ts": first_ts,
+            "last_ts": first_ts + 5.0,
+            "last_durable_ts": first_ts + 5.0,
+            "edits": 1,
+            "cwd": repo_norm,
+            "git_root": repo_norm,
+            "paths": [app_norm],
+            "content_marks": [{"ts": first_ts + 5.0, "fp": fp, "unknown": false}],
+        });
+        rio::write_json(&cwg_common::marker_path(sess), &marker).unwrap();
+
+        let tp = td.path.join("transcript.jsonl");
+        let t_iso = |dt: f64| crate::win32_sqlite::format_iso_utc(first_ts + dt);
+        let steps = vec![
+            // Crashed native subagent (`sender=system ... with id "<cid>" encountered an error`) must NOT leak in `in_flight_subagents`.
+            json!({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": t_iso(10.0), "tool_calls": [
+                {"name": "invoke_subagent", "args": {"TypeName": "code-explorer", "Role": "Explorer", "Prompt": "Inspect calls"}},
+                {"name": "schedule", "args": {"DurationSeconds": 540, "Prompt": "Any cond timer", "TimerCondition": "any"}},
+                {"name": "schedule", "args": {"DurationSeconds": 540, "Prompt": "Specific sender timer", "TimerCondition": "worker-cid-A"}},
+                {"name": "schedule", "args": {"DurationSeconds": 540, "Prompt": "Never cond timer", "TimerCondition": "never"}}
+            ]}),
+            json!({"step_index": 2, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": t_iso(10.1), "content": "Created the following subagent:\n{\"conversationId\": \"b54aa8cd-1540-4ec7-8612-68520efe248e\"}"}),
+            json!({"step_index": 3, "source": "MODEL", "type": "GENERIC", "status": "RUNNING", "created_at": t_iso(10.2), "content": "Tool is running as a background task with task id: sess-anom-7f1db8fd/task-any"}),
+            json!({"step_index": 4, "source": "MODEL", "type": "GENERIC", "status": "RUNNING", "created_at": t_iso(10.3), "content": "Tool is running as a background task with task id: sess-anom-7f1db8fd/task-sender"}),
+            json!({"step_index": 5, "source": "MODEL", "type": "GENERIC", "status": "RUNNING", "created_at": t_iso(10.4), "content": "Tool is running as a background task with task id: sess-anom-7f1db8fd/task-never"}),
+            // Reminder without `[Message]` header must NOT cancel `TimerCondition: "any"`.
+            json!({"step_index": 6, "source": "SYSTEM", "type": "SYSTEM_MESSAGE", "status": "DONE", "created_at": t_iso(11.0), "content": "<SYSTEM_MESSAGE>\nReminder: work efficiently.\n</SYSTEM_MESSAGE>"}),
+            // Crashed subagent notification (`sender=system`) retires b54aa8cd AND cancels `task-any` (`TimerCondition: "any"`), while keeping `task-sender` and `task-never`.
+            json!({"step_index": 7, "source": "SYSTEM", "type": "SYSTEM_MESSAGE", "status": "DONE", "created_at": t_iso(12.0), "content": format!("<SYSTEM_MESSAGE>\n[Message] timestamp={} sender=system priority=MESSAGE_PRIORITY_HIGH content=The subagent Explorer (code-explorer) with id \"b54aa8cd-1540-4ec7-8612-68520efe248e\" encountered an error and has either stopped or failed to start execution: unknown tool\n</SYSTEM_MESSAGE>", t_iso(12.0))}),
+            // Message from `worker-cid-B` must NOT cancel `task-sender` (`TimerCondition: "worker-cid-A"`).
+            json!({"step_index": 8, "source": "SYSTEM", "type": "SYSTEM_MESSAGE", "status": "DONE", "created_at": t_iso(13.0), "content": format!("<SYSTEM_MESSAGE>\n[Message] timestamp={} sender=worker-cid-B priority=MESSAGE_PRIORITY_HIGH content=[swarm] new board message #10\n</SYSTEM_MESSAGE>", t_iso(13.0))}),
+            // Message from `worker-cid-A` cancels `task-sender`, leaving only `task-never`.
+            json!({"step_index": 9, "source": "SYSTEM", "type": "SYSTEM_MESSAGE", "status": "DONE", "created_at": t_iso(14.0), "content": format!("<SYSTEM_MESSAGE>\n[Message] timestamp={} sender=worker-cid-A priority=MESSAGE_PRIORITY_HIGH content=[swarm] new board message #11\n</SYSTEM_MESSAGE>", t_iso(14.0))}),
+            // Brand-new active timer `task-7715` launched after prior ones; `manage_task(list)` confirms only `task-7715` is running (retiring stale `task-never`).
+            json!({"step_index": 10, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": t_iso(15.0), "tool_calls": [
+                {"name": "schedule", "args": {"DurationSeconds": 480, "Prompt": "Check CI", "TimerCondition": "any"}},
+                {"name": "manage_task", "args": {"Action": "list"}}
+            ]}),
+            json!({"step_index": 11, "source": "MODEL", "type": "GENERIC", "status": "RUNNING", "created_at": t_iso(15.1), "content": "Tool is running as a background task with task id: sess-anom-7f1db8fd/task-7715"}),
+            json!({"step_index": 12, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": t_iso(15.2), "content": "You have 1 background task(s) currently running:\n[{\"taskId\":\"sess-anom-7f1db8fd/task-7715\",\"toolName\":\"schedule\"}]"})
+        ];
+        fs::write(&tp, steps.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n").unwrap();
+
+        // Verify intermediate `TimerCondition` transitions independently of `manage_task(list)`.
+        let sw_after_reminder = scan_swarm_activity(SwarmScanInput {
+            steps: &steps[..6],
+            transcript_path: None,
+            first_ts,
+            round_start_msg_id: 0,
+            cwd: &repo_norm,
+            marker: Some(&marker),
+        });
+        assert_eq!(
+            sw_after_reminder.pending_bg_tasks,
+            vec![
+                "sess-anom-7f1db8fd/task-any".to_string(),
+                "sess-anom-7f1db8fd/task-never".to_string(),
+                "sess-anom-7f1db8fd/task-sender".to_string(),
+            ],
+            "Reminder without [Message] header must not cancel TimerCondition timers"
+        );
+        let sw_after_other_sender = scan_swarm_activity(SwarmScanInput {
+            steps: &steps[..8],
+            transcript_path: None,
+            first_ts,
+            round_start_msg_id: 0,
+            cwd: &repo_norm,
+            marker: Some(&marker),
+        });
+        assert_eq!(
+            sw_after_other_sender.pending_bg_tasks,
+            vec![
+                "sess-anom-7f1db8fd/task-never".to_string(),
+                "sess-anom-7f1db8fd/task-sender".to_string(),
+            ],
+            "TimerCondition=any must retire on incoming [Message], while TimerCondition=worker-cid-A ignores worker-cid-B"
+        );
+        let sw_after_matching_sender = scan_swarm_activity(SwarmScanInput {
+            steps: &steps[..9],
+            transcript_path: None,
+            first_ts,
+            round_start_msg_id: 0,
+            cwd: &repo_norm,
+            marker: Some(&marker),
+        });
+        assert_eq!(
+            sw_after_matching_sender.pending_bg_tasks,
+            vec!["sess-anom-7f1db8fd/task-never".to_string()],
+            "TimerCondition=worker-cid-A must retire when worker-cid-A posts, keeping TimerCondition=never"
+        );
+
+        let sw = scan_swarm_activity(SwarmScanInput {
+            steps: &steps,
+            transcript_path: None,
+            first_ts,
+            round_start_msg_id: 0,
+            cwd: &repo_norm,
+            marker: Some(&marker),
+        });
+        assert_eq!(
+            sw.pending_bg_tasks,
+            vec!["sess-anom-7f1db8fd/task-7715".to_string()],
+            "cancelled TimerCondition timers and manage_task(list)-absent tasks must retire cleanly: {:?}",
+            sw.pending_bg_tasks
+        );
+        // Server restart notice clears remaining pending background tasks and in-flight native subagents launched before restart,
+        // while recording failures for incomplete native reviewer/simplify attempts and preserving saved verdicts written before crash.
+        let saved_rev_tp = td.path.join("saved_reviewer_transcript.jsonl");
+        fs::write(
+            &saved_rev_tp,
+            format!(
+                "{}\n",
+                json!({
+                    "step_index": 1,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": t_iso(17.5),
+                    "content": "All checks look solid.\nVERDICT: APPROVED"
+                })
+            ),
+        )
+        .unwrap();
+        let saved_rev_uri = format!("file:///{}", saved_rev_tp.to_string_lossy().replace('\\', "/"));
+
+        let mut steps_restarted = steps.clone();
+        steps_restarted.extend([
+            json!({
+                "step_index": 13,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": t_iso(16.0),
+                "tool_calls": [
+                    {"name": "invoke_subagent", "args": {"TypeName": "research", "Role": "Scout", "Prompt": "Check docs"}},
+                    {"name": "invoke_subagent", "args": {"TypeName": "adversarial-reviewer", "Role": "Interrupted Reviewer", "Prompt": "Review"}},
+                    {"name": "invoke_subagent", "args": {"TypeName": "simplify-reuse-reviewer", "Role": "Interrupted Simplify", "Prompt": "Simplify"}},
+                    {"name": "invoke_subagent", "args": {"TypeName": "adversarial-reviewer", "Role": "Saved Verdict Reviewer", "Prompt": "Review"}},
+                    {"name": "schedule", "args": {"DurationSeconds": 300, "IsDaemon": true, "Prompt": "Passive oneshot", "TimerCondition": "any"}}
+                ]
+            }),
+            json!({
+                "step_index": 14,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": t_iso(16.1),
+                "content": "Created the following subagent:\n{\"conversationId\": \"11112222-3333-4444-5555-666677778888\"}"
+            }),
+            json!({
+                "step_index": 15,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": t_iso(16.2),
+                "content": "Created the following subagent:\n{\"conversationId\": \"22223333-4444-5555-6666-777788889999\"}"
+            }),
+            json!({
+                "step_index": 16,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": t_iso(16.3),
+                "content": "Created the following subagent:\n{\"conversationId\": \"33334444-5555-6666-7777-888899990000\"}"
+            }),
+            json!({
+                "step_index": 17,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": t_iso(16.4),
+                "content": format!("Created the following subagent:\n{{\"conversationId\": \"44445555-6666-7777-8888-999900001111\", \"logAbsoluteUri\": \"{}\"}}", saved_rev_uri)
+            }),
+            json!({
+                "step_index": 18,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "created_at": t_iso(16.5),
+                "content": "Tool is running as a background task with task id: sess-anom-7f1db8fd/task-passive-any"
+            }),
+        ]);
+        let sw_passive_before = scan_swarm_activity(SwarmScanInput {
+            steps: &steps_restarted,
+            transcript_path: None,
+            first_ts,
+            round_start_msg_id: 0,
+            cwd: &repo_norm,
+            marker: Some(&marker),
+        });
+        assert!(
+            sw_passive_before
+                .passive_bg_tasks
+                .contains(&"sess-anom-7f1db8fd/task-passive-any".to_string()),
+            "one-shot IsDaemon=true timer must start in passive_bg_tasks: {:?}",
+            sw_passive_before.passive_bg_tasks
+        );
+        // Host crash notice arrives after saved reviewer already persisted VERDICT: APPROVED, and also cancels passive TimerCondition=any timer.
+        steps_restarted.push(json!({
+            "step_index": 19,
+            "source": "SYSTEM",
+            "type": "SYSTEM_MESSAGE",
+            "status": "DONE",
+            "created_at": t_iso(18.0),
+            "content": format!("<SYSTEM_MESSAGE>\n[Message] timestamp={} sender=system priority=MESSAGE_PRIORITY_HIGH content=The subagent Saved Verdict Reviewer (adversarial-reviewer) with id \"44445555-6666-7777-8888-999900001111\" encountered an error and has either stopped or failed: post-turn teardown error\n</SYSTEM_MESSAGE>", t_iso(18.0))
+        }));
+        let sw_passive_after = scan_swarm_activity(SwarmScanInput {
+            steps: &steps_restarted,
+            transcript_path: None,
+            first_ts,
+            round_start_msg_id: 0,
+            cwd: &repo_norm,
+            marker: Some(&marker),
+        });
+        assert!(
+            !sw_passive_after
+                .passive_bg_tasks
+                .contains(&"sess-anom-7f1db8fd/task-passive-any".to_string()),
+            "one-shot IsDaemon=true timer with TimerCondition=any must retire from passive_bg_tasks on matching [Message]: {:?}",
+            sw_passive_after.passive_bg_tasks
+        );
+        let sub_before_restart = scan_native_subagents(&steps_restarted, None, first_ts);
+        assert_eq!(
+            sub_before_restart.reviews.len(),
+            1,
+            "reviewer verdict saved in transcript before host crash notice must be preserved, not discarded: {:?}",
+            sub_before_restart.reviews
+        );
+        assert_eq!(
+            sub_before_restart.reviews[0].get("verdict").and_then(Value::as_str),
+            Some("APPROVED")
+        );
+        assert!(
+            sub_before_restart
+                .in_flight_subagents
+                .contains(&"research:11112222".to_string()),
+            "live native subagent must be tracked as in-flight before server restart"
+        );
+        steps_restarted.push(json!({
+            "step_index": 20,
+            "source": "SYSTEM",
+            "type": "SYSTEM_MESSAGE",
+            "status": "DONE",
+            "created_at": t_iso(20.0),
+            "content": format!("<SYSTEM_MESSAGE>\n[Message] timestamp={} sender=system priority=MESSAGE_PRIORITY_LOW content=[Notice] All your subagents and background tasks have been stopped due to server restart.\n</SYSTEM_MESSAGE>", t_iso(20.0))
+        }));
+        let sw_restarted = scan_swarm_activity(SwarmScanInput {
+            steps: &steps_restarted,
+            transcript_path: None,
+            first_ts,
+            round_start_msg_id: 0,
+            cwd: &repo_norm,
+            marker: Some(&marker),
+        });
+        assert!(
+            sw_restarted.pending_bg_tasks.is_empty(),
+            "server restart notice must clear pending background tasks: {:?}",
+            sw_restarted.pending_bg_tasks
+        );
+        let sub_after_restart = scan_native_subagents(&steps_restarted, None, first_ts);
+        assert!(
+            sub_after_restart.in_flight_subagents.is_empty()
+                && sub_after_restart.in_flight_simplify_lenses.is_empty(),
+            "server restart notice must clear in-flight native subagents launched before restart: {:?}",
+            sub_after_restart.in_flight_subagents
+        );
+        assert_eq!(
+            sub_after_restart.review_failures.len(),
+            1,
+            "server restart interrupting incomplete native reviewer must record 1 review failure: {:?}",
+            sub_after_restart.review_failures
+        );
+        assert_eq!(
+            sub_after_restart
+                .simplify_failures
+                .get("simplify-reuse-reviewer")
+                .map(Vec::len),
+            Some(1),
+            "server restart interrupting incomplete native simplify subagent must record 1 simplify failure: {:?}",
+            sub_after_restart.simplify_failures
+        );
+        assert_eq!(
+            sub_after_restart.reviews.len(),
+            1,
+            "saved reviewer verdict must remain preserved even after subsequent server restart"
+        );
+
+        // Native simplify interrupted after intermediate `send_message` (both delivered and child-only) must record failure,
+        // whereas a completed `final` turn saved before host crash/restart must still be credited as success.
+        let simp_send_delivered_tp = td.path.join("simp_send_delivered.jsonl");
+        let simp_send_child_only_tp = td.path.join("simp_send_child_only.jsonl");
+        let simp_final_saved_tp = td.path.join("simp_final_saved.jsonl");
+        let simp_error_partial_tp = td.path.join("simp_error_partial.jsonl");
+        let send_only_line = format!(
+            "{}\n",
+            json!({
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": t_iso(22.0),
+                "tool_calls": [{"name": "send_message", "args": {"Recipient": sess, "Message": "Starting simplify inspection..."}}]
+            })
+        );
+        fs::write(&simp_send_delivered_tp, &send_only_line).unwrap();
+        fs::write(&simp_send_child_only_tp, &send_only_line).unwrap();
+        fs::write(
+            &simp_final_saved_tp,
+            format!(
+                "{}\n",
+                json!({
+                    "step_index": 1,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": t_iso(22.5),
+                    "content": "No actionable efficiency simplifications."
+                })
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &simp_error_partial_tp,
+            format!(
+                "{}\n",
+                json!({
+                    "step_index": 1,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "ERROR",
+                    "created_at": t_iso(22.6),
+                    "content": "Partial streamed simplify output before crash..."
+                })
+            ),
+        )
+        .unwrap();
+        let to_uri = |p: &Path| format!("file:///{}", p.to_string_lossy().replace('\\', "/"));
+        let simp_steps = vec![
+            json!({
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": t_iso(21.0),
+                "tool_calls": [
+                    {"name": "invoke_subagent", "args": {"TypeName": "simplify-reuse-reviewer", "Role": "Delivered Interim", "Prompt": "Simplify"}},
+                    {"name": "invoke_subagent", "args": {"TypeName": "simplify-quality-reviewer", "Role": "ChildOnly Interim", "Prompt": "Simplify"}},
+                    {"name": "invoke_subagent", "args": {"TypeName": "simplify-efficiency-reviewer", "Role": "Saved Final", "Prompt": "Simplify"}},
+                    {"name": "invoke_subagent", "args": {"TypeName": "simplify-reviewer", "Role": "Partial Error Final", "Prompt": "Simplify"}}
+                ]
+            }),
+            json!({"step_index": 2, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": t_iso(21.1), "content": format!("Created the following subagent:\n{{\"conversationId\": \"aaaa1111-0000-0000-0000-000000000001\", \"logAbsoluteUri\": \"{}\"}}", to_uri(&simp_send_delivered_tp))}),
+            json!({"step_index": 3, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": t_iso(21.2), "content": format!("Created the following subagent:\n{{\"conversationId\": \"aaaa1111-0000-0000-0000-000000000002\", \"logAbsoluteUri\": \"{}\"}}", to_uri(&simp_send_child_only_tp))}),
+            json!({"step_index": 4, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": t_iso(21.3), "content": format!("Created the following subagent:\n{{\"conversationId\": \"aaaa1111-0000-0000-0000-000000000003\", \"logAbsoluteUri\": \"{}\"}}", to_uri(&simp_final_saved_tp))}),
+            json!({"step_index": 5, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": t_iso(21.4), "content": format!("Created the following subagent:\n{{\"conversationId\": \"aaaa1111-0000-0000-0000-000000000004\", \"logAbsoluteUri\": \"{}\"}}", to_uri(&simp_error_partial_tp))}),
+            json!({"step_index": 6, "source": "SYSTEM", "type": "SYSTEM_MESSAGE", "status": "DONE", "created_at": t_iso(22.1), "content": format!("<SYSTEM_MESSAGE>\n[Message] timestamp={} sender=aaaa1111-0000-0000-0000-000000000001 priority=MESSAGE_PRIORITY_HIGH content=Starting simplify inspection...\n</SYSTEM_MESSAGE>", t_iso(22.1))}),
+            json!({"step_index": 7, "source": "SYSTEM", "type": "SYSTEM_MESSAGE", "status": "DONE", "created_at": t_iso(23.0), "content": format!("<SYSTEM_MESSAGE>\n[Message] timestamp={} sender=system priority=MESSAGE_PRIORITY_HIGH content=The subagent ChildOnly Interim (simplify-quality-reviewer) with id \"aaaa1111-0000-0000-0000-000000000002\" encountered an error and has either stopped or failed: crash after interim send\n</SYSTEM_MESSAGE>", t_iso(23.0))}),
+            json!({"step_index": 8, "source": "SYSTEM", "type": "SYSTEM_MESSAGE", "status": "DONE", "created_at": t_iso(23.2), "content": format!("<SYSTEM_MESSAGE>\n[Message] timestamp={} sender=system priority=MESSAGE_PRIORITY_HIGH content=The subagent Partial Error Final (simplify-reviewer) with id \"aaaa1111-0000-0000-0000-000000000004\" encountered an error and has either stopped or failed: stream interrupted\n</SYSTEM_MESSAGE>", t_iso(23.2))}),
+            json!({"step_index": 9, "source": "SYSTEM", "type": "SYSTEM_MESSAGE", "status": "DONE", "created_at": t_iso(24.0), "content": format!("<SYSTEM_MESSAGE>\n[Message] timestamp={} sender=system priority=MESSAGE_PRIORITY_LOW content=[Notice] All your subagents and background tasks have been stopped due to server restart.\n</SYSTEM_MESSAGE>", t_iso(24.0))}),
+        ];
+        let sub_simp_ev = scan_native_subagents(&simp_steps, None, first_ts);
+        assert!(
+            sub_simp_ev.simplify_successes.get("simplify-reuse-reviewer").is_none()
+                && sub_simp_ev.simplify_failures.get("simplify-reuse-reviewer").map(Vec::len) == Some(1),
+            "delivered interim send_message interrupted by server restart must record failure, not success: {:?}",
+            sub_simp_ev
+        );
+        assert!(
+            sub_simp_ev.simplify_successes.get("simplify-quality-reviewer").is_none()
+                && sub_simp_ev.simplify_failures.get("simplify-quality-reviewer").map(Vec::len) == Some(1),
+            "child-only interim send_message interrupted by host crash must record failure, not success: {:?}",
+            sub_simp_ev
+        );
+        assert!(
+            sub_simp_ev.simplify_successes.get("simplify-efficiency-reviewer").map(Vec::len) == Some(1)
+                && sub_simp_ev.simplify_failures.get("simplify-efficiency-reviewer").is_none(),
+            "saved final DONE simplify turn completed before restart must be credited as success: {:?}",
+            sub_simp_ev
+        );
+        assert!(
+            sub_simp_ev.simplify_successes.get("simplify-reviewer").is_none()
+                && sub_simp_ev.simplify_failures.get("simplify-reviewer").map(Vec::len) == Some(1),
+            "partial PLANNER_RESPONSE with status=ERROR before host crash must record failure, not success: {:?}",
+            sub_simp_ev
+        );
+        let sub_ev = scan_native_subagents(&steps, None, first_ts);
+        assert!(
+            sub_ev.in_flight_subagents.is_empty(),
+            "crashed native subagent (`sender=system ... encountered an error`) must NOT leak in in_flight_subagents: {:?}",
+            sub_ev.in_flight_subagents
+        );
+
+        // Pre-seed total_waits = 32 (the old cap that triggered anom-7f1db8fd): must STILL park on new active timer task-7715.
+        rio::write_json(
+            &cwg_common::enforcement_state_path(sess),
+            &json!({
+                "candidate_key": cwg_common::candidate_key(&marker),
+                "candidate_first_ts": first_ts,
+                "blocks": 0,
+                "waits": 1,
+                "total_waits": 32,
+                "last_wait_progress": "273:0:12:bg:sess-anom-7f1db8fd/task-7705",
+            }),
+        )
+        .unwrap();
+        let park = decide_stop(&json!({
+            "conversationId": sess,
+            "transcriptPath": tp.to_string_lossy(),
+            "fullyIdle": false,
+            "lastAssistantMessage": "Waiting on CI timer task-7715",
+        }));
+        assert!(
+            park.is_none(),
+            "total_waits=32 with active progress and timer task-7715 must allow background_wait parking, got: {:?}",
+            park
+        );
+
+        // Once total_waits reaches MAX_TOTAL_BACKGROUND_WAITS, Stop blocks with an explicit background_wait cap diagnostic.
+        rio::write_json(
+            &cwg_common::enforcement_state_path(sess),
+            &json!({
+                "candidate_key": cwg_common::candidate_key(&marker),
+                "candidate_first_ts": first_ts,
+                "blocks": 0,
+                "waits": 0,
+                "total_waits": MAX_TOTAL_BACKGROUND_WAITS,
+                "last_wait_progress": "273:0:12:bg:sess-anom-7f1db8fd/task-7705",
+            }),
+        )
+        .unwrap();
+        let blk = decide_stop(&json!({
+            "conversationId": sess,
+            "transcriptPath": tp.to_string_lossy(),
+            "fullyIdle": false,
+            "lastAssistantMessage": "Waiting on CI timer task-7715",
+        }))
+        .expect("reaching MAX_TOTAL_BACKGROUND_WAITS must still enforce finite Stop block");
+        assert!(
+            blk.contains("background_wait cap reached"),
+            "cap-exceeded block must explain background_wait cap reached, got: {}",
+            blk
+        );
+
+        // Stalled waits reaching MAX_BACKGROUND_WAITS on the exact same progress_sig must also block with diagnostic.
+        rio::write_json(
+            &cwg_common::enforcement_state_path(sess),
+            &json!({
+                "candidate_key": cwg_common::candidate_key(&marker),
+                "candidate_first_ts": first_ts,
+                "blocks": 0,
+                "waits": MAX_BACKGROUND_WAITS,
+                "total_waits": MAX_BACKGROUND_WAITS,
+                "last_wait_progress": "0:0:0:bg:sess-anom-7f1db8fd/task-7715",
+            }),
+        )
+        .unwrap();
+        let blk_stall = decide_stop(&json!({
+            "conversationId": sess,
+            "transcriptPath": tp.to_string_lossy(),
+            "fullyIdle": false,
+            "lastAssistantMessage": "Waiting on CI timer task-7715",
+        }))
+        .expect("reaching MAX_BACKGROUND_WAITS without progress must block");
+        assert!(
+            blk_stall.contains("background_wait cap reached"),
+            "stalled-cap block must explain background_wait cap reached, got: {}",
+            blk_stall
+        );
     }
 
     #[test]
