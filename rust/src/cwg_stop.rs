@@ -10996,6 +10996,38 @@ Command output:
             why_pass
         );
 
+        // anom-641ce6cf: standalone background `npm --workspace backend exec -- jest ...` must also record as a standalone validation pass.
+        let exec_steps = vec![
+            json!({
+                "step_index": 1574,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-25T11:20:01Z",
+                "tool_calls": [{"name": "run_command", "args": {"CommandLine": "npm --workspace backend exec -- jest src/__tests__/bitrixUserSync.test.ts src/__tests__/install.test.ts"}}]
+            }),
+            json!({
+                "step_index": 1575,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "created_at": "2026-11-25T11:20:02Z",
+                "content": "Created At: 2026-11-25T16:20:02+05:00\nTool is running as a background task with task id: sess-anom-1ba1a936/task-1575\n"
+            }),
+            json!({
+                "step_index": 1576,
+                "source": "SYSTEM",
+                "type": "SYSTEM_MESSAGE",
+                "created_at": "2026-11-25T11:20:15Z",
+                "content": "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-25T11:20:14Z sender=sess-anom-1ba1a936/task-1575 priority=MESSAGE_PRIORITY_HIGH content=Task id \"sess-anom-1ba1a936/task-1575\" finished with result:\nCommand exited with code 0.\n\nCommand output:\n176 passed (176)\n</SYSTEM_MESSAGE>"
+            }),
+        ];
+        let exec_ev = read_checks_evidence_with_steps_in_cwd("sess-anom-641ce6cf", first_ts, &exec_steps, &repo_norm);
+        assert!(
+            exec_ev.passed_count == 1 && exec_ev.failed_count == 0 && exec_ev.latest_pass_ts >= last_durable_ts,
+            "standalone background `npm --workspace backend exec -- jest ...` must record as standalone validation pass: {:?}",
+            exec_ev
+        );
+
         match prev_home {
             Some(v) => std::env::set_var("CARBON_STACK_HOME", v),
             None => std::env::remove_var("CARBON_STACK_HOME"),
