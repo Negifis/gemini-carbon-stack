@@ -2285,6 +2285,7 @@ pub(crate) fn find_suffixed_open_marker_session(eff_session: &str, git_root: &st
     best
 }
 
+#[cfg(test)]
 pub(crate) fn check_review_root_mismatch(session: &str, git_root: &str) -> Option<String> {
     if session.is_empty() || git_root.is_empty() {
         return None;
@@ -2293,12 +2294,251 @@ pub(crate) fn check_review_root_mismatch(session: &str, git_root: &str) -> Optio
     if !m.is_object() || json_truthy(m.get("closed")) || cwg_common::candidate_class(&m) != cwg_common::WORK_PERSISTENT {
         return None;
     }
-    let exp_rr = val_to_str(cwg_common::resolve_candidate_context(&m, false).get("review_git_root"));
-    if !exp_rr.is_empty() && rio::fold_path(git_root) != rio::fold_path(&exp_rr) {
-        Some(exp_rr)
-    } else {
-        None
+    let cctx = cwg_common::resolve_candidate_context(&m, false);
+    let fold_actual = rio::fold_path(git_root);
+    let roots = cctx.get("review_git_roots").and_then(Value::as_array)?;
+    if roots.is_empty() || roots.iter().any(|r| rio::fold_path(&val_to_str(Some(r))) == fold_actual) {
+        return None;
     }
+    let exp_rr = val_to_str(cctx.get("review_git_root"));
+    (!exp_rr.is_empty()).then_some(exp_rr)
+}
+
+const MAX_EXTRA_UNTRACKED_DIFF_BYTES: usize = 16 * 1024;
+
+pub(crate) fn is_symlink_or_reparse_point(meta: &fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn format_untracked_candidate_diff(u_rel: &str, abs_p: &str) -> Option<String> {
+    let meta = fs::symlink_metadata(abs_p).ok()?;
+    // SAFETY: Never dereference symlinks or Windows reparse points when rendering untracked candidate diffs; emit the link target path like Git `mode 120000` so external secret files cannot be exfiltrated into the review packet.
+    if is_symlink_or_reparse_point(&meta) {
+        let target = fs::read_link(abs_p)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "<unreadable symlink target>".to_string());
+        return Some(format!(
+            "diff --git a/{0} b/{0}\nnew file mode 120000\n--- /dev/null\n+++ b/{0}\n@@ -0,0 +1 @@\n+{1}\n",
+            u_rel, target
+        ));
+    }
+    if !meta.is_file() {
+        return None;
+    }
+    let bytes = fs::read(abs_p).ok()?;
+    if bytes.contains(&0) {
+        return Some(format!(
+            "diff --git a/{0} b/{0}\nnew file (binary, {1} bytes)\n",
+            u_rel,
+            bytes.len()
+        ));
+    }
+    let truncated = bytes.len() > MAX_EXTRA_UNTRACKED_DIFF_BYTES;
+    let slice = &bytes[..bytes.len().min(MAX_EXTRA_UNTRACKED_DIFF_BYTES)];
+    let body = String::from_utf8_lossy(slice);
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out = format!(
+        "diff --git a/{0} b/{0}\nnew file\n--- /dev/null\n+++ b/{0}\n@@ -0,0 +1,{1} @@\n",
+        u_rel,
+        lines.len()
+    );
+    for ln in &lines {
+        out.push('+');
+        out.push_str(ln);
+        out.push('\n');
+    }
+    if truncated {
+        out.push_str(&format!("... [truncated at {} bytes]\n", MAX_EXTRA_UNTRACKED_DIFF_BYTES));
+    }
+    Some(out)
+}
+
+fn append_other_roots_to_delta(
+    extra_stat: &str,
+    extra_diff: &str,
+    extra_hints: &[String],
+    stat: &mut String,
+    diff: &mut String,
+    hint: &mut String,
+) {
+    if extra_stat.is_empty() && extra_diff.is_empty() {
+        return;
+    }
+    append_extra_section(stat, extra_stat, "\n");
+    append_extra_section(diff, extra_diff, "\n\n");
+    if !extra_hints.is_empty() && !hint.contains(&extra_hints[0]) {
+        append_extra_section(hint, &extra_hints.join("; "), "; ");
+    }
+}
+
+pub(crate) fn collect_other_roots_candidate_diff(session: &str, review_root: &str) -> (String, String, Vec<String>) {
+    // INVARIANT: When a multi-root candidate is reviewed from one worktree, append strictly candidate-owned diffs from every other touched git root so Codex reviews the full candidate scope rather than only the launched worktree.
+    if session.is_empty() || review_root.is_empty() {
+        return (String::new(), String::new(), Vec::new());
+    }
+    let Some(m) = cwg_common::read_marker_with_pending(session) else {
+        return (String::new(), String::new(), Vec::new());
+    };
+    if !m.is_object() || json_truthy(m.get("closed")) || cwg_common::candidate_class(&m) != cwg_common::WORK_PERSISTENT {
+        return (String::new(), String::new(), Vec::new());
+    }
+    let dpaths = cwg_common::durable_paths_from_val(m.get("paths"));
+    if dpaths.is_empty() {
+        return (String::new(), String::new(), Vec::new());
+    }
+    let cwd = val_to_str(m.get("cwd"));
+    let fold_rev = rio::fold_path(review_root);
+    let mut root_cache: HashMap<String, Option<String>> = HashMap::new();
+    let mut by_root: std::collections::BTreeMap<String, Vec<(String, String)>> = std::collections::BTreeMap::new();
+    for p in &dpaths {
+        let abs_p = cwg_common::resolve_against_cwd(p, &cwd);
+        let pdir = Path::new(&abs_p)
+            .parent()
+            .map(|d| rio::fold_path(&d.to_string_lossy()))
+            .unwrap_or_default();
+        let gr_opt = root_cache
+            .entry(pdir)
+            .or_insert_with(|| cwg_common::find_enclosing_git_root(&abs_p))
+            .clone();
+        let Some(gr) = gr_opt else { continue; };
+        if rio::fold_path(&gr) == fold_rev {
+            continue;
+        }
+        let norm_abs = rio::normalize_path(&abs_p);
+        let norm_gr = rio::normalize_path(&gr);
+        let prefix = format!("{}/", norm_gr.trim_end_matches('/'));
+        let rel = if rio::fold_path(&norm_abs).starts_with(&rio::fold_path(&prefix)) {
+            let gr_segs = norm_gr.trim_end_matches('/').split('/').count();
+            norm_abs.split('/').skip(gr_segs).collect::<Vec<_>>().join("/")
+        } else {
+            continue;
+        };
+        if !rel.is_empty() {
+            by_root.entry(norm_gr).or_default().push((rel, abs_p));
+        }
+    }
+    if by_root.is_empty() {
+        return (String::new(), String::new(), Vec::new());
+    }
+
+    let mut stat_parts: Vec<String> = Vec::new();
+    let mut diff_parts: Vec<String> = Vec::new();
+    let mut hints: Vec<String> = Vec::new();
+    for (other_root, mut items) in by_root {
+        items.sort_by(|a, b| a.0.cmp(&b.0));
+        items.dedup_by(|a, b| a.0 == b.0);
+        let rels: Vec<&str> = items.iter().map(|(r, _)| r.as_str()).collect();
+        let (rc_h, _, _) = rio::run_git(&other_root, &["rev-parse", "--verify", "-q", "HEAD"], 3.0);
+        let diff_base = if rc_h == 1 { "--cached" } else { "HEAD" };
+        // SAFETY: Always pass `--literal-pathspecs` so literal candidate filenames like `routes/[id].ts` never expand as Git pathspec globs matching unrelated files like `routes/i.ts`.
+        let mut st_args = vec!["--literal-pathspecs", "diff", "--stat", diff_base, "--"];
+        st_args.extend(rels.iter().copied());
+        let (rc_s, out_s, _) = rio::run_git(&other_root, &st_args, 6.0);
+        let mut df_args = vec!["--literal-pathspecs", "diff", diff_base, "--"];
+        df_args.extend(rels.iter().copied());
+        let (rc_d, out_d, _) = rio::run_git(&other_root, &df_args, 8.0);
+        let mut root_stat = if rc_s == 0 { out_s.trim().to_string() } else { String::new() };
+        let mut root_diff = if rc_d == 0 { out_d.trim().to_string() } else { String::new() };
+
+        let mut untracked_args = vec!["--literal-pathspecs", "-c", "core.quotepath=false", "status", "--porcelain=v1", "-uall", "-z", "--"];
+        untracked_args.extend(rels.iter().copied());
+        let (rc_u, out_u, _) = rio::run_git(&other_root, &untracked_args, 6.0);
+        if rc_u == 0 {
+            let abs_by_rel: HashMap<&str, &str> = items.iter().map(|(r, a)| (r.as_str(), a.as_str())).collect();
+            for rec in out_u.split('\0') {
+                let Some(u_rel) = rec.strip_prefix("?? ") else { continue; };
+                let Some(&abs_p) = abs_by_rel.get(u_rel) else { continue; };
+                if !root_stat.is_empty() { root_stat.push('\n'); }
+                root_stat.push_str(&format!(" {} | (untracked candidate file)", u_rel));
+                if let Some(u_diff) = format_untracked_candidate_diff(u_rel, abs_p) {
+                    if !root_diff.is_empty() { root_diff.push('\n'); }
+                    root_diff.push_str(&u_diff);
+                }
+            }
+        }
+        let mut git_errs: Vec<String> = Vec::new();
+        for (op, rc) in [
+            ("rev-parse HEAD", rc_h),
+            ("diff --stat", rc_s),
+            ("diff", rc_d),
+            ("status", rc_u),
+        ] {
+            if rc != 0 && !(op == "rev-parse HEAD" && rc == 1) {
+                let kind = if rc == 124 { "timed out" } else { "failed" };
+                git_errs.push(format!("git {} {} (rc={})", op, kind, rc));
+            }
+        }
+        let sample_list = rels.iter().take(6).copied().collect::<Vec<_>>().join(", ");
+        if !git_errs.is_empty() {
+            // SAFETY: Never claim a secondary root is clean when any Git probe failed or timed out; report it explicitly as unverified so timeout continuations cannot misrepresent an untracked/modified secondary file as reverted.
+            let warn = format!(
+                "(unverified relative to {}: {}; inspect candidate path(s) directly: {})",
+                diff_base,
+                git_errs.join(", "),
+                sample_list
+            );
+            if root_stat.is_empty() {
+                stat_parts.push(format!("[Additional candidate root: {}]\n{}", other_root, warn));
+            } else {
+                stat_parts.push(format!("[Additional candidate root: {}]\n{}\n{}", other_root, root_stat, warn));
+            }
+            if !root_diff.is_empty() {
+                diff_parts.push(format!("# Additional candidate root: {}\n# {}\n{}", other_root, warn, root_diff));
+            }
+        } else if !root_stat.is_empty() || !root_diff.is_empty() {
+            if !root_stat.is_empty() {
+                stat_parts.push(format!("[Additional candidate root: {}]\n{}", other_root, root_stat));
+            }
+            if !root_diff.is_empty() {
+                diff_parts.push(format!("# Additional candidate root: {}\n{}", other_root, root_diff));
+            }
+        } else {
+            // INVARIANT: Emit an explicit clean-state marker only when all Git probes succeeded with empty diff/status (e.g. after reverting a secondary worktree to HEAD across a timeout retry) so the reviewer never assumes stale prior-round edits persist.
+            stat_parts.push(format!(
+                "[Additional candidate root: {}]\n(clean relative to {}: no local diff for candidate path(s): {})",
+                other_root, diff_base, sample_list
+            ));
+        }
+        let sample_rels: Vec<String> = rels.iter().take(4).map(|r| rio::quote_ps_literal(r)).collect();
+        hints.push(format!("git -C {} --literal-pathspecs diff {} -- {}", rio::quote_ps_literal(&other_root), diff_base, sample_rels.join(" ")));
+    }
+    (stat_parts.join("\n"), diff_parts.join("\n\n"), hints)
+}
+
+#[cfg(test)]
+pub(crate) fn test_apply_timeout_continuation_with_other_roots(
+    saved: Option<&Map<String, Value>>,
+    review_root: &str,
+    curr_tree: &str,
+    session: &str,
+) -> (String, String, String) {
+    let (mut id_stat, mut id_text, mut inspect_hint) = (String::new(), String::new(), String::new());
+    let (extra_stat, extra_diff, extra_hints) = collect_other_roots_candidate_diff(session, review_root);
+    apply_timeout_continuation_delta(saved, review_root, "", "", curr_tree, "", "", "", &mut id_stat, &mut id_text, &mut inspect_hint);
+    append_other_roots_to_delta(&extra_stat, &extra_diff, &extra_hints, &mut id_stat, &mut id_text, &mut inspect_hint);
+    (id_stat, id_text, inspect_hint)
+}
+
+fn append_extra_section(base: &mut String, extra: &str, sep: &str) {
+    if extra.trim().is_empty() {
+        return;
+    }
+    if !base.trim().is_empty() {
+        base.push_str(sep);
+    }
+    base.push_str(extra);
 }
 
 fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
@@ -2353,19 +2593,25 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
     if let Err(e) = sync_marker_before_review(&eff_session) {
         return fail_json(e, "Failed to synchronize candidate marker fingerprint before review; retry `carbon-stack codex-lane review` once marker lock/storage is available.", json!({ "round_consumed": false }), args.pretty);
     }
-    // INVARIANT: Reject mismatched worktree/repo `--cwd` before latching XHIGH, mutating closure_halt, or spawning Codex so a sibling STANDARD worktree can never burn rounds or poison closure state for the active HIGH worktree.
-    if let Some(exp_rr) = check_review_root_mismatch(&eff_session, &git_root) {
-        return fail_json(
-            "review_root_mismatch",
-            &format!(
-                "Active candidate requires review in `{}`, not `{}`; re-run `carbon-stack codex-lane review --cwd {}`.",
-                exp_rr,
-                rio::normalize_path(&git_root),
-                rio::quote_ps_literal(&exp_rr),
-            ),
-            json!({ "round_consumed": false, "expected_review_root": exp_rr, "actual_git_root": rio::normalize_path(&git_root) }),
-            args.pretty,
-        );
+    // INVARIANT: Validate allowed review roots and latch `cycle_review_root` atomically under `marker_lock_path` before latching XHIGH, mutating closure_halt, or spawning Codex so concurrent reviews or sibling STANDARD worktrees can never race past the lock or poison closure state.
+    match cwg_common::validate_and_latch_review_root(&eff_session, None, &git_root) {
+        cwg_common::ReviewRootGateResult::Allowed => {}
+        cwg_common::ReviewRootGateResult::Mismatch(exp_rr) => {
+            return fail_json(
+                "review_root_mismatch",
+                &format!(
+                    "Active candidate requires review in `{}`, not `{}`; re-run `carbon-stack codex-lane review --cwd {}`.",
+                    exp_rr,
+                    rio::normalize_path(&git_root),
+                    rio::quote_ps_literal(&exp_rr),
+                ),
+                json!({ "round_consumed": false, "expected_review_root": exp_rr, "actual_git_root": rio::normalize_path(&git_root) }),
+                args.pretty,
+            );
+        }
+        cwg_common::ReviewRootGateResult::LatchFailed => {
+            return fail_json("marker_review_root_latch_failed", "Failed to persist cycle review root under marker lock; retry `carbon-stack codex-lane review`.", json!({ "round_consumed": false }), args.pretty);
+        }
     }
     let req_risk = if args.xhigh { "XHIGH" } else { "" };
     // SAFETY: Latch `XHIGH` BEFORE `check_health()` so fallback paths preserve escalated cycle risk in `Stop`.
@@ -2401,7 +2647,17 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
     let curr_tree = if resolved_diff_file.is_empty() && !git_root.is_empty() && rio::git_toplevel(&git_root, false).is_some() {
         rio::capture_worktree_tree_oid(&git_root, 10.0)
     } else { String::new() };
-    let (diff_stat, diff_text, base_hint) = compute_base_diff(review_root, &resolved_diff_file, explicit_diff_body.as_ref(), &curr_tree);
+    let (mut diff_stat, mut diff_text, mut base_hint) = compute_base_diff(review_root, &resolved_diff_file, explicit_diff_body.as_ref(), &curr_tree);
+    let (extra_root_stat, extra_root_diff, extra_root_hints) = if resolved_diff_file.is_empty() && !eff_session.is_empty() {
+        collect_other_roots_candidate_diff(&eff_session, review_root)
+    } else {
+        (String::new(), String::new(), Vec::new())
+    };
+    append_extra_section(&mut diff_stat, &extra_root_stat, "\n");
+    append_extra_section(&mut diff_text, &extra_root_diff, "\n\n");
+    if !extra_root_hints.is_empty() {
+        append_extra_section(&mut base_hint, &extra_root_hints.join("; "), "; ");
+    }
 
     let (mut launch_gen, mut launch_gts, mut saved_thread) = (0u64, 0.0f64, None::<Map<String, Value>>);
     let mut eff_cycle_reset_ts = 0.0f64;
@@ -2444,7 +2700,7 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
             explicit_resume: &args.resume, force_new: cur_force_fresh, model: &eff_model, effort,
         }, Some(cur_saved.as_ref()));
         let prev_tree = cur_saved.as_ref().map(|st| val_to_str(st.get("last_reviewed_tree_oid"))).unwrap_or_default();
-        let (cs, cb, ch) = if resolved_diff_file.is_empty() && cwg_common::is_git_oid(&prev_tree) {
+        let (mut cs, mut cb, mut ch) = if resolved_diff_file.is_empty() && cwg_common::is_git_oid(&prev_tree) {
             let tgt = cwg_common::is_git_oid(&curr_tree).then_some(curr_tree.as_str());
             let (s, b) = run_git_diff_with_stat(review_root, &prev_tree, tgt);
             let p12 = &prev_tree[..prev_tree.len().min(12)];
@@ -2454,6 +2710,7 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
             };
             (s, b, h)
         } else { (String::new(), String::new(), base_hint.clone()) };
+        append_other_roots_to_delta(&extra_root_stat, &extra_root_diff, &extra_root_hints, &mut cs, &mut cb, &mut ch);
         launch_gen = cg; launch_gts = ct;
         prior_ledger = cur_saved.as_ref().map(|st| val_to_str(st.get("last_review_output"))).unwrap_or_default();
         business_intent = resolve_business_intent(&args.intent, &eff_session, &git_root, cand_ts, raw_saved.as_ref());
@@ -2508,6 +2765,8 @@ fn cmd_review_in_dir(args: &ReviewArgs, invocation_dir: &Path) -> i32 {
         }
     } else {
         apply_timeout_continuation_delta(saved_thread.as_ref(), review_root, &resolved_diff_file, &explicit_diff_sha, &curr_tree, &diff_stat, &diff_text, &base_hint, &mut id_stat, &mut id_text, &mut inspect_hint);
+        // INVARIANT: Even when the primary worktree's `curr_tree` did not change across a timeout retry, keep candidate diffs from any additional touched git roots attached so edits in secondary worktrees are never dropped on continuation.
+        append_other_roots_to_delta(&extra_root_stat, &extra_root_diff, &extra_root_hints, &mut id_stat, &mut id_text, &mut inspect_hint);
     }
 
     let saved_next_to = if is_to_cont { saved_thread.as_ref().map_or(0, |st| val_to_f64(st.get("next_timeout_seconds")) as i64) } else { 0 };

@@ -478,6 +478,39 @@ pub fn candidate_restored_to_clean_head(marker: &Value) -> (bool, String) {
             "outside git repository, durable edits cannot be proven restored".to_string(),
         );
     }
+    let marker_cwd = val_to_str(marker.get("cwd"));
+    let base_dir = if marker_cwd.is_empty() {
+        git_root.as_str()
+    } else {
+        marker_cwd.as_str()
+    };
+    let fold_root = rio::fold_path(&git_root);
+    // SAFETY: Fail closed if any edited path belongs to a different enclosing git root (e.g. a nested worktree inside a parent repo whose `git status` ignores nested `.git` entries).
+    let mut root_cache: HashMap<String, Option<String>> = HashMap::new();
+    for p in &dpaths {
+        let abs_p = cwg_common::resolve_against_cwd(p, base_dir);
+        let pdir = Path::new(&abs_p)
+            .parent()
+            .map(|d| rio::fold_path(&d.to_string_lossy()))
+            .unwrap_or_default();
+        let enclosing_opt = root_cache
+            .entry(pdir)
+            .or_insert_with(|| cwg_common::find_enclosing_git_root(&abs_p));
+        let Some(enclosing) = enclosing_opt.as_deref() else {
+            return (
+                false,
+                "candidate edit path has no enclosing git repository; cannot prove restored"
+                    .to_string(),
+            );
+        };
+        if rio::fold_path(enclosing) != fold_root {
+            return (
+                false,
+                "candidate edits span a different git worktree than marker git_root; cannot prove restored"
+                    .to_string(),
+            );
+        }
+    }
     let mut args: Vec<&str> = Vec::with_capacity(3 + dpaths.len());
     args.push("status");
     args.push("--porcelain=v1");
@@ -7529,6 +7562,7 @@ fn marker_matches_validated(
         || val_to_f64(live.get("last_ts")) > val_to_f64(expected.get("last_ts")) + TS_EPS
         || live.get("closure_halt") != expected.get("closure_halt")
         || live.get("cycle_declared_risk") != expected.get("cycle_declared_risk")
+        || live.get("cycle_review_root") != expected.get("cycle_review_root")
         || val_to_i64(live.get("round_start_msg_id")) != val_to_i64(expected.get("round_start_msg_id"))
         || val_to_i64(live.get("round_id")) != val_to_i64(expected.get("round_id"))
     {
@@ -15012,5 +15046,444 @@ Command output:
             "lastAssistantMessage": "[gate] draft-blocked: SIMPLIFY_UNAVAILABLE"
         }));
         assert!(stop_blk6.is_some(), "live decide_stop must block draft-blocked on block 1/3 while simplify worker is alive");
+    }
+
+    #[test]
+    fn test_nested_worktree_standard_multi_root_review_and_undo_clean_guard() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let td = TempEnvDir::new("stop-nested-wt-b9691e64");
+        let parent = td.path.join("wa-tg-tun-new");
+        let wt = parent.join("codex-worktrees").join("daily-gitlab-497");
+        let unrelated = td.path.join("unrelated-repo");
+        fs::create_dir_all(parent.join(".lead-agent")).unwrap();
+        fs::create_dir_all(wt.join("backend").join("src").join("enterprise")).unwrap();
+        fs::create_dir_all(unrelated.join(".git")).unwrap();
+
+        // Initialize real parent git repo with nested gitignore + nested worktree `.git` file/repo
+        let run_g = |dir: &Path, args: &[&str]| {
+            let (rc, _, err) = rio::run_git(&dir.to_string_lossy(), args, 5.0);
+            assert_eq!(rc, 0, "git {:?} in {:?} failed: {}", args, dir, err);
+        };
+        run_g(&parent, &["init", "-q"]);
+        run_g(&parent, &["config", "user.email", "test@example.com"]);
+        run_g(&parent, &["config", "user.name", "Test"]);
+        fs::write(parent.join(".gitignore"), "codex-worktrees/\n").unwrap();
+        fs::write(parent.join("README.md"), "parent\n").unwrap();
+        run_g(&parent, &["add", "."]);
+        run_g(&parent, &["commit", "-q", "-m", "init"]);
+
+        run_g(&wt, &["init", "-q"]);
+        run_g(&wt, &["config", "user.email", "test@example.com"]);
+        run_g(&wt, &["config", "user.name", "Test"]);
+        let wt_file = wt.join("backend").join("src").join("enterprise").join("ConnectionRuntime.ts");
+        fs::write(&wt_file, "export const v = 1;\n").unwrap();
+        run_g(&wt, &["add", "."]);
+        run_g(&wt, &["commit", "-q", "-m", "wt init"]);
+        fs::write(&wt_file, "export const v = 2;\n").unwrap();
+
+        let parent_norm = rio::normalize_path(&parent.to_string_lossy());
+        let wt_norm = rio::normalize_path(&wt.to_string_lossy());
+        let unrelated_norm = rio::normalize_path(&unrelated.to_string_lossy());
+        let wt_file_norm = rio::normalize_path(&wt_file.to_string_lossy());
+        let parent_php = parent.join(".lead-agent").join("crm.php");
+        fs::write(&parent_php, "<?php echo 1;\n").unwrap();
+        let parent_php_norm = rio::normalize_path(&parent_php.to_string_lossy());
+        let parent_md = parent.join("README.md");
+        let parent_md_norm = rio::normalize_path(&parent_md.to_string_lossy());
+
+        // 1. Direct edit_file in nested worktree while workspace cwd=parent must bind marker.git_root to nested worktree.
+        let sess_edit = "sess-nested-wt-edit";
+        crate::cwg_mark::record_post_tool_use(&json!({
+            "conversationId": sess_edit,
+            "cwd": parent_norm,
+            "toolCall": {
+                "name": "edit_file",
+                "args": { "Path": wt_file_norm, "Target": "v = 1", "Replacement": "v = 2" }
+            }
+        }))
+        .unwrap();
+        let m_edit = rio::read_json(&cwg_common::marker_path(sess_edit)).unwrap();
+        assert_eq!(
+            rio::fold_path(&val_to_str(m_edit.get("git_root"))),
+            rio::fold_path(&wt_norm),
+            "first edit_file in nested worktree must bind marker.git_root to nested worktree, got: {:?}",
+            m_edit.get("git_root")
+        );
+
+        // 2. Legacy marker with parent git_root + nested worktree path must NOT falsely auto-retire as undo-clean.
+        let parent_head = rio::git_head_oid(&parent_norm);
+        let m_legacy_undo = json!({
+            "session": "sess-nested-wt-undo",
+            "class": cwg_common::WORK_PERSISTENT,
+            "closed": false,
+            "first_ts": now_sec() - 60.0,
+            "cwd": parent_norm,
+            "git_root": parent_norm,
+            "opening_head": parent_head,
+            "paths": [wt_file_norm],
+        });
+        assert!(
+            !candidate_restored_to_clean_head(&m_legacy_undo).0,
+            "dirty nested worktree file must NEVER auto-retire as undo-clean against clean parent repo"
+        );
+
+        // 3. LOW doc in parent + STANDARD code in nested worktree -> max_risk_roots selects nested worktree uniquely.
+        let m_low_std = json!({
+            "session": "sess-nested-wt-low-std",
+            "class": cwg_common::WORK_PERSISTENT,
+            "closed": false,
+            "first_ts": now_sec() - 60.0,
+            "cwd": parent_norm,
+            "git_root": parent_norm,
+            "paths": [parent_md_norm, wt_file_norm],
+        });
+        let cctx_low_std = cwg_common::resolve_candidate_context(&m_low_std, false);
+        assert_eq!(
+            rio::fold_path(&val_to_str(cctx_low_std.get("review_git_root"))),
+            rio::fold_path(&wt_norm),
+            "STANDARD nested worktree must beat LOW parent doc for review_git_root"
+        );
+
+        // 4. Exact b9691e64 scenario: STANDARD paths in BOTH parent (.lead-agent/crm.php) and nested worktree (ConnectionRuntime.ts).
+        let sess_multi = "sess-nested-wt-b9691e64";
+        let now = now_sec();
+        let first_ts = now - 300.0;
+        let paths_multi = vec![parent_php_norm.clone(), wt_file_norm.clone()];
+        let fp_multi = cwg_common::content_fingerprint(&paths_multi, cwg_common::MAX_FINGERPRINT_FILE_BYTES);
+        let m_multi = json!({
+            "session": sess_multi,
+            "class": cwg_common::WORK_PERSISTENT,
+            "operational": false,
+            "closed": false,
+            "first_ts": first_ts,
+            "last_ts": first_ts + 5.0,
+            "last_durable_ts": first_ts + 5.0,
+            "edits": 2,
+            "cwd": parent_norm,
+            "git_root": parent_norm,
+            "paths": paths_multi,
+            "content_marks": [{"ts": first_ts + 5.0, "fp": fp_multi, "unknown": false}],
+        });
+        rio::write_json(&cwg_common::marker_path(sess_multi), &m_multi).unwrap();
+        assert!(
+            codex_lane::check_review_root_mismatch(sess_multi, &wt_norm).is_none(),
+            "STANDARD multi-root candidate must accept --cwd <nested-worktree> instead of rejecting with review_root_mismatch"
+        );
+        assert!(
+            codex_lane::check_review_root_mismatch(sess_multi, &unrelated_norm).is_some(),
+            "unrelated clean repo must still be rejected by check_review_root_mismatch"
+        );
+
+        // 5. Atomic validate_and_latch_review_root pins nested worktree: prevents mid-cycle root-hopping to parent, includes other-root candidate diffs (excluding unrelated dirty files), AND lets Stop find APPROVED XHIGH review in nested worktree.
+        let parent_unrelated = parent.join("unrelated_dirty.txt");
+        fs::write(&parent_unrelated, "do not include me\n").unwrap();
+        let (extra_stat, extra_diff, extra_hints) = codex_lane::collect_other_roots_candidate_diff(sess_multi, &wt_norm);
+        assert!(extra_stat.contains(".lead-agent/crm.php"), "multi-root review packet must include candidate path stat from parent root, got: {}", extra_stat);
+        assert!(extra_diff.contains("<?php echo 1;"), "multi-root review packet must include candidate file diff from parent root, got: {}", extra_diff);
+        assert!(!extra_diff.contains("do not include me"), "multi-root review packet must exclude unrelated dirty files from parent root, got: {}", extra_diff);
+        assert!(!extra_hints.is_empty(), "multi-root review packet must emit inspect hint for additional root");
+
+        assert_eq!(
+            cwg_common::validate_and_latch_review_root(sess_multi, None, &wt_norm),
+            cwg_common::ReviewRootGateResult::Allowed
+        );
+        assert_eq!(
+            codex_lane::check_review_root_mismatch(sess_multi, &parent_norm).map(|s| rio::fold_path(&s)),
+            Some(rio::fold_path(&wt_norm)),
+            "once nested worktree is latched for the cycle, parent repo must be rejected to block root-hopping"
+        );
+        assert!(matches!(
+            cwg_common::validate_and_latch_review_root(sess_multi, None, &parent_norm),
+            cwg_common::ReviewRootGateResult::Mismatch(_)
+        ));
+        assert!(cwg_common::latch_marker_declared_risk(sess_multi, None, "XHIGH"));
+
+        let sd = td.path.join("codex-sessions");
+        fs::create_dir_all(&sd).unwrap();
+        struct ScopedEnv(&'static str, Option<String>);
+        impl Drop for ScopedEnv {
+            fn drop(&mut self) {
+                match &self.1 {
+                    Some(v) => unsafe { std::env::set_var(self.0, v) },
+                    None => unsafe { std::env::remove_var(self.0) },
+                }
+            }
+        }
+        let prev_sd = std::env::var("CARBON_CODEX_SESSIONS_DIR").ok();
+        unsafe { std::env::set_var("CARBON_CODEX_SESSIONS_DIR", &sd) };
+        let _sd_env = ScopedEnv("CARBON_CODEX_SESSIONS_DIR", prev_sd);
+        let brain = td.path.join("brain");
+        let check_ts = first_ts + 20.0;
+        let simp_ts = first_ts + 40.0;
+        let iso = |t: f64| crate::win32_sqlite::format_iso_utc(t);
+        let mk_brief = |lane: &str| {
+            format!(
+                "{}\n{}",
+                cwg_common::fixed_simplify_lens_marker(lane),
+                cwg_common::fixed_simplify_prompt(lane).unwrap()
+            )
+        };
+        let p_reuse = mk_brief("simplify-reuse-reviewer");
+        let p_qual = mk_brief("simplify-quality-reviewer");
+        let p_eff = mk_brief("simplify-efficiency-reviewer");
+        let tp = setup_neon_session_env(
+            &brain,
+            sess_multi,
+            &format!(
+                "{}\n",
+                json!({
+                    "step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE",
+                    "created_at": iso(check_ts),
+                    "tool_calls": [{"name": "run_command", "args": {"CommandLine": "npm test"}}]
+                })
+            ),
+            json!({
+                "members": {
+                    "simplify-reuse": {"role": "worker", "conversation_id": "cid-sr", "model": cwg_common::SONNET_HIGH_MODEL, "brief": p_reuse, "state": "killed", "killed": true},
+                    "simplify-quality": {"role": "worker", "conversation_id": "cid-sq", "model": cwg_common::SONNET_HIGH_MODEL, "brief": p_qual, "state": "killed", "killed": true},
+                    "simplify-efficiency": {"role": "worker", "conversation_id": "cid-se", "model": cwg_common::SONNET_HIGH_MODEL, "brief": p_eff, "state": "killed", "killed": true},
+                }
+            }),
+            &[
+                json!({"seq": 1, "agent": "coordinator", "time": iso(simp_ts - 5.0), "text": format!("@simplify-reuse {}", p_reuse)}),
+                json!({"seq": 2, "agent": "coordinator", "time": iso(simp_ts - 4.0), "text": format!("@simplify-quality {}", p_qual)}),
+                json!({"seq": 3, "agent": "coordinator", "time": iso(simp_ts - 3.0), "text": format!("@simplify-efficiency {}", p_eff)}),
+                json!({"seq": 4, "agent": "simplify-reuse", "time": iso(simp_ts), "text": "@coordinator [done] No actionable reuse simplifications."}),
+                json!({"seq": 5, "agent": "simplify-quality", "time": iso(simp_ts + 1.0), "text": "@coordinator [done] No actionable quality simplifications."}),
+                json!({"seq": 6, "agent": "simplify-efficiency", "time": iso(simp_ts + 2.0), "text": "@coordinator [done] No actionable efficiency simplifications."}),
+            ],
+            &[],
+        );
+        let chk_p = cwg_common::checks_ledger_path(sess_multi);
+        fs::create_dir_all(chk_p.parent().unwrap()).unwrap();
+        fs::write(
+            &chk_p,
+            format!(
+                "{}\n",
+                json!({
+                    "ts": check_ts, "start_ts": check_ts - 1.0, "cmd": "npm test",
+                    "cwd": wt_norm, "passed": true, "kind": "check", "step_idx": 1
+                })
+            ),
+        )
+        .unwrap();
+        let rev_ts = simp_ts + 20.0;
+        let rid = "cwg-nestwt000001";
+        let nonce = "112233445566";
+        rio::write_json(
+            &cwg_common::marker_path(sess_multi)
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("packets")
+                .join(format!("{}.json", rid)),
+            &json!({
+                "review_id": rid, "packet_nonce": nonce, "cwd": wt_norm, "effort": "ultra",
+                "phase": "ordinary", "session": sess_multi, "created_ts": rev_ts - 2.0, "committed": true,
+            }),
+        )
+        .unwrap();
+        let rev_iso = iso(rev_ts);
+        fs::write(
+            sd.join(format!("rollout-{}.jsonl", rid)),
+            [
+                json!({"type": "session_meta", "timestamp": rev_iso, "payload": {"id": "sid-nestwt", "source": "exec"}}),
+                json!({"type": "turn_context", "timestamp": rev_iso, "payload": {"model": cwg_common::CODEX_ASTRA_MODEL, "effort": "ultra"}}),
+                json!({"type": "response_item", "timestamp": rev_iso, "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": format!("REVIEW_ID: {}\nPACKET_NONCE: {}\n", rid, nonce)}]}}),
+                json!({"type": "event_msg", "timestamp": rev_iso, "payload": {"type": "task_complete", "last_agent_message": "VERDICT: APPROVED"}}),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let stop_res = decide_stop(&json!({
+            "conversationId": sess_multi,
+            "transcriptPath": tp.to_string_lossy(),
+            "fullyIdle": true,
+            "lastAssistantMessage": "[gate] verified: XHIGH; reviewed in nested worktree daily-gitlab-497",
+        }));
+        assert!(
+            stop_res.is_none(),
+            "APPROVED XHIGH review in latched nested worktree must close Stop cleanly, got: {:?}",
+            stop_res
+        );
+
+        // 6. Security precedence: adding a HIGH file in parent overrides any latched STANDARD cycle_review_root.
+        let parent_ci = parent.join(".gitlab-ci.yml");
+        fs::write(&parent_ci, "stages: [test]\n").unwrap();
+        let parent_ci_norm = rio::normalize_path(&parent_ci.to_string_lossy());
+        let sess_hi = "sess-nested-wt-hi-override";
+        let m_hi = json!({
+            "session": sess_hi,
+            "class": cwg_common::WORK_PERSISTENT,
+            "closed": false,
+            "first_ts": first_ts,
+            "cwd": parent_norm,
+            "git_root": parent_norm,
+            "paths": [parent_ci_norm, wt_file_norm],
+            "cycle_review_root": {"candidate_first_ts": first_ts, "git_root": wt_norm},
+        });
+        rio::write_json(&cwg_common::marker_path(sess_hi), &m_hi).unwrap();
+        assert_eq!(
+            codex_lane::check_review_root_mismatch(sess_hi, &wt_norm).map(|s| rio::fold_path(&s)),
+            Some(rio::fold_path(&parent_norm)),
+            "unique HIGH review root must override latched STANDARD cycle_review_root"
+        );
+
+        // 7. R1 #6: Stale LOW latch on root A must be replaced cleanly when two other roots (B, C) escalate to STANDARD.
+        let wt_c = parent.join("codex-worktrees").join("daily-gitlab-498");
+        fs::create_dir_all(wt_c.join(".git")).unwrap();
+        let wt_c_file = wt_c.join("app.ts");
+        fs::write(&wt_c_file, "export const c = 1;\n").unwrap();
+        let wt_c_norm = rio::normalize_path(&wt_c.to_string_lossy());
+        let wt_c_file_norm = rio::normalize_path(&wt_c_file.to_string_lossy());
+        let sess_stale_low = "sess-nested-wt-stale-low";
+        let m_stale_low = json!({
+            "session": sess_stale_low,
+            "class": cwg_common::WORK_PERSISTENT,
+            "closed": false,
+            "first_ts": first_ts,
+            "cwd": parent_norm,
+            "git_root": parent_norm,
+            "paths": [parent_md_norm, wt_file_norm, wt_c_file_norm],
+            "cycle_review_root": {"candidate_first_ts": first_ts, "git_root": parent_norm},
+        });
+        rio::write_json(&cwg_common::marker_path(sess_stale_low), &m_stale_low).unwrap();
+        assert_eq!(
+            cwg_common::validate_and_latch_review_root(sess_stale_low, None, &wt_norm),
+            cwg_common::ReviewRootGateResult::Allowed,
+            "stale LOW latch on parent must be overwritten when STANDARD roots B & C supersede it"
+        );
+        assert!(matches!(
+            cwg_common::validate_and_latch_review_root(sess_stale_low, None, &wt_c_norm),
+            cwg_common::ReviewRootGateResult::Mismatch(_)
+        ));
+
+        // 8. R2 #3 + #4: Literal pathspecs prevent `routes/[id].ts` from matching unrelated tracked `routes/i.ts`, and timeout continuation with unchanged primary tree still retains secondary-root candidate diffs.
+        fs::create_dir_all(parent.join("routes")).unwrap();
+        let route_i = parent.join("routes").join("i.ts");
+        let route_glob = parent.join("routes").join("[id].ts");
+        fs::write(&route_i, "export const i = 1;\n").unwrap();
+        fs::write(&route_glob, "export const id = 1;\n").unwrap();
+        run_g(&parent, &["add", "routes/i.ts", "routes/[id].ts"]);
+        run_g(&parent, &["commit", "-q", "-m", "add routes"]);
+        fs::write(&route_i, "export const i = 999; // SECRET_UNRELATED\n").unwrap();
+        fs::write(&route_glob, "export const id = 2; // CANDIDATE_ONLY\n").unwrap();
+        let route_glob_norm = rio::normalize_path(&route_glob.to_string_lossy());
+        let sess_glob = "sess-nested-wt-literal-pathspec";
+        let m_glob = json!({
+            "session": sess_glob,
+            "class": cwg_common::WORK_PERSISTENT,
+            "closed": false,
+            "first_ts": first_ts,
+            "cwd": parent_norm,
+            "git_root": parent_norm,
+            "paths": [route_glob_norm, wt_file_norm],
+        });
+        rio::write_json(&cwg_common::marker_path(sess_glob), &m_glob).unwrap();
+        let (glob_stat, glob_diff, glob_hints) = codex_lane::collect_other_roots_candidate_diff(sess_glob, &wt_norm);
+        assert!(glob_diff.contains("CANDIDATE_ONLY"), "literal pathspec must include routes/[id].ts diff, got: {}", glob_diff);
+        assert!(!glob_diff.contains("SECRET_UNRELATED"), "literal pathspec must NOT leak unrelated tracked routes/i.ts, got: {}", glob_diff);
+        assert!(!glob_stat.contains("routes/i.ts"), "literal pathspec stat must exclude routes/i.ts, got: {}", glob_stat);
+        assert!(glob_hints.iter().any(|h| h.contains("--literal-pathspecs")), "hint must use --literal-pathspecs, got: {:?}", glob_hints);
+
+        let same_tree = rio::capture_worktree_tree_oid(&wt_norm, 5.0);
+        let saved_to = json!({"timeout_worktree_tree_oid": same_tree}).as_object().cloned();
+        let (to_stat, to_diff, _) = codex_lane::test_apply_timeout_continuation_with_other_roots(
+            saved_to.as_ref(),
+            &wt_norm,
+            &same_tree,
+            sess_glob,
+        );
+        assert!(to_stat.contains("[id].ts"), "timeout continuation with unchanged primary tree must preserve other-root stat, got: {}", to_stat);
+        assert!(to_diff.contains("CANDIDATE_ONLY"), "timeout continuation with unchanged primary tree must preserve other-root diff, got: {}", to_diff);
+
+        // R3 #1: Reverting the secondary root's candidate file back to HEAD while primary tree stays unchanged must explicitly report clean state on timeout continuation.
+        run_g(&parent, &["--literal-pathspecs", "checkout", "HEAD", "--", "routes/[id].ts"]);
+        let (to_clean_stat, to_clean_diff, to_clean_hint) = codex_lane::test_apply_timeout_continuation_with_other_roots(
+            saved_to.as_ref(),
+            &wt_norm,
+            &same_tree,
+            sess_glob,
+        );
+        assert!(
+            to_clean_stat.contains("clean relative to HEAD") && to_clean_stat.contains("routes/[id].ts"),
+            "timeout continuation after reverting secondary worktree must explicitly report clean state, got: {}",
+            to_clean_stat
+        );
+        assert!(to_clean_diff.is_empty(), "reverted secondary worktree diff should be empty, got: {}", to_clean_diff);
+        assert!(to_clean_hint.contains("--literal-pathspecs"), "reverted secondary worktree must still emit inspect hint, got: {}", to_clean_hint);
+
+        // R4 #1: When git probes fail in a secondary root (e.g. broken .git / timeout), packet must explicitly report unverified and NEVER claim `clean relative to`.
+        let broken_wt = parent.join("codex-worktrees").join("broken-git-wt");
+        fs::create_dir_all(&broken_wt).unwrap();
+        fs::write(broken_wt.join(".git"), "gitdir: ./missing_gitdir\n").unwrap();
+        let broken_file = broken_wt.join("new_untracked.ts");
+        fs::write(&broken_file, "export const x = 1;\n").unwrap();
+        let broken_file_norm = rio::normalize_path(&broken_file.to_string_lossy());
+        let sess_broken = "sess-nested-wt-broken-probe";
+        rio::write_json(
+            &cwg_common::marker_path(sess_broken),
+            &json!({
+                "session": sess_broken, "class": cwg_common::WORK_PERSISTENT, "closed": false,
+                "first_ts": first_ts, "cwd": parent_norm, "git_root": parent_norm,
+                "paths": [broken_file_norm, wt_file_norm],
+            }),
+        )
+        .unwrap();
+        let (brk_stat, _, _) = codex_lane::collect_other_roots_candidate_diff(sess_broken, &wt_norm);
+        assert!(
+            brk_stat.contains("unverified relative to") && !brk_stat.contains("clean relative to"),
+            "failed git probe in secondary root must emit explicit unverified warning and NEVER claim clean, got: {}",
+            brk_stat
+        );
+
+        // 9. R2 #1: Untracked symlink/reparse point in secondary root must never dereference and exfiltrate target file contents.
+        let secret_out = td.path.join("outside_secret.env");
+        fs::write(&secret_out, "API_KEY=TOP_SECRET_NEVER_LEAK\n").unwrap();
+        let link_path = parent.join(".lead-agent").join("leak_link.env");
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&secret_out, &link_path).is_ok();
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&secret_out, &link_path).is_ok();
+        if linked {
+            let link_norm = rio::normalize_path(&link_path.to_string_lossy());
+            let sess_link = "sess-nested-wt-symlink-guard";
+            rio::write_json(
+                &cwg_common::marker_path(sess_link),
+                &json!({
+                    "session": sess_link, "class": cwg_common::WORK_PERSISTENT, "closed": false,
+                    "first_ts": first_ts, "cwd": parent_norm, "git_root": parent_norm,
+                    "paths": [link_norm, wt_file_norm],
+                }),
+            )
+            .unwrap();
+            let (_, link_diff, _) = codex_lane::collect_other_roots_candidate_diff(sess_link, &wt_norm);
+            assert!(!link_diff.contains("TOP_SECRET_NEVER_LEAK"), "untracked symlink must NEVER leak target contents: {}", link_diff);
+            assert!(link_diff.contains("new file mode 120000"), "untracked symlink must emit Git mode 120000 target diff: {}", link_diff);
+        }
+        #[cfg(windows)]
+        {
+            // Also verify unprivileged NTFS directory junction reparse point never dereferences target secrets.
+            let secret_dir = td.path.join("outside_secret_dir");
+            fs::create_dir_all(&secret_dir).unwrap();
+            fs::write(secret_dir.join("cred.txt"), "JUNCTION_SECRET_NEVER_LEAK\n").unwrap();
+            let junc_path = parent.join(".lead-agent").join("leak_junction");
+            let st = std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J", &junc_path.to_string_lossy(), &secret_dir.to_string_lossy()])
+                .status()
+                .unwrap();
+            assert!(st.success(), "mklink /J should succeed unprivileged on Windows");
+            let junc_meta = fs::symlink_metadata(&junc_path).unwrap();
+            assert!(
+                codex_lane::is_symlink_or_reparse_point(&junc_meta),
+                "NTFS junction must be classified as reparse point"
+            );
+            let _ = fs::remove_dir(&junc_path);
+        }
     }
 }

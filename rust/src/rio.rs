@@ -100,24 +100,6 @@ fn swarm_group_suffix_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"-\d+\z").expect("swarm_group_suffix_re"))
 }
 
-fn cd_leading_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r#"(?i)^\s*(?:cd(?:\s+/d)?|Set-Location|Push-Location)\s+["']?(?P<dir>[^"';&|\r\n]+)["']?"#,
-        )
-        .expect("cd_leading_re")
-    })
-}
-
-fn git_dash_c_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r#"(?i)\bgit(?:\.exe)?\s+-C\s+["']?(?P<dir>[^"';&|\r\n]+)["']?"#)
-            .expect("git_dash_c_re")
-    })
-}
-
 pub(crate) fn leading_null_pipe_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?i)\A\s*\$null\s*\|\s*").expect("leading_null_pipe_re"))
@@ -2305,17 +2287,502 @@ pub fn extract_bg_task_id(text: &str) -> Option<String> {
         .map(|m| m.as_str().to_string())
 }
 
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum PsQuoteKind {
+    Single,
+    Double,
+    Bare,
+}
+
+fn split_ps_top_level_statements(cmd: &str) -> Vec<&str> {
+    let bytes = cmd.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let mut in_sq = false;
+    let mut in_dq = false;
+    let mut paren_depth = 0usize;
+    let mut brace_depth = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_sq {
+            if b == b'\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                in_sq = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_dq {
+            if b == b'`' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_dq = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' => in_sq = true,
+            b'"' => in_dq = true,
+            b'(' => paren_depth += 1,
+            b')' => paren_depth = paren_depth.saturating_sub(1),
+            b'{' => brace_depth += 1,
+            b'}' => brace_depth = brace_depth.saturating_sub(1),
+            b';' | b'\r' | b'\n' if paren_depth == 0 && brace_depth == 0 => {
+                let seg = cmd[start..i].trim();
+                if !seg.is_empty() {
+                    out.push(seg);
+                }
+                start = i + 1;
+            }
+            b'&' if paren_depth == 0
+                && brace_depth == 0
+                && i + 1 < bytes.len()
+                && bytes[i + 1] == b'&' =>
+            {
+                let seg = cmd[start..i].trim();
+                if !seg.is_empty() {
+                    out.push(seg);
+                }
+                i += 2;
+                start = i;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let tail = cmd[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail);
+    }
+    out
+}
+
+fn parse_ps_token_at(s: &str) -> Option<(String, PsQuoteKind, &str)> {
+    let trimmed = s.trim_start_matches([' ', '\t']);
+    let bytes = trimmed.as_bytes();
+    let first = *bytes.first()?;
+    if first == b'\'' {
+        let mut val = String::new();
+        let mut i = 1usize;
+        while i < bytes.len() {
+            if bytes[i] == b'\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    val.push('\'');
+                    i += 2;
+                    continue;
+                }
+                return Some((val, PsQuoteKind::Single, &trimmed[i + 1..]));
+            }
+            let ch = trimmed[i..].chars().next()?;
+            val.push(ch);
+            i += ch.len_utf8();
+        }
+        return None;
+    }
+    if first == b'"' {
+        let mut val = String::new();
+        let mut i = 1usize;
+        while i < bytes.len() {
+            if bytes[i] == b'`' && i + 1 < bytes.len() {
+                let ch = trimmed[i + 1..].chars().next()?;
+                val.push(ch);
+                i += 1 + ch.len_utf8();
+                continue;
+            }
+            if bytes[i] == b'"' {
+                return Some((val, PsQuoteKind::Double, &trimmed[i + 1..]));
+            }
+            let ch = trimmed[i..].chars().next()?;
+            val.push(ch);
+            i += ch.len_utf8();
+        }
+        return None;
+    }
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if matches!(
+            bytes[i],
+            b' ' | b'\t' | b';' | b'|' | b'&' | b'>' | b'<' | b'\r' | b'\n' | b')' | b'}'
+        ) {
+            break;
+        }
+        i += 1;
+    }
+    if i == 0 {
+        return None;
+    }
+    Some((trimmed[..i].to_string(), PsQuoteKind::Bare, &trimmed[i..]))
+}
+
+fn has_unquoted_shell_meta(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    let mut in_sq = false;
+    let mut in_dq = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_sq {
+            if b == b'\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                in_sq = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_dq {
+            if b == b'`' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
+                return true;
+            }
+            if b == b'"' {
+                in_dq = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' => in_sq = true,
+            b'"' => in_dq = true,
+            b'|' | b'>' | b'<' | b'`' | b'(' | b')' | b'{' | b'}' | b'&' | b';' | b'\r' | b'\n' => {
+                return true;
+            }
+            b'@' if i + 1 < bytes.len() && matches!(bytes[i + 1], b'"' | b'\'') => return true,
+            b'$' if i + 1 < bytes.len() && bytes[i + 1] == b'(' => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    in_sq || in_dq
+}
+
+fn expand_ps_path_token(
+    raw: &str,
+    kind: PsQuoteKind,
+    vars: &HashMap<String, String>,
+) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if kind == PsQuoteKind::Single {
+        return Some(trimmed.to_string());
+    }
+    if trimmed.contains("$(") || trimmed.contains('`') {
+        return None;
+    }
+    if !trimmed.contains('$') {
+        return Some(trimmed.to_string());
+    }
+    let after_dollar = trimmed.strip_prefix('$')?;
+    let (var_name, rest) = if let Some(braced) = after_dollar.strip_prefix('{') {
+        let close = braced.find('}')?;
+        (&braced[..close], &braced[close + 1..])
+    } else {
+        let len = after_dollar
+            .bytes()
+            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            .count();
+        (&after_dollar[..len], &after_dollar[len..])
+    };
+    if var_name.is_empty()
+        || (!rest.is_empty() && !rest.starts_with('\\') && !rest.starts_with('/'))
+        || rest.contains('$')
+    {
+        return None;
+    }
+    let base = vars.get(&var_name.to_ascii_lowercase())?;
+    let mut joined = base.clone();
+    joined.push_str(rest);
+    let out = joined.trim().to_string();
+    (!out.is_empty()).then_some(out)
+}
+
+fn strip_leading_null_pipe(s: &str) -> &str {
+    if let Some(m) = leading_null_pipe_re().find(s) {
+        &s[m.end()..]
+    } else {
+        s
+    }
+}
+
+fn is_readonly_ps_preamble_cmd(word: &str) -> bool {
+    // SAFETY: Allow ONLY pure built-in PowerShell utility/management cmdlets plus the built-in `pwd` alias (`Get-Location` in PowerShell / builtin in POSIX shells; never external binaries like `rg`/`whoami`/`hostname`) so preamble skipping cannot hide `--pre` preprocessors or PATH hijacks.
+    matches!(
+        word.to_ascii_lowercase().as_str(),
+        "write-output"
+            | "write-host"
+            | "get-location"
+            | "pwd"
+            | "test-path"
+            | "resolve-path"
+            | "split-path"
+            | "join-path"
+            | "get-childitem"
+            | "get-item"
+            | "get-itemproperty"
+            | "get-content"
+            | "select-string"
+            | "get-date"
+    )
+}
+
+fn is_safe_ps_preamble_env_var(name_low: &str) -> bool {
+    !matches!(
+        name_low,
+        "path"
+            | "pathext"
+            | "psmodulepath"
+            | "comspec"
+            | "ripgrep_config_path"
+            | "node_options"
+            | "ld_preload"
+            | "ld_library_path"
+            | "dyld_insert_libraries"
+            | "dyld_library_path"
+            | "pythonstartup"
+            | "pythonpath"
+            | "pythonhome"
+    ) && !name_low.starts_with("git_")
+        && !name_low.starts_with("carbon_")
+}
+
+fn parse_ps_preamble_stmt(stmt: &str, vars: &mut HashMap<String, String>) -> bool {
+    let s = strip_leading_null_pipe(stmt).trim();
+    if s.is_empty() {
+        return true;
+    }
+    if let Some(after_dollar) = s.strip_prefix('$') {
+        let (is_env, ident_src) = if after_dollar
+            .as_bytes()
+            .get(..4)
+            .is_some_and(|b| b.eq_ignore_ascii_case(b"env:"))
+        {
+            (true, &after_dollar[4..])
+        } else {
+            (false, after_dollar)
+        };
+        let nlen = ident_src
+            .bytes()
+            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            .count();
+        if nlen > 0 {
+            let name_low = ident_src[..nlen].to_ascii_lowercase();
+            let after_name = ident_src[nlen..].trim_start_matches([' ', '\t']);
+            if let Some(after_eq) = after_name.strip_prefix('=') {
+                if !after_eq.starts_with('=') {
+                    let rhs = after_eq.trim();
+                    if has_unquoted_shell_meta(rhs) {
+                        if !is_env {
+                            vars.remove(&name_low);
+                        }
+                        return false;
+                    }
+                    let Some((tok, kind, tail)) = parse_ps_token_at(rhs) else {
+                        if !is_env {
+                            vars.remove(&name_low);
+                        }
+                        return false;
+                    };
+                    if !tail.trim().is_empty() {
+                        if !is_env {
+                            vars.remove(&name_low);
+                        }
+                        return false;
+                    }
+                    if is_env {
+                        return is_safe_ps_preamble_env_var(&name_low);
+                    }
+                    if matches!(
+                        name_low.as_str(),
+                        "erroractionpreference"
+                            | "progresspreference"
+                            | "warningpreference"
+                            | "verbosepreference"
+                            | "informationpreference"
+                            | "psnativecommanduseerroractionpreference"
+                    ) {
+                        return true;
+                    }
+                    if let Some(expanded) = expand_ps_path_token(&tok, kind, vars) {
+                        vars.insert(name_low, expanded);
+                        return true;
+                    }
+                    vars.remove(&name_low);
+                    return false;
+                }
+            }
+        }
+    }
+    if let Some((word, PsQuoteKind::Bare, _)) = parse_ps_token_at(s) {
+        if is_readonly_ps_preamble_cmd(&word) && !has_unquoted_shell_meta(s) {
+            return true;
+        }
+    }
+    false
+}
+
+fn parse_nav_stmt(stmt: &str, vars: &HashMap<String, String>) -> Option<String> {
+    let s = strip_leading_null_pipe(stmt).trim();
+    let (cmd_word, PsQuoteKind::Bare, mut rest) = parse_ps_token_at(s)? else {
+        return None;
+    };
+    let is_nav = matches!(
+        cmd_word.to_ascii_lowercase().as_str(),
+        "cd" | "chdir" | "set-location" | "sl" | "push-location" | "pushd"
+    );
+    if !is_nav || !rest.starts_with([' ', '\t']) {
+        return None;
+    }
+    if let Some((flag, PsQuoteKind::Bare, after_flag)) = parse_ps_token_at(rest) {
+        let fl = flag.to_ascii_lowercase();
+        if (cmd_word.eq_ignore_ascii_case("cd") && fl == "/d")
+            || fl == "-literalpath"
+            || fl == "-path"
+        {
+            rest = after_flag;
+        }
+    }
+    let (tok, kind, tail) = parse_ps_token_at(rest)?;
+    if !tail.trim().is_empty() {
+        return None;
+    }
+    expand_ps_path_token(&tok, kind, vars)
+}
+
+enum GitStmtKind {
+    NotGit,
+    WithDashC(Option<String>),
+    ReadOnlyNoDashC,
+    MutatingNoDashC,
+}
+
+fn is_readonly_git_subcommand(sub: &str, rest: &str) -> bool {
+    let sub_low = sub.to_ascii_lowercase();
+    if !matches!(
+        sub_low.as_str(),
+        "status"
+            | "diff"
+            | "log"
+            | "show"
+            | "grep"
+            | "rev-parse"
+            | "ls-files"
+            | "ls-tree"
+            | "cat-file"
+            | "describe"
+            | "rev-list"
+            | "merge-base"
+            | "for-each-ref"
+            | "name-rev"
+            | "check-ignore"
+            | "shortlog"
+            | "blame"
+    ) {
+        return false;
+    }
+    if has_unquoted_shell_meta(rest) {
+        return false;
+    }
+    let mut tail = rest;
+    while let Some((tok, _, next)) = parse_ps_token_at(tail) {
+        if tok == "--output" || tok.starts_with("--output=") {
+            return false;
+        }
+        tail = next;
+    }
+    true
+}
+
+fn parse_git_dash_c_stmt(stmt: &str, vars: &HashMap<String, String>) -> GitStmtKind {
+    let mut s = strip_leading_null_pipe(stmt).trim();
+    if let Some(after_amp) = s.strip_prefix('&') {
+        let next = after_amp.trim_start_matches([' ', '\t']);
+        if !next.starts_with('&') {
+            s = next;
+        }
+    }
+    let Some((cmd_tok, _, mut rest)) = parse_ps_token_at(s) else {
+        return GitStmtKind::NotGit;
+    };
+    let base = cmd_tok
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&cmd_tok)
+        .to_ascii_lowercase();
+    if base != "git" && base != "git.exe" {
+        return GitStmtKind::NotGit;
+    }
+    while let Some((tok, kind, after)) = parse_ps_token_at(rest) {
+        if kind == PsQuoteKind::Bare && matches!(tok.as_str(), "--no-optional-locks" | "--no-pager" | "-P") {
+            rest = after;
+            continue;
+        }
+        if kind == PsQuoteKind::Bare && tok == "-C" {
+            let Some((dir_tok, dir_kind, _)) = parse_ps_token_at(after) else {
+                return GitStmtKind::WithDashC(None);
+            };
+            return GitStmtKind::WithDashC(expand_ps_path_token(&dir_tok, dir_kind, vars));
+        }
+        if kind == PsQuoteKind::Bare && is_readonly_git_subcommand(&tok, after) {
+            return GitStmtKind::ReadOnlyNoDashC;
+        }
+        break;
+    }
+    GitStmtKind::MutatingNoDashC
+}
+
 pub fn extract_cd_prefix_or_git_c(cmd: &str) -> (Option<String>, Option<String>) {
-    let cd_dir = cd_leading_re()
-        .captures(cmd)
-        .and_then(|c| c.name("dir"))
-        .map(|m| m.as_str().trim().to_string())
-        .filter(|s| !s.is_empty());
-    let git_c_dir = git_dash_c_re()
-        .captures(cmd)
-        .and_then(|c| c.name("dir"))
-        .map(|m| m.as_str().trim().to_string())
-        .filter(|s| !s.is_empty());
+    // INVARIANT: Scan past pure PowerShell preamble statements (`$ErrorActionPreference`, `$env:`, literal `$var = "..."`, literal `Write-Output`) before leading directory navigation or first non-readonly `git` / `git -C`; stop at any potentially mutating statement so a trailing `cd`/`git -C` can never mask an earlier mutation's working directory.
+    let mut vars: HashMap<String, String> = HashMap::new();
+    let mut cd_dir: Option<String> = None;
+    let mut git_c_dir: Option<String> = None;
+    let mut saw_non_preamble = false;
+    let mut saw_git = false;
+
+    for stmt in split_ps_top_level_statements(cmd) {
+        if !saw_non_preamble {
+            if let Some(dir) = parse_nav_stmt(stmt, &vars) {
+                cd_dir = Some(dir);
+                saw_non_preamble = true;
+                continue;
+            }
+            if parse_ps_preamble_stmt(stmt, &mut vars) {
+                continue;
+            }
+            saw_non_preamble = true;
+        } else if parse_ps_preamble_stmt(stmt, &mut vars) {
+            continue;
+        }
+        if !saw_git {
+            match parse_git_dash_c_stmt(stmt, &vars) {
+                GitStmtKind::ReadOnlyNoDashC => {}
+                GitStmtKind::WithDashC(gc_opt) => {
+                    saw_git = true;
+                    git_c_dir = gc_opt;
+                }
+                GitStmtKind::MutatingNoDashC | GitStmtKind::NotGit => {
+                    saw_git = true;
+                }
+            }
+        }
+        if cd_dir.is_some() && saw_git {
+            break;
+        }
+    }
     (cd_dir, git_c_dir)
 }
 
@@ -2899,8 +3366,14 @@ mod tests {
         assert!(safe_key_alnum_re().is_match("a-b"));
         assert!(compact_json_scalar_re().is_match("-42.5e1"));
         assert!(swarm_group_suffix_re().is_match("worker-2"));
-        assert!(cd_leading_re().is_match("Set-Location C:\\repo; git status"));
-        assert!(git_dash_c_re().is_match("git -C C:\\repo status"));
+        assert_eq!(
+            extract_cd_prefix_or_git_c("Set-Location C:\\repo; git status"),
+            (Some("C:\\repo".to_string()), None)
+        );
+        assert_eq!(
+            extract_cd_prefix_or_git_c("git -C C:\\repo status"),
+            (None, Some("C:\\repo".to_string()))
+        );
         assert!(leading_null_pipe_re().is_match("$null | git status"));
         assert!(tokenade_wrap_seg_re().is_match("tokenade wrap 'git status'"));
     }
@@ -3705,5 +4178,136 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_extract_cd_prefix_and_git_c_powershell_preamble_and_vars() {
+        assert_eq!(
+            extract_cd_prefix_or_git_c(
+                r#"$ErrorActionPreference = 'Stop'; Push-Location "C:\repo\wt"; npm test"#
+            ),
+            (Some(r"C:\repo\wt".to_string()), None)
+        );
+        assert_eq!(
+            extract_cd_prefix_or_git_c(
+                r#"$ErrorActionPreference = 'Stop'; $env:QA_OUT = "C:\out"; Push-Location "C:\repo\wt\panel"; npx playwright test"#
+            ),
+            (Some(r"C:\repo\wt\panel".to_string()), None)
+        );
+        assert_eq!(
+            extract_cd_prefix_or_git_c(
+                r#"$wt = "C:\repo\wt"; git -C $wt grep -n foo"#
+            ),
+            (None, Some(r"C:\repo\wt".to_string()))
+        );
+        assert_eq!(
+            extract_cd_prefix_or_git_c(
+                r#"$ErrorActionPreference = 'Continue'; $wt = 'C:\repo\O''Connor\wt'; Write-Output "=== run ==="; Push-Location "$wt\panel"; npm test"#
+            ),
+            (Some(r"C:\repo\O'Connor\wt\panel".to_string()), None)
+        );
+        assert_eq!(
+            extract_cd_prefix_or_git_c(r"git -C C:\repo status"),
+            (None, Some(r"C:\repo".to_string()))
+        );
+        assert_eq!(
+            extract_cd_prefix_or_git_c(r#"git reset --hard; Push-Location "C:\clean""#),
+            (None, None)
+        );
+        assert_eq!(
+            extract_cd_prefix_or_git_c(r"git reset --hard; git -C C:\clean status"),
+            (None, None)
+        );
+        assert_eq!(
+            extract_cd_prefix_or_git_c(r#"$wt = 'C:\repo\wt'; Push-Location '$wt'; npm test"#),
+            (Some("$wt".to_string()), None)
+        );
+        assert_eq!(
+            extract_cd_prefix_or_git_c(r#"$wt = $(whoami); Push-Location $wt; npm test"#),
+            (None, None)
+        );
+        // R1 #1: parenthesized expression inside Write-Output can mutate parent repo and must stop preamble.
+        assert_eq!(
+            extract_cd_prefix_or_git_c(
+                r#"Write-Output (New-Item -Path '.\src\generated.ts' -ItemType File); Push-Location '.\codex-worktrees\fix'; npm test"#
+            ),
+            (None, None)
+        );
+        // R1 #2: read-only git without -C must not mask a following mutating git -C, while redirected/mutating git still stops scan.
+        assert_eq!(
+            extract_cd_prefix_or_git_c(
+                r#"git status; git -C .\codex-worktrees\fix apply C:\patches\fix.patch"#
+            ),
+            (None, Some(r".\codex-worktrees\fix".to_string()))
+        );
+        assert_eq!(
+            extract_cd_prefix_or_git_c(r#"git status > out.txt; git -C .\codex-worktrees\fix status"#),
+            (None, None)
+        );
+        // R2 #2: any non-preamble non-git statement after read-only git stops -C search so parent writes are not masked.
+        assert_eq!(
+            extract_cd_prefix_or_git_c(
+                r#"git status; Set-Content .\src\settings.ts $content; git -C .\codex-worktrees\fix status"#
+            ),
+            (None, None)
+        );
+        // R3 #2: pure read-only inspection commands (e.g. Get-Location) without shell meta allow subsequent git -C / Push-Location.
+        assert_eq!(
+            extract_cd_prefix_or_git_c(
+                r#"Get-Location; git -C .\codex-worktrees\fix apply C:\patches\fix.patch"#
+            ),
+            (None, Some(r".\codex-worktrees\fix".to_string()))
+        );
+        assert_eq!(
+            extract_cd_prefix_or_git_c(
+                r#"Get-Location > loc.txt; git -C .\codex-worktrees\fix apply C:\patches\fix.patch"#
+            ),
+            (None, None)
+        );
+        // Closure Pass 1 #1: built-in PowerShell/POSIX `pwd` (`Get-Location`) allows following `git -C` when free of shell meta, and stops on redirection.
+        assert_eq!(
+            extract_cd_prefix_or_git_c(
+                r#"pwd; git -C .\codex-worktrees\fix apply C:\patches\fix.patch"#
+            ),
+            (None, Some(r".\codex-worktrees\fix".to_string()))
+        );
+        assert_eq!(
+            extract_cd_prefix_or_git_c(
+                r#"pwd > loc.txt; git -C .\codex-worktrees\fix apply C:\patches\fix.patch"#
+            ),
+            (None, None)
+        );
+        // R4 #2: external binaries (`rg --pre`, `whoami`), execution-sensitive `$env:` vars, and PowerShell here-strings must NEVER be treated as safe preamble.
+        assert_eq!(
+            extract_cd_prefix_or_git_c(
+                r#"rg --pre evil.cmd pattern .; git -C .\codex-worktrees\fix status"#
+            ),
+            (None, None)
+        );
+        assert_eq!(
+            extract_cd_prefix_or_git_c(r#"whoami; git -C .\codex-worktrees\fix status"#),
+            (None, None)
+        );
+        assert_eq!(
+            extract_cd_prefix_or_git_c(
+                r#"$env:PATH = '.\evil'; git status; git -C .\codex-worktrees\fix status"#
+            ),
+            (None, None)
+        );
+        assert_eq!(
+            extract_cd_prefix_or_git_c(
+                "Write-Output @\"\n\"'$(New-Item evil)'\"\n\"@; Push-Location '.\\codex-worktrees\\fix'"
+            ),
+            (None, None)
+        );
+        // R1 #3: non-ASCII PowerShell variable names must never panic on UTF-8 slicing.
+        assert_eq!(
+            extract_cd_prefix_or_git_c(r#"$aПуть = 'C:\repo\worktree'; Push-Location $aПуть"#),
+            (None, None)
+        );
+        assert_eq!(
+            extract_cd_prefix_or_git_c(r#"$wt = 'C:\repo\папка'; Push-Location $wt"#),
+            (Some(r"C:\repo\папка".to_string()), None)
+        );
     }
 }

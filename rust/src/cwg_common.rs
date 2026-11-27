@@ -3629,7 +3629,7 @@ pub fn is_valid_risk(risk: &str) -> bool {
     )
 }
 
-fn resolve_against_cwd(path: &str, cwd: &str) -> String {
+pub(crate) fn resolve_against_cwd(path: &str, cwd: &str) -> String {
     let p = Path::new(path);
     if !cwd.trim().is_empty() && !p.is_absolute() {
         Path::new(cwd).join(p).to_string_lossy().into_owned()
@@ -4745,7 +4745,7 @@ pub fn requires_tests(
     requires_tests_impl(risk, cwd, paths, policy, git_root_opt, None)
 }
 
-fn find_enclosing_git_root(path: &str) -> Option<String> {
+pub fn find_enclosing_git_root(path: &str) -> Option<String> {
     let mut cur = Path::new(path);
     if !cur.is_dir() {
         cur = cur.parent()?;
@@ -4810,10 +4810,11 @@ pub fn resolve_candidate_context(marker: &Value, include_tests: bool) -> Value {
     } else {
         Value::Null
     };
-    // INVARIANT: Bind Codex review lookup to the unique review-requiring edited worktree root (or unique edited root) so edits made in an external worktree under a sibling parent workspace recognize `--cwd <edited-worktree>` reviews without letting a STANDARD worktree approve a HIGH one.
+    // INVARIANT: Bind Codex review lookup to the unique review-requiring edited worktree root (so a STANDARD worktree can never approve a HIGH one); when no path inherently requires review, narrow to highest-risk edited roots (`STANDARD` > `LOW`) and honor a cycle-latched `cycle_review_root` within them so escalated reviews in a nested/multi-root worktree cannot hop roots mid-cycle.
     let mut root_cache: HashMap<String, Option<String>> = HashMap::new();
     let mut review_roots: HashMap<String, String> = HashMap::new();
     let mut all_edited_roots: HashMap<String, String> = HashMap::new();
+    let mut root_max_risk: HashMap<String, String> = HashMap::new();
     for (abs_p, p_pol, p_risk) in &items {
         let pdir = Path::new(abs_p)
             .parent()
@@ -4826,17 +4827,50 @@ pub fn resolve_candidate_context(marker: &Value, include_tests: bool) -> Value {
         if let Some(gr) = gr_opt {
             let fgr = rio::fold_path(&gr);
             all_edited_roots.entry(fgr.clone()).or_insert_with(|| gr.clone());
+            root_max_risk
+                .entry(fgr.clone())
+                .and_modify(|cur| *cur = max_risk(&[cur.clone(), p_risk.clone()]))
+                .or_insert_with(|| p_risk.clone());
             if requires_review(p_risk, Some(p_pol)) {
                 review_roots.entry(fgr).or_insert(gr);
             }
         }
     }
-    let review_git_root = if review_roots.len() == 1 {
-        review_roots.into_values().next().unwrap_or_default()
-    } else if review_roots.is_empty() && all_edited_roots.len() == 1 {
-        all_edited_roots.into_values().next().unwrap_or_default()
+    let top_edited_risk = if root_max_risk.is_empty() {
+        String::new()
     } else {
-        git_root_opt.clone().unwrap_or_default()
+        let vals: Vec<String> = root_max_risk.values().cloned().collect();
+        max_risk(&vals)
+    };
+    let max_risk_roots: HashMap<String, String> = all_edited_roots
+        .iter()
+        .filter(|(fgr, _)| root_max_risk.get(*fgr).is_some_and(|r| *r == top_edited_risk))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let single_root = |r: String| {
+        let list = if r.is_empty() { vec![] } else { vec![r.clone()] };
+        (r, list)
+    };
+    let (review_git_root, review_git_roots): (String, Vec<String>) = if review_roots.len() == 1 {
+        single_root(review_roots.into_values().next().unwrap_or_default())
+    } else if review_roots.is_empty() && max_risk_roots.len() == 1 {
+        single_root(max_risk_roots.into_values().next().unwrap_or_default())
+    } else if review_roots.is_empty() && max_risk_roots.len() > 1 {
+        let latched = active_marker_review_root(marker);
+        if !latched.is_empty() && max_risk_roots.contains_key(&rio::fold_path(&latched)) {
+            (latched.clone(), vec![latched])
+        } else {
+            let mut roots: Vec<String> = max_risk_roots.values().cloned().collect();
+            roots.sort();
+            let def_root = git_root_opt
+                .as_ref()
+                .filter(|gr| max_risk_roots.contains_key(&rio::fold_path(gr)))
+                .cloned()
+                .unwrap_or_else(|| roots.first().cloned().unwrap_or_default());
+            (def_root, roots)
+        }
+    } else {
+        single_root(git_root_opt.clone().unwrap_or_default())
     };
     let git_root_val = match git_root_opt {
         Some(gr) => Value::String(gr),
@@ -4847,6 +4881,7 @@ pub fn resolve_candidate_context(marker: &Value, include_tests: bool) -> Value {
         "cwd": cwd,
         "git_root": git_root_val,
         "review_git_root": review_git_root,
+        "review_git_roots": review_git_roots,
         "dpaths": dpaths,
         "policy": policy,
         "floor": floor,
@@ -5344,6 +5379,114 @@ pub fn latch_marker_closure_halt_for_marker(
         blocked_ids,
         cycle_base_ts: exp_first_ts,
     });
+}
+
+pub fn active_marker_review_root(marker: &Value) -> String {
+    let Some(rr) = marker.get("cycle_review_root").and_then(|v| v.as_object()) else {
+        return String::new();
+    };
+    let rr_first_ts = val_to_f64(rr.get("candidate_first_ts"));
+    let marker_first_ts = val_to_f64(marker.get("first_ts"));
+    if marker_first_ts <= 0.0 || (rr_first_ts - marker_first_ts).abs() > TS_EPS {
+        return String::new();
+    }
+    let gr = val_to_str(rr.get("git_root")).trim().to_string();
+    if gr.is_empty() {
+        String::new()
+    } else {
+        rio::normalize_path(&gr)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewRootGateResult {
+    Allowed,
+    Mismatch(String),
+    LatchFailed,
+}
+
+pub fn validate_and_latch_review_root(
+    session: &str,
+    expected_first_ts: Option<f64>,
+    git_root: &str,
+) -> ReviewRootGateResult {
+    let norm_root = rio::normalize_path(git_root.trim());
+    if session.trim().is_empty() || norm_root.is_empty() {
+        return ReviewRootGateResult::Allowed;
+    }
+    let fold_target = rio::fold_path(&norm_root);
+    let skey = rio::safe_key(session, "default");
+    let mpath = marker_path(&skey);
+    rio::with_file_lock(&marker_lock_path(&skey), 5.0, 30.0, |locked| {
+        if !locked {
+            return ReviewRootGateResult::LatchFailed;
+        }
+        let raw = rio::read_json(&mpath);
+        let (merged_opt, consumed_ids) = apply_pending_marker_deltas(&skey, raw.as_ref());
+        let Some(mut fresh) = merged_opt else {
+            return ReviewRootGateResult::Allowed;
+        };
+        if !fresh.is_object()
+            || json_truthy(fresh.get("closed"))
+            || candidate_class(&fresh) != WORK_PERSISTENT
+        {
+            return ReviewRootGateResult::Allowed;
+        }
+        let live_first_ts = val_to_f64(fresh.get("first_ts"));
+        if live_first_ts <= 0.0 {
+            return ReviewRootGateResult::LatchFailed;
+        }
+        if let Some(exp_fts) = expected_first_ts {
+            if (live_first_ts - exp_fts).abs() > TS_EPS {
+                return ReviewRootGateResult::LatchFailed;
+            }
+        }
+        // SAFETY: Validate allowed review roots and latch `cycle_review_root` atomically under `marker_lock_path` so concurrent multi-worktree reviews cannot race past the latch; replace any stale latch whose root fell out of the current max-risk allowed set.
+        let cctx = resolve_candidate_context(&fresh, false);
+        let allowed = cctx
+            .get("review_git_roots")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if allowed.is_empty() {
+            return ReviewRootGateResult::Allowed;
+        }
+        let allowed_folds: HashSet<String> = allowed
+            .iter()
+            .map(|r| rio::fold_path(&val_to_str(Some(r))))
+            .collect();
+        if !allowed_folds.contains(&fold_target) {
+            return ReviewRootGateResult::Mismatch(val_to_str(cctx.get("review_git_root")));
+        }
+        if allowed.len() == 1 {
+            return ReviewRootGateResult::Allowed;
+        }
+        let cur_rr = active_marker_review_root(&fresh);
+        if !cur_rr.is_empty() && allowed_folds.contains(&rio::fold_path(&cur_rr)) {
+            if rio::fold_path(&cur_rr) != fold_target {
+                return ReviewRootGateResult::Mismatch(cur_rr);
+            }
+            if consumed_ids.is_empty() {
+                return ReviewRootGateResult::Allowed;
+            }
+        } else if let Some(mobj) = fresh.as_object_mut() {
+            mobj.insert(
+                "cycle_review_root".to_string(),
+                json!({
+                    "candidate_first_ts": live_first_ts,
+                    "git_root": norm_root,
+                }),
+            );
+        }
+        if rio::write_json(&mpath, &fresh).is_ok() {
+            if !consumed_ids.is_empty() {
+                ack_pending_marker_deltas(&skey, &consumed_ids);
+            }
+            ReviewRootGateResult::Allowed
+        } else {
+            ReviewRootGateResult::LatchFailed
+        }
+    })
 }
 
 pub fn active_marker_declared_risk(marker: &Value) -> String {

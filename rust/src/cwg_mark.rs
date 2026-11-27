@@ -4883,6 +4883,24 @@ pub fn evaluate_pre_tool_use(payload: &Value) {
     rio::emit_pre_tool("allow", None, None);
 }
 
+fn anchor_marker_cwd<'a>(cwd: &'a str, git_root: Option<&'a str>, fallback: &'a str) -> &'a str {
+    // INVARIANT: Keep `marker["cwd"]` anchored to the shell's initial workspace/repo root when inside the edited git root, but re-anchor to the edited worktree root when editing a nested/external worktree outside the parent workspace.
+    match (cwd.is_empty(), git_root.filter(|s| !s.is_empty())) {
+        (false, Some(gr)) => {
+            let f_cwd = rio::fold_path(cwd);
+            let f_gr = rio::fold_path(gr);
+            if f_cwd == f_gr || f_cwd.starts_with(&format!("{}/", f_gr.trim_end_matches('/'))) {
+                cwd
+            } else {
+                gr
+            }
+        }
+        (false, None) => cwd,
+        (true, Some(gr)) => gr,
+        (true, None) => fallback,
+    }
+}
+
 pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
     let tc = payload.get("toolCall").and_then(|v| v.as_object());
     let tool_name = tc
@@ -4938,7 +4956,10 @@ pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
             return Ok(());
         }
         let target_vec = vec![target_path.to_string()];
-        cwg_common::publish_claim(&session, &target_vec, false, &cwd);
+        let resolved_target = cwg_common::resolve_against_cwd(target_path, &cwd);
+        let target_git_root = cwg_common::find_enclosing_git_root(&resolved_target);
+        let edit_cwd = anchor_marker_cwd(&cwd, target_git_root.as_deref(), &cwd);
+        cwg_common::publish_claim(&session, &target_vec, false, edit_cwd);
         let base_name = Path::new(target_path)
             .file_name()
             .and_then(|s| s.to_str())
@@ -4946,13 +4967,13 @@ pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
         let cause_lbl = format!("{}:{}", tool_name, base_name);
         let (before, after, persisted) = update_candidate_marker(CandidateMarkerUpdate {
             session: &session,
-            cwd: &cwd,
+            cwd: edit_cwd,
             durable_new_paths: &target_vec,
             changed_lines_delta: estimate_changed_lines(tool_name, args),
             shell_durable_edit: false,
             unknown_barrier: false,
             cause_label: &cause_lbl,
-            known_git_root: None,
+            known_git_root: target_git_root.as_deref(),
             opening_head_override: None,
         });
         let cctx = cwg_common::resolve_candidate_context(&after, false);
@@ -5199,25 +5220,7 @@ pub fn record_post_tool_use(payload: &Value) -> Result<(), String> {
 
     cwg_common::publish_claim(&session, &changed_paths, false, &cmd_cwd);
 
-    // INVARIANT: Keep `marker["cwd"]` anchored to the shell's initial workspace/repo root rather than an ephemeral `Set-Location` subpackage directory so later commands executed from the root are never misclassified against a subpackage `package.json`.
-    let marker_cwd: &str = if !cwd.is_empty() {
-        match snap_git_root.as_deref() {
-            Some(gr) if !gr.is_empty() => {
-                let f_cwd = rio::fold_path(&cwd);
-                let f_gr = rio::fold_path(gr);
-                if f_cwd == f_gr || f_cwd.starts_with(&format!("{}/", f_gr.trim_end_matches('/'))) {
-                    &cwd
-                } else {
-                    gr
-                }
-            }
-            _ => &cwd,
-        }
-    } else if let Some(gr) = snap_git_root.as_deref().filter(|s| !s.is_empty()) {
-        gr
-    } else {
-        &cmd_cwd
-    };
+    let marker_cwd: &str = anchor_marker_cwd(&cwd, snap_git_root.as_deref(), &cmd_cwd);
 
     let before_opening_head: String = match before_snap.as_ref().and_then(|v| v.as_object()) {
         Some(bmap) if json_truthy(bmap.get("in_git")) => {
