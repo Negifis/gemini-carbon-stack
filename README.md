@@ -11,7 +11,7 @@
 - `templates/` и `.env.example` — обезличенные шаблоны конфигурации:
   - `templates/mcp_config.json` — ленивая загрузка (`"eager": false`) и фильтрация `"enabledTools"` для **Serena MCP** и **Context7 MCP**.
   - `templates/antigravity-cli-settings.json` — конфигурация `agy` CLI с маршрутизацией на `Orchestrator (Neon)` и `"useG1Credits": false`.
-  - `templates/GEMINI.md` — тонкий глобальный контекст (`16` строк) для `Turn-0` токен-диеты.
+  - `templates/GEMINI.md` — тонкий глобальный контекст для `Turn-0` токен-диеты.
 - `plugin/` — нативный плагин-бандл Antigravity (`gemini-carbon-stack`):
   - `plugin.json`, `hooks.json` — манифест плагина и 5 групп runtime-хуков (`SessionStart`, `PreInvocation`, `PreToolUse`, `PostToolUse`, `Stop`).
   - `bin/carbon-stack.exe` — релизный Rust-бинарник гейта (`cwg_*`), независимого ревью (`codex-lane`), `continuity`, защитных хуков (`safety_guards`, `comment_density_guard`), локальной FTS5-памяти (`carbon-memory`), импортера сессий Claude Code (`claude-chat-importer`), оркестратора worktree-задач (`chip-handoff`), поиска (`code-search`), кэша роя (`swarm-cache`), безопасного управления worktrees (`worktree-guard`), самодиагностики (`stack-doctor`) и установщика (`install`).

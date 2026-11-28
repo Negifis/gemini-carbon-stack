@@ -21,7 +21,7 @@ Before mutating a live system (server, DB, remote account, service):
 3. Run read-only precheck / dry-run first when available.
 4. For irreversible wide-blast-radius changes, validate the plan before execution (never post-hoc).
 
-After running: verify actual system state matches expected outcome and separate verified facts from assumptions. Never run `simplify` or code review on executed throwaway scripts. Close with `[gate] operational: <precheck>; <verified effect>` (or `no-change` if nothing changed).
+After running: verify actual system state matches expected outcome and separate verified facts from assumptions. Skip `simplify` and code review for executed throwaway scripts. Operational runs close cleanly at Stop on their own; add an optional final `[gate] operational: <precheck>; <verified effect>` (or `no-change`) line when recording the result explicitly.
 
 ## 3. Risk Floors (`PERSISTENT`)
 
@@ -38,7 +38,7 @@ Determine risk by blast radius, data sensitivity, reversibility, and security bo
   - Failures caused by or inside task scope: fix root cause in source (`root-cause-engineering`).
   - Pre-existing out-of-scope failures: hand off to a worktree subagent or `carbon-stack chip-handoff open` (verify reproduction on base revision without mixing fixes into current candidate). Parent verifies every handoff result.
 - **Disabled checks are hidden failures:** never add skip/xfail markers, `eslint-disable`, `# noqa`, `# type: ignore`, `@ts-ignore`, linter exclusions, or `--no-verify`; re-enable any encountered in touched scope and fix underlying causes.
-- Unavailable checks (missing service/credentials): state honestly what could not run and why; never report unrun checks as passing.
+- Unavailable checks (missing service/credentials): state clearly what remained unrun and why, keeping them separate from passing checks.
 
 ## 5. Finite Review & Autonomous Closure
 
@@ -50,7 +50,7 @@ Determine risk by blast radius, data sensitivity, reversibility, and security bo
 
 ## 6. Terminal Receipts & Anomalies
 
-End `PERSISTENT` completions with one factual final line:
+Place the terminal `[gate]` receipt on the standalone unfenced last non-empty line. End `PERSISTENT` completions with:
 - `[gate] verified: <LOW|STANDARD|HIGH|XHIGH>; <candidate and checks>`
 - `[gate] pr-ready: <branch/PR and closure summary>` | `[gate] draft-blocked: <blocker and handoff>`
 
