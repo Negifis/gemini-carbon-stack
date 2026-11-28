@@ -4607,19 +4607,35 @@ fn evaluate_simplify_states(
     out
 }
 
+fn simplify_lane_current(
+    states: &HashMap<&'static str, SimplifyLaneState>,
+    lane: &str,
+) -> bool {
+    states.get(lane) == Some(&SimplifyLaneState::Current)
+}
+
+fn simplify_lanes_current(
+    states: &HashMap<&'static str, SimplifyLaneState>,
+    lanes: &[&str],
+) -> bool {
+    lanes.iter().all(|&l| simplify_lane_current(states, l))
+}
+
 fn missing_simplify_lenses(
     effective_risk: &str,
     states: &HashMap<&'static str, SimplifyLaneState>,
 ) -> Vec<&'static str> {
-    let is_current = |lane: &str| states.get(lane) == Some(&SimplifyLaneState::Current);
     match effective_risk {
         "HIGH" | "XHIGH" => cwg_common::SIMPLIFY_LENSES
             .iter()
             .copied()
-            .filter(|&l| !is_current(l))
+            .filter(|&l| !simplify_lane_current(states, l))
             .collect(),
         "STANDARD" => {
-            if is_current(cwg_common::SIMPLIFY_LANE) {
+            // INVARIANT: Completing all 3 fixed-prompt lenses strictly supersedes 1-lens `simplify-reviewer` on STANDARD (partial 1/3 or 2/3 still blocks).
+            if simplify_lane_current(states, cwg_common::SIMPLIFY_LANE)
+                || simplify_lanes_current(states, cwg_common::SIMPLIFY_LENSES)
+            {
                 Vec::new()
             } else {
                 vec![cwg_common::SIMPLIFY_LANE]
@@ -4629,21 +4645,9 @@ fn missing_simplify_lenses(
     }
 }
 
-fn simplify_completed_ts(
-    effective_risk: &str,
-    eff: &EffectiveSimplifyEvidence,
-    missing_simplify: &[&str],
-) -> f64 {
-    if !missing_simplify.is_empty() {
-        return 0.0;
-    }
-    let required: &[&str] = match effective_risk {
-        "HIGH" | "XHIGH" => cwg_common::SIMPLIFY_LENSES,
-        "STANDARD" => &[cwg_common::SIMPLIFY_LANE],
-        _ => return 0.0,
-    };
+fn simplify_lane_set_ready_ts(eff: &EffectiveSimplifyEvidence, lanes: &[&str]) -> Option<f64> {
     let mut ready_ts = 0.0_f64;
-    for &lane in required {
+    for &lane in lanes {
         // INVARIANT: Anchor each lens to its earliest valid candidate completion (`min`) so later retries cannot advance the cutoff and launder counted post-simplify rounds.
         let first_ok = eff
             .successes
@@ -4653,14 +4657,43 @@ fn simplify_completed_ts(
             .iter()
             .copied()
             .filter(|&ts| ts > 0.0)
-            .reduce(f64::min)
-            .unwrap_or(0.0);
-        if first_ok <= 0.0 {
-            return 0.0;
-        }
+            .reduce(f64::min)?;
         ready_ts = ready_ts.max(first_ok);
     }
-    ready_ts
+    (ready_ts > 0.0).then_some(ready_ts)
+}
+
+fn simplify_completed_ts(
+    effective_risk: &str,
+    eff: &EffectiveSimplifyEvidence,
+    states: &HashMap<&'static str, SimplifyLaneState>,
+    missing_simplify: &[&str],
+) -> f64 {
+    if !missing_simplify.is_empty() {
+        return 0.0;
+    }
+    match effective_risk {
+        "HIGH" | "XHIGH" => simplify_lane_set_ready_ts(eff, cwg_common::SIMPLIFY_LENSES)
+            .unwrap_or(0.0),
+        "STANDARD" => {
+            let single_ts = if simplify_lane_current(states, cwg_common::SIMPLIFY_LANE) {
+                simplify_lane_set_ready_ts(eff, &[cwg_common::SIMPLIFY_LANE])
+            } else {
+                None
+            };
+            let triple_ts = if simplify_lanes_current(states, cwg_common::SIMPLIFY_LENSES) {
+                simplify_lane_set_ready_ts(eff, cwg_common::SIMPLIFY_LENSES)
+            } else {
+                None
+            };
+            [single_ts, triple_ts]
+                .into_iter()
+                .flatten()
+                .reduce(f64::min)
+                .unwrap_or(0.0)
+        }
+        _ => 0.0,
+    }
 }
 
 fn format_simplify_block_reason(
@@ -5933,7 +5966,12 @@ fn validate_candidate_closure_inner(
                 .any(|&l| states.get(l) == Some(&SimplifyLaneState::Exhausted));
         (states, missing, unavailable)
     };
-    let simplify_ready_ts = simplify_completed_ts(&effective_risk, &eff_simp, &missing_simplify);
+    let simplify_ready_ts = simplify_completed_ts(
+        &effective_risk,
+        &eff_simp,
+        &simplify_states,
+        &missing_simplify,
+    );
     let review_ran_after_simplify = |r: &Value| -> bool {
         simplify_ready_ts <= 0.0 || val_to_f64(r.get("launch_ts")) + TS_EPS >= simplify_ready_ts
     };
@@ -14319,16 +14357,76 @@ Command output:
             sub_ev: &SubagentEvidence::default(), swarm_ev: &two_lenses,
             codex_reviews: &[], ctx: None, steps: None, transcript_path: None,
         }).0);
+        // anom-050ca3f8: completing all 3 fixed-prompt lenses strictly supersedes 1-lens simplify-reviewer on STANDARD (2/3 still blocks).
+        let run_std = |sw: &SwarmEvidence| {
+            let sub_empty = SubagentEvidence::default();
+            let closure = validate_candidate_closure(CandidateClosureInput {
+                receipt: Some(&rcp_std), marker_in: &m_std, checks_ev: &checks_ok,
+                sub_ev: &sub_empty, swarm_ev: sw,
+                codex_reviews: &[], ctx: None, steps: None, transcript_path: None,
+            });
+            let mut probe = codex_lane::ClosureCycleSummary::default();
+            let _ = validate_candidate_closure_inner(
+                CandidateClosureInput {
+                    receipt: Some(&rcp_std), marker_in: &m_std, checks_ev: &checks_ok,
+                    sub_ev: &sub_empty, swarm_ev: sw,
+                    codex_reviews: &[], ctx: None, steps: None, transcript_path: None,
+                },
+                Some(&mut probe),
+            );
+            (closure, probe)
+        };
+        let single_ok_run = SwarmSimplifyRun {
+            lane: cwg_common::SIMPLIFY_LANE,
+            worker: cwg_common::SIMPLIFY_SWARM_LANE.to_string(),
+            model: cwg_common::SONNET_HIGH_MODEL.to_string(),
+            launch_ts: first_ts + 11.0,
+            done_ts: first_ts + 12.0,
+            has_fixed_prompt: true,
+        };
         let three_lenses = completed_swarm_simplify_ev(cwg_common::SIMPLIFY_LENSES, first_ts + 20.0);
-        let (ok_std_3, why_std_3) = validate_candidate_closure(CandidateClosureInput {
-            receipt: Some(&rcp_std), marker_in: &m_std, checks_ev: &checks_ok,
-            sub_ev: &SubagentEvidence::default(), swarm_ev: &three_lenses,
-            codex_reviews: &[], ctx: None, steps: None, transcript_path: None,
-        });
+        let mut three_lenses_staggered = three_lenses.clone();
+        three_lenses_staggered.simplify_runs[1].done_ts = first_ts + 22.0;
+        three_lenses_staggered.simplify_runs[2].done_ts = first_ts + 25.0;
+        let ((ok_std_3, res_std_3), probe_std_3) = run_std(&three_lenses_staggered);
         assert!(
-            !ok_std_3 && why_std_3.contains("missing: simplify-reviewer"),
-            "STANDARD must strictly require 1-lens simplify-reviewer, got: {}",
-            why_std_3
+            ok_std_3 && res_std_3 == "verified",
+            "STANDARD must accept completed 3-lens simplify as strict superset of simplify-reviewer, got: {}",
+            res_std_3
+        );
+        assert!(
+            probe_std_3.missing_simplify_lenses.is_empty()
+                && (probe_std_3.simplify_completed_ts - (first_ts + 25.0)).abs() < 0.01,
+            "STANDARD 3-lens probe must clear missing lenses and anchor simplify_completed_ts to max of earliest per-lens completions, got: {:?} ts={}",
+            probe_std_3.missing_simplify_lenses,
+            probe_std_3.simplify_completed_ts
+        );
+
+        // If 1-lens simplify-reviewer succeeded earlier but later FAILED (not Current), STANDARD 3-lens completion must anchor simplify_completed_ts to the Current 3-lens set, not the failed single lens.
+        let mut std_failed_single_plus_3 = three_lenses_staggered.clone();
+        std_failed_single_plus_3.simplify_runs.push(single_ok_run.clone());
+        std_failed_single_plus_3
+            .simplify_failures
+            .entry(cwg_common::SIMPLIFY_LANE.to_string())
+            .or_default()
+            .push(first_ts + 15.0);
+        let ((ok_std_fb3, res_std_fb3), probe_std_fallback_3) = run_std(&std_failed_single_plus_3);
+        assert!(ok_std_fb3 && res_std_fb3 == "verified", "got: {}", res_std_fb3);
+        assert!(
+            (probe_std_fallback_3.simplify_completed_ts - (first_ts + 25.0)).abs() < 0.01,
+            "failed single lens must not anchor simplify_completed_ts when satisfied by 3 lenses, got: {}",
+            probe_std_fallback_3.simplify_completed_ts
+        );
+
+        // If BOTH 1-lens (Current, earlier) and 3-lens (Current, later) completed on STANDARD, keep earliest ready_ts (anti-laundering).
+        let mut std_both_current = three_lenses_staggered.clone();
+        std_both_current.simplify_runs.push(single_ok_run);
+        let ((ok_std_both, res_std_both), probe_std_both) = run_std(&std_both_current);
+        assert!(ok_std_both && res_std_both == "verified", "got: {}", res_std_both);
+        assert!(
+            (probe_std_both.simplify_completed_ts - (first_ts + 12.0)).abs() < 0.01,
+            "when both single and 3-lens are Current on STANDARD, keep earliest ready_ts, got: {}",
+            probe_std_both.simplify_completed_ts
         );
 
         // 3. HIGH and XHIGH reject combined simplify-reviewer or 2/3 lenses, accept 3/3 lenses, and reject pre-candidate stale simplify calls.

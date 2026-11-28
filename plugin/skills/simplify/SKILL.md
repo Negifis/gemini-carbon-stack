@@ -12,7 +12,7 @@ A bounded, behavior-preserving polish pass over the changed scope: clearer, more
 This skill explicitly authorizes invoking the native `swarm` tool for mandatory simplification so exact models can be pinned (`invoke_subagent` only accepts Gemini tiers):
 
 - **`LOW`:** never required (docs, comments, tests-only, static assets).
-- **`STANDARD`:** **1 mandatory pass in 1 combined lens** via `swarm`:
+- **`STANDARD`:** **1 mandatory pass in 1 combined lens** via `swarm` (if all 3 `HIGH`/`XHIGH` lenses already completed for the candidate, they strictly satisfy `STANDARD` without running an extra `simplify-reviewer`):
   - `swarm(action="add", name="simplify-reviewer", model="claude-sonnet-5-5-high", brief="<scope packet>")`
 - **`HIGH` and `XHIGH`:** **1 mandatory pass in 3 parallel lenses BEFORE Round 1 `codex-lane review`** via `swarm` (launched together in one turn):
   1. `swarm(action="add", name="simplify-reuse", model="claude-sonnet-5-5-high", brief="<scope packet>")`

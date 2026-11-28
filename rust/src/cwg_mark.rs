@@ -931,21 +931,29 @@ enum NpmFlagMode {
     Exec,
 }
 
+#[derive(Default)]
+struct NpmFlagCounts {
+    ws: usize,
+    prefix: usize,
+}
+
 type FlagSpecs = (&'static [&'static str], &'static [&'static str], &'static [&'static str]);
 
 fn pkg_mgr_flag_specs(mgr: PkgMgr, npm_mode: NpmFlagMode) -> FlagSpecs {
-    // SAFETY: `npm --prefix <dir> exec` resolves binaries from `<dir>` without changing child CWD (unlike `npm --prefix <dir> test|run` or `npm --workspace <ws> exec`), so `--prefix` is permitted only for `TestOrRun`, never `Exec`.
+    // SAFETY: `npm --prefix <dir> exec` only switches child CWD when paired with a single workspace selector (`-w`/`--workspace`), enforced via `NpmFlagCounts` in `parse_js_exec_validation_runner`.
+    const NPM_VALUE_FLAGS: &[&str] = &["--prefix", "-w", "--workspace"];
+    const NPM_VALUE_FLAGS_EQ: &[&str] = &["--prefix=", "-w=", "--workspace="];
     match mgr {
         PkgMgr::Npm => match npm_mode {
             NpmFlagMode::Exec => (
                 &["--silent", "-s", "--no", "--no-install"],
-                &["-w", "--workspace"],
-                &["-w=", "--workspace="],
+                NPM_VALUE_FLAGS,
+                NPM_VALUE_FLAGS_EQ,
             ),
             NpmFlagMode::TestOrRun => (
                 &["--silent", "-s"],
-                &["--prefix", "-w", "--workspace"],
-                &["--prefix=", "-w=", "--workspace="],
+                NPM_VALUE_FLAGS,
+                NPM_VALUE_FLAGS_EQ,
             ),
         },
         PkgMgr::Pnpm => (&["--silent", "-s"], &["--dir", "-C"], &["--dir="]),
@@ -961,12 +969,28 @@ fn is_workspace_selector_flag(raw: &str) -> bool {
         || raw.starts_with("--workspace=")
 }
 
+fn is_prefix_flag(raw: &str) -> bool {
+    raw == "--prefix" || raw.starts_with("--prefix=")
+}
+
+fn count_npm_flag_within_limit(raw: &str, counts: &mut NpmFlagCounts) -> bool {
+    if is_workspace_selector_flag(raw) {
+        counts.ws += 1;
+        counts.ws <= 1
+    } else if is_prefix_flag(raw) {
+        counts.prefix += 1;
+        counts.prefix <= 1
+    } else {
+        true
+    }
+}
+
 fn scan_flag_run(
     tokens: &[String],
     mut i: usize,
     (silent, exact, eq): FlagSpecs,
     stop_at_double_dash: bool,
-    ws_count: &mut usize,
+    counts: &mut NpmFlagCounts,
 ) -> Option<(usize, bool)> {
     while i < tokens.len() {
         let raw = tokens[i].as_str();
@@ -979,11 +1003,8 @@ fn scan_flag_run(
         }
         match consume_flag_value(tokens, &mut i, exact, eq) {
             FlagScan::Consumed => {
-                if is_workspace_selector_flag(raw) {
-                    *ws_count += 1;
-                    if *ws_count > 1 {
-                        return None;
-                    }
+                if !count_npm_flag_within_limit(raw, counts) {
+                    return None;
                 }
                 continue;
             }
@@ -1001,11 +1022,11 @@ fn scan_flag_run(
 fn scan_pkg_mgr_prefix(
     tokens: &[String],
     npm_mode: NpmFlagMode,
-) -> Option<(PkgMgr, FlagSpecs, usize, usize)> {
+) -> Option<(PkgMgr, FlagSpecs, usize, NpmFlagCounts)> {
     let mgr = tokens.first().and_then(|h| pkg_mgr_kind(h.as_str()))?;
     let specs = pkg_mgr_flag_specs(mgr, npm_mode);
-    let mut ws_count = 0usize;
-    let (mut i, _) = scan_flag_run(tokens, 1, specs, false, &mut ws_count)?;
+    let mut counts = NpmFlagCounts::default();
+    let (mut i, _) = scan_flag_run(tokens, 1, specs, false, &mut counts)?;
     if matches!(mgr, PkgMgr::Yarn)
         && tokens
             .get(i)
@@ -1014,17 +1035,17 @@ fn scan_pkg_mgr_prefix(
         if !tokens.get(i + 1).is_some_and(|ws| is_flag_value(ws)) {
             return None;
         }
-        ws_count += 1;
+        counts.ws += 1;
         i += 2;
     }
-    Some((mgr, specs, i, ws_count))
+    Some((mgr, specs, i, counts))
 }
 
 fn npm_trailing_flags_safe(
     tokens: &[String],
     mut i: usize,
     (silent, exact, eq): FlagSpecs,
-    ws_count: &mut usize,
+    counts: &mut NpmFlagCounts,
 ) -> bool {
     while i < tokens.len() {
         let raw = tokens[i].as_str();
@@ -1037,11 +1058,8 @@ fn npm_trailing_flags_safe(
         }
         match consume_flag_value(tokens, &mut i, exact, eq) {
             FlagScan::Consumed => {
-                if is_workspace_selector_flag(raw) {
-                    *ws_count += 1;
-                    if *ws_count > 1 {
-                        return false;
-                    }
+                if !count_npm_flag_within_limit(raw, counts) {
+                    return false;
                 }
                 continue;
             }
@@ -1057,11 +1075,11 @@ fn npm_trailing_flags_safe(
 }
 
 fn parse_js_exec_validation_runner(tokens: &[String]) -> Option<(&'static str, usize)> {
-    // INVARIANT: Unified syntactic parser for `npx`/`bunx` and `npm|pnpm|yarn exec` / `bun x` enforcing at most one workspace selector flag across all positions before `--`, disallowing `--prefix` on `npm exec` (which does not switch child CWD), and passing exact `(runner_name, arg_start)` to `has_non_executing_validation_arg_tokens`.
+    // INVARIANT: Unified syntactic parser for `npx`/`bunx` and `npm|pnpm|yarn exec` / `bun x` enforcing at most one workspace selector and one `--prefix` across all positions before `--`, rejecting `--prefix` without a workspace selector on `npm exec` (since bare `--prefix` leaves child CWD unchanged), and passing exact `(runner_name, arg_start)` to `has_non_executing_validation_arg_tokens`.
     if let Some(hit) = parse_npx_or_bunx_validation_runner(tokens) {
         return Some(hit);
     }
-    let (mgr, specs, sub_i, mut ws_count) = scan_pkg_mgr_prefix(tokens, NpmFlagMode::Exec)?;
+    let (mgr, specs, sub_i, mut counts) = scan_pkg_mgr_prefix(tokens, NpmFlagMode::Exec)?;
     let sub = tokens.get(sub_i)?;
     let is_exec = match mgr {
         PkgMgr::Npm | PkgMgr::Pnpm | PkgMgr::Yarn => sub.eq_ignore_ascii_case("exec"),
@@ -1073,7 +1091,7 @@ fn parse_js_exec_validation_runner(tokens: &[String]) -> Option<(&'static str, u
     let after_exec = sub_i + 1;
     let (runner_i, needs_npm_trailing_check) = match mgr {
         PkgMgr::Npm => {
-            let (next_i, saw_dd) = scan_flag_run(tokens, after_exec, specs, true, &mut ws_count)?;
+            let (next_i, saw_dd) = scan_flag_run(tokens, after_exec, specs, true, &mut counts)?;
             (next_i, !saw_dd)
         }
         PkgMgr::Pnpm | PkgMgr::Yarn | PkgMgr::Bun => {
@@ -1087,15 +1105,18 @@ fn parse_js_exec_validation_runner(tokens: &[String]) -> Option<(&'static str, u
         }
     };
     let (runner, arg_start) = match_js_validation_runner(tokens, runner_i)?;
-    if needs_npm_trailing_check && !npm_trailing_flags_safe(tokens, arg_start, specs, &mut ws_count) {
+    if needs_npm_trailing_check && !npm_trailing_flags_safe(tokens, arg_start, specs, &mut counts) {
+        return None;
+    }
+    if matches!(mgr, PkgMgr::Npm) && counts.prefix > 0 && counts.ws == 0 {
         return None;
     }
     Some((runner, arg_start))
 }
 
 fn parse_pkg_mgr_validation_runner(tokens: &[String]) -> bool {
-    // INVARIANT: Unified token-based validation admission for npm/pnpm/yarn/bun allowing at most one workspace selector flag and single-target directory flags while failing closed on multi-package filters (`--filter`/`-F`) and unknown/abbreviated npm flags before `--`.
-    let Some((mgr, specs, i, mut ws_count)) = scan_pkg_mgr_prefix(tokens, NpmFlagMode::TestOrRun) else {
+    // INVARIANT: Unified token-based validation admission for npm/pnpm/yarn/bun allowing at most one workspace selector and one `--prefix` flag (plus single-target directory flags) while failing closed on multi-package filters (`--filter`/`-F`) and unknown/abbreviated npm flags before `--`.
+    let Some((mgr, specs, i, mut counts)) = scan_pkg_mgr_prefix(tokens, NpmFlagMode::TestOrRun) else {
         return false;
     };
     let Some(sub) = tokens.get(i) else {
@@ -1114,7 +1135,7 @@ fn parse_pkg_mgr_validation_runner(tokens: &[String]) -> bool {
             } else {
                 return false;
             };
-            npm_trailing_flags_safe(tokens, tail_i, specs, &mut ws_count)
+            npm_trailing_flags_safe(tokens, tail_i, specs, &mut counts)
         }
         PkgMgr::Bun => {
             sub.eq_ignore_ascii_case("test")
@@ -5788,12 +5809,60 @@ mod tests {
             ("bun --cwd backend x jest --runInBand", "VALIDATION"),
             ("bunx vitest run", "VALIDATION"),
             ("bunx -- jest --runInBand", "VALIDATION"),
-            // R1 #1 & #2: reject --prefix on npm exec (does not switch child CWD) and reject multiple workspace selectors across all positions
+            // R1 #1 & #2: reject --prefix on npm exec without single workspace selector (does not switch child CWD) and reject multiple workspace/prefix selectors across all positions
             (
                 r#"npm.cmd --prefix "C:\wt\app" exec -- tsc --noEmit"#,
                 "UNCERTAIN",
             ),
             ("npm --prefix backend exec -- tsc --noEmit", "UNCERTAIN"),
+            ("npm --prefix=backend exec -- tsc --noEmit", "UNCERTAIN"),
+            ("npm exec --prefix backend -- jest", "UNCERTAIN"),
+            ("npm exec jest --prefix backend", "UNCERTAIN"),
+            // anom-96b610fc: npm --prefix <worktree> exec with single -w/--workspace switches child CWD to <worktree>/<ws>
+            (
+                r#"npm --prefix C:\Users\in\Desktop\Projects\wa-tg-tun-new\codex-worktrees\daily-gitlab-497 exec --workspace=backend -- jest --runInBand src/__tests__/scheduledMessageService.test.ts"#,
+                "VALIDATION",
+            ),
+            (
+                r#"npm.cmd --prefix "C:\wt\app" exec --workspace=backend -- jest --runInBand src/__tests__/a.test.ts src/__tests__/b.test.ts"#,
+                "VALIDATION",
+            ),
+            (
+                r#"npm --prefix "C:\wt\app" -w backend exec -- vitest run"#,
+                "VALIDATION",
+            ),
+            (
+                r#"npm --prefix="C:\wt\app" exec -w backend --no-install -- eslint src/"#,
+                "VALIDATION",
+            ),
+            (
+                r#"npm --prefix "C:\wt\app" exec jest -w backend"#,
+                "VALIDATION",
+            ),
+            (
+                r#"npm --prefix "C:\wt\app" exec -- jest --workspace=backend"#,
+                "UNCERTAIN",
+            ),
+            (
+                r#"npm --prefix "C:\wt\a" --prefix "C:\wt\b" -w backend exec -- jest"#,
+                "UNCERTAIN",
+            ),
+            (
+                r#"npm --prefix "C:\wt\a" -w backend exec --workspace=frontend -- jest"#,
+                "UNCERTAIN",
+            ),
+            (
+                r#"npm --prefix "C:\wt\app" exec --workspace=backend -- jest --listTests"#,
+                "UNCERTAIN",
+            ),
+            (
+                r#"npm --prefix "C:\wt\app" exec --workspace=backend -- jest -o"#,
+                "MUTATING",
+            ),
+            (
+                r#"npm --prefix "C:\wt\a" --prefix "C:\wt\b" test -w backend"#,
+                "UNCERTAIN",
+            ),
             ("npm -w backend exec --workspace frontend -- jest", "UNCERTAIN"),
             ("npm -w backend -w frontend exec -- jest", "UNCERTAIN"),
             ("npm -w backend exec jest --workspace frontend", "UNCERTAIN"),
